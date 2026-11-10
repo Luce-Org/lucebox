@@ -360,10 +360,13 @@ bool Qwen4ExpSeqEngine::sample_verify_row(SeqSlot & slot, int32_t fed, const Qwe
 }
 
 namespace {
-// A mode's rate decays by this per step it runs; the other mode runs every kExploreSteps steps.
+// A mode's tokens and seconds decay by this per step it runs (~10 steps of memory): lower follows a change of load
+// sooner and lets a few slow steps swing the choice.
 constexpr double kModeDecay = 0.9;
+// The mode not chosen runs every kExploreSteps steps so its rate stays current: lower measures it more often and
+// spends more steps in the slower mode.
 constexpr long long kExploreSteps = 32;
-// Batched verify steps before the plain step's first measurement.
+// Batched verify steps before the plain mode's first measurement (verify usually pays, so it is measured first).
 constexpr long long kVerifyFirstSteps = 4;
 }  // namespace
 
@@ -388,8 +391,9 @@ void Qwen4ExpSeqEngine::record_mode(int n, bool verify, double tokens, double se
 }
 
 int Qwen4ExpSeqEngine::batched_verify_rows(const StepPlan & plan) const {
+    if (decode_mode_ == DecodeMode::plain) return 0;
     const int rows = batched_verify_width(plan);
-    return rows > 0 && verify_pays((int)plan.decode.size()) ? rows : 0;
+    return rows > 0 && (decode_mode_ == DecodeMode::verify || verify_pays((int)plan.decode.size())) ? rows : 0;
 }
 
 int Qwen4ExpSeqEngine::batched_verify_width(const StepPlan & plan) const {
@@ -456,7 +460,9 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::batched_verify_step(const StepPlan & pl
     }
     const auto t_draft = std::chrono::steady_clock::now();
     // Rows reach each slot's sampler as its solo verify hands them over (Qwen4ExpRows): the device's picks for an
-    // argmax sampler, else the step's largest candidate count first and the whole row on demand.
+    // argmax sampler, else the step's largest candidate count first and the whole row on demand. One count serves
+    // every slot (the graph takes one top-k): sample_logits_top draws exactly from any count at least its sampler's
+    // sample_logits_top_n, and reads the whole row when the candidates do not settle the draw.
     std::vector<Qwen4ExpRows> how((size_t)n);
     Qwen4ExpRowOutputs out;
     for (int s = 0; s < n; ++s) {
@@ -721,23 +727,9 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     if (plan.decode.empty() && plan.prefills.empty()) return result;
     if (mtp_eligible(plan)) return mtp_step(plan.decode[0]);
     if (const int rows = batched_verify_rows(plan)) return batched_verify_step(plan, rows);
-    // A step that could have verified drafts: its time and tokens rate the plain mode (verify_pays).
-    struct PlainTimer {
-        Qwen4ExpSeqEngine * engine = nullptr;
-        int n = 0;
-        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-        ~PlainTimer() {
-            if (!engine) return;
-            ggml_backend_synchronize(engine->backend_);
-            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            engine->record_mode(n, false, (double)n, s);
-            ++engine->batched_.plain_steps;
-        }
-    } plain_timer;
-    if (batched_verify_width(plan) > 0) {
-        plain_timer.engine = this;
-        plain_timer.n = (int)plan.decode.size();
-    }
+    // A step that could have verified drafts: its time and tokens rate the plain mode (verify_pays), once it succeeded.
+    const bool rate_plain = batched_verify_width(plan) > 0;
+    const auto plain_t0 = std::chrono::steady_clock::now();
 
     struct PendingPrefill {
         int slot;
@@ -887,6 +879,12 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         }
         result.prefills.push_back(std::move(output));
     }
+    if (rate_plain) {
+        ggml_backend_synchronize(backend_);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - plain_t0).count();
+        record_mode((int)plan.decode.size(), false, (double)plan.decode.size(), s);
+        ++batched_.plain_steps;
+    }
     return result;
 }
 
@@ -911,7 +909,10 @@ void Qwen4ExpSeqEngine::retire(int slot) {
         if (slot == mtp_slot_ && verify_width_ == 0) mtp_costs_->store(*mtp_width_, m.context);
         m = MtpState{};
     }
-    if (batched_.steps > 0) {
+    // The batched steps' summary once no other request is left: one line per busy stretch.
+    bool last = true;
+    for (int s = 0; s < slot_count(); ++s) last = last && (s == slot || !slots_.is_active(s));
+    if (last && batched_.steps > 0) {
         std::fprintf(stderr,
             "[qwen4exp-mtp] batched verify steps=%lld slots=%.2f tokens_per_step=%.2f step_ms=%.1f draft_ms=%.1f "
             "verify_ms=%.1f builds=%llu replays=%llu plain_steps=%lld\n",
@@ -927,8 +928,8 @@ void Qwen4ExpSeqEngine::retire(int slot) {
                 k, r.verify_s > 0 ? r.verify_tokens / r.verify_s : 0.0, r.verify_steps,
                 r.plain_s > 0 ? r.plain_tokens / r.plain_s : 0.0, r.plain_steps);
         }
-        batched_ = {};
     }
+    if (last) batched_ = {};
     ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();

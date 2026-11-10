@@ -33,18 +33,24 @@ struct Qwen4ExpRow;
 // the engine enforces the backend's byte allowance on capture.
 //
 // Every slot's cache carries the MTP draft layer and verify rollback state; the first slot's covers the widest verify
-// (its rollback buffers are close to 1 GiB), the others' kQwen4ExpBatchedVerifyRows rows. Admission takes the lowest
-// free slot, so a request arriving at an idle server lands there. It drafts and verifies like the single-slot loop
-// while it is the only decoder with nothing prefilling, returning accepted drafts as committed tokens. Greedy requests
-// decoding together (or one alone on another slot) draft kQwen4ExpBatchedVerifyRows - 1 tokens each and verify them
-// all in one multi-slot graph (qwen4exp_verify_batched), so the experts a step reads serve every slot's drafts.
-// Otherwise the slots decode one token per step in the batched graph, which still returns each slot's final HC
-// residual, so the draft layers stay caught up and drafting resumes. Every pick is computed where the multi-slot rows
-// compute it, so a request's text does not depend on the other requests. The draft layer's state sits in the cache
-// (K/V, mtp_prev_hidden at mtp_prev_pos) at every prompt-chunk boundary, where prefix snapshots capture it.
+// (its rollback buffers are close to 1 GiB), the others' at most kQwen4ExpBatchedVerifyRows rows. Admission takes the
+// lowest free slot, so a request arriving at an idle server lands there. It drafts and verifies like the single-slot
+// loop while it is the only decoder with nothing prefilling, returning accepted drafts as committed tokens (with an
+// adaptive width, prompt-lookup drafts are verified there too). Requests decoding together (or one alone on another
+// slot), greedy or sampled, either draft rows - 1 tokens each and verify them all in one multi-slot graph
+// (qwen4exp_verify_batched; rows is kQwen4ExpBatchedVerifyRows, or fewer when the caches' draft cap is lower), so the
+// experts a step reads serve every slot's drafts, or decode one token each in the batched graph, which still returns
+// each slot's final HC residual, so the draft layers stay caught up and drafting resumes. The step takes the mode
+// that has committed more tokens per second at that many slots (verify_pays), unless a test forces one
+// (set_decode_mode). Every pick is computed where the multi-slot rows compute it, so a request's text does not depend
+// on the other requests or the mode. The draft layer's state sits in the cache (K/V, mtp_prev_hidden at
+// mtp_prev_pos) at every prompt-chunk boundary, where prefix snapshots capture it.
 class Qwen4ExpSeqEngine final : public SeqEngine {
 public:
     static constexpr int kPrefixCheckpoints = 64;
+    // How decoding slots beside each other step (above): measured, or always verify (where the plan allows it) or
+    // always plain. Tests force each mode to check both against the requests' alone streams.
+    enum class DecodeMode { measured, verify, plain };
 
     Qwen4ExpSeqEngine(ggml_backend_t backend, const Qwen4ExpWeights & weights,
                       std::vector<Qwen4ExpCache *> caches, int max_ctx,
@@ -72,6 +78,7 @@ public:
     // cap plus one (a fixed --verify-width, or QWEN4EXP_MTP_MAX_VERIFY when adaptive), so the scheduler keeps
     // drafting while a thinking budget is still open and hands off to single tokens only near its close.
     int max_decode_tokens() const override { return mtp_slot_ >= 0 ? caches_[(size_t) mtp_slot_]->mtp_draft + 1 : 1; }
+    void set_decode_mode(DecodeMode mode) { decode_mode_ = mode; }
 
 private:
     AdmitResult admit_cold(uint64_t request_id, const std::vector<int32_t> & prompt,
@@ -143,6 +150,7 @@ private:
         long long verify_steps = 0, plain_steps = 0, steps = 0;
     };
     std::vector<ModeRates> mode_rates_;   // [0, kQwen4ExpMaxBatchedSlots]
+    DecodeMode decode_mode_ = DecodeMode::measured;
     // The adaptive verify width and its costs per context range: the single-slot
     // loop's when the backend passes them (else this engine's own).
     AdaptiveSpecWidth own_mtp_width_ = qwen4exp_mtp_width_controller();
