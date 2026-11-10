@@ -1321,7 +1321,15 @@ bool Qwen35SeqEngine::settle_kvflash_(std::vector<PrefillOutput> & prefill_outpu
         if (s.prefilling() && kvflash_slot_turn_apply_due(recall_[(size_t)slot].turn, s.cur_pos)) apply_recall5_(slot);
         live.push_back(slot);
     }
-    return kvf_->settle(live) >= 0;
+    if (kvf_->settle(live) < 0) return false;
+    for (const PrefillOutput & o : prefill_outputs) {   // what the answer decodes against, as the serial engine prints it
+        if (o.status != PrefillOutput::Status::completed || !std::getenv("LUCE_KVFLASH_DEBUG_RESIDENT")) continue;
+        const KvFlashSlotPager & p = kvf_kv_->pager(o.slot);
+        const int committed = slots_.slot(o.slot).cur_pos;
+        std::fprintf(stderr, "[kvflash-dbg] after prefill kv_offset=%d committed=%d resident=%s slot=%d\n",
+                     recall_[(size_t)o.slot].turn.kv_offset, committed, p.debug_resident(committed / p.chunk_tokens()).c_str(), o.slot);
+    }
+    return true;
 }
 
 // A KVFlash slot's whole column from its pager: 4 entries per resident chunk,
