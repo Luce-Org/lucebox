@@ -1,5 +1,6 @@
 #include "kvflash_drafter_scorer.h"
 
+#include "common/kvflash_pflash_map.h"
 #include "qwen35_drafter.h"
 #include "server/tokenizer.h"
 
@@ -84,6 +85,17 @@ bool score_tokens_resilient(DrafterContext & ctx, const std::vector<int32_t> & i
     return true;
 }
 
+// Ids the target vocabulary has beyond the drafter's fold into its range (see KvFlashDrafterScorer).
+std::vector<int32_t> fold_to_drafter_vocab(const std::vector<int32_t> & ids, int32_t vocab_clamp) {
+    std::vector<int32_t> out = ids;
+    if (vocab_clamp > 1001) {   // fold range must stay positive
+        for (auto & t : out) {
+            if (t >= vocab_clamp) t = 1000 + t % (vocab_clamp - 1000);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 bool KvFlashDrafterScorer::score_chunks(const std::vector<int32_t> & ids,
@@ -93,12 +105,7 @@ bool KvFlashDrafterScorer::score_chunks(const std::vector<int32_t> & ids,
     out.clear();
     if (!ctx_ || !ctx_->loaded || S < kLookahead + 1 || chunk_tokens <= 0) return false;
 
-    std::vector<int32_t> score_ids = ids;
-    if (vocab_clamp_ > 1001) {   // fold range must stay positive
-        for (auto & t : score_ids) {
-            if (t >= vocab_clamp_) t = 1000 + t % (vocab_clamp_ - 1000);
-        }
-    }
+    const std::vector<int32_t> score_ids = fold_to_drafter_vocab(ids, vocab_clamp_);
 
     std::vector<float> smooth;
     if (!score_tokens_resilient(*ctx_, score_ids, smooth)) return false;
@@ -112,6 +119,42 @@ bool KvFlashDrafterScorer::score_chunks(const std::vector<int32_t> & ids,
         out[c] = m / std::max(1, e_ - s_);
     }
     return true;
+}
+
+bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int chunk_tokens,
+                                        std::vector<float> & out) {
+    const int S = (int)ids.size();
+    out.clear();
+    segments_ = 0;
+    stats_ = {};
+    if (!ctx_ || !ctx_->loaded || S < kLookahead + 1 || chunk_tokens <= 0) return false;
+
+    // The drafter shares the target's tokenizer: the ids go through unchanged.
+    std::string err;
+    const int64_t n_vocab = ctx_->state ? ctx_->state->weights.embedder.n_vocab : 0;
+    if (!kvflash_pflash2_ids_fit(ids, n_vocab, err)) { std::fprintf(stderr, "[kvflash] pflash2: %s\n", err.c_str()); return false; }
+
+    // The release request: lookahead 128, the query ends at the last message's content,
+    // keep 1.0, chunk 256, pool 1, suffix candidates, every message mapped.
+    const PFlashRequestMessages msgs = kvflash_message_map(ids, roles_);
+    if (!msgs.all_error.empty()) { std::fprintf(stderr, "[kvflash] pflash2: message map: %s\n", msgs.all_error.c_str()); return false; }
+    // The request path's strict selection records every candidate with its density (the attention lift);
+    // the selection itself is not used.
+    const int query_end = kvflash_message_query_end(msgs);
+    if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: the last message is empty, no query\n"); return false; }
+    const std::vector<int32_t> kept = drafter_score_and_compress(
+        *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/128, /*pool_kernel=*/1,
+        query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
+    const auto & lifts = pflash_last_candidate_lifts();
+    if (kept.empty() || lifts.empty()) return false;
+
+    std::vector<PFlashTokenSpan> spans;
+    std::vector<double> density;
+    for (const auto & l : lifts) { spans.push_back(l.span); density.push_back(l.lift); }
+    out = kvflash_pflash_chunk_scores(spans, density, S, chunk_tokens);
+    stats_ = pflash_last_scoring_stats();
+    segments_ = (int)spans.size();
+    return !out.empty();
 }
 
 // ── KvFlashCrossTokScorer ───────────────────────────────────────────────

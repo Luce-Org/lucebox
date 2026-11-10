@@ -94,16 +94,48 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
         out_bin = Path(d) / "out.bin"
         r, w = os.pipe()
         try:
-            cmd = [str(bin_path), str(target), str(draft), str(prompt_bin),
-                   str(n_gen), str(out_bin),
-                   "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
-                   f"--stream-fd={w}"]
-            proc = subprocess.Popen(cmd, pass_fds=(w,),
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+            if sys.platform == "win32":
+                import msvcrt
+
+                os.set_inheritable(w, True)
+                stream_fd_val = int(msvcrt.get_osfhandle(w))
+            else:
+                stream_fd_val = w
+
+            cmd = [
+                str(bin_path),
+                str(target),
+                str(draft),
+                str(prompt_bin),
+                str(n_gen),
+                str(out_bin),
+                "--fast-rollback",
+                "--ddtree",
+                f"--ddtree-budget={budget}",
+                f"--stream-fd={stream_fd_val}",
+            ]
+
+            if sys.platform == "win32":
+                proc = subprocess.Popen(
+                    cmd,
+                    close_fds=False,
+                    stdout=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    pass_fds=(w,),
+                    stdout=subprocess.DEVNULL,
+                )
         except BaseException:
-            os.close(r)
-            os.close(w)
+            try:
+                os.close(r)
+            except OSError:
+                pass
+            try:
+                os.close(w)
+            except OSError:
+                pass
             raise
 
         os.close(w)
