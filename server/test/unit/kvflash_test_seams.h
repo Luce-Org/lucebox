@@ -5,6 +5,12 @@
 
 namespace luce::common {
 
+// Owner of an arena row, -1 for the scratch and dead-row blocks and out-of-range rows.
+inline int kvflash_slot_of_row(int64_t row, int n_slots, int quota_chunks, int chunk_tokens = kKvFlashChunkTokens) {
+    if (row < 0 || row >= (int64_t)n_slots * quota_chunks * chunk_tokens) return -1;
+    return (int)(row / ((int64_t)quota_chunks * chunk_tokens));
+}
+
 // First row of the scratch block (owned by no slot).
 inline int64_t kvflash_scratch_row(int n_slots, int quota_chunks, int chunk_tokens = kKvFlashChunkTokens) {
     return (int64_t)n_slots * quota_chunks * chunk_tokens;

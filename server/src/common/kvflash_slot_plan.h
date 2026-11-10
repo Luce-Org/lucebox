@@ -56,9 +56,12 @@ inline KvFlashAutoBudget kvflash_budget_per_slot(KvFlashAutoBudget b, int n_slot
 // The arena a KVFlash slot engine allocates: `rows` is ctx_alloc, `pool_tokens`
 // the N x Q x chunk the pool is derived as. --kv-pool-tokens is never a size
 // here; given and different, it is refused with `error` set (rows 0).
-struct KvFlashArenaSizing { int64_t rows = 0, pool_tokens = 0; std::string error; };
+// Layout: [N slices][N x chain_scratch_stride chain scratch rows][one dead-row block].
+// `scratch_base` is the first chain scratch row (the pool's end, 16-aligned) and `dead_row`
+// the first row of the dead block; with no chain stride they coincide at the pool's end.
+struct KvFlashArenaSizing { int64_t rows = 0, pool_tokens = 0, scratch_base = 0, dead_row = 0; std::string error; };
 inline KvFlashArenaSizing kvflash_arena_sizing(int n_slots, int quota_chunks, int64_t kv_pool_tokens,
-                                               int chunk_tokens = kKvFlashChunkTokens) {
+                                               int chunk_tokens = kKvFlashChunkTokens, int chain_scratch_stride = 0) {
     KvFlashArenaSizing r;
     if (n_slots < 1 || quota_chunks < 1) { r.error = "KVFlash arena needs at least one slot and one chunk of quota"; return r; }
     r.pool_tokens = (int64_t)n_slots * quota_chunks * chunk_tokens;
@@ -69,8 +72,15 @@ inline KvFlashArenaSizing kvflash_arena_sizing(int n_slots, int quota_chunks, in
         r.pool_tokens = 0;
         return r;
     }
-    r.rows = kvflash_arena_rows(n_slots, quota_chunks, chunk_tokens);
-    if (r.rows > INT32_MAX) { r.error = "KVFlash arena exceeds INT32_MAX rows"; r.rows = r.pool_tokens = 0; }
+    if (chain_scratch_stride < 0 || (chain_scratch_stride > 0 && (chain_scratch_stride % 16 != 0 || r.pool_tokens % 16 != 0))) {
+        r.error = "KVFlash chain scratch stride " + std::to_string(chain_scratch_stride) + " must be a non-negative multiple of 16";
+        r.pool_tokens = 0;
+        return r;
+    }
+    r.scratch_base = r.pool_tokens;
+    r.dead_row = r.pool_tokens + (int64_t)n_slots * chain_scratch_stride;
+    r.rows = kvflash_arena_rows(n_slots, quota_chunks, chunk_tokens) + (int64_t)n_slots * chain_scratch_stride;
+    if (r.rows > INT32_MAX) { r.error = "KVFlash arena exceeds INT32_MAX rows"; r.rows = r.pool_tokens = r.scratch_base = r.dead_row = 0; }
     return r;
 }
 

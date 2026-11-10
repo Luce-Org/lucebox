@@ -63,6 +63,43 @@ TEST_CASE(KvflashSlotPlanFixture, arena_sizing_derives_the_pool_and_refuses_a_di
     CHECK(!kvflash_arena_sizing(8, 1 << 24, 0).error.empty());    // rows do not fit the int ctx_alloc
 }
 
+TEST_CASE(KvflashSlotPlanFixture, arena_sizing_without_a_chain_keeps_the_one_scratch_block_layout) {
+    const KvFlashArenaSizing a = kvflash_arena_sizing(2, 32, 0);
+    CHECK(a.error.empty());
+    CHECK(a.rows == 2 * 32 * 64 + 64);
+    CHECK(a.scratch_base == a.pool_tokens);          // no chain rows: both sit where the slices end
+    CHECK(a.dead_row == a.pool_tokens);
+}
+
+TEST_CASE(KvflashSlotPlanFixture, arena_sizing_with_a_chain_adds_one_scratch_stride_per_slot_between_the_slices_and_the_dead_block) {
+    const int N = 2, Q = 32, stride = 16;            // a block-16 chain: paged_token_capacity(16) == 16
+    const KvFlashArenaSizing a = kvflash_arena_sizing(N, Q, 0, 64, stride);
+    REQUIRE(a.error.empty());
+    CHECK(a.pool_tokens == N * Q * 64);              // the pool is unchanged
+    CHECK(a.scratch_base == N * Q * 64);             // chain scratch starts at the end of the last slice
+    CHECK(a.scratch_base % 16 == 0);
+    CHECK(a.dead_row == a.scratch_base + (int64_t)N * stride);   // the dead-row block follows the scratch rows
+    CHECK(a.rows == a.dead_row + 64);                // N*Q*64 + N*stride + 64
+    CHECK(a.rows == kvflash_arena_rows(N, Q) + (int64_t)N * stride);
+    // no slot owns a chain scratch row or the dead block
+    for (int64_t r = a.scratch_base; r < a.rows; r++) CHECK(kvflash_slot_of_row(r, N, Q) == -1);
+    // every slot's scratch window [base + s*stride, +stride) is disjoint and inside the arena
+    for (int sl = 0; sl < N; sl++) CHECK(a.scratch_base + (int64_t)(sl + 1) * stride <= a.dead_row);
+    // --kv-pool-tokens stays derived, chain or not
+    CHECK(!kvflash_arena_sizing(N, Q, 2048, 64, stride).error.empty());
+    CHECK(kvflash_arena_sizing(N, Q, N * Q * 64, 64, stride).error.empty());
+}
+
+TEST_CASE(KvflashSlotPlanFixture, arena_sizing_refuses_a_chain_stride_that_is_not_block_aligned_or_overflows_int32) {
+    CHECK(!kvflash_arena_sizing(2, 32, 0, 64, 12).error.empty());      // scratch_base + slot*stride must stay 16-aligned
+    CHECK(!kvflash_arena_sizing(2, 32, 0, 64, -16).error.empty());
+    // N*Q*64 + N*stride + 64 > INT32_MAX though the slices and the dead block alone fit
+    const int Q = (int)(((int64_t)INT32_MAX - 64) / 64 / 2);           // 2 slots fill the int range exactly
+    CHECK(kvflash_arena_sizing(2, Q, 0).error.empty());
+    CHECK(!kvflash_arena_sizing(2, Q, 0, 64, 1 << 20).error.empty());
+    CHECK(kvflash_arena_sizing(2, 32, 0, 64, 16).rows == 2 * 32 * 64 + 2 * 16 + 64);
+}
+
 TEST_CASE(KvflashSlotPlanFixture, slices_tile_the_arena_exactly) {
     const int N = 4, Q = 352;                       // Q = 22,528 tokens
     REQUIRE(kvflash_arena_rows(N, Q) == (int64_t)N * Q * 64 + 64);   // N x Q x 64 + scratch block
