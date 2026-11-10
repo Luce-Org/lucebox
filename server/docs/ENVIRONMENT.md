@@ -150,7 +150,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_ENGRAM_DEVICE` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill applies Engram on the device residual; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_EXPLICIT_SPLIT` - deepseek4/deepseek4_graph.cpp, deepseek4_fused_verify.inc (=1: V4.1 explicit verify lanes run the split-KV flash schedule on the F16 cache; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_MASK_F16_ONCE` - deepseek4/deepseek4_fused_verify.inc (=1: one F16 copy of the verify mask per step; set by `--profile ds41-r9700-gorgon`)
-- `LUCE_DS4_F16_KV_LANES` - deepseek4/deepseek4_graph.cpp (=1: single-token verify lanes keep F16 K/V too; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_F16_KV_LANES` - deepseek4/deepseek4_graph.cpp (=1: single-token verify lanes keep F16 K/V too, paged lanes excepted, which read their gathered rows; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_FUSE_ROUTER` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact router select and weights ops for decode and verify; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
 - `LUCE_DS4_FUSE_COLLAPSE` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact HC collapse op; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
 - `LUCE_DS4_DEVICE_TOPK` - deepseek4/deepseek4_graph.cpp (=1: hybrid prefill takes each token's top route candidates from the device; the host orders them exactly as before; set by `--profile ds41-r9700-gorgon`)
@@ -246,7 +246,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_TP_FUSED_HC_JOIN` - deepseek4_fused_verify.inc
 - `LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS` - deepseek4_fused_verify.inc
 - `LUCE_DS4_TP_MASKED_ROUTES` - deepseek4_fused_verify.inc
-- `LUCE_DS4_TP_NATIVE_ROUTE_WIDTH` - deepseek4_fused_verify.inc
+- `LUCE_DS4_TP_NATIVE_ROUTE_WIDTH` - deepseek4_fused_verify.inc (=1: steps of more than one row keep the six routed experts in one owner graph; verify lanes and paged steps always do)
 - `LUCE_DS4_TP_ROUTE_PREFORK` - moe_hybrid_ffn_eval.cpp
 - `LUCE_DS4_VERIFY_BUILD_TIMING` - deepseek4_fused_verify.inc (DIAGNOSTIC: fused-verify graph build timing)
 - `LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE` - dspark_head.cpp (KILL SWITCH: =1 rebuilds the DSpark Markov chain graph on every call)

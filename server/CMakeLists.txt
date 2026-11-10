@@ -2227,6 +2227,20 @@ if(LUCE_TESTS)
         target_link_libraries(test_ds4_paged_prefill_model PRIVATE
             luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base hip::host)
     endif()
+    # Optional full-model regression for paged DeepSeek V4.1 on the
+    # ds41-r9700-gorgon profile: a sequence's tokens do not depend on the
+    # sequences beside it. Needs the model and the box's expert placement.
+    if(LUCE_GPU_BACKEND STREQUAL "hip" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_paged_exact_model.cpp")
+        add_executable(test_ds4_paged_exact_model test/unit/test_ds4_paged_exact_model.cpp)
+        target_include_directories(test_ds4_paged_exact_model PRIVATE
+            ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_ds4_paged_exact_model PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP
+            LUCE_MODEL_CARDS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../share/model_cards"
+            LUCE_SERVER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(test_ds4_paged_exact_model PRIVATE
+            luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base hip::host)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/unit/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
