@@ -778,14 +778,23 @@ static bool build_batched_routed_graph(
         return t;
     };
     if (tokenwise && n_tokens > 1) {
+        // A token's input, routes and weights are column views: a column of a
+        // dense tensor is dense, so it needs no copy of its own. The input is
+        // gathered on this owner in one copy first, since views of a tensor
+        // on another device cross to it one by one. Every node is the
+        // owner's: an unplaced copy would follow its graph neighbour, the
+        // other owner's last node in a split step, and make this owner wait
+        // for that one.
+        const auto column = [&](ggml_tensor * m, int64_t rows, int t) {
+            ggml_tensor * col = ggml_view_2d(ctx, m, rows, 1, m->nb[1], (size_t) t * m->nb[1]);
+            return ggml_is_contiguous(col) ? col : track(ggml_cont(ctx, col));
+        };
+        ggml_tensor * inp_owner = track(ggml_cont(ctx, inp));
         ggml_tensor * joined = nullptr;
         for (int t = 0; t < n_tokens; ++t) {
-            ggml_tensor * inp_col = ggml_cont(ctx, ggml_view_2d(
-                ctx, inp, n_embd, 1, inp->nb[1], (size_t) t * inp->nb[1]));
-            ggml_tensor * sel_col = ggml_cont(ctx, ggml_view_2d(
-                ctx, sel, n_used, 1, sel->nb[1], (size_t) t * sel->nb[1]));
-            ggml_tensor * wts_col = ggml_cont(ctx, ggml_view_2d(
-                ctx, wts, n_used, 1, wts->nb[1], (size_t) t * wts->nb[1]));
+            ggml_tensor * inp_col = column(inp_owner, n_embd, t);
+            ggml_tensor * sel_col = column(sel, n_used, t);
+            ggml_tensor * wts_col = column(wts, n_used, t);
             ggml_tensor * routed_col = nullptr;
             if (!build_batched_routed_graph(
                     ctx, gate_tensor, up_tensor, down_tensor, gate_up_tensor,
