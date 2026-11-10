@@ -299,7 +299,7 @@ protected:
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
     int                            kvflash_mask_pos_ = -1;   // decode position the cached mask was cut at
     int  kvflash_tokens_ = 0;                       // 0 = off
-    int  kvflash_tau_    = 64;
+    int  kvflash_tau_    = 64;                      // tokens between decode-time reselects; 0 = none (recall modes)
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
     // Pool sizing inputs — shared so MoE placement reserves exactly the pool
@@ -313,6 +313,9 @@ protected:
     // (kvflash_qk.h); no drafter. Keys pool at chunk-seal time; the query
     // comes from cache_.q_cap (graph capture_qk).
     bool                    kvflash_qk_policy_ = false;
+    // The policy's decode-time half: pooled keys, the decode-step query capture and a rescore every kvflash_tau_
+    // tokens. Off under a recall mode (kvflash_tau_ == 0), whose plan holds while the answer decodes.
+    bool kvflash_qk_decode() const { return kvflash_qk_policy_ && kvflash_tau_ > 0; }
     KvFlashQkPool           kvflash_qk_pool_;
     KvFlashTargetQkScorer * kvflash_qk_scorer_ = nullptr;  // owned by kvflash_scorer_
     int                     kvflash_qk_pooled_upto_ = 0;   // chunks pooled so far

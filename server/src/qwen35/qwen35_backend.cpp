@@ -478,9 +478,6 @@ bool Qwen35Backend::init() {
                                             cfg_.paged_attention
                                                 ? kvflash_budget_per_slot(kvf_budget, concurrent_slots())
                                                 : kvf_budget);
-    if (kvflash_tokens_ > 0) {
-        kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
-    }
     // LUCE_KVFLASH_PREAMBLE_ROWS=R: R rounded up to a chunk is reserved inside the pool for the pinned preamble,
     // so the history budget is the pool minus the reserve and the pool (the decode cost) stays what --kvflash asked.
     kvflash_preamble_reserve_ = kvflash_preamble_rows_ = 0;
@@ -514,6 +511,8 @@ bool Qwen35Backend::init() {
         kvflash_uq_queries_ = plan.uq_queries;
         if (plan.reselect_mode == 0) kvflash_select_queries_ = 0;
     }
+    if (kvflash_tokens_ > 0)
+        kvflash_tau_ = luce::common::kvflash_decode_reselect_tau(kvflash_prefill_reselect_, env_int_or_default("LUCE_KVFLASH_TAU", 64));
     if (kvflash_uq_queries_ > 0) {
         const std::string why = luce::common::kvflash_uq_gate(w_.im_start_id, w_.user_id, w_.im_end_id, w_.tool_response_id);
         if (!why.empty()) {
@@ -798,13 +797,8 @@ bool Qwen35Backend::init() {
         // (without this, slot_for() waits on the host instead).
         if (!tensor_parallel_ && target_backend_ && ggml_backend_is_cuda(target_backend_))
             kvflash_pager_.set_compute_stream(ggml_backend_cuda_get_stream(target_backend_));
-        if (kvflash_qk_policy_) {
-            KvFlashQkDims qd;
-            qd.n_layers   = (int)cache_.attn_k.size();
-            qd.n_q_heads  = w_.n_head;
-            qd.n_kv_heads = w_.n_head_kv;
-            qd.head_dim   = w_.n_embd_head_k;
-            kvflash_qk_pool_.reset(qd);
+        if (kvflash_qk_decode()) {
+            kvflash_qk_pool_.reset(kvflash_exact_dims());
             auto qs = std::make_unique<KvFlashTargetQkScorer>(&kvflash_qk_pool_);
             kvflash_qk_scorer_ = qs.get();
             kvflash_scorer_ = std::move(qs);
@@ -812,7 +806,8 @@ bool Qwen35Backend::init() {
         std::printf("[kvflash] resident pool %d tokens (logical max_ctx %d), "
                     "tau=%d, policy=%s\n",
                     kvflash_tokens_, cfg_.device.max_ctx, kvflash_tau_,
-                    kvflash_qk_policy_ ? "qk (target pooled-K vs decode query)"
+                    kvflash_prefill_reselect_ ? "recall (planned at the turn's prefill, held while it decodes)"
+                    : kvflash_qk_policy_ ? "qk (target pooled-K vs decode query)"
                     : !kvflash_drafter_path_.empty()
                         ? "drafter (attaches on first reselect)"
                         : "lru (recency-only: no Qwen3.5-0.8B drafter found "
@@ -1872,7 +1867,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     window.loaded = [this] {
         // pflash + kvflash synergy: the drafter doubles as the pool's
         // Memory Indexer (tau-step reselect). Pager stays LRU without it.
-        if (kvflash_active() && !kvflash_scorer_) {
+        if (kvflash_active() && kvflash_tau_ > 0 && !kvflash_scorer_) {
             kvflash_scorer_ = std::make_unique<KvFlashDrafterScorer>(&drafter_ctx_);
             std::fprintf(stderr, "[kvflash] drafter scorer attached (tau=%d)\n",
                          kvflash_tau_);
@@ -2516,7 +2511,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_policy_)) {
+                               /*capture_qk=*/pool && kvflash_qk_decode())) {
             result.fail(GenerateErrorCode::BackendSpecific,
                              "restore step-graph build");
             return result;
@@ -2688,7 +2683,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_, kvflash_preamble_reserve_);
         if (!kvf_consume) {   // a consuming restore keeps the restored pager
             kvflash_pager_.reset();
-            if (kvflash_qk_policy_) {
+            if (kvflash_qk_decode()) {
                 kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
                 kvflash_qk_pooled_upto_ = 0;
             }
@@ -3102,7 +3097,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // QK policy: pool the post-RoPE keys of chunks this batch sealed
         // (they are resident — sealed inside the protected tail window).
-        if (kvflash_active() && kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+        if (kvflash_active() && kvflash_qk_decode()) kvflash_qk_pool_to(committed);
 
         // Sync draft-side features if active.
         if (remote_draft_.active() && !draft_parked_) {
@@ -3199,7 +3194,7 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
     // maskless qwen35moe pipelined decode reads the whole padded pool span.
     kvflash_pager_.zero_free_blocks();
     kvflash_mask_epoch_ = (uint64_t)-1;
-    if (kvflash_qk_policy_) {
+    if (kvflash_qk_decode()) {
         kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
         kvflash_qk_pooled_upto_ = 0;
         kvflash_qk_pool_to(committed);
@@ -3229,7 +3224,7 @@ bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
     kvflash_scores_.clear();
     kvflash_history_ = kvflash_restore_history({}, snap.cur_pos, &prompt);
     kvflash_apply_preamble_pin(&prompt, false);
-    if (kvflash_qk_policy_) {
+    if (kvflash_qk_decode()) {
         kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
         const int sealed = snap.cur_pos / ct;
         for (int c = 0; c < sealed; c++) {
@@ -3684,7 +3679,7 @@ void Qwen35Backend::kvflash_uq_append(std::vector<const float *> & qs, int seale
 // with the query held in cache_.q_cap.
 bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) {
     const int ct = kvflash_pager_.chunk_tokens();
-    const KvFlashQkDims & d = kvflash_qk_pool_.dims();
+    const KvFlashQkDims d = kvflash_exact_dims();
     if (ct <= 0 || d.n_layers <= 0 || !cache_.q_cap) return false;
     const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
     if ((size_t)ggml_nelements(cache_.q_cap) != qsize) return false;
@@ -3971,7 +3966,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_policy_,
+                               /*capture_qk=*/pool && kvflash_qk_decode(),
                                /*paged_attention=*/paged);
         }, embed_buf, hidden, rope_pos)) {
             return false;
@@ -4083,7 +4078,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         cache_.cur_pos = committed;
         if (pool) {
             kvflash_history_.push_back(next_tok);
-            if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+            if (kvflash_qk_decode()) kvflash_qk_pool_to(committed);
             kvflash_maybe_reselect((int)(out_tokens.size() - reselect_from));   // generated tokens counted from the request's output origin
         }
         if (io.is_cancelled()) break;
@@ -4409,7 +4404,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             c.q_stage_on = on && c.q_stage; c.q_stage_n = 0; c.q_stage_base = -1;
         }
         ~QStageGuard() { c.q_stage_on = false; c.q_stage_n = 0; c.q_stage_base = -1; }
-    } q_stage_guard{cache_, kvflash_active() && kvflash_qk_policy_};
+    } q_stage_guard{cache_, kvflash_active() && kvflash_qk_decode()};
 
     // KVFlash history: every committed id (accepted drafts, bonus, replay and
     // injected tokens) lands in out_tokens in order; mirror them into
@@ -4674,7 +4669,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         // A chunk a verify opened ahead of AR and the step did not reach
         // (rejected tail, terminal or budget-close repair) goes back first.
         kvflash_settle_chunks(kvflash_pager_, committed);
-        if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+        if (kvflash_qk_decode()) kvflash_qk_pool_to(committed);
     };
     // Decode-time reselection: AR reselects right after it emits generated
     // token g (g % tau == 0), before it forwards that token. At a step start

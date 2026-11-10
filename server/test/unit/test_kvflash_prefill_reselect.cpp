@@ -40,6 +40,22 @@ TEST_CASE(KvflashPrefillReselectFixture, modes_four_and_five_need_the_qk_policy_
     CHECK(kvflash_reselect_mode(4, true, "cosine", nullptr) == 0);   // the cosine scorer is gone
 }
 
+// ---- a recall mode holds the turn's plan while the answer decodes ------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, a_recall_mode_has_no_decode_time_reselect) {
+    // The slot engine never reselects while it decodes. A serial reselect after tau tokens would swap the turn's
+    // recall picks for single-query QK picks, so the pool would depend on the engine and on the answer's length.
+    CHECK(kvflash_decode_reselect_tau(4, 64) == 0);
+    CHECK(kvflash_decode_reselect_tau(5, 64) == 0);
+    CHECK(kvflash_decode_reselect_tau(5, 1) == 0);
+}
+TEST_CASE(KvflashPrefillReselectFixture, without_a_recall_mode_the_decode_time_reselect_keeps_its_interval) {
+    CHECK(kvflash_decode_reselect_tau(0, 64) == 64);
+    CHECK(kvflash_decode_reselect_tau(0, 256) == 256);
+    CHECK(kvflash_decode_reselect_tau(0, 0) == 1);       // the interval floor
+    CHECK(kvflash_decode_reselect_tau(0, -5) == 1);
+}
+
 TEST_CASE(KvflashPrefillReselectFixture, recall_plan_keeps_features_for_one_device_and_drops_them_under_tp) {
     const KvflashFeatureAsk profile{4, 64};
     const KvflashFeaturePlan one = kvflash_recall_features(1, profile);   // TP = 1: everything stays on

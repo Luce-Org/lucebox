@@ -25,6 +25,12 @@ inline int kvflash_reselect_mode(int env_mode, bool qk_policy, const char * scor
     return 0;
 }
 
+// Tokens between two decode-time reselects (LUCE_KVFLASH_TAU, at least 1); 0 = none. A recall mode plans the pool for
+// the whole turn when the prefill reaches the cut and holds that plan while the answer decodes.
+inline int kvflash_decode_reselect_tau(int reselect_mode, int tau_env) {
+    return reselect_mode != 0 ? 0 : std::max(1, tau_env);
+}
+
 // Which recall features stay on. Recall (mode 4/5) and the user-question queries need the per-token query capture
 // (TargetCache::q_cap_all). That tensor has no split in the tensor-parallel layout, so with tp_degree > 1 both are
 // off; the pool, the pin and the rest of KVFlash are untouched. `why` is empty when nothing the request asked for was turned off.
