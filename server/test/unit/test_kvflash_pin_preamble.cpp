@@ -95,16 +95,28 @@ TEST_CASE(KvflashPinPreambleFixture, preamble_rows_env) {
 
 // ---- pin rows / recall floor / budget -------------------------------------
 TEST_CASE(KvflashPinPreambleFixture, pin_rows_never_exceed_the_reserve) {
-    CHECK(kvflash_preamble_pin_rows(500, 1000) == 500);
-    CHECK(kvflash_preamble_pin_rows(1500, 1000) == 1000);
-    CHECK(kvflash_preamble_pin_rows(0, 1000) == 0);
-    CHECK(kvflash_preamble_pin_rows(500, 0) == 0);
+    CHECK(kvflash_preamble_pin_rows(500, 1000, 0) == 500);
+    CHECK(kvflash_preamble_pin_rows(1500, 1000, 0) == 1000);
+    CHECK(kvflash_preamble_pin_rows(0, 1000, 0) == 0);
+    CHECK(kvflash_preamble_pin_rows(500, 0, 640) == 0);       // pin off
 }
-TEST_CASE(KvflashPinPreambleFixture, pin_chunks_counts_the_covered_chunks) {
-    CHECK(kvflash_pin_chunks(0, 7168, 64) == 0);
-    CHECK(kvflash_pin_chunks(7000, 0, 64) == 0);          // feature off
-    CHECK(kvflash_pin_chunks(7000, 7168, 64) == 110);     // ceil(7000 / 64)
-    CHECK(kvflash_pin_chunks(9000, 7168, 64) == 112);     // clipped to the reserve
+
+// The recall step never picks a chunk under its floor (kvflash_recall_first_chunk), so an unpinned chunk there is
+// gone for good once it is evicted: the pin covers the floor whatever the preamble's length.
+TEST_CASE(KvflashPinPreambleFixture, the_pin_covers_the_recall_floor) {
+    CHECK(kvflash_preamble_pin_rows(526, 1152, 640) == 640);  // a 9-chunk preamble: chunk 9 is pinned with it
+    CHECK(kvflash_preamble_pin_rows(0, 1152, 640) == 640);    // no system block: the session's first chunks
+    CHECK(kvflash_preamble_pin_rows(900, 1152, 640) == 900);  // a preamble past the floor: the preamble
+    CHECK(kvflash_preamble_pin_rows(526, 320, 640) == 320);   // the reserve caps both
+
+    PagerHarness h;
+    KvFlashConfig cfg;
+    cfg.pool_tokens = 512; cfg.chunk_tokens = 16; cfg.sink_chunks = 1; cfg.tail_window_chunks = 4;
+    KvFlashPager p;
+    must(p.attach(cfg, h.k, h.v));
+    must(p.alloc_span(0, 20 * 16));
+    CHECK(kvflash_pin_preamble(p, 40, 288) == kKvFlashRecallUnit);                  // a 3-chunk preamble, an 18-chunk reserve
+    CHECK(kvflash_recall_first_chunk(kvflash_pinned_prefix(p)) == kvflash_pinned_prefix(p));   // no chunk is neither pinned nor a candidate
 }
 
 // ---- pager: pin, truncate, re-pin ------------------------------------------
@@ -128,7 +140,7 @@ TEST_CASE(KvflashPinPreambleFixture, pin_preamble_truncate_below_then_repin) {
     p.reset();                           // request start: reset clears pins
     CHECK(!p.is_pinned(0));
     CHECK(kvflash_pin_preamble(p, 300, 64) == 1);
-    CHECK(kvflash_pin_preamble(p, 0, 64) == 0);    // no preamble: nothing pinned
+    CHECK(kvflash_pin_preamble(p, 0, 64) == 1);    // no preamble: the session's first chunk, up to the reserve
     CHECK(kvflash_pin_preamble(p, 300, 0) == 0);   // feature off: nothing pinned
 }
 

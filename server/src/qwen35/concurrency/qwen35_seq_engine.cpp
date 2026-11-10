@@ -886,7 +886,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
     p.score_hook = nullptr;
     if (b_.kvflash_preamble_rows_ > 0) {
-        // LUCE_KVFLASH_PREAMBLE_ROWS: the slot's system+tools preamble is never a victim and never a recall candidate.
+        // LUCE_KVFLASH_PREAMBLE_ROWS: the slot's system+tools preamble and the rest of the recall floor are never victims.
         // Every turn: a new session's pager starts without pins.
         const int e = kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id);
         std::fprintf(stderr, "[kvflash] slot %d preamble pin end=%d pinned_chunks=%d reserve=%d\n",

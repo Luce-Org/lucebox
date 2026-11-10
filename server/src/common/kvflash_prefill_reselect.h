@@ -185,23 +185,19 @@ inline std::string kvflash_preamble_gate(int32_t im_start, int32_t system_role) 
     return "";
 }
 
-// Rows to pin: the preamble, never more than the reserve.
-inline int kvflash_preamble_pin_rows(int preamble_end, int reserve_rows) {
-    return preamble_end <= 0 || reserve_rows <= 0 ? 0 : std::min(preamble_end, reserve_rows);
+// Rows to pin: the preamble or the rows under the recall floor (floor_rows), whichever is longer, never more than
+// the reserve; 0 with the pin off. The recall step never picks a chunk under its floor, so one left unpinned there
+// is gone for good once it is evicted.
+inline int kvflash_preamble_pin_rows(int preamble_end, int reserve_rows, int floor_rows) {
+    return reserve_rows <= 0 ? 0 : std::min(std::max(preamble_end, floor_rows), reserve_rows);
 }
 
-// Chunks the pin covers (an upper bound on what the pager accepts).
-inline int kvflash_pin_chunks(int preamble_end, int reserve_rows, int chunk_tokens) {
-    const int rows = kvflash_preamble_pin_rows(preamble_end, reserve_rows);
-    return rows <= 0 || chunk_tokens <= 0 ? 0 : (rows + chunk_tokens - 1) / chunk_tokens;
-}
-
-// Pins the preamble chunks of `pager` (anything with pin_range / is_pinned / chunk_tokens); returns
-// the number of chunks actually pinned (the pager refuses a span that would deadlock eviction).
+// Pins the preamble chunks of `pager` and the rest of the recall floor (anything with pin_range / is_pinned /
+// chunk_tokens); returns the number of chunks actually pinned (the pager refuses a span that would deadlock eviction).
 template <class Pager>
 inline int kvflash_pin_preamble(Pager & pager, int preamble_end, int reserve_rows) {
-    const int rows = kvflash_preamble_pin_rows(preamble_end, reserve_rows);
     const int ct = pager.chunk_tokens();
+    const int rows = kvflash_preamble_pin_rows(preamble_end, reserve_rows, kKvFlashRecallUnit * ct);
     if (rows <= 0 || ct <= 0) return 0;
     pager.pin_range(0, rows);
     int n = 0;

@@ -3705,7 +3705,7 @@ luce::common::KvFlashRecallIn Qwen35Backend::kvflash_recall_in(int committed, in
     in.unit = kvflash_select_unit_;
     in.reserve = (end - committed + ct - 1) / ct + 1;
     in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
-    in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
+    in.pinned_chunks = luce::common::kvflash_pinned_prefix(p);   // what the pager holds pinned: the preamble and the recall floor
     return in;
 }
 
