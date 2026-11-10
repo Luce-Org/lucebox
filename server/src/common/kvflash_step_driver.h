@@ -38,7 +38,7 @@ struct KvFlashStepWork { int slot; int64_t kv_start; int tokens; };   // rows th
 
 class KvFlashStepDriver final {
 public:
-    KvFlashStepDriver(std::vector<KvFlashSlotPager *> pagers, KvFlashArena & arena, int headroom_blocks = 8)
+    KvFlashStepDriver(std::vector<KvFlashSlotPager *> pagers, KvFlashArena & arena, int headroom_blocks = kKvFlashSlotHeadroom)
         : pagers_(std::move(pagers)), arena_(arena), headroom_(headroom_blocks), uploaded_(pagers_.size(), ~uint64_t(0)) {}
 
     struct Result { bool ok = true; std::vector<int> ran; };
