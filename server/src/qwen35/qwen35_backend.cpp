@@ -515,12 +515,12 @@ bool Qwen35Backend::init() {
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
     if (!post_kvflash_init_gate()) return false;
-    // KVFlash is resolved from env at init; this is the authoritative
-    // paged×KVFlash compatibility check.
     // After the gate: a subclass that zeroed the pool leaves no pager, and fast
     // rollback stays on.
     cfg_.fast_rollback = luce::common::spec_fast_rollback_enabled(
         kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
+    // KVFlash is resolved from env at init; this is the authoritative
+    // paged×KVFlash compatibility check.
     if (cfg_.paged_attention && kvflash_active()) {
         std::fprintf(stderr,
             "[paged-attention] cannot be combined with KVFlash "
