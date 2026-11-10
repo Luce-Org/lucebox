@@ -2,6 +2,7 @@
 
 #include "fattn-common.cuh"
 #include "mma.cuh"
+#include "paged-attn-common.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -199,6 +200,10 @@ static __device__ __forceinline__ void multi_vec_dot_kq_q8_0(
         }
     }
 }
+
+// Tokens whose K·Q partial sums are reduced together, see
+// paged_attn_reduce_group.
+static constexpr int PAGED_ATTN_SCORE_GROUP = 2;
 
 // Quantizes scale*log2(e)*Q to q8_1 once per decode step. The decode kernel
 // used to requantize Q per (warp, partition) through shared memory; at long
@@ -492,35 +497,54 @@ static __global__ void paged_attn_decode(
             }
         }
 
+        // Tile token j = c + n_groups*u is token u of score group c, so the
+        // group reduction leaves token j's score on lane j when the lane
+        // keeps the result of group j % n_groups.
+        // Q4_0 unpacking holds more registers per token, so its rows are
+        // reduced one token at a time to keep the kernel's occupancy.
+        constexpr int group_size =
+            type_K == GGML_TYPE_Q4_0 ? 1 : PAGED_ATTN_SCORE_GROUP;
+        constexpr int n_groups   = nthreads / group_size;
         float score_mine[n_batch_heads];
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
             score_mine[h] = -FLT_MAX;
         }
 
-        for (int j = 0; j < tile_len; ++j) {
-            const int32_t phys_j = __shfl_sync(0xFFFFFFFF, phys_mine, j, WARP_SIZE);
-            if (phys_j < 0) {
-                continue;
-            }
-            const char * k_row =
-                k + (int64_t) phys_j * k_nb1 + (int64_t) kv_head * k_nb2;
-
-            float sums[n_batch_heads] = {0.0f};
-            if constexpr (type_K == GGML_TYPE_F16) {
-                multi_vec_dot_kq_f16<D, n_batch_heads>(k_row, q_reg, sums);
-            } else if constexpr (type_K == GGML_TYPE_Q4_0) {
-                multi_vec_dot_kq_q4_0<D, n_batch_heads>(k_row, q_i32, q_ds, sums);
-            } else {
-                static_assert(type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q4_0 ||
-                              type_K == GGML_TYPE_Q8_0, "unsupported K type");
-                multi_vec_dot_kq_q8_0<D, n_batch_heads>(k_row, q_i32, q_ds, sums);
+        for (int c = 0; c < n_groups && c < tile_len; ++c) {
+            float sums[n_batch_heads][group_size];
+#pragma unroll
+            for (int u = 0; u < group_size; ++u) {
+                // Lanes past the tile hold -1, like unmapped tokens.
+                const int32_t phys_j = paged_attn_lane_value(phys_mine, c + n_groups*u);
+                float token_sums[n_batch_heads] = {0.0f};
+                if (phys_j >= 0) {
+                    const char * k_row =
+                        k + (int64_t) phys_j * k_nb1 + (int64_t) kv_head * k_nb2;
+                    if constexpr (type_K == GGML_TYPE_F16) {
+                        multi_vec_dot_kq_f16<D, n_batch_heads>(k_row, q_reg, token_sums);
+                    } else if constexpr (type_K == GGML_TYPE_Q4_0) {
+                        multi_vec_dot_kq_q4_0<D, n_batch_heads>(k_row, q_i32, q_ds, token_sums);
+                    } else {
+                        static_assert(type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q4_0 ||
+                                      type_K == GGML_TYPE_Q8_0, "unsupported K type");
+                        multi_vec_dot_kq_q8_0<D, n_batch_heads>(k_row, q_i32, q_ds, token_sums);
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < n_batch_heads; ++h) {
+                    sums[h][u] = token_sums[h];
+                }
             }
 #pragma unroll
             for (int h = 0; h < n_batch_heads; ++h) {
-                const float score = warp_reduce_sum(sums[h]);
-                score_mine[h] = lane == j ? score : score_mine[h];
+                const float score = paged_attn_reduce_group<group_size>(sums[h]);
+                score_mine[h] = lane % n_groups == c ? score : score_mine[h];
             }
+        }
+#pragma unroll
+        for (int h = 0; h < n_batch_heads; ++h) {
+            score_mine[h] = phys_mine >= 0 ? score_mine[h] : -FLT_MAX;
         }
 
         // Tile softmax update: one accumulator rescale per tile, skipped
@@ -529,7 +553,7 @@ static __global__ void paged_attn_decode(
         float w_mine[n_batch_heads];
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
-            const float tile_max = warp_reduce_max(score_mine[h]);
+            const float tile_max = paged_attn_warp_max(score_mine[h]);
             if (tile_max > qk_max[h]) {
                 const float old_scale = exp2f(qk_max[h] - tile_max);
                 qk_sum[h] *= old_scale;
@@ -542,11 +566,11 @@ static __global__ void paged_attn_decode(
             w_mine[h] = score_mine[h] > -FLT_MAX/2
                 ? exp2f(score_mine[h] - qk_max[h])
                 : 0.0f;
-            qk_sum[h] += warp_reduce_sum(w_mine[h]);
+            qk_sum[h] += paged_attn_warp_sum(w_mine[h]);
         }
 
         for (int j = 0; j < tile_len; ++j) {
-            const int32_t phys_j = __shfl_sync(0xFFFFFFFF, phys_mine, j, WARP_SIZE);
+            const int32_t phys_j = paged_attn_lane_value(phys_mine, j);
             if (phys_j < 0) {
                 continue;
             }
@@ -556,7 +580,7 @@ static __global__ void paged_attn_decode(
             float weight[n_batch_heads];
 #pragma unroll
             for (int h = 0; h < n_batch_heads; ++h) {
-                weight[h] = __shfl_sync(0xFFFFFFFF, w_mine[h], j, WARP_SIZE);
+                weight[h] = paged_attn_lane_value(w_mine[h], j);
             }
 
 #pragma unroll
@@ -1205,27 +1229,22 @@ extern "C" size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void) {
     return g_paged_attn_wmma256_launch_count;
 }
 
+// Shared memory of one paged_attn_wmma block, in half2s. Its phases alias at
+// offset 0: Q staging (32 x 132), K staging (64 x 68), V staging (128 dims x
+// 36 where it is transposed, else 64 x 68) and the combine strips (128 x 36);
+// the kernel asserts that each fits. The largest two fill the 18 KiB, which
+// fits two blocks per CU (64 KiB budget on gfx1201).
+static constexpr int PAGED_ATTN_WMMA_SMEM_HALF2 = 128*36;
+
 // Vectorized paged K/V gather for one sequence and one KV head. Each thread
 // owns 16 contiguous half2s (64 B) of one token row, so the block-table entry
 // is resolved once per thread instead of once per (row, half2) element: F16
 // rows are read as four 16-byte chunks, Q8_0 rows (the engine config) as one
 // 32-dim block_q8_0 (34 B) with 4-byte qs loads. Writes the same
-// tile[i*stride_tile + kk] layout as the scalar version; tokens beyond
+// tile[i*stride_tile + kk] layout as the scalar version, or with `transposed`
+// the dims x tokens layout of paged_attn_wmma_store_transposed; tokens beyond
 // k_VKQ_sup or outside the validated block table yield zeros.
-// Write one thread's segment of `vec` half2s to the stage tile as vec/4
-// 16-byte stores (both quant branches produce the segment in registers first,
-// the zero path writes zeros the same way).
-template <int vec>
-static __device__ __forceinline__ void paged_attn_wmma_store_segment(
-        uint32_t * __restrict__ out, const uint32_t (&h)[vec]) {
-#pragma unroll
-    for (int m = 0; m < vec / 4; ++m) {
-        *reinterpret_cast<uint4 *>(out + 4 * m) =
-            make_uint4(h[4*m], h[4*m+1], h[4*m+2], h[4*m+3]);
-    }
-}
-
-template <ggml_type type, int stride_tile, int nbatch_h2>
+template <ggml_type type, int stride_tile, int nbatch_h2, bool transposed>
 static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
         const char * __restrict__ kv,
         const char * __restrict__ block_table,
@@ -1236,8 +1255,8 @@ static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
         int32_t token0, int32_t k_VKQ_sup,
         int32_t dim0,
         half2 * __restrict__ tile) {
-    constexpr int vec = nbatch_h2 / 4;          // half2s owned by one thread
-    static_assert(nbatch_h2 % 4 == 0 && vec % 4 == 0, "bad stage width");
+    constexpr int vec = nbatch_h2 / PAGED_ATTN_WMMA_ROW_THREADS; // half2s owned by one thread
+    static_assert(nbatch_h2 % PAGED_ATTN_WMMA_ROW_THREADS == 0 && vec % 4 == 0, "bad stage width");
     constexpr int qk = 32;                      // dims per Q8_0/Q4_0 block
     static_assert(type == GGML_TYPE_F16 || 2 * vec == qk,
                   "Q8_0/Q4_0 need one 32-dim block per thread");
@@ -1246,8 +1265,8 @@ static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
 
     const int warp_size = 32;
     const int tid = threadIdx.x + threadIdx.y * warp_size;
-    const int row = tid / 4;                    // token row within the chunk
-    const int sub = tid % 4;                    // 16-half2 segment of the row
+    const int row = tid / PAGED_ATTN_WMMA_ROW_THREADS; // token row within the chunk
+    const int sub = tid % PAGED_ATTN_WMMA_ROW_THREADS; // 16-half2 segment of the row
     const int32_t n_physical_blocks = pool_tokens / block_size;
 
     const char * rowbase = nullptr;
@@ -1263,19 +1282,21 @@ static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
         }
     }
 
-    uint32_t * out = reinterpret_cast<uint32_t *>(tile + row * stride_tile + sub * vec);
+    // Every lane reaches the store, which the transposed one needs for its
+    // exchange between token pairs.
+    uint32_t h[vec];
     if (rowbase == nullptr) {
-        const uint32_t zeros[vec] = {};
-        paged_attn_wmma_store_segment<vec>(out, zeros);
-        return;
-    }
-
-    if constexpr (type == GGML_TYPE_F16) {
+#pragma unroll
+        for (int m = 0; m < vec; ++m) {
+            h[m] = 0;
+        }
+    } else if constexpr (type == GGML_TYPE_F16) {
         const uint4 * src = reinterpret_cast<const uint4 *>(
             rowbase + (size_t) (dim0 + sub * vec) * sizeof(half2));
 #pragma unroll
         for (int m = 0; m < vec / 4; ++m) {
-            *reinterpret_cast<uint4 *>(out + 4 * m) = src[m];
+            const uint4 s = src[m];
+            h[4*m] = s.x; h[4*m+1] = s.y; h[4*m+2] = s.z; h[4*m+3] = s.w;
         }
     } else if constexpr (type == GGML_TYPE_Q4_0) {
         // Q4_0: this segment is exactly one block_q4_0 = {half d; uint8_t qs[16]}
@@ -1289,7 +1310,6 @@ static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
         for (int j = 0; j < qk / 8; ++j) {
             memcpy(&w[j], blk + 2 + 4 * j, 4);
         }
-        uint32_t h[vec];
 #pragma unroll
         for (int m = 0; m < vec; ++m) {
             const int t0 = 2 * m, t1 = t0 + 1;
@@ -1299,27 +1319,30 @@ static __device__ __forceinline__ void paged_attn_wmma_stage_tile(
             const half2 hv = make_half2(d * (float) (q0 - 8), d * (float) (q1 - 8));
             h[m] = *reinterpret_cast<const uint32_t *>(&hv);
         }
-        paged_attn_wmma_store_segment<vec>(out, h);
     } else {
         // Q8_0: this segment is exactly one block_q8_0 = {half d; int8 qs[32]}.
         const int blk_idx = (dim0 + sub * vec) / (qk / 2);
         const char * blk = rowbase + (size_t) blk_idx * kblock_bytes;
-        const float d = __half2float(*(const half *) blk);
+        const half2 d = __half2half2(*(const half *) blk);
         uint32_t w[qk / 4];
 #pragma unroll
         for (int j = 0; j < qk / 4; ++j) {
             memcpy(&w[j], blk + 2 + 4 * j, 4);
         }
-        uint32_t h[vec];
 #pragma unroll
-        for (int m = 0; m < qk / 2; ++m) {
-            const int e0 = 2 * m;
-            const int8_t v0 = (int8_t) ((w[e0 >> 2] >> ((e0 & 3) * 8)) & 0xff);
-            const int8_t v1 = (int8_t) ((w[(e0 + 1) >> 2] >> (((e0 + 1) & 3) * 8)) & 0xff);
-            const half2 hv = make_half2(d * (float) v0, d * (float) v1);
-            h[m] = *reinterpret_cast<const uint32_t *>(&hv);
+        for (int j = 0; j < qk / 4; ++j) {
+            uint32_t hj[2];
+            paged_attn_q8_0_to_half2(w[j], d, hj);
+            h[2 * j] = hj[0];
+            h[2 * j + 1] = hj[1];
         }
-        paged_attn_wmma_store_segment<vec>(out, h);
+    }
+
+    if constexpr (transposed) {
+        paged_attn_wmma_store_transposed<vec, stride_tile>(tile, row, sub, h);
+    } else {
+        paged_attn_wmma_store_segment<vec>(
+            reinterpret_cast<uint32_t *>(tile + row * stride_tile + sub * vec), h);
     }
 }
 
@@ -1359,7 +1382,18 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
     using T_B_VKQ = tile<16,  8, half2>;
     using T_C_VKQ = tile<16,  8, half2>;
     constexpr int stride_tile_K = nbatch_K2 + 4;
+#if defined(AMD_WMMA_AVAILABLE)
+    // V staged dims x tokens, the layout of the VKQ mma's V operand.
+    constexpr bool transpose_V  = true;
+    constexpr int stride_tile_V = nbatch_fa/2 + 4;
+    static_assert(2*nbatch_V2*stride_tile_V <= PAGED_ATTN_WMMA_SMEM_HALF2, "V tile exceeds the smem");
+#else
+    // V staged tokens x dims, transposed by the fragment loads.
+    constexpr bool transpose_V  = false;
     constexpr int stride_tile_V = nbatch_V2 + 4;
+    static_assert(nbatch_fa*stride_tile_V <= PAGED_ATTN_WMMA_SMEM_HALF2, "V tile exceeds the smem");
+#endif // defined(AMD_WMMA_AVAILABLE)
+    static_assert(nbatch_fa*stride_tile_K <= PAGED_ATTN_WMMA_SMEM_HALF2, "K tile exceeds the smem");
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #pragma unroll
@@ -1377,7 +1411,7 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
         {
-            paged_attn_wmma_stage_tile<type_K, stride_tile_K, nbatch_K2>(
+            paged_attn_wmma_stage_tile<type_K, stride_tile_K, nbatch_K2, false>(
                 k, block_table, bt_nb0, bt_nb1, k_nb1, kv_head, seq_s, block_size,
                 pool_tokens, k_nb2, token_begin + kb0*nbatch_fa, k_VKQ_sup, k0_start, tile_K);
             __syncthreads();
@@ -1498,11 +1532,6 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
         }
     }
 
-#if defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
-    T_A_VKQ A_identity;
-    make_identity_mat(A_identity);
-#endif // defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
-
     // VKQ phase: stage the V tile (reusing the K smem) and accumulate.
 #pragma unroll
     for (int i0_start = 0; i0_start < DV; i0_start += 2*nbatch_V2) {
@@ -1510,7 +1539,7 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
         const int i0_stop = i0_start + 2*nbatch_V2;
 
         {
-            paged_attn_wmma_stage_tile<type_V, stride_tile_V, nbatch_V2>(
+            paged_attn_wmma_stage_tile<type_V, stride_tile_V, nbatch_V2, transpose_V>(
                 v, block_table, bt_nb0, bt_nb1, v_nb1, kv_head, seq_s, block_size,
                 pool_tokens, v_nb2, token_begin + kb0*nbatch_fa, k_VKQ_sup, i0_start/2, tile_V);
             __syncthreads();
@@ -1525,14 +1554,18 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
             for (int k00 = 0; k00 < nbatch_fa/2; k00 += np*T_A_VKQ::J) {
                 const int k0 = k00 + (threadIdx.y % np)*T_A_VKQ::J;
 
-                T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
+                T_A_VKQ A;
 #if defined(LDMATRIX_TRANS_AVAILABLE)
+                // Transposed in SRAM but not in registers, gets transposed on load.
                 load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+#elif defined(AMD_WMMA_AVAILABLE)
+                // Staged in the operand layout: one 16-byte chunk of a dim row per lane.
+                static_assert(T_A_VKQ::ne == 4, "one 16-byte chunk per lane");
+                const int dim = i_VKQ_0 - i0_start + A.get_i(0);
+                *reinterpret_cast<uint4 *>(A.x) = *reinterpret_cast<const uint4 *>(
+                    tile_V_i + dim*stride_tile_V + paged_attn_wmma_pair_col(dim, k0 + A.get_j(0)));
 #else
-                // Use mma to transpose T_A_VKQ for RDNA.
-                T_A_VKQ A_trans;
-                load_ldmatrix(A_trans, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
-                mma(A, A_trans, A_identity);
+                NO_DEVICE_CODE;
 #endif // defined(LDMATRIX_TRANS_AVAILABLE)
 
                 mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
@@ -1595,6 +1628,7 @@ static __global__ void paged_attn_wmma(
     using T_C_KQ  = tile<16, 16, float>;
     using T_C_VKQ = tile<16,  8, half2>;
     constexpr int stride_tile_Q = DKQ/2 + 4;
+    static_assert(ncols*stride_tile_Q <= PAGED_ATTN_WMMA_SMEM_HALF2, "Q tile exceeds the smem");
 
     const int gqa_ratio = n_head / n_head_kv;
     const int kv_head   = blockIdx.x;
@@ -1896,6 +1930,8 @@ static __global__ void paged_attn_wmma(
 
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
+    static_assert(nwarps*cols_per_warp*tile_stride <= PAGED_ATTN_WMMA_SMEM_HALF2,
+                  "combine strips exceed the smem");
 
     {
         // jc_cwm = jc combine write meta
@@ -2203,11 +2239,8 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     const int32_t rows_per_block = 4;
     const dim3 grid(n_head_kv, (n_rows + rows_per_block - 1) / rows_per_block, n_partitions);
     const dim3 block(32, 8);
-    // Tiles alias sequentially at smem offset 0: Q staging (32x132),
-    // K/V staging (64x68), combine strips (128x36 half2s). Allocating the
-    // phase max (128 strips x 36 half2s = 18 KiB) fits two blocks per CU
-    // (64 KiB budget on gfx1201); mask is computed inline, no smem.
-    const size_t smem = (size_t) 128*36 * sizeof(half2);
+    // The mask is computed inline and needs no smem.
+    const size_t smem = (size_t) PAGED_ATTN_WMMA_SMEM_HALF2 * sizeof(half2);
 
     const int64_t output_rows = (int64_t) n_rows * n_head;
     ggml_cuda_pool_alloc<half>   acc_scratch(ctx.pool());
