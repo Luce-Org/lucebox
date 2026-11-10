@@ -108,7 +108,8 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width = 0);
+                         int width = 0,
+                         int valid_from = 0);   // first ring position this session wrote; the window never reads below it
 
 struct DraftKvBatchGraph {
     DraftKvBatchGraph() = default;

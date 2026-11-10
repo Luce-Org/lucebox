@@ -23,6 +23,7 @@
 
 #include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/chain_spec_shapes.h"
 #include "common/concurrency/kvflash_slot_kv.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/kvflash_admit_plan.h"
@@ -111,6 +112,8 @@ public:
                               const SamplerCfg & sampler,
                               int max_new_tokens,
                               const AdmitMeta & meta) override;
+    AdmitResult admit_bounded_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
+                               int max_new_tokens, const AdmitMeta & meta);   // the admission itself; admit_bounded records the bound
 
     AdmitResult admit_with_prefix(
         uint64_t request_id,
@@ -237,6 +240,15 @@ private:
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
     void reset_slot_draft_kv(int slot);
+    // Codex P1-1: the generation bound each slot was admitted with; a chain round never commits past it.
+    std::vector<int> gen_cap_;
+    void set_gen_cap_(int slot, int cap) { if (slot >= 0) { if ((size_t)slot >= gen_cap_.size()) gen_cap_.resize((size_t)slot + 1, 1 << 30); gen_cap_[(size_t)slot] = cap; } }
+    // Codex P2-3: the first position whose feature row in the slot's ring belongs to its current session. A resumed or
+    // restored session has KV and recurrent state but no features below its resume point; the drafter never reads there.
+    std::vector<int> feat_from_;
+    void set_feat_from_(int slot, int v) { if (slot >= 0) { if ((size_t)slot >= feat_from_.size()) feat_from_.resize((size_t)slot + 1, 0); feat_from_[(size_t)slot] = v; } }
+    int feat_from_of_(int slot) const { return slot_value_or(feat_from_, slot, 0); }
+    void trim_unaccepted_chunks_();   // Codex P1-2: every live slot's pager back to ceil(len/64) chunks
     // The longest block a round with these selected lanes drafts.
     int chain_draft_width(const std::vector<uint8_t> & selected) const;
     std::optional<PreparedChainRound> prepare_chain_drafts(

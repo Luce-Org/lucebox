@@ -137,6 +137,19 @@ public:
         return (int64_t)s.capacity_blocks * block_size() - (int64_t)s.len;
     }
 
+    // A chain round plans rows for its whole width before verify and accepts a prefix: a chunk opened only by rows that
+    // were not accepted is dropped, so the pager holds exactly ceil(len/block) chunks (a park records n_chunks and an
+    // adopt checks that count; the next crossing into the chunk must allocate and upload afresh). True when it trimmed.
+    bool trim_to_len(int slot) {
+        if (slot < 0 || slot >= (int)slots_.size() || !slots_[(size_t)slot].live) return false;
+        const uint32_t len = slots_[(size_t)slot].len;
+        KvFlashSlotPager & p = *pagers_[(size_t)slot];
+        const int keep = (int)((len + block_size() - 1) / block_size());
+        if (len == 0 || p.n_chunks() <= keep) return false;
+        p.truncate((int64_t)len);
+        return true;
+    }
+
     PagedKvAppendResult append(PagedKvSequenceHandle h, uint32_t n, bool only_first_last = false) override {
         PagedKvAppendResult r;
         Slot * s = live_(h);
