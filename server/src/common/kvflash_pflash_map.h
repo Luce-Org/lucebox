@@ -106,7 +106,7 @@ inline int kvflash_message_query_end(const PFlashRequestMessages & m) {
 inline std::string kvflash_pflash2_config_error(const std::function<std::string(const char *)> & get, int slots) {
     static const char * const kExact[][2] = {   // value "" = any non-empty
         {"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
-        {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PARSER", "latest_user"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
+        {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
         {"PFLASH_SCORING_HEAD_GGUF", ""}, {"PFLASH_SEGMENT_PROBE_GGUF", ""}, {"PFLASH_REQUEST_PROBE_GGUF", ""},
         {"PFLASH_QUERY_CANDIDATES", "1"}, {"PFLASH_QUERY_PIN", ""}};
     for (const auto & kv : kExact) {

@@ -193,3 +193,66 @@ TEST_CASE(KvflashPrefillReselectFixture, recall_plan_unit_other_than_ten) {
     CHECK((int)p.picked.size() == 30);
     for (int b : p.picked) CHECK(b * 2 >= 10);               // the 10-chunk sink floor holds at every unit
 }
+
+// ---- the eviction hook only ranks chunks that are already written ------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, hook_protects_chunks_not_yet_written_even_when_the_ledger_covers_them) {
+    // The drafter scores the whole prompt (20 chunks) but only 12 are committed; the rest are the batch being allocated.
+    std::vector<float> scores(20, 0.0f);
+    for (int c = 0; c < 12; c++) CHECK(kvflash_hook_score(scores, 12, c) == 0.0f);
+    for (int c = 12; c < 20; c++) CHECK(kvflash_hook_score(scores, 12, c) >= 1e30f);
+    CHECK(kvflash_hook_score(scores, 30, 25) >= 1e30f);   // past the ledger: protected as before
+    CHECK(kvflash_hook_score(scores, 30, 19) == 0.0f);    // committed and scored: ranked
+}
+
+// ---- the recall gate: when a pool can hold a recall at all -------------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, recall_gate_skips_a_user_turn_that_cannot_fit_the_pool) {
+    // 256 blocks of 64 (--kvflash 16384), 18 preamble chunks, 60 recall chunks.
+    const auto a = kvflash_recall_gate(true, 5000, 45000, 64, 256, 18, 60);   // 40K-token turn after 5K of system+tools
+    CHECK(a.skip == KvFlashRecallSkip::PoolTooSmall);
+    const auto b = kvflash_recall_gate(true, 192, 40192, 64, 256, 18, 60);    // 192-token history plus a 40K turn
+    CHECK(b.skip == KvFlashRecallSkip::PoolTooSmall);
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_gate_counts_the_turn_once_in_the_fits_test) {
+    // 11.5K session + 2.5K paste: 220 chunks in a 256-block pool. The turn is counted once, so it fits.
+    const auto c = kvflash_recall_gate(true, 11500, 14000, 64, 256, 18, 60);
+    CHECK(c.skip == KvFlashRecallSkip::Fits);
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_gate_skips_a_turn_with_no_sealed_chunk_before_it) {
+    CHECK(kvflash_recall_gate(true, 63, 5000, 64, 256, 18, 60).skip == KvFlashRecallSkip::NoSealedChunk);
+    CHECK(kvflash_recall_gate(true, 0, 5000, 64, 256, 18, 60).skip == KvFlashRecallSkip::NoSealedChunk);
+    CHECK(kvflash_recall_gate(false, 5000, 9000, 64, 256, 18, 60).skip == KvFlashRecallSkip::NoSealedChunk);   // no user turn found
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_gate_runs_when_the_history_overflows_a_pool_that_can_hold_the_plan) {
+    const auto g = kvflash_recall_gate(true, 15000, 20000, 64, 256, 18, 60);
+    CHECK(g.skip == KvFlashRecallSkip::None);
+    CHECK(g.reserve == (5000 + 63) / 64 + 1);
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_gate_leaves_small_pools_as_recency_pools) {
+    // A 500-token turn: reserve 9 chunks. 18 + 60 + 9 + 2 = 89 blocks are needed (5696 tokens of pool).
+    for (int pool_tokens : {1280, 1536, 2048, 4096, 5632}) {
+        const auto g = kvflash_recall_gate(true, 20000, 20500, 64, pool_tokens / 64, 18, 60);
+        CHECK(g.skip == KvFlashRecallSkip::PoolTooSmall);
+    }
+    CHECK(kvflash_recall_gate(true, 20000, 20500, 64, 6144 / 64, 18, 60).skip == KvFlashRecallSkip::None);
+}
+
+// ---- the GPU scorer latch ------------------------------------------------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, gpu_scorer_failures_that_are_not_the_scorers_fault_do_not_latch) {
+    CHECK(!kvflash_gpu_failure_latches("no sealed chunks"));
+    CHECK(!kvflash_gpu_failure_latches("needs 900 MiB (+256 MiB margin) but 400 MiB are free"));
+    CHECK(kvflash_gpu_failure_latches("graph compute failed"));
+    CHECK(kvflash_gpu_failure_latches("unexpected pool K tensor shape or type"));
+}
+
+// ---- the victim tier ---------------------------------------------------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, victim_tier_default_is_mode_five_only_and_its_bytes_are_budgeted) {
+    CHECK(kvflash_victim_blocks_default(5, 256) == 512);
+    for (int m : {0, 4}) CHECK(kvflash_victim_blocks_default(m, 256) == 0);
+    CHECK(kvflash_pool_density_factor(5) == 3);   // pool + 2x tier
+    CHECK(kvflash_pool_density_factor(4) == 1);
+    CHECK(kvflash_pool_density_factor(0) == 1);
+}
