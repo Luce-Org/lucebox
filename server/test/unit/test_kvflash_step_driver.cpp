@@ -5,9 +5,12 @@
 #include "kvflash_slot_world.h"
 #include "../../src/common/kvflash_step_driver.h"
 #include "../../src/common/kvflash_engine_step.h"
+#include "../../src/common/kvflash_prefill_reselect.h"
+#include "../../src/common/kvflash_slot_plan.h"
 #include "../../src/common/concurrency/kvflash_slot_kv.h"
 #include "../../src/common/concurrency/seq_slot_manager.h"
 
+#include <cstdio>
 #include <memory>
 #include <vector>
 
@@ -169,6 +172,32 @@ TEST_CASE(KvflashStepDriverFixture, a_cut_that_lacks_several_blocks_queues_them_
     CHECK(w.s[0]->resident_blocks() == kQ - 4);                       // but all four missing blocks (headroom 4) are on their way out
     r = run(w, {{0, kQ * kChunk, 4 * kChunk}});
     CHECK((r.ran == std::vector<int>{0}));                            // one step later it runs, not four
+}
+
+// The preamble reserve of a slot comes out of what the step headroom and the pager's floor leave
+// (kvflash_slot_pin_pool). A pin reaching into them leaves settle no victim: the cut would idle at every step.
+TEST_CASE(KvflashStepDriverFixture, a_pinned_preamble_never_starves_a_slot_at_any_pool_size) {
+    const KvFlashConfig cfg;
+    const int headroom = kKvFlashSlotHeadroom, ct = cfg.chunk_tokens, end = 20 * kKvFlashCutU;
+    for (int q = 15; q <= 48; q++) {
+        KvFlashTestArena arena;
+        arena.set_host_wait([] {});
+        KvFlashTestSlots s = kvflash_test_slots(1, q, cfg, &arena);
+        KvFlashStepDriver drv(kvflash_test_raw(s), arena, headroom);
+        const int reserve = kvflash_preamble_reserve_in_pool(kvflash_slot_pin_pool(q * ct, headroom, cfg), 1152, ct);
+        kvflash_pin_preamble(*s[0], 4096, reserve);                    // a preamble longer than the reserve
+        int pos = 0, idle = 0;
+        for (int step = 0; step < 100 && pos < end && idle < 3; step++) {
+            const auto r = drv.run_step({{0, pos, kKvFlashCutU}});
+            REQUIRE(r.ok);
+            drv.finish_step();
+            idle = r.ran.empty() ? idle + 1 : 0;
+            if (!r.ran.empty()) pos += kKvFlashCutU;
+            REQUIRE(drv.settle({0}) >= 0);
+        }
+        CHECK(pos == end);                                             // q is in the failure output through pos
+        if (pos != end) std::fprintf(stderr, "starved: quota %d chunks, reserve %d rows, stopped at %d\n", q, reserve, pos);
+    }
 }
 
 TEST_CASE(KvflashStepDriverFixture, kvflash_step_limits_grant_whole_cuts_to_each_slice_and_a_whole_number_of_cuts_per_step) {

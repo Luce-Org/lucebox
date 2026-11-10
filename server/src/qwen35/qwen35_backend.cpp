@@ -490,7 +490,9 @@ bool Qwen35Backend::init() {
                 rows = 0;
             }
         }
-        const int reserve = luce::common::kvflash_preamble_reserve_in_pool(kvflash_tokens_, rows, KvFlashConfig{}.chunk_tokens);
+        const int reserve = luce::common::kvflash_preamble_reserve_in_pool(
+            cfg_.paged_attention ? luce::common::kvflash_slot_pin_pool(kvflash_tokens_, luce::common::kKvFlashSlotHeadroom) : kvflash_tokens_,
+            rows, KvFlashConfig{}.chunk_tokens);
         if (rows > 0 && reserve == 0)
             std::fprintf(stderr, "[kvflash] preamble pin disabled: reserve of %d rows leaves no history in the %d-token pool\n",
                          rows, kvflash_tokens_);
@@ -1791,8 +1793,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
                                        FixedChainConfig fixed_chain, int max_prefills, int mixed, int long_mixed,
                                        int long_threshold, int idle) {
-    constexpr int kHeadroom = 8;
     using namespace luce::common;
+    constexpr int kHeadroom = kKvFlashSlotHeadroom;
     kvf_arena_ = std::make_unique<KvFlashArena>();
     if (!kvf_arena_->stream_usable()) {
         set_last_error("KVFlash: the page stream could not be created");

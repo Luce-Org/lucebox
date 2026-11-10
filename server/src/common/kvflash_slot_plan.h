@@ -87,9 +87,17 @@ inline KvFlashArenaSizing kvflash_arena_sizing(int n_slots, int quota_chunks, in
 // Headroom: page-outs per step are capped at `headroom_blocks`, so the
 // slot's usable quota is Q - headroom and a page-in never waits on a block
 // freed in the same step. The usable quota must still leave an evictable block.
+inline constexpr int kKvFlashSlotHeadroom = 8;   // blocks: one 512-token cut
 inline bool kvflash_headroom_ok(int quota_chunks, int headroom_blocks, const KvFlashConfig & cfg = {}) {
     return headroom_blocks >= 0 &&
            (quota_chunks - headroom_blocks) * cfg.chunk_tokens >= kvflash_min_pool_tokens(cfg);
+}
+
+// The pool a slot's preamble reserve comes out of: what the step headroom and the pager's own floor leave. A slot
+// settles to its quota minus the headroom, so a pin reaching into them leaves settle no victim and the slot's next
+// cut idles at every step.
+inline int kvflash_slot_pin_pool(int pool_tokens, int headroom_blocks, const KvFlashConfig & cfg = {}) {
+    return pool_tokens - headroom_blocks * cfg.chunk_tokens - kvflash_min_pool_tokens(cfg);
 }
 
 // A quota must leave an evictable block (the pager's own floor).
