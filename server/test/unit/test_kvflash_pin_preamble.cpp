@@ -132,6 +132,25 @@ TEST_CASE(KvflashPinPreambleFixture, pin_preamble_truncate_below_then_repin) {
     CHECK(kvflash_pin_preamble(p, 300, 0) == 0);   // feature off: nothing pinned
 }
 
+// What the recall step excludes from its candidates is what the pager holds pinned, on either engine.
+TEST_CASE(KvflashPinPreambleFixture, the_pinned_prefix_is_what_the_pager_holds_pinned) {
+    PagerHarness h;
+    KvFlashConfig cfg;
+    cfg.pool_tokens = 512; cfg.chunk_tokens = 16; cfg.sink_chunks = 1; cfg.tail_window_chunks = 4;
+    KvFlashPager p;
+    must(p.attach(cfg, h.k, h.v));
+    must(p.alloc_span(0, 20 * 16));
+    CHECK(kvflash_pinned_prefix(p) == 0);
+    CHECK(kvflash_pin_preamble(p, 40, 48) == 3);          // a 40-row preamble: chunks 0-2
+    CHECK(kvflash_pinned_prefix(p) == 3);
+    p.pin_step_range(10 * 16, 12 * 16);                   // a step's pins further on are not part of it
+    CHECK(kvflash_pinned_prefix(p) == 3);
+    p.truncate(16);                                       // below the preamble: the pins are clipped
+    CHECK(kvflash_pinned_prefix(p) == 1);
+    p.reset();
+    CHECK(kvflash_pinned_prefix(p) == 0);
+}
+
 TEST_CASE(KvflashPinPreambleFixture, pin_survives_the_dense_reset_path) {
     // kvflash_sync_prefill: reset(), identity slot_for over the prompt, then the pin is re-applied.
     PagerHarness h;
