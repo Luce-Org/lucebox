@@ -209,6 +209,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
     release_draft_graphs();
+    if (embed_rows_buf_) ggml_backend_buffer_free(embed_rows_buf_);
     for (DraftFeatureMirror & mirror : slot_feature_mirrors_) {
         draft_feature_mirror_free(mirror);
     }
@@ -778,8 +779,25 @@ void Qwen35SeqEngine::fail_prefill(
     prefill_outputs.push_back(std::move(out));
 }
 
+bool Qwen35SeqEngine::ensure_embed_rows(size_t floats) {
+    if (floats <= embed_rows_floats_) return true;
+    // The previous step synchronized: nothing reads the old rows any more.
+    if (embed_rows_buf_) ggml_backend_buffer_free(embed_rows_buf_);
+    embed_rows_buf_ = nullptr;
+    embed_rows_ = nullptr;
+    embed_rows_floats_ = 0;
+    ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(
+        ggml_backend_get_device(b_.target_backend_));
+    if (!host) host = ggml_backend_cpu_buffer_type();
+    embed_rows_buf_ = ggml_backend_buft_alloc_buffer(host, floats * sizeof(float));
+    if (!embed_rows_buf_) return false;
+    embed_rows_ = static_cast<float *>(ggml_backend_buffer_get_base(embed_rows_buf_));
+    embed_rows_floats_ = floats;
+    return true;
+}
+
 Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
-        int slot, int max_tokens,
+        int slot, int max_tokens, float * embeddings,
         std::vector<PrefillOutput> & prefill_outputs) {
     PrefillStage stage;
     if (!slots_.is_prefilling(slot)) return stage;
@@ -816,10 +834,9 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     }
 
     stage.rows = std::move(chunk.rows);
-    stage.embeddings.resize((size_t)b_.w_.n_embd * stage.chunk);
     if (!b_.w_.embedder.embed(
             seq.sample_history.data() + stage.kv_pos, stage.chunk,
-            stage.embeddings.data())) {
+            embeddings)) {
         fail_prefill(slot, prefill_outputs, "prefill embed failed",
                      "prefill embedding failed");
         return PrefillStage{};
@@ -827,7 +844,7 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     if (slot < static_cast<int>(slot_images_.size()) &&
         slot_images_[static_cast<size_t>(slot)].payload) {
         const SlotImages & images = slot_images_[static_cast<size_t>(slot)];
-        images.rows.overwrite(stage.embeddings.data(), stage.kv_pos, stage.chunk, b_.w_.n_embd);
+        images.rows.overwrite(embeddings, stage.kv_pos, stage.chunk, b_.w_.n_embd);
         stage.positions.assign(static_cast<size_t>(4) * stage.chunk, 0);
         images.rows.prompt->positions.fill(stage.positions.data(), stage.kv_pos, stage.chunk);
     }
@@ -1818,6 +1835,14 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     live_physical_rows_.reserve(inputs.size());
     live_slot_ids_.reserve(inputs.size());
 
+    // Input embedding rows for every planned prompt token and the widest
+    // decode bucket.
+    if (!ensure_embed_rows((size_t)w.n_embd *
+            ((size_t)planned_prefill_tokens +
+             (inputs.empty() ? 0
+                 : (size_t)chain_decode_bucket_width((int)inputs.size()))))) {
+        return fail_step("input embedding rows allocation failed");
+    }
     int max_kv_len = 1;
     for (const StepInput & in : inputs) {
         DecodeOutput out;
@@ -1856,10 +1881,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     std::vector<PrefillStage> prefills;
     prefills.reserve(plan.prefills.size());
+    int staged_rows = 0;
     for (const PrefillSlice & slice : plan.prefills) {
         const size_t outputs_before = prefill_outputs.size();
-        PrefillStage prefill =
-            stage_prefill_chunk(slice.slot, slice.max_tokens, prefill_outputs);
+        PrefillStage prefill = stage_prefill_chunk(
+            slice.slot, slice.max_tokens,
+            embed_rows_ + (size_t)w.n_embd * staged_rows, prefill_outputs);
         if (!prefill.ready) {
             if (prefill_outputs.size() == outputs_before) {
                 fail_prefill(
@@ -1869,6 +1896,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             }
             return fail_step("selected prefill work made no progress");
         }
+        staged_rows += prefill.chunk;
         prefills.push_back(std::move(prefill));
     }
 
@@ -1967,22 +1995,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         return fail_step("packed prefill/decode graph build failed");
     }
 
-    embed_buf_.resize((size_t)hidden * n_total);
-    int token_offset = 0;
-    for (const PrefillStage & prefill : prefills) {
-        std::copy(prefill.embeddings.begin(), prefill.embeddings.end(),
-                  embed_buf_.begin() + (size_t)hidden * token_offset);
-        token_offset += prefill.chunk;
-    }
+    // The prompt rows are already in place (stage_prefill_chunk).
     if (with_decode &&
         !w.embedder.embed(
             dec_tokens_.data(), decode_bucket,
-            embed_buf_.data() + (size_t)hidden * n_prefill)) {
+            embed_rows_ + (size_t)hidden * n_prefill)) {
         return fail_step("decode embedding failed");
     }
     ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.inp_embed, embed_buf_.data(), 0,
+        b_.target_backend_, sg.inp_embed, embed_rows_, 0,
         sizeof(float) * (size_t)hidden * n_total);
+    int token_offset = 0;
 
     pos_buf_.assign((size_t)4 * n_total, 0);
     token_offset = 0;
@@ -2124,6 +2147,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
     }
     if (st != GGML_STATUS_SUCCESS) {
+        // The pinned embedding rows may still be in flight.
+        ggml_backend_synchronize(b_.target_backend_);
         return fail_step("packed prefill/decode compute failed");
     }
 

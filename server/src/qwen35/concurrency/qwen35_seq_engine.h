@@ -147,7 +147,6 @@ private:
         int chunk = 0;
         bool commit = false;
         std::vector<int64_t> rows;
-        std::vector<float> embeddings;
         // Axis-major [4 x chunk] rotary positions when the slot holds images;
         // empty means the plain kv_pos + i positions.
         std::vector<int32_t> positions;
@@ -192,7 +191,10 @@ private:
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
-    PrefillStage stage_prefill_chunk(int slot, int max_tokens,
+    // Grows the pinned input-embedding rows to at least `floats`.
+    bool ensure_embed_rows(size_t floats);
+    // Stages one prompt chunk; its input embeddings go to `embeddings`.
+    PrefillStage stage_prefill_chunk(int slot, int max_tokens, float * embeddings,
                                      std::vector<PrefillOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
@@ -321,7 +323,13 @@ private:
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;
     std::vector<int32_t>     feature_rows_;
-    std::vector<float>       embed_buf_;
+    // The packed step's input embeddings in pinned host memory: prompt
+    // chunks are dequantized straight into it and copied to the device by
+    // DMA. Every step synchronizes before it returns, so the next step may
+    // overwrite it.
+    ggml_backend_buffer_t    embed_rows_buf_ = nullptr;
+    float *                  embed_rows_ = nullptr;
+    size_t                   embed_rows_floats_ = 0;
     std::vector<int32_t>     pos_buf_;
     std::vector<int64_t>     rows_buf_;
     std::vector<int32_t>     argmax_buf_;
