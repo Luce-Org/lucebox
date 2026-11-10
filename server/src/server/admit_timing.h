@@ -1,4 +1,4 @@
-// The two durations of a request the slot scheduler admits late: the wait for admission (queue), the prefill.
+// The two durations of a request the slot scheduler admits: the wait for admission (queue), the prefill.
 // Pure: timestamps in, seconds out (the scheduler stamps them; tests pass synthetic ones).
 #pragma once
 
@@ -7,16 +7,16 @@
 namespace luce::common {
 
 struct AdmitTiming {
-    double queue_s = 0.0;     // first admit attempt -> successful admit (Deferred retries)
+    double queue_s = 0.0;     // arrival -> successful admit (the HTTP queue, Deferred retries)
     double prefill_s = 0.0;   // successful admit -> prefill complete
 };
 
-inline AdmitTiming admit_timing(std::chrono::steady_clock::time_point first_attempt,
+inline AdmitTiming admit_timing(std::chrono::steady_clock::time_point arrived,
                                 std::chrono::steady_clock::time_point admitted,
                                 std::chrono::steady_clock::time_point prefill_end) {
     using sec = std::chrono::duration<double>;
     AdmitTiming t;
-    t.queue_s = sec(admitted - first_attempt).count();
+    t.queue_s = sec(admitted - arrived).count();
     t.prefill_s = sec(prefill_end - admitted).count();
     return t;
 }

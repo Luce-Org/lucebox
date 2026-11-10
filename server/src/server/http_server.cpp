@@ -7672,6 +7672,7 @@ void HttpServer::process_job(ServerJob * job) {
 // ─── Job queue ──────────────────────────────────────────────────────────
 
 void HttpServer::enqueue(ServerJob * job) {
+    job->arrived_at = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(queue_mu_);
     if (stopping_.load()) {
         // Return routed requests to the listener for a shutdown response.
