@@ -94,6 +94,8 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
+// The same count for the launches on one device (0 for an index out of range).
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count_on(int device);
 // Calling-thread count of MMQ calls that skipped their src1 quantize because
 // the Q8 memo served an earlier call's q8_1.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_glue_q8_memo_hit_count(void);
@@ -244,6 +246,17 @@ GGML_BACKEND_API void ggml_backend_cuda_mul_mat_whole_row_lanes(struct ggml_tens
 // (1..GGML_MOE_FUSED_WAKE_SLOTS) once it is computed, which ends a ggml_moe_fused_wake_hold of that slot on another
 // device. What the node computes does not change.
 GGML_BACKEND_API void ggml_backend_cuda_div_wake_post(struct ggml_tensor * div, int slot);
+
+// A MUL_MAT_ID whose tokens share expert weight reads: the grouped MoE kernel
+// sorts its (token, route) pairs by expert, so tokens routed to the same expert
+// share that expert's weight reads through the cache. It is taken only under
+// batch-invariant products and only where the per-expert MoE kernel reproduces
+// the single-token launch, so each token stays bit-identical to the same
+// product alone (mmvq.cu, mmid_grouped_requested: ROCmFP2 experts, up to the
+// batch-invariant MoE width). Other shapes, types and devices compute it as
+// usual. LUCE_MMID_GROUPED=0 turns it off; LUCE_MMID_GROUPED_TYPES and
+// LUCE_MMID_GROUPED_DEVICE do not apply to this per-node request.
+GGML_BACKEND_API void ggml_backend_cuda_mul_mat_id_grouped(struct ggml_tensor * mul_mat_id);
 
 // Calling-thread override of the weight rows per wave on the batch-invariant
 // Q8_0 multi-column launch (mmvq.cu c_invariant_rpb): 0 = LUCE_MMVQ_INVARIANT_ROWS
