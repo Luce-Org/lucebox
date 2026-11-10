@@ -72,7 +72,33 @@ TEST_CASE(KvflashPflashMapFixture, the_message_map_has_role_and_content_span_per
     CHECK((m.all_spans[3].begin == 25 && m.all_spans[3].end == 27));
     REQUIRE(m.human.size() == 1);                       // the tool result is not human
     CHECK((m.human[0].begin == 10 && m.human_index == std::vector<int>{1}));
-    CHECK(kvflash_message_query_end(m) == 27);
+}
+
+// ---- the query end: the latest human message --------------------
+TEST_CASE(KvflashPflashMapFixture, on_an_agent_turn_the_query_ends_at_the_human_question_not_at_the_tool_result) {
+    // The history is scored against what the human asked. Scored against the tail of the last tool result, the
+    // passages the question needs lose their place on the turn that writes the answer.
+    const std::vector<int32_t> ids = {kS, kSys, kNL, 10, 11, kEnd, kNL,           // system [3,5)
+                                      kS, kU, kNL, 20, 21, kEnd, kNL,             // user [10,12)
+                                      kS, kA, kNL, 30, kEnd, kNL,                 // assistant [17,18)
+                                      kS, kU, kNL, kTR, kNL, 40, 41, kEnd, kNL,   // tool result [25,27)
+                                      kS, kA, kNL};
+    CHECK(kvflash_message_query_end(kvflash_message_map(ids, kChat)) == 12);
+}
+TEST_CASE(KvflashPflashMapFixture, a_new_human_message_moves_the_query_end_to_it) {
+    const std::vector<int32_t> ids = {kS, kU, kNL, 20, 21, kEnd, kNL,             // user [3,5)
+                                      kS, kA, kNL, 30, kEnd, kNL,                 // assistant [10,11)
+                                      kS, kU, kNL, 22, 23, 24, kEnd, kNL,         // user [16,19)
+                                      kS, kA, kNL};
+    CHECK(kvflash_message_query_end(kvflash_message_map(ids, kChat)) == 19);
+}
+TEST_CASE(KvflashPflashMapFixture, without_a_human_message_with_content_the_query_ends_at_the_last_message) {
+    const std::vector<int32_t> none = {kS, kSys, kNL, 10, 11, kEnd, kNL, kS, kA, kNL, 30, kEnd, kNL, kS, kA, kNL};
+    CHECK(kvflash_message_query_end(kvflash_message_map(none, kChat)) == 11);     // the assistant message [10,11)
+    const std::vector<int32_t> empty_human = {kS, kU, kNL, kEnd, kNL,                         // user, empty content
+                                              kS, kU, kNL, kTR, kNL, 40, 41, kEnd, kNL,       // tool result [10,12)
+                                              kS, kA, kNL};
+    CHECK(kvflash_message_query_end(kvflash_message_map(empty_human, kChat)) == 12);
 }
 TEST_CASE(KvflashPflashMapFixture, the_message_map_gives_the_last_two_human_turns_latest_first_and_empty_content_is_0_0) {
     const std::vector<int32_t> ids = {kS, kU, kNL, 1, kEnd, kNL, kS, kU, kNL, kEnd, kNL, kS, kU, kNL, 2, 3, kEnd, kNL, kS, kA, kNL};

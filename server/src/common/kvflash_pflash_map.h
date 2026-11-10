@@ -95,9 +95,12 @@ inline PFlashRequestMessages kvflash_message_map(const std::vector<int32_t> & id
     return m;
 }
 
-// The query end of the request: the end of the last message's content; 0 when there is none (no messages, or an
-// empty final message, whose span is {0,0}) so the caller refuses instead of querying an earlier message.
+// The query end of the request: the end of the latest human message's content, so an agent turn (tool calls and
+// results after the question) scores the history against the question, as the PFlash request path does for an agent
+// loop. Without a human message that has content, the end of the last message; 0 when that one is empty too (its
+// span is {0,0}) so the caller refuses instead of querying an earlier message.
 inline int kvflash_message_query_end(const PFlashRequestMessages & m) {
+    if (!m.human.empty() && m.human.front().end > 0) return m.human.front().end;
     return m.all_spans.empty() ? 0 : m.all_spans.back().end;
 }
 
