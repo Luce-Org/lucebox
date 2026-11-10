@@ -181,8 +181,8 @@ void test_explicit_specla_tau_is_preserved() {
 }
 
 // SpecLA with KVFlash used to fall back to ordinary DDTree and run. DDTree with KVFlash
-// is now refused at startup (the DDTree loop does not settle terminal steps like AR),
-// so the fallback ends in that refusal, with or without an explicit tau.
+// is refused at startup (the DDTree loop does not settle terminal steps like AR),
+// so --specla is refused too, with or without an explicit tau.
 void check_kvflash_specla_fallback_is_refused(bool explicit_tau) {
     BackendArgs args = plain_args();
     args.draft_path = "/models/draft.gguf";
@@ -201,7 +201,10 @@ void check_kvflash_specla_fallback_is_refused(bool explicit_tau) {
     const BackendPreparationFailure & failure =
         std::get<BackendPreparationFailure>(result);
     CHECK(failure.error == BackendPreparationError::FeatureCompatibility);
-    CHECK(failure.message.find("--ddtree cannot run with --kvflash") != std::string::npos);
+    // The user passed --specla, never --ddtree: the error names --specla.
+    CHECK(failure.message.find("--specla cannot run with --kvflash") != std::string::npos);
+    CHECK(failure.message.find("drop --ddtree") == std::string::npos);  // not a flag the user passed
+    CHECK(failure.warnings.empty());
 }
 
 void test_kvflash_specla_fallback_to_ddtree_is_refused() {

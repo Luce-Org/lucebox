@@ -104,13 +104,15 @@ BackendPreparation BackendPlanBuilder::resolve(
                 "Qwen3.6 SpecLA requires --draft <path>",
                 std::move(warnings));
         } else {
-            args.ddtree_mode = true;
+            // SpecLA verifies through DDTree, which KVFlash refuses.
             if (admission.kvflash_requested()) {
-                warnings.push_back(
-                    "--specla is unavailable with KVFlash; using ordinary "
-                    "DDTree verification");
-                args.specla_mode = false;
+                return failure(
+                    BackendPreparationError::FeatureCompatibility,
+                    "--specla cannot run with --kvflash (LUCE_KVFLASH): SpecLA verifies "
+                    "with the DDTree loop, which does not settle terminal steps like AR; "
+                    "drop --specla");
             }
+            args.ddtree_mode = true;
         }
         if (!args.specla_mode && !args.ddtree_tau_explicit) {
             args.ddtree_tau = std::numeric_limits<float>::infinity();
