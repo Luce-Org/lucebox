@@ -196,3 +196,13 @@ TEST_CASE(KvflashSessionStoreFixture, a_busy_identity_admits_the_second_request_
     CHECK(kvflash_admit_identity(book, {"S", "claude"}, {false, false}, 44).sid == "S");   // parked: it resumes
     CHECK(kvflash_admit_identity(book, {std::string(kKvFlashSidMax + 1, 'x'), "body"}, active, 45).sid.size() == kKvFlashSidMax + 1);   // the gate still refuses it
 }
+
+// A client-chosen id the engine cannot hold or log safely is no identity: the request is served without a session, never refused.
+TEST_CASE(KvflashSessionStoreFixture, an_oversized_or_control_character_id_is_no_identity) {
+    CHECK(kvflash_bound_identity({"S", "claude"}).sid == "S");
+    CHECK(kvflash_bound_identity({std::string(kKvFlashSidMax, 'x'), "header"}).sid.size() == kKvFlashSidMax);
+    CHECK(kvflash_bound_identity({std::string(kKvFlashSidMax + 1, 'x'), "header"}).empty());
+    CHECK(kvflash_bound_identity({std::string(kKvFlashSidMax + 1, 'x'), "header"}).client.empty());
+    CHECK(kvflash_bound_identity({"x\n[server] chat DONE ok=true", "body"}).empty());   // forges a log line
+    CHECK(kvflash_bound_identity({"a\x1b[31mb", "body"}).empty());
+}

@@ -624,7 +624,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         const KvFlashSessionId id = kvflash_admit_identity(book_, {who.sid, who.client}, active_slots_(), request_id);
         who.sid = id.sid; who.client = id.client;
     }
-    if (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_()) == KvFlashAdmitVerdict::invalid_identity) {   // the HTTP boundary answers 400 first; an engine caller is held to the same bound
+    if (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_()) == KvFlashAdmitVerdict::invalid_identity) {   // the HTTP boundary drops such an id first; an engine caller is held to the same bound
         refused.status = AdmitResult::Status::failed;
         refused.error = "session id longer than " + std::to_string(kKvFlashSidMax) + " bytes";
         return refused;
@@ -679,7 +679,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                 bool other_parked = false;
                 for (const auto & o : parked_list_()) other_parked |= o.parked.slot != pick.slot;
                 const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded);
-                if (act == KvFlashResumeRefused::refuse) {   // the backstop of the early refusal: the session stays parked, the HTTP boundary answers 400
+                if (act == KvFlashResumeRefused::refuse) {   // the backstop of the early refusal: the session stays parked, the HTTP boundary answers the refusal
                     std::fprintf(stderr, "[kvflash] slot %d resume of sid=%s refused: %s (the session stays parked)\n", pick.slot, who.sid.c_str(), result.error.c_str());
                     return result;
                 }

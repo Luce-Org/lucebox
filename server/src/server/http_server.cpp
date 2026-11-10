@@ -3620,10 +3620,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
-        if (!kvflash_identity_valid(req.session)) {   // a session id the engine could not hold
-            send_error(fd, 400, "session id is longer than " + std::to_string(kKvFlashSidMax) + " bytes");
-            return true;
-        }
+        req.session = kvflash_bound_identity(req.session);   // an id the engine could not hold or log is no identity
         if (hr.body.find("\"tools\"") != std::string::npos) {
             // json sorts object keys; the prompt shows tools as the client wrote them.
             const auto ordered = nlohmann::ordered_json::parse(hr.body, nullptr, false);
