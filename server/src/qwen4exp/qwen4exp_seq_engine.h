@@ -4,9 +4,11 @@
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/seq_slot_manager.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_graph.h"
 #include "qwen4exp_mtp.h"
 
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -92,7 +94,11 @@ private:
         uint64_t verify_builds = 0;
     };
     bool mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
-                     std::vector<float> & logits);
+                     std::vector<float> & logits, const Qwen4ExpInputs * inputs = nullptr);
+    // A prompt chunk's host inputs (embeddings, PLE rows): those gathered while the previous chunk computed when they
+    // were gathered for these tokens and this history, else gathered now. Then starts the gather for the slot's next
+    // chunk, which the single-slot loop also runs ahead.
+    Qwen4ExpInputs prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment);
     bool mtp_eligible(const StepPlan & plan) const;
     StepResult mtp_step(const StepInput & input);
 
@@ -116,6 +122,12 @@ private:
     SpecWidthCostMemory own_mtp_costs_;
     AdaptiveSpecWidth * mtp_width_;
     SpecWidthCostMemory * mtp_costs_;
+    struct InputGather {   // a slot's next prompt chunk: its position, tokens and PLE history, and its inputs
+        int pos0 = -1;
+        std::vector<int32_t> tokens, prev;
+        std::future<Qwen4ExpInputs> inputs;
+    };
+    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); last, so joined before the rest goes
 };
 
 } // namespace luce::common

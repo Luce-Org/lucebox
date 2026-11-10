@@ -46,7 +46,8 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
                 qwen4exp_verify_supported(*caches_[0]) ? 0 : -1),
       verify_width_(verify_width),
       mtp_width_(mtp_width ? mtp_width : &own_mtp_width_),
-      mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_) {}
+      mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_),
+      next_inputs_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     ggml_backend_synchronize(backend_);
@@ -190,27 +191,28 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
 // mtp_prev_pos), so a cache restored from a prefix snapshot keeps drafting; a
 // cache without that row prefills plainly and its request decodes undrafted.
 bool Qwen4ExpSeqEngine::mtp_prefill(Qwen4ExpCache & cache, const int32_t * tokens, int n, int pos0,
-                                    std::vector<float> & logits) {
+                                    std::vector<float> & logits, const Qwen4ExpInputs * inputs) {
     const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
     Qwen4ExpMtpPending & pending = mtp_.pending;
     pending.tok.clear();
     if (pos0 > 0 && cache.mtp_prev_pos != pos0 - 1) {
         mtp_.live = false;
         pending.h.clear();
-        return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits).ok;
+        return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, nullptr, false, false, inputs).ok;
     }
     pending.h.resize(pos0 > 0 ? hd : 0);
     if (pos0 > 0) ggml_backend_tensor_get(cache.mtp_prev_hidden, pending.h.data(), 0, hd * sizeof(float));
     pending.pos = std::max(0, pos0 - 1);
     std::vector<float> hidden;
     if (n > 1) {
-        if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true).ok)
+        if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true, inputs).ok)
             return false;
         pending.h.swap(hidden);
         pending.pos = pos0 + n - 1;
         return true;
     }
-    if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden).ok) return false;
+    if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden, false, false, inputs).ok)
+        return false;
     if (pos0 > 0) pending.tok.assign(tokens, tokens + 1);
     pending.h.insert(pending.h.end(), hidden.begin(), hidden.end());
     if (!qwen4exp_mtp_catch_up(backend_, weights_, cache, pending, 0) || pending.h.size() != hd) return false;
@@ -353,6 +355,32 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
         (unsigned long long)ticket.checkpoint.id, slot, ticket.checkpoint.tokens, event.bytes,
         (double)event.elapsed_us / 1000.0);
     return event;
+}
+
+Qwen4ExpInputs Qwen4ExpSeqEngine::prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment) {
+    const std::vector<int32_t> & prev = segment.cache->ple_prev;
+    InputGather & next = next_inputs_[(size_t)slot];
+    Qwen4ExpInputs inputs;
+    if (next.inputs.valid()) {
+        Qwen4ExpInputs ahead = next.inputs.get();
+        if (next.pos0 == segment.pos0 && next.prev == prev &&
+            next.tokens == std::vector<int32_t>(segment.tokens, segment.tokens + segment.n_tokens)) {
+            inputs = std::move(ahead);
+        }
+    }
+    if (!inputs.ok) inputs = qwen4exp_prepare_inputs(weights_, segment.tokens, segment.n_tokens, prev);
+    // The slot's next chunk as the next step plans it when nothing else changes (this chunk is appended already).
+    const SeqSlot & s = slots_.slot(slot);
+    const int n = inputs.ok && s.cur_pos < s.prompt_len ? prefill_segment(slot, prefill_granule_) : 0;
+    if (n > 0) {
+        next.pos0 = s.cur_pos;
+        next.tokens.assign(s.sample_history.begin() + s.cur_pos, s.sample_history.begin() + s.cur_pos + n);
+        next.prev = inputs.ple_prev;
+        next.inputs = std::async(std::launch::async, [this, tokens = next.tokens, prev = next.prev] {
+            return qwen4exp_prepare_inputs(weights_, tokens.data(), (int) tokens.size(), prev);
+        });
+    }
+    return inputs;
 }
 
 int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
@@ -551,10 +579,11 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     logits.resize(forward_segments.size());
     for (size_t i = plan.decode.size(); i < forward_segments.size(); ++i) {
         const auto & segment = forward_segments[i];
+        const Qwen4ExpInputs inputs = prompt_inputs(plan.prefills[i - plan.decode.size()].slot, segment);
         const bool mtp = mtp_slot_ >= 0 && mtp_.live && segment.cache == caches_[(size_t)mtp_slot_];
-        if (mtp ? !mtp_prefill(*segment.cache, segment.tokens, segment.n_tokens, segment.pos0, logits[i])
+        if (mtp ? !mtp_prefill(*segment.cache, segment.tokens, segment.n_tokens, segment.pos0, logits[i], &inputs)
                 : !qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
-                                    segment.n_tokens, segment.pos0, logits[i]).ok)
+                                    segment.n_tokens, segment.pos0, logits[i], nullptr, false, false, &inputs).ok)
             return fail("qwen4exp solo prefill forward failed");
     }
     if (std::any_of(logits.begin(), logits.end(), [this](const auto & row) {
@@ -622,6 +651,7 @@ void Qwen4ExpSeqEngine::retire(int slot) {
         if (verify_width_ == 0) mtp_costs_->store(*mtp_width_, mtp_.context);
         mtp_ = MtpState{};
     }
+    next_inputs_[(size_t)slot] = InputGather{};   // its next chunk is not coming: wait out its gather, drop it
     ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();
