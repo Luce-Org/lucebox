@@ -13,6 +13,7 @@
 #include "prefill_helpers.h"
 #include "common/blocking_row_pool.h"
 #include "common/concurrency/chain_spec_shapes.h"
+#include "common/kvflash_chain_plan.h"
 #include "common/dflash2_head.h"
 #include "common/kvflash_exact_fast.h"
 #include "common/kvflash_prefill_reselect.h"
@@ -1532,7 +1533,7 @@ void Qwen35SeqEngine::observe_chain_width(
 
 SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
-        PreparedChainRound && prepared_round) {
+        PreparedChainRound && prepared_round, const ChainTablePlan * kvf_plan) {
     StepResult result;
     const std::vector<StepInput> & inputs = plan.decode;
     if (!plan.prefills.empty() || selected.size() != inputs.size()) {
@@ -1667,7 +1668,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
         staged_round.track(lane.slot);
-        if (append.new_block >= 0 &&
+        if (!kvf_ && append.new_block >= 0 &&
             !upload_block_table_delta(
                 lane.slot, append.new_block_index,
                 &append.new_block, 1)) {
@@ -1832,6 +1833,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     ggml_backend_tensor_set(
         graph.kv_write_rows, write_rows.data(), 0,
         sizeof(int64_t) * write_rows.size());
+    if (kvf_) {   // (b): the arena column from the pager, covering every chunk the plan allocated; never a pool delta
+        if (!kvf_plan) { result.error = "KVFlash chain round without a pager plan"; return result; }
+        for (const auto & [slot, cover] : kvf_plan->cover_len) {
+            if (kvf_->table_stale(slot) && !upload_kvflash_column(slot, cover)) {
+                result.error = "KVFlash block-table column exceeds device capacity";
+                return result;
+            }
+        }
+    }
     ggml_backend_tensor_set(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
@@ -2006,7 +2016,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
         staged_round.track(proposal.slot);
-        if (!block_table_delta_fits(
+        if (!kvf_ && !block_table_delta_fits(
                 proposal.slot, append.first_new_block,
                 append.new_blocks.size())) {
             result.error = "accepted chain block-table update failed";
@@ -2129,7 +2139,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     }
 
     for (const Proposal & proposal : proposals) {
-        if (!upload_block_table_delta(
+        if (!kvf_ && !upload_block_table_delta(
                 proposal.slot, proposal.append.first_new_block,
                 proposal.append.new_blocks.data(),
                 proposal.append.new_blocks.size())) {
@@ -2231,6 +2241,23 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     return result;
 }
 
+void Qwen35SeqEngine::log_kvflash_chain_round_(const StepResult & result, const std::vector<uint8_t> & selected) {
+    kvf_chain_stats_.resize((size_t)slots_.slot_count(), {0, 0});
+    for (size_t i = 0; i < result.decode.size() && i < selected.size(); ++i) {
+        if (!selected[i]) continue;
+        auto & st = kvf_chain_stats_[(size_t)result.decode[i].slot];
+        st.first++;
+        st.second += 1 + result.decode[i].committed_tokens.size();   // the root and the accepted drafts
+    }
+    if (++kvf_chain_rounds_ % 64 != 1) return;   // the first round, then every 64th
+    std::fprintf(stderr, "[kvflash-chain] %llu chain rounds", (unsigned long long)kvf_chain_rounds_);
+    for (size_t slot = 0; slot < kvf_chain_stats_.size(); ++slot) {
+        const auto & st = kvf_chain_stats_[slot];
+        if (st.first) std::fprintf(stderr, "; slot %zu: %llu rounds, %.2f tokens/round", slot, (unsigned long long)st.first, (double)st.second / (double)st.first);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     StepResult result;
     std::vector<DecodeOutput> & decode_outputs = result.decode;
@@ -2306,8 +2333,45 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         std::optional<PreparedChainRound> prepared =
             prepare_chain_drafts(inputs, chain_lanes);
         if (prepared) {
-            for (const StepInput & in : inputs) stash_pos_[(size_t)in.slot] = -1;   // a chain round commits several tokens: no one-token-back state
-            return step_chain_spec(plan, chain_lanes, std::move(*prepared));
+            // KVFlash (Stage C-4 a): the pager plans this round's rows first, `width` per spec lane and one per AR
+            // lane, so the accepted prefix finds its rows already allocated. A lane the pager could not fit sends the
+            // round down the AR path below (BlocksExhausted is an AR round, never an error).
+            ChainTablePlan kvf_plan;
+            ChainRoundVerdict verdict = ChainRoundVerdict::Chain;
+            if (kvf_) {
+                std::vector<ChainLaneIn> lanes;
+                lanes.reserve(inputs.size());
+                for (size_t i = 0; i < inputs.size(); ++i) {
+                    const bool spec = chain_lanes[i] != 0;
+                    const int width = spec && i < prepared->drafts.size() ? (int)prepared->drafts[i].tokens.size() : 1;
+                    lanes.push_back({inputs[i].slot, slots_.slot(inputs[i].slot).cur_pos, spec, width});
+                }
+                kvf_plan = chain_table_plan(lanes, slots_.max_context());
+                verdict = ChainRoundVerdict::FallbackAr;
+                if (kvf_plan.valid) {
+                    void * compute_stream = ggml_backend_is_cuda(b_.target_backend_)
+                        ? (void *)ggml_backend_cuda_get_stream(b_.target_backend_) : nullptr;
+                    const KvFlashStepDriver::Result ran = kvf_->run_step(kvf_plan.work, compute_stream);
+                    if (!ran.ok) return fail_step("KVFlash step failed (page-out, page-in or allocation)");
+                    verdict = chain_round_verdict(kvf_plan, ran.ran);
+                    if (verdict == ChainRoundVerdict::FallbackAr) kvf_->finish_step();   // the AR step plans its own rows
+                }
+                if (verdict == ChainRoundVerdict::FallbackAr) {
+                    static int n_fallback = 0;
+                    if (n_fallback++ % 64 == 0)
+                        std::fprintf(stderr, "[kvflash-chain] round fell back to AR (the pager had no free block for a lane): %d so far\n", n_fallback);
+                }
+            }
+            if (verdict == ChainRoundVerdict::Chain) {
+                for (const StepInput & in : inputs) stash_pos_[(size_t)in.slot] = -1;   // a chain round commits several tokens: no one-token-back state
+                StepResult chain = step_chain_spec(plan, chain_lanes, std::move(*prepared), kvf_ ? &kvf_plan : nullptr);
+                if (kvf_) {
+                    if (!chain.error.empty()) return fail_step(chain.error);   // abort_step, the live slots are never parked
+                    if (!settle_kvflash_()) return fail_step("KVFlash page-out failed");   // (d): after the readback; also rewinds
+                    log_kvflash_chain_round_(chain, chain_lanes);
+                }
+                return chain;
+            }
         }
     }
 

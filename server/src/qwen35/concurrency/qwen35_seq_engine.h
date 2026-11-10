@@ -27,6 +27,7 @@
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/kvflash_admit_plan.h"
 #include "common/kvflash_engine_step.h"
+#include "common/kvflash_chain_plan.h"
 #include "common/kvflash_session_store.h"
 #include "common/kvflash_slot_turn.h"
 #include "common/kvflash_step_driver.h"
@@ -243,7 +244,11 @@ private:
         const std::vector<uint8_t> & selected);
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
-        PreparedChainRound && prepared);
+        PreparedChainRound && prepared, const ChainTablePlan * kvf_plan);
+    // KVFlash chain rounds: one rate-limited line per 64 rounds (rounds, accepted tokens, per slot).
+    void log_kvflash_chain_round_(const StepResult & result, const std::vector<uint8_t> & selected);
+    std::vector<std::pair<uint64_t, uint64_t>> kvf_chain_stats_;   // per slot: {spec rounds, tokens committed by them}
+    uint64_t kvf_chain_rounds_ = 0;
     // Verify width for one batched chain round. Each verify graph bucket
     // keeps its own AdaptiveSpecWidth: a round's cost depends on the graph's
     // rows (bucket lanes x width), while the width that maximizes committed
