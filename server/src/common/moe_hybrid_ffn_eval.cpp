@@ -1,4 +1,5 @@
 #include "moe_hybrid_ffn_eval.h"
+#include "moe_split_step.h"
 #include "cuda_graph_overrides.h"
 #include "moe_input_ready.h"
 
@@ -1250,12 +1251,15 @@ static ggml_tensor * build_moe_owner_join(
                        : secondary_ready;
     }
 
-    if (schedule_graph && secondary && policy.targeted_join_split) {
-        // The scheduler starts a new primary split at this join, allowing both
-        // owner branches to be enqueued before unlike-runtime host staging.
-        ggml_build_forward_expand(schedule_graph, secondary);
+    if (schedule_graph && secondary && (out.split_join || policy.targeted_join_split)) {
+        // A split step (moe_split_step.h): the secondary owner's sum right
+        // after the routes, then the main owner's experts and shared expert,
+        // then the join, where the caller's scheduler ends the main owner's
+        // split.
+        moe_split_queue_expert(schedule_graph, secondary);
+        if (primary) ggml_build_forward_expand(schedule_graph, primary);
         ggml_tensor * combined = primary
-            ? ggml_add(ctx, secondary, primary) : secondary;
+            ? moe_split_join(ctx, secondary, primary) : secondary;
         if (primary) {
             out.join_nodes.push_back(combined);
         }

@@ -29,6 +29,7 @@
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
+#include "../common/moe_split_step.h"
 #include "../common/pinned_stage.h"
 #include "../common/host_stream_flag.h"
 

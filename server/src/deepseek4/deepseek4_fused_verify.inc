@@ -1510,6 +1510,14 @@ static bool ds4_build_fused_verify_graph(
                 streamed = &streamed_owner;
             }
             inputs.router_nodes = router_nodes;
+            // Both owners on GPUs of one runtime without a device join: a
+            // split step (moe_split_step.h). The secondary GPU's experts are
+            // queued once the routes exist, and the join ends the main GPU's
+            // split, so its own experts and the shared expert run beside them
+            // instead of after them.
+            inputs.split_join = pair_capabilities.native_gpu_handoff &&
+                                !allow_direct_device_join && !cluster_hybrid && !streamed;
+            if (inputs.split_join) hybrid_schedule_graph = gf;
             const MoeHybridLayerStorage & hybrid_layer =
                 hybrid->layers[(size_t) il];
             const bool has_hot_routed =
@@ -1890,6 +1898,13 @@ static bool ds4_build_fused_verify_graph(
         const bool report_split_count = mixed_policy.report_split_count;
         ggml_backend_sched_set_late_cross_input_split(
             fg.sched, late_join_split);
+        // A split step's joins end the main GPU's splits (moe_split_step.h).
+        const bool split_step = std::any_of(
+            fg.hybrid_inputs.begin(), fg.hybrid_inputs.end(),
+            [](const MoeHybridGraphInputs & inputs) {
+                return inputs.split_join && !inputs.join_nodes.empty();
+            });
+        if (split_step) moe_split_sched_init(fg.sched);
         ggml_backend_sched_set_deferred_peer_copy_split(
             fg.sched, device_join_split);
         ggml_backend_sched_set_batch_split_copies(

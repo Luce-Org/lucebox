@@ -690,6 +690,7 @@ add_library(luce_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_split_step.cpp
     src/common/moe_hybrid_expert_cache.cpp
     src/common/platform_io.cpp
     src/common/tensor_file_reader.cpp
