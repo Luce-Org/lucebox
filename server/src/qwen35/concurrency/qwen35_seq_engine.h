@@ -74,10 +74,11 @@ public:
                     int prefill_quantum = 512);
     // KVFlash slots (Track C): the slots allocate through `kv` (one arena, one
     // slice per slot) and `driver` runs the pager work of every step (LRU only,
-    // D1 cuts of kKvFlashCutU). No pool, no offload, no prefix store, no images.
+    // D1 cuts of kKvFlashCutU). `fixed_chain` (Stage C) is default-disabled: AR only. No pool, no offload, no prefix store, no images.
     // `kv` and `driver` must outlive the engine.
     Qwen35SeqEngine(Qwen35Backend & backend, KvFlashSlotKv & kv, KvFlashStepDriver & driver,
                     int max_ctx, int64_t scratch_row,
+                    FixedChainConfig fixed_chain,
                     int max_prefills = 8,
                     int mixed_prefill_tokens = 2048,
                     int long_mixed_prefill_tokens = 4096,
