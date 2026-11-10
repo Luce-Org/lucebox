@@ -3325,15 +3325,8 @@ static void mul_mat_vec_q8_0_rdna4_launch_glu(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, 0, vx_gate, glu_limit, glu_op, mmvq_q8_twin{});
 }
 
-// Benchmarks only (ggml_backend_cuda_set_mmvq_q8_rdna4_shape): one block shape for every product below, to time the
-// shapes against each other; -1 keeps the table. Every shape adds the same partials in the same order.
-static int g_mmvq_q8_rdna4_shape_override = -1;
-constexpr int kMmvqQ8Rdna4Shapes = 15;
-
 // The block shape mul_mat_vec_q8_0_rdna4_launch_nc picks for rows of nb blocks (0..3 from the table, in its order).
 static int mmvq_q8_rdna4_shape(const int nb, const int64_t rows, const int kb_off) {
-    const int o = g_mmvq_q8_rdna4_shape_override;
-    if (o >= 2 || (o == 0 && kb_off == 0 && nb <= 16) || (o == 1 && kb_off == 0 && nb <= 24)) return o;
     if (kb_off == 0 && nb <= 16) return 0;
     if (kb_off == 0 && nb <= 24) return 1;
     if (rows <= 1024 || nb <= 64) return 2;
@@ -3371,17 +3364,6 @@ static void mul_mat_vec_q8_0_rdna4_launch_nc(
         case 0:  Q8_RDNA4_LAUNCH(4, 1, 4, 2); break;
         case 1:  Q8_RDNA4_LAUNCH(4, 1, 4, 3); break;
         case 2:  Q8_RDNA4_LAUNCH(2, 4, 2);    break;
-        case 4:  Q8_RDNA4_LAUNCH(4, 8, 1);    break;
-        case 5:  Q8_RDNA4_LAUNCH(1, 8, 1);    break;
-        case 6:  Q8_RDNA4_LAUNCH(2, 2, 2);    break;
-        case 7:  Q8_RDNA4_LAUNCH(4, 4, 1);    break;
-        case 8:  Q8_RDNA4_LAUNCH(2, 4, 1);    break;
-        case 9:  Q8_RDNA4_LAUNCH(4, 2, 2);    break;
-        case 10: Q8_RDNA4_LAUNCH(1, 4, 2);    break;
-        case 11: Q8_RDNA4_LAUNCH(4, 1, 1);    break;
-        case 12: Q8_RDNA4_LAUNCH(8, 1, 1);    break;
-        case 13: Q8_RDNA4_LAUNCH(2, 1, 4);    break;
-        case 14: Q8_RDNA4_LAUNCH(4, 1, 2);    break;
         default: Q8_RDNA4_LAUNCH(2, 8, 1);    break;
     }
 #undef Q8_RDNA4_LAUNCH
@@ -3436,17 +3418,6 @@ static void mul_mat_vec_q8_0_rdna4_launch(
 #undef Q8_RDNA4_NC
 }
 #endif // defined(GGML_USE_HIP)
-
-extern "C" int ggml_backend_cuda_set_mmvq_q8_rdna4_shape(int shape) {
-#if defined(GGML_USE_HIP)
-    const int prev = g_mmvq_q8_rdna4_shape_override;
-    g_mmvq_q8_rdna4_shape_override = shape >= 0 && shape < kMmvqQ8Rdna4Shapes ? shape : -1;
-    return prev;
-#else
-    GGML_UNUSED(shape);
-    return -1;
-#endif
-}
 
 extern "C" void ggml_backend_cuda_mul_mat_rdna4_rows(ggml_tensor * mul_mat) {
     GGML_ASSERT(mul_mat != nullptr && mul_mat->op == GGML_OP_MUL_MAT);

@@ -216,10 +216,6 @@ GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols
 // Returns the previous setting.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
 
-// Benchmarks only: the RDNA4 Q8_0 matvec block shape for every product (0..14), -1 for the shape table. Every shape
-// gives the same bits. Returns the previous setting.
-GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_q8_rdna4_shape(int shape);
-
 // Rows of one Q8_0 matrix split between an RDNA4 and an RDNA3.5 GPU. A Q8_0 MUL_MAT node flagged here runs the RDNA4
 // Q8_0 matvec on RDNA3.5 too (wave32 on both: the same partials, summed in the same order), so each output row has
 // the bits the RDNA4 device gives it, at one column or up to eight batch-invariant ones. RDNA4 runs that kernel for
