@@ -1160,6 +1160,7 @@ private:
 
     // Send SSE heartbeat comment to prune disconnected clients.
     void sse_heartbeat();
+    void sse_drop_closed_at_cap();
 
     // Resolve and cache path to share/status.html.
     std::string status_html_path_;

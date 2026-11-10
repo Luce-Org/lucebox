@@ -2300,6 +2300,19 @@ void HttpServer::sse_heartbeat() {
     }
 }
 
+// A closed status page keeps its slot until a send to it fails (an event, or the second idle heartbeat). When the
+// list is full, the subscribers whose peer has closed leave first, so reloads do not use up the cap.
+void HttpServer::sse_drop_closed_at_cap() {
+    std::lock_guard<std::mutex> send_lk(sse_send_mu_);
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    if (sse_fds_.size() + sse_pending_ < kMaxStatusSubscribers) return;
+    sse_fds_.erase(std::remove_if(sse_fds_.begin(), sse_fds_.end(), [](SocketHandle fd) {
+        if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Connected) return false;
+        socket_close(fd);
+        return true;
+    }), sse_fds_.end());
+}
+
 HttpServer::~HttpServer() {
     shutdown();
     #ifdef LUCE_HAS_CURL
@@ -2677,6 +2690,7 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     // Status SSE stream: hold connection open and push updates.
     if (hr.method == "GET" && hr.path == "/status/events") {
+        sse_drop_closed_at_cap();
         {
             std::lock_guard<std::mutex> lk(sse_mu_);
             // A slot is reserved here, counting live and pending subscribers, so
