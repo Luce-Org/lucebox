@@ -686,6 +686,9 @@ bool slot_state_stash_copy(ggml_backend_t backend, TargetCache & c, SlotStateSta
     add(c.ssm_state, s.ssm);
     add(c.conv_state, s.conv);
     ggml_backend_cuda_copy_batch_async(backend, descs.data(), (int)descs.size());
+    // Stash -> slot: the next admission touches this slab through another stream (host reads, cudaStreamPerThread), so the copy
+    // must be complete before the slot is handed on. Slot -> stash stays queued: the next decode step is on the same stream.
+    if (!to_stash) ggml_backend_synchronize(backend);
     return true;
 }
 

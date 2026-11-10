@@ -1855,6 +1855,14 @@ if(LUCE_TESTS)
             SKIP_RETURN_CODE 77
             ENVIRONMENT "GGML_BATCH_PEER_COPIES=0")
     endif()
+    # The slot-state stash copy must be complete when it returns (CUDA; skips without a device).
+    if(LUCE_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_slot_state_stash_fence.cpp")
+        add_executable(test_slot_state_stash_fence test/unit/test_slot_state_stash_fence.cpp)
+        target_include_directories(test_slot_state_stash_fence PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_slot_state_stash_fence PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET} CUDA::cudart)
+        list(APPEND _fence_test_targets test_slot_state_stash_fence)
+    endif()
     # GPU F32 copy into a strided view (the PFlash scorer's chunked logits
     # copy; a one-key-wide last chunk used to take the dense transpose
     # kernel). CUDA and HIP; exits 77 without a device.
@@ -3165,6 +3173,7 @@ if(LUCE_TESTS)
         test_rocmfp_mix_gateup_glu
         test_rocmfp_mix_glu_fusable
         test_cuda_copy_batch
+        ${_fence_test_targets}
         test_qn_split_fusions
         test_uma_budget
         test_mmq_tile_twin_gate
