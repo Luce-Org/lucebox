@@ -710,8 +710,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.admitted_at = attempt_at;
         s.queue_s = admit_timing(started_at, attempt_at, attempt_at).queue_s;
         s.decode_started_at = attempt_at;  // sane on prefill failure
-        s.cached_prefix_tokens = prefix.restored.tokens;
-        s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
+        s.cached_prefix_tokens = admit_cached_tokens(prefix.restored.tokens, ar.resumed_tokens);
+        s.prompt_left = (int)req.prompt_tokens.size() - s.cached_prefix_tokens;
         s.prompt_new = s.prompt_left;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
