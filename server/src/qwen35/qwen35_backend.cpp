@@ -194,7 +194,7 @@ static FILE * open_dflash_floor_log() {
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
         int64_t kv_bytes_per_token, int64_t scratch_tokens,
-        bool fixed_chain) {
+        bool fixed_chain, int max_verify_tokens) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -215,7 +215,9 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
-        (int64_t)sizeof(float) * (1 + luce::common::kvflash_q_cap_all_rows());
+        (int64_t)sizeof(float) * (1 + luce::common::kvflash_q_cap_all_rows() +
+         luce::common::kvflash_q_stage_rows(
+             max_verify_tokens > 0 ? max_verify_tokens : LUCE_DRAFT_BLOCK_SIZE));
     const int64_t paged_metadata =
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
@@ -588,7 +590,7 @@ bool Qwen35Backend::init() {
             kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
         budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
             w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-            scratch_tokens, fixed_chain.enabled);
+            scratch_tokens, fixed_chain.enabled, max_verify_tokens);
         if (cfg_.kv_pool_tokens > 0) {
             const int64_t max_pool_tokens =
                 ((int64_t)INT32_MAX - scratch_tokens) /
