@@ -1,12 +1,12 @@
 // KvFlashStepDriver: what the seq engine runs around the
 // graph of one step. kvflash_preflight_step (D2) decides which slots start the
 // step, kvflash_plan_step orders their pager work and run_step executes it over
-// the slot pagers and the arena. LRU only.
+// the slot pagers and the arena.
 //
 // Engine use: run_step before the graph; abort_step() on any failure after it;
 // settle() after the argmax readback sync queues the page-outs that keep every
 // live slot at its usable quota (Q - headroom), so the next step finds the
-// free blocks it needs, a decode row never idles, and a prefill cut is not paced
+// free blocks it needs, and a prefill cut is not paced
 // at one eviction per step. The step pins protect the step's own chunks and
 // outlive the graph: the engine calls finish_step() after the readback. A
 // slot's table column is re-uploaded only when table_stale(slot).
@@ -16,6 +16,7 @@
 
 #include "kvflash_arena.h"
 #include "kvflash_slot_plan.h"
+#include "kvflash_slot_pager.h"
 
 #include <algorithm>
 #include <vector>
@@ -111,6 +112,8 @@ public:
     // The step pins stay until here, after the readback.
     void finish_step() { for (KvFlashSlotPager * p : pagers_) p->end_step(); }
     void abort_step() { for (KvFlashSlotPager * p : pagers_) p->abort_step(); }
+
+    int headroom() const { return headroom_; }
 
     // The one host wait that makes every queued page-out's block allocatable (before a truncate).
     void complete_all() { arena_.complete_all(); }
