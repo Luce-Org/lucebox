@@ -876,8 +876,8 @@ void Qwen35SeqEngine::begin_resume_(int slot) {
 }
 
 // C1.4: the slot's turn (kvflash_slot_turn.h). R > kv_offset snapshots at the
-// cut ending at R; R == kv_offset > 0 snapshots the resume state now; R == 0
-// resets the slab at the rewind.
+// cut ending at R; R == kv_offset snapshots the resume state now. A recall turn
+// has a sealed chunk before R (the plan), so R > 0.
 void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset) {
     SlotRecall & rc = recall_[(size_t)slot];
     rc = SlotRecall{};
@@ -897,7 +897,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
             std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=5: drafter scoring failed (LRU)\n", slot);
         }
     } else if (rc.turn.first_pass()) {
-        if (rc.turn.r == rc.turn.kv_offset && rc.turn.r > 0) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
+        if (rc.turn.r == rc.turn.kv_offset) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts%s)\n",
                      slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.end_rung ? ", header rung" : "");
     } else if (recall_on_) {
@@ -938,7 +938,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     const int sealed = r / ct;
     bool scored = false;
     rc.scores.clear();
-    if (sealed > 0 && !qs.empty()) {
+    if (!qs.empty()) {
         std::vector<std::vector<float>> o;
         std::vector<KvFlashMassPlanes> planes;
         if (b_.kvflash_exact_scores_gpu_on(p, sealed, qs, o, planes) || b_.kvflash_exact_scores_on(p, sealed, qs, o, &planes)) {
@@ -950,16 +950,14 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     if (!scored)
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4 @%d: scoring failed (n_q=%d sealed=%d); LRU replay\n",
                      slot, r, n_q, sealed);
-    if (r == 0) {
-        reset_recurrent_slot(b_.cache_, slot);
-    } else if (!rc.snap_ok || !restore_slot_state(b_.cache_, slot, rc.snap)) {
+    if (!rc.snap_ok || !restore_slot_state(b_.cache_, slot, rc.snap)) {
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4 @%d: state restore failed (snap %d)\n", slot, r, rc.snap_ok ? 1 : 0);
         return false;
     }
     // The R state is this turn's sticky checkpoint (the next turn resumes at R and prefills the question
     // with the recent window, as a cold turn does: a replay state there cost recall), the resume-time
     // fallback below it the trunk (Rule A); else freed (~150 MiB).
-    if (sticky_on_ && r > 0) place_ckpt_(slot, SlotCkpt{r, std::move(rc.snap)});
+    if (sticky_on_) place_ckpt_(slot, SlotCkpt{r, std::move(rc.snap)});
     rc.snap = SlotStateSnapshot{};
     rc.snap_ok = false;
     // Pending frees would be double-freed by the truncate's relayout; the apply's page-outs must free at once
