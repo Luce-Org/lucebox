@@ -48,6 +48,9 @@ int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
 
 // The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
 constexpr int kQwen4ExpMaxBatchedSlots = 4;
+// The rows per slot of a batched verify (qwen4exp_verify_batched): a pending token and three drafts. Two slots fill one
+// batch-invariant product (8 rows).
+constexpr int kQwen4ExpBatchedVerifyRows = 4;
 
 // What a T=1 decode or verify forward reads back in place of its logits rows (n_vocab floats each: a 5-row verify
 // is 5 MB, over PCIe when the target is a discrete card).
@@ -225,7 +228,11 @@ bool qwen4exp_mtp_step(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4E
 // backend lacks those rows or more than four slots are active, each slot runs its solo forward.
 // Reference caches also use per-slot solo forwards. The server admits at most four slots.
 // out_hidden, when set, receives slot `hidden_slot`'s final HC residual (n_embd * n_hc floats), as
-// qwen4exp_forward's out_hidden would, so that slot's MTP head can draft once it decodes alone.
+// qwen4exp_forward's out_hidden would, so that slot's MTP head can draft once it decodes alone; with hidden_slot < 0,
+// every slot's, slot-major.
+// out_greedy, when set and the slots ran as one graph: every slot's argmax (the lowest id on ties, a host scan's
+// pick), and out_logits holds only the rows logits_rows asks for (all when null; the others are left empty), so a
+// greedy slot reads one id instead of its vocabulary row. Otherwise out_greedy is left empty and out_logits is full.
 Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        ggml_backend_t backend,
                                        const Qwen4ExpWeights & w,
@@ -236,6 +243,28 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
                                        Qwen4ExpBatchedDecodeWorkspace & workspace,
                                        std::vector<std::vector<float>> & out_logits,
                                        int hidden_slot = -1,
-                                       std::vector<float> * out_hidden = nullptr);
+                                       std::vector<float> * out_hidden = nullptr,
+                                       std::vector<int32_t> * out_greedy = nullptr,
+                                       const uint8_t * logits_rows = nullptr);
+
+// Allocation plan of the batched verify graph: n_slots slots of `rows` rows at `pos` (the cache stands in for each).
+Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+    Qwen4ExpCache & cache, int n_slots, int rows, int pos);
+// Every decoding slot's MTP verify in one graph: slot s feeds `rows` tokens (its pending token, then rows - 1 drafts),
+// slot-major in `tokens`, at positions[s] onward. Each row computes what a T=1 decode at its position computes (the
+// slot groups' batch-invariant products, each row's own T=1 attention, each slot's recurrence over its rows), and every
+// slot keeps its per-row rollback states as a solo verify does (qwen4exp_verify_rollback). Needs every cache with the
+// MTP rollback state (qwen4exp_verify_supported), dense attention for every row and no KVFlash pool. False: not run
+// (the caller decodes the step plainly). `out` (Qwen4ExpRowOutputs, top_n in) receives each row's argmax and, with
+// top_n > 0, its top_n candidates; the logits rows stay on the device until the next call
+// (qwen4exp_verify_batched_row). hidden: each row's final HC residual (n_embd * n_hc floats), slot-major.
+bool qwen4exp_verify_batched_supported(const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
+                                       const int32_t * positions, int n_slots, int rows);
+Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, int n_slots, int rows,
+        Qwen4ExpBatchedDecodeWorkspace & workspace, Qwen4ExpRowOutputs & out, std::vector<float> & hidden);
+// Row `row` (slot-major) of the last qwen4exp_verify_batched's logits, n_vocab floats, into `out`.
+bool qwen4exp_verify_batched_row(const Qwen4ExpBatchedDecodeWorkspace & workspace, const Qwen4ExpWeights & w, int row,
+                                 std::vector<float> & out);
 
 }  // namespace luce::common

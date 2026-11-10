@@ -218,8 +218,8 @@ struct Qwen4ExpMoeParts {
 // the target; build_moe_routed runs the routed experts on the expert device.
 struct Qwen4ExpMoeRoute {
     ggml_tensor * xin    = nullptr;   // expert input, F16 for prompt chunks (half the link bytes)
-    ggml_tensor * sel    = nullptr;   // [n_used, T], the expert device's picks (hot ones -1)
-    ggml_tensor * hot    = nullptr;   // [n_used, T], hot-stack slots on the target (cold ones -1)
+    ggml_tensor * sel    = nullptr;   // [n_used, T], the expert device's picks (with hot lanes: ggml_moe_hot_routes)
+    ggml_tensor * hot    = nullptr;   // [n_lanes, T], the hot lanes' slots on the target (null: no hot lanes)
     ggml_tensor * wsel   = nullptr;   // [n_used, T]
     ggml_tensor * shared = nullptr;   // gated shared expert, [n_embd, T]
 };
@@ -286,18 +286,19 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     r.shared = ggml_mul(c, r.shared, ggml_sigmoid(c, shared_logit));
     // The expert kernels convert their activations to F16 anyway.
     r.xin = n_tokens > kSplitShortRows ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
-    // Decode and verify steps with hot experts: each pick runs on one device,
-    // masked (-1) on the other. Single-token steps take the same route as
-    // verify rows, so every generated token computes its hot picks with the
-    // same tokenwise kernel whatever the verify width, and greedy text does not
-    // depend on the adaptive width. Prompt chunks keep every pick on the expert
-    // device: only the matvec kernels take masked ids on gfx1151 (MMQ faults
-    // on them).
-    if (n_tokens <= QWEN4EXP_MTP_MAX_VERIFY && il >= 0 && il < (int) w.hot_lut.size() && w.hot_lut[il]) {
-        ggml_tensor * flat = ggml_reshape_1d(c, ggml_is_contiguous(r.sel) ? r.sel : ggml_cont(c, r.sel),
-                                             w.n_expert_used * n_tokens);
-        r.hot = ggml_reshape_2d(c, ggml_get_rows(c, w.hot_lut[il], flat), w.n_expert_used, n_tokens);
-        r.sel = ggml_reshape_2d(c, ggml_get_rows(c, w.cold_lut[il], flat), w.n_expert_used, n_tokens);
+    // Decode and verify steps with hot experts: a token's first hot picks (up to w.hot->lanes, in route order) run on
+    // the target, each in a lane, the others on the expert device, masked on the other one. The target computes a
+    // lane with the expert device's bits for that pick (test_qn_split_fusions hot_lanes), and the expert device sums
+    // every pick in route order (ggml_moe_combine_lanes), so the text does not depend on which experts are hot: the
+    // same as with none, alone or beside other requests. Prompt chunks keep every pick on the expert device: only the
+    // matvec kernels take masked ids on gfx1151 (MMQ faults on them).
+    if (n_tokens <= QWEN4EXP_MTP_MAX_VERIFY && il >= 0 && w.hot && w.hot->lut[(size_t) il]) {
+        // The counts steer which experts the slots hold (Qwen4ExpHotSet::tick).
+        r.hot = ggml_moe_hot_routes(c, r.sel, w.hot->lut[(size_t) il], nullptr, w.hot->lanes, true);
+        r.sel = ggml_moe_hot_routes(c, r.sel, w.hot->lut[(size_t) il], w.hot->hist[(size_t) il], w.hot->lanes, false);
+    } else if (il >= 0 && w.hot && w.hot->lut[(size_t) il]) {
+        // A prompt chunk: the same ids, and its picks count, so the slots start moving to the prompt's experts.
+        r.sel = ggml_moe_hot_routes(c, r.sel, w.hot->lut[(size_t) il], w.hot->hist[(size_t) il], 0, false);
     }
     if (gf) {
         ggml_build_forward_expand(gf, r.sel);
@@ -307,17 +308,15 @@ static Qwen4ExpMoeRoute build_moe_route(ggml_context * c, ggml_tensor * cur,
     return r;
 }
 
-// The hot experts' weighted sum plus the shared expert, on the target while
-// the expert device runs the cold picks.
-static ggml_tensor * build_moe_hot(ggml_context * c, const Qwen4ExpMoeRoute & r,
-                                   const MoeHybridLayerStorage & hot, const Qwen4ExpWeights & w) {
+// The hot lanes' expert outputs, [n_embd, n_lanes, T], on the target while the expert device runs the other picks.
+static ggml_tensor * build_moe_lanes(ggml_context * c, const Qwen4ExpMoeRoute & r, const Qwen4ExpWeights & w, int il) {
     ggml_tensor * x3 = ggml_reshape_3d(c, r.xin, w.n_embd, 1, r.hot->ne[1]);
-    ggml_tensor * down = moe_experts(c, hot.gate_hot, hot.up_hot, hot.down_hot, x3, r.hot);
-    return ggml_ds4_moe_fused_combine_shared(c, down, r.wsel, r.shared);
+    const Qwen4ExpHotSet & h = *w.hot;
+    return moe_experts(c, h.gate[(size_t) il], h.up[(size_t) il], h.down[(size_t) il], x3, r.hot);
 }
 
-// The routed experts and their weighted sum, on the expert device: only the
-// [n_embd, T] sum crosses back, not [n_embd, n_used, T].
+// The routed experts and their weighted sum, on the expert device: only the [n_embd, T] sum crosses back, not
+// [n_embd, n_used, T]. With hot lanes the target's lane outputs cross to it first (the lanes run beside its picks).
 static ggml_tensor * build_moe_routed(ggml_context * c, const Qwen4ExpMoeRoute & r,
                                       const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
                                       std::vector<ggml_tensor *> & expert_nodes, ggml_tensor ** x3_out = nullptr) {
@@ -327,7 +326,9 @@ static ggml_tensor * build_moe_routed(ggml_context * c, const Qwen4ExpMoeRoute &
     ggml_tensor * cur3 = ggml_reshape_3d(c, xin, w.n_embd, 1, n_tokens);
     if (x3_out) *x3_out = cur3;
     ggml_tensor * down = moe_experts(c, L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, cur3, r.sel, &expert_nodes);
-    ggml_tensor * routed = ggml_ds4_moe_fused_combine_shared(c, down, r.wsel, nullptr);
+    ggml_tensor * routed = r.hot
+        ? ggml_moe_combine_lanes(c, down, build_moe_lanes(c, r, w, layer_index(L, w)), r.wsel, r.sel)
+        : ggml_ds4_moe_fused_combine_shared(c, down, r.wsel, nullptr);
     expert_nodes.push_back(routed);
     if (n_tokens > kSplitShortRows) {   // prompt chunks: the sum crosses back as F16 too
         routed = ggml_cast(c, routed, GGML_TYPE_F16);
@@ -445,10 +446,9 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
         // The expert device's nodes right after the router, so the target's split ends there and the handoff leaves
         // before target work that only the join needs (the FFN mix's injection otherwise lands in between).
         if (gf) ggml_build_forward_expand(gf, routed);
-        ggml_tensor * target = r.hot ? build_moe_hot(c, r, w.hot->layers[il], w) : r.shared;
         // After the target's last node before the join, so the read runs in its wait for the routed sum.
-        if (gf) prefetch_next_weights(c, gf, target, il, w);
-        return moe_join(c, routed, target);
+        if (gf) prefetch_next_weights(c, gf, r.shared, il, w);
+        return moe_join(c, routed, r.shared);
     }
     ggml_tensor * sel = nullptr, * wsel = nullptr;
     // One device: the router keeps its place in the graph. Queued ahead of the experts, steps on gfx1151 alone lose
@@ -469,49 +469,78 @@ ggml_tensor * build_moe(ggml_context * c, ggml_tensor * cur,
 
 // ── Linear attention: gated delta net (36 layers) ───────────────────────
 
+// A linear-attention layer's input projections over T rows: qkv [conv_channels, T] and the output gate z [d_in, T],
+// and alpha/beta, as one stacked [2*Hv, T] product (ab: alpha rows, then beta rows) or two [Hv, T] ones.
+struct Qwen4ExpLinearProj {
+    ggml_tensor * qkv = nullptr, * z = nullptr, * ab = nullptr, * alpha = nullptr, * beta = nullptr;
+};
+
+static Qwen4ExpLinearProj linear_attn_proj(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
+                                           const Qwen4ExpLayer & L) {
+    Qwen4ExpLinearProj p;
+    p.qkv = mm(c, L.attn_qkv, cur);
+    p.z   = mm(c, L.attn_gate, cur);
+    // Next to each other in the graph (z is otherwise placed after the recurrence): two products of the same
+    // activations, which RDNA4 runs as one launch (GGML_CUDA_QN_MMVQ_TWIN).
+    ggml_build_forward_expand(gf, p.qkv);
+    ggml_build_forward_expand(gf, p.z);
+    // Steps whose alpha and beta projections the loader stacked (L.ssm_alpha_beta) run them as one matmul, the same
+    // per-row sums, and the recurrence reads the two strided halves through one layout.
+    if (cur->ne[1] <= QWEN4EXP_MTP_MAX_VERIFY && L.ssm_gate_ba && L.ssm_alpha_beta) {
+        p.ab = mm(c, L.ssm_alpha_beta, cur);
+    } else {
+        p.beta  = mm(c, L.ssm_beta, cur);
+        p.alpha = mm(c, L.ssm_alpha, cur);
+    }
+    return p;
+}
+
+// Rows [r0, r0 + n) of p (one sequence's rows of a multi-sequence batch).
+static Qwen4ExpLinearProj linear_attn_proj_rows(ggml_context * c, const Qwen4ExpLinearProj & p, int64_t r0, int64_t n) {
+    auto rows = [&](ggml_tensor * x) {
+        return x ? ggml_view_2d(c, x, x->ne[0], n, x->nb[1], (size_t) r0 * x->nb[1]) : nullptr;
+    };
+    return { rows(p.qkv), rows(p.z), rows(p.ab), rows(p.alpha), rows(p.beta) };
+}
+
+// One sequence's linear attention after its input projections: the conv, the recurrence on its state and the gated
+// norm. Returns [d_in, T] for the caller's ssm_out product, or with `project`, the layer output [n_embd, T].
 // spec_states / spec_conv (verify forward): receive the recurrent state after every token and the conv history after
 // every token, so any accepted prefix can be retained.
-ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
-                                const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-                                ggml_tensor * ssm_state, ggml_tensor * conv_state,
-                                ggml_tensor * spec_states = nullptr, ggml_tensor * spec_conv = nullptr) {
+static ggml_tensor * linear_attn_rows(ggml_context * c, ggml_cgraph * gf, const Qwen4ExpLinearProj & p,
+                                      const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+                                      ggml_tensor * ssm_state, ggml_tensor * conv_state,
+                                      ggml_tensor * spec_states, ggml_tensor * spec_conv, bool project) {
     const int64_t D      = w.ssm_d_state;              // 128
     const int64_t Hk     = w.ssm_n_group;              // 16
     const int64_t Hv     = w.linear_value_heads;       // 48
     const int64_t d_in   = w.ssm_d_inner;              // 6144
-    const int64_t T      = cur->ne[1];
+    const int64_t T      = p.qkv->ne[1];
     const int64_t kernel = w.ssm_d_conv;
     const int64_t conv_channels = 2 * Hk * D + d_in;   // 10240
     const float   eps    = w.rms_eps;
-
-    ggml_tensor * qkv = mm(c, L.attn_qkv, cur);        // [conv_channels, T]
-    ggml_tensor * z   = mm(c, L.attn_gate, cur);       // [d_in, T]
-    // Next to each other in the graph (z is otherwise placed after the recurrence): two products of the same
-    // activations, which RDNA4 runs as one launch (GGML_CUDA_QN_MMVQ_TWIN).
-    ggml_build_forward_expand(gf, qkv);
-    ggml_build_forward_expand(gf, z);
+    ggml_tensor * qkv = p.qkv;
+    ggml_tensor * z   = p.z;
 
     // Decode, draft and verify steps (up to 8 rows) let the recurrence apply sigmoid(beta) and softplus(alpha + dt_bias)
     // * A to the raw projections, the same expressions as the ops below. Prompt chunks on gfx1151 need the ops: the
     // tiled recurrence takes finished gates.
     const bool step = T <= QWEN4EXP_MTP_MAX_VERIFY;
     const bool raw_gates = step && L.ssm_gate_ba;
-    // Steps whose alpha and beta projections the loader stacked (L.ssm_alpha_beta) run them as one matmul, the same
-    // per-row sums, and the recurrence reads the two strided halves through one layout.
-    const bool stacked = raw_gates && L.ssm_alpha_beta;
+    const bool stacked = p.ab != nullptr;
     ggml_tensor * beta;
     ggml_tensor * gate;
     if (stacked) {
-        ggml_tensor * ab = mm(c, L.ssm_alpha_beta, cur);   // [2*Hv, T]: alpha rows, then beta rows
+        ggml_tensor * ab = p.ab;   // [2*Hv, T]: alpha rows, then beta rows
         gate = ggml_view_4d(c, ab, 1, Hv, T, 1, ab->nb[0], ab->nb[1], ab->nb[1] * T, 0);
         beta = ggml_view_4d(c, ab, 1, Hv, T, 1, ab->nb[0], ab->nb[1], ab->nb[1] * T, Hv * ab->nb[0]);
     } else if (raw_gates) {
-        beta = ggml_reshape_4d(c, mm(c, L.ssm_beta, cur), 1, Hv, T, 1);
-        gate = ggml_reshape_4d(c, mm(c, L.ssm_alpha, cur), 1, Hv, T, 1);
+        beta = ggml_reshape_4d(c, p.beta, 1, Hv, T, 1);
+        gate = ggml_reshape_4d(c, p.alpha, 1, Hv, T, 1);
     } else {
-        beta = ggml_reshape_4d(c, mm(c, L.ssm_beta, cur), 1, Hv, T, 1);
+        beta = ggml_reshape_4d(c, p.beta, 1, Hv, T, 1);
         beta = ggml_sigmoid(c, beta);
-        ggml_tensor * alpha = ggml_reshape_3d(c, mm(c, L.ssm_alpha, cur), Hv, T, 1);
+        ggml_tensor * alpha = ggml_reshape_3d(c, p.alpha, Hv, T, 1);
         alpha = ggml_softplus(c, ggml_add(c, alpha, L.ssm_dt_bias));
         gate = ggml_reshape_4d(c, ggml_mul(c, alpha, L.ssm_a), 1, Hv, T, 1);
     }
@@ -624,7 +653,7 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
 
     // Gated norm written as F16 in one pass, read directly by ssm_out's Q8_0 -> F16 GEMM (same arithmetic as the
     // chain below, so bit-exact).
-    if (w.gfx1151 && ggml_backend_cuda_mmb_f16_input_ok(L.ssm_out, T)) {
+    if (project && w.gfx1151 && ggml_backend_cuda_mmb_f16_input_ok(L.ssm_out, T)) {
         ggml_tensor * lin_raw = mm(c, L.ssm_out, ggml_gated_rms_norm_f16(c, attn, L.ssm_norm, z, eps));
         return ggml_reshape_2d(c, lin_raw, w.n_embd, T);
     }
@@ -632,8 +661,17 @@ ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor 
     ggml_tensor * out = ggml_mul(c, normed, ggml_sigmoid(c, ggml_reshape_4d(c, z, D, Hv, T, 1)));
 
     ggml_tensor * final = ggml_reshape_3d(c, out, d_in, T, 1);
+    if (!project) return ggml_reshape_2d(c, final, d_in, T);
     ggml_tensor * lin_raw = mm(c, L.ssm_out, final);
     return ggml_reshape_2d(c, lin_raw, w.n_embd, T);
+}
+
+ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
+                                const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+                                ggml_tensor * ssm_state, ggml_tensor * conv_state,
+                                ggml_tensor * spec_states = nullptr, ggml_tensor * spec_conv = nullptr) {
+    return linear_attn_rows(c, gf, linear_attn_proj(c, gf, cur, L), L, w, ssm_state, conv_state,
+                            spec_states, spec_conv, /*project=*/true);
 }
 
 // ── Full attention: dense GQA (12 layers) ───────────────────────────────
@@ -2604,6 +2642,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
                 : qwen4exp_attn_rows(cache, kv_len) <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
+        if (split && w.hot) w.hot->tick(backend, w);   // hot expert swaps go live between graphs
         if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
                               out_rows)) {
             return res;
@@ -2815,6 +2854,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         // Split prompt chunks: no HIP graph capture (long kernels gain nothing, and
         // capture fails on allocating kernels such as the CUB segmented sort).
         ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
+        if (split && w.hot) w.hot->tick(backend, w, T <= QWEN4EXP_MTP_MAX_VERIFY ? 0 : (int) T);
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -3343,14 +3383,19 @@ static Qwen4ExpForwardResult forward_sequential(ggml_backend_t backend,
         std::vector<std::vector<float>> & out_logits, int hidden_slot = -1, std::vector<float> * out_hidden = nullptr) {
     Qwen4ExpForwardResult result;
     out_logits.resize((size_t) n_segments);
+    std::vector<float> all, row;   // hidden_slot < 0: every slot's row, slot-major
     for (int s = 0; s < n_segments; ++s) {
         const auto & segment = segments[s];
+        std::vector<float> * hidden = !out_hidden ? nullptr : hidden_slot < 0 ? &row : s == hidden_slot ? out_hidden
+                                                                                     : nullptr;
         if (!qwen4exp_forward(backend, w, *segment.cache, segment.tokens,
-                segment.n_tokens, segment.pos0, out_logits[s], s == hidden_slot ? out_hidden : nullptr).ok) {
+                segment.n_tokens, segment.pos0, out_logits[s], hidden).ok) {
             out_logits.clear();
             return result;
         }
+        if (hidden == &row) all.insert(all.end(), row.begin(), row.end());
     }
+    if (out_hidden && hidden_slot < 0) out_hidden->swap(all);
     result.ok = true;
     return result;
 }
@@ -3551,6 +3596,10 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
     ws.logits = build_lm_head(ctx, gf, w, lb.output_mix(res_hc, xn_next), split ? &ws.expert_nodes : nullptr);
     ggml_set_output(ws.logits);
     ggml_build_forward_expand(gf, ws.logits);
+    // Each slot's greedy pick: a greedy slot reads one id instead of its vocabulary row (1 MB).
+    ws.greedy = ggml_argmax(ctx, ws.logits);
+    ggml_set_output(ws.greedy);
+    ggml_build_forward_expand(gf, ws.greedy);
     // Appended after the logits, which keep their node order: the slots' final HC residuals.
     ws.hidden = nullptr;
     if (with_hidden) {
@@ -3613,10 +3662,12 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         Qwen4ExpCache * const * caches, const int32_t * tokens,
         const int32_t * positions, int n_slots,
         Qwen4ExpBatchedDecodeWorkspace & workspace,
-        std::vector<std::vector<float>> & out_logits, int hidden_slot, std::vector<float> * out_hidden) {
+        std::vector<std::vector<float>> & out_logits, int hidden_slot, std::vector<float> * out_hidden,
+        std::vector<int32_t> * out_greedy, const uint8_t * logits_rows) {
     Qwen4ExpForwardResult result;
+    if (out_greedy) out_greedy->clear();
     if (!backend || !caches || !tokens || !positions || n_slots <= 0) return result;
-    if (hidden_slot < 0 || hidden_slot >= n_slots) out_hidden = nullptr;
+    if (hidden_slot >= n_slots) out_hidden = nullptr;
     const bool split = w.expert_backend != nullptr;
     const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
     out_logits.clear();
@@ -3767,6 +3818,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     }
     // Match solo MMVQ arithmetic regardless of the number of active slots.
     const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
+    if (split && w.hot) w.hot->tick(backend, w);
     const ggml_status status = split ? ggml_backend_sched_graph_compute(workspace.sched, workspace.gf)
                                      : ggml_backend_graph_compute(backend, workspace.gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -3774,17 +3826,24 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         clear_qwen4exp_batched_decode_workspace(workspace);
         return result;
     }
-    std::vector<float> packed((size_t) w.n_vocab * n_slots);
-    ggml_backend_tensor_get(workspace.logits, packed.data(), 0, packed.size() * sizeof(float));
     out_logits.resize((size_t) n_slots);
+    const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
+    if (out_greedy && workspace.greedy) {
+        out_greedy->resize((size_t) n_slots);
+        ggml_backend_tensor_get(workspace.greedy, out_greedy->data(), 0, (size_t) n_slots * sizeof(int32_t));
+    }
     for (int s = 0; s < n_slots; ++s) {
-        out_logits[(size_t) s].assign(packed.begin() + (size_t) s * w.n_vocab,
-                                      packed.begin() + (size_t) (s + 1) * w.n_vocab);
+        if (out_greedy && !out_greedy->empty() && logits_rows && !logits_rows[s]) continue;
+        out_logits[(size_t) s].resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(workspace.logits, out_logits[(size_t) s].data(), (size_t) s * row_bytes, row_bytes);
     }
     if (out_hidden) {
         const size_t hd = (size_t) w.n_embd * w.n_hc;
         if ((size_t) ggml_nelements(workspace.hidden) != hd * (size_t) n_slots) {
             out_hidden->clear();
+        } else if (hidden_slot < 0) {   // every slot's row
+            out_hidden->resize(hd * (size_t) n_slots);
+            ggml_backend_tensor_get(workspace.hidden, out_hidden->data(), 0, out_hidden->size() * sizeof(float));
         } else {
             out_hidden->resize(hd);
             ggml_backend_tensor_get(workspace.hidden, out_hidden->data(), (size_t) hidden_slot * hd * sizeof(float),
@@ -3799,6 +3858,427 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     }
     result.ok = true;
     return result;
+}
+
+
+// ── Batched verify: every decoding slot's MTP rows in one graph ─────────
+
+namespace {
+
+// Rows per product: the matvec batch (MMVQ_MAX_BATCH_SIZE) whose per-row arithmetic is the one-row product's.
+constexpr int kVerifyGroupRows = 8;
+// The candidates the memory plan reserves per row: a top_k sampler with a penalty asks for twice its power-of-two
+// cover (sample_logits_top_n), 64 for the cards' top_k 20.
+constexpr int kPlanTopN = 64;
+
+// A group's full attention for its slots' verify rows (slot-major, `R` per slot): every slot writes its rows' K/V (and
+// raw indexer keys) at once, then each row attends as a T=1 decode at its position does, over its own span behind its
+// own mask (column r of `mask`, F16 [max span, rows]), which hides the slot's later rows.
+ggml_tensor * build_full_attn_verify(ggml_context * c, ggml_cgraph * gf, ggml_tensor * qfull, ggml_tensor * kraw,
+        ggml_tensor * vraw, ggml_tensor * cur, ggml_tensor * positions, ggml_tensor * mask,
+        ggml_tensor * const * kv_rows, const int64_t * spans, const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
+        Qwen4ExpCache * const * caches, int n_slots, int R, int fi, bool indexer) {
+    const int64_t D = w.n_embd_head_k, Hq = w.n_head, Hk = w.n_head_kv;
+    ggml_tensor * keys = indexer && caches[0]->indexer_raw[(size_t) fi] ? mm(c, L.indexer_k_proj, cur) : nullptr;
+    const Qwen4ExpAttnQkv qkv = attn_qkv(c, L, w, qfull, kraw, vraw, positions);
+    ggml_tensor * q = qkv.q, * gate = qkv.gate, * k = qkv.k, * v = qkv.v;
+    ggml_tensor * qfa = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));   // [D, rows, Hq]
+    ggml_tensor * rows = nullptr;
+    for (int s = 0; s < n_slots; ++s) {
+        const Qwen4ExpCache & cache = *caches[s];
+        ggml_tensor * k_cache = cache.attn_k[(size_t) fi];
+        ggml_tensor * v_cache = cache.attn_v[(size_t) fi];
+        if (keys) {
+            ggml_build_forward_expand(gf, ggml_set_rows(c, cache.indexer_raw[(size_t) fi],
+                ggml_view_2d(c, keys, keys->ne[0], R, keys->nb[1], (size_t) s * R * keys->nb[1]), kv_rows[s]));
+        }
+        auto slot_rows = [&](ggml_tensor * x) {   // [D, Hk, R] -> [D, R, Hk], the cache rows' layout
+            return ggml_cont(c, ggml_permute(c,
+                ggml_view_3d(c, x, D, Hk, R, x->nb[1], x->nb[2], (size_t) s * R * x->nb[2]), 0, 2, 1, 3));
+        };
+        ggml_build_forward_expand(gf, ggml_set_rows(c, k_cache, slot_rows(k), kv_rows[s]));
+        ggml_build_forward_expand(gf, ggml_set_rows(c, v_cache, slot_rows(v), kv_rows[s]));
+        for (int j = 0; j < R; ++j) {
+            const int r = s * R + j;
+            const int64_t span = spans[r];
+            ggml_tensor * kfull = ggml_view_3d(c, k_cache, D, span, Hk, k_cache->nb[1], k_cache->nb[2], 0);
+            ggml_tensor * vfull = ggml_view_3d(c, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
+            ggml_tensor * qs = ggml_view_3d(c, qfa, D, 1, Hq, qfa->nb[1], qfa->nb[2], (size_t) r * qfa->nb[1]);
+            ggml_tensor * mr = ggml_view_2d(c, mask, span, 1, mask->nb[1], (size_t) r * mask->nb[1]);
+            ggml_tensor * attn = ggml_flash_attn_ext(c, qs, kfull, vfull, mr, 1.0f / sqrtf((float) D), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            attn = ggml_reshape_2d(c, attn, D * Hq, 1);
+            rows = rows ? ggml_concat(c, rows, attn, 1) : attn;
+        }
+    }
+    return ggml_mul(c, rows, ggml_sigmoid(c, gate));
+}
+
+// The batched verify graph's nodes and inputs, in `ctx` and `ws`; nothing is allocated. The slots form groups of
+// whole slots of at most kVerifyGroupRows rows (two or more in split mode, whose layers interleave as a multi-slot
+// decode step's do); each group runs a solo verify's layer pieces over its rows, with each slot's attention rows,
+// recurrence and PLE convolution against the slot's own cache. top_n > 0 adds each row's top_n candidates.
+bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
+        int n_slots, int R, bool has_ple, const std::vector<int64_t> & spans, int top_n,
+        Qwen4ExpBatchedDecodeWorkspace & ws) {
+    const bool split = w.expert_backend != nullptr;
+    const int64_t T = (int64_t) n_slots * R;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, kQwen4ExpGraphNodes, false);
+    if (!gf) return false;
+    ws.expert_nodes.clear();
+    Qwen4ExpLayerBuilder lb(ctx, gf, w, *caches[0], /*verify=*/true, split, has_ple, ws.expert_nodes);
+    ws.inp_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, T);
+    ggml_set_input(ws.inp_emb);
+    ws.ple_in = nullptr;
+    if (has_ple) {
+        ws.ple_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.ple_head_dim * w.ple_n_heads, T);
+        ggml_set_input(ws.ple_in);
+    }
+    ws.masks.clear();
+    ws.kv_rows.clear();
+    for (int s = 0; s < n_slots; ++s) {
+        ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, R));
+        ggml_set_input(ws.kv_rows.back());
+    }
+    ws.slot_ids = nullptr;
+    ws.slot_qsa.clear();
+    ws.qsa_params = ws.qsa_visibility = ws.qsa_positions = nullptr;
+
+    struct SlotGroup {
+        int s0 = 0, ns = 0;   // its slots
+        ggml_tensor * res_hc = nullptr, * xn_next = nullptr, * inject = nullptr;
+        ggml_tensor * positions = nullptr, * routed = nullptr;
+        // Its rows' masks (one input), and their copy on the expert device for the layers that run there: the
+        // rows' views of it do not cross on their own (a split takes at most 30 inputs).
+        ggml_tensor * mask = nullptr, * mask_remote = nullptr;
+        Qwen4ExpMoeRoute route;
+    };
+    const int per_group = std::max(1, kVerifyGroupRows / R);
+    int n_groups = (n_slots + per_group - 1) / per_group;
+    if (split && n_groups < 2 && n_slots >= 2) n_groups = 2;
+    std::vector<SlotGroup> groups((size_t) n_groups);
+    for (int g = 0, s0 = 0; g < n_groups; ++g) {
+        SlotGroup & G = groups[(size_t) g];
+        G.s0 = s0;
+        G.ns = n_slots / n_groups + (g < n_slots % n_groups ? 1 : 0);
+        s0 += G.ns;
+        const int64_t n = (int64_t) G.ns * R;
+        int64_t span = 0;
+        for (int64_t r = (int64_t) G.s0 * R; r < (int64_t) (G.s0 + G.ns) * R; ++r)
+            span = std::max(span, spans[(size_t) r]);
+        G.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, n);
+        ggml_set_input(G.mask);
+        ws.masks.push_back(G.mask);
+        ggml_tensor * emb = ggml_view_2d(ctx, ws.inp_emb, w.n_embd, n, ws.inp_emb->nb[1],
+                                         (size_t) G.s0 * R * ws.inp_emb->nb[1]);
+        G.res_hc = repeat_dim1(ctx, ggml_reshape_3d(ctx, emb, w.n_embd, 1, n), w.n_hc);
+    }
+
+    auto stage_r = [&](SlotGroup & G, int il) {
+        const Qwen4ExpLayer & L = w.layers[il];
+        const int64_t n = (int64_t) G.ns * R;
+        Qwen4ExpCache * const * gc = caches + G.s0;
+        if (L.is_ple && has_ple) {
+            ggml_tensor * rows = nullptr;
+            for (int j = 0; j < G.ns; ++j) {
+                ggml_tensor * hidden = ggml_view_3d(ctx, G.res_hc, w.n_embd, w.n_hc, R,
+                    G.res_hc->nb[1], G.res_hc->nb[2], (size_t) j * R * G.res_hc->nb[2]);
+                ggml_tensor * ple = ggml_view_2d(ctx, ws.ple_in, ws.ple_in->ne[0], R, ws.ple_in->nb[1],
+                    (size_t) (G.s0 + j) * R * ws.ple_in->nb[1]);
+                ggml_tensor * row = build_ple(ctx, gf, hidden, ple, L, w,
+                    gc[j]->ple_conv_state[(size_t) lb.ple_idx[il]], gc[j]->spec_ple);
+                rows = rows ? ggml_concat(ctx, rows, row, 2) : row;
+            }
+            G.res_hc = rows;
+            G.xn_next = nullptr;
+        }
+        ggml_tensor * cur = lb.attn_input(il, G.res_hc, G.xn_next, G.inject);
+        if (L.is_full_attention) {
+            const int fi = lb.full_idx[il];
+            if (!G.positions) {
+                G.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+                ggml_set_input(G.positions);
+            }
+            // A layer whose rows live on the expert device runs there: the group's input, positions, masks and K/V
+            // rows cross (its masks once a step, through the copy the first such layer makes).
+            cur = lb.on_cache_device(fi, [&] {
+                ggml_tensor * mask = G.mask;
+                if (caches[0]->remote(fi)) {
+                    if (!G.mask_remote) G.mask_remote = ggml_cont(ctx, G.mask);
+                    mask = G.mask_remote;
+                }
+                ggml_tensor * qfull = mm(ctx, L.wq, cur);
+                ggml_tensor * kraw = mm(ctx, L.wk, cur);
+                ggml_tensor * vraw = mm(ctx, L.wv, cur);
+                return mm(ctx, L.wo, build_full_attn_verify(ctx, gf, qfull, kraw, vraw, cur, G.positions, mask,
+                    ws.kv_rows.data() + G.s0, spans.data() + (size_t) G.s0 * R, L, w, gc, G.ns, R, fi, w.qsa));
+            });
+        } else {
+            // The input projections run over the group's rows; each slot's conv and recurrence over its own rows and
+            // state (writing every row's state to its rollback rows), as its solo verify runs them.
+            const int li = lb.lin_idx[il];
+            const Qwen4ExpLinearProj p = linear_attn_proj(ctx, gf, cur, L);
+            // The Gorgon's fused gated norm feeds ssm_out from F16 rows: each slot keeps its solo verify's product.
+            const bool per_slot_out = w.gfx1151;
+            ggml_tensor * rows = nullptr;
+            for (int j = 0; j < G.ns; ++j) {
+                ggml_tensor * row = linear_attn_rows(ctx, gf, linear_attn_proj_rows(ctx, p, (int64_t) j * R, R), L, w,
+                    gc[j]->ssm_state[(size_t) li], gc[j]->conv_state[(size_t) li],
+                    gc[j]->spec_ssm[(size_t) li], gc[j]->spec_conv[(size_t) li], per_slot_out);
+                rows = rows ? ggml_concat(ctx, rows, row, 1) : row;
+            }
+            cur = per_slot_out ? rows : ggml_reshape_2d(ctx, mm(ctx, L.ssm_out, rows), w.n_embd, n);
+        }
+        if (!split || !qwen4exp_split_layer(L, w)) {
+            G.res_hc = lb.ffn_half(il, cur, G.inject, G.res_hc, n, G.xn_next);
+            return;
+        }
+        cur = lb.ffn_input(il, cur, G.inject, G.res_hc, n);
+        G.route = build_moe_route(ctx, cur, L, w);
+        for (ggml_tensor * t : { G.route.xin, G.route.sel, G.route.wsel, G.route.shared, G.inject, G.res_hc }) {
+            ggml_build_forward_expand(gf, t);
+        }
+    };
+    auto stage_s = [&](SlotGroup & G, int il) {
+        if (!G.route.sel) return;
+        G.routed = build_moe_routed(ctx, G.route, w.layers[il], w, ws.expert_nodes);
+        ggml_build_forward_expand(gf, G.routed);
+    };
+    auto stage_c = [&](SlotGroup & G, int il) {
+        if (!G.route.sel) return;
+        G.res_hc = lb.ffn_output(il, moe_join(ctx, G.routed, G.route.shared), G.inject, G.res_hc,
+                                 (int64_t) G.ns * R, G.xn_next);
+        G.route = {};
+        if (G.xn_next) ggml_build_forward_expand(gf, G.xn_next);
+        ggml_build_forward_expand(gf, G.res_hc);
+    };
+    if (n_groups > 1) {
+        interleave_layers(w.n_layer, groups, stage_r, stage_s, stage_c);
+    } else {
+        for (int il = 0; il < w.n_layer; ++il) {
+            stage_r(groups[0], il);
+            stage_s(groups[0], il);
+            stage_c(groups[0], il);
+        }
+    }
+
+    // Each group's output head (at most kVerifyGroupRows rows: the one-row product's arithmetic), greedy picks and,
+    // for sampled slots, top candidates; the rows stay on the device for a sampler that needs a whole row.
+    ws.groups.clear();
+    ggml_tensor * res_hc = nullptr;
+    for (SlotGroup & G : groups) {
+        Qwen4ExpBatchedDecodeWorkspace::GroupInput out{G.positions, G.s0 * R, G.ns * R};
+        out.logits = build_lm_head(ctx, gf, w, lb.output_mix(G.res_hc, G.xn_next), split ? &ws.expert_nodes : nullptr);
+        out.greedy = ggml_argmax(ctx, out.logits);
+        if (top_n > 0) {
+            out.top_ids = ggml_top_k(ctx, out.logits, top_n);
+            out.top_vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, out.logits, 1, out.logits->ne[0], out.logits->ne[1]),
+                                         out.top_ids);
+        }
+        for (ggml_tensor * t : {out.logits, out.greedy, out.top_ids, out.top_vals}) {
+            if (!t) continue;
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, t);
+        }
+        ws.groups.push_back(out);
+        res_hc = res_hc ? ggml_concat(ctx, res_hc, G.res_hc, 2) : G.res_hc;
+    }
+    ws.logits = nullptr;
+    ws.greedy = nullptr;
+    ws.hidden = ggml_cont(ctx, res_hc);
+    ggml_set_output(ws.hidden);
+    ggml_build_forward_expand(gf, ws.hidden);
+    ws.gf = gf;
+    ws.rows = R;
+    ws.top_n = top_n;
+    return true;
+}
+
+// A verify row's dense span: a T=1 decode's at that position in the multi-slot graph (batched_span).
+std::vector<int64_t> verify_row_spans(Qwen4ExpCache * const * caches, const int32_t * positions, int n_slots, int R) {
+    std::vector<int64_t> spans;
+    for (int s = 0; s < n_slots; ++s)
+        for (int j = 0; j < R; ++j) spans.push_back(batched_span(*caches[s], positions[s] + j, false));
+    return spans;
+}
+
+}  // namespace
+
+Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache & cache, int n_slots, int rows, int pos) {
+    Qwen4ExpGraphMemory memory;
+    memory.graph = SIZE_MAX;
+    if (n_slots < 1 || n_slots > kQwen4ExpMaxBatchedSlots || rows < 2 || rows > cache.mtp_draft + 1 ||
+        !qwen4exp_verify_supported(cache) || pos < 0 || pos + rows > cache.max_ctx) return memory;
+    const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
+    ggml_context * ctx = graph_context(nullptr, backend, w, cache.max_ctx, false);
+    if (!ctx) return memory;
+    // An allocation plan only: the slots share one cache and nothing runs.
+    std::vector<Qwen4ExpCache *> caches((size_t) n_slots, &cache);
+    std::vector<int32_t> positions((size_t) n_slots, pos);
+    Qwen4ExpBatchedDecodeWorkspace plan;
+    if (build_batched_verify_nodes(ctx, w, caches.data(), n_slots, rows,
+            w.ple_reader.available() && !cache.ple_layer_ids.empty(),
+            verify_row_spans(caches.data(), positions.data(), n_slots, rows), kPlanTopN, plan)) {
+        memory.graph = 0;
+        graph_memory(backend, ctx, plan.gf, w.gfx1151, memory);
+    }
+    ggml_free(ctx);
+    return memory;
+}
+
+bool qwen4exp_verify_batched_supported(const Qwen4ExpWeights & w, Qwen4ExpCache * const * caches,
+                                       const int32_t * positions, int n_slots, int rows) {
+    if (n_slots < 1 || n_slots > kQwen4ExpMaxBatchedSlots || rows < 2 || rows > kVerifyGroupRows) return false;
+    for (int s = 0; s < n_slots; ++s) {
+        const Qwen4ExpCache * c = caches[s];
+        if (!c || !qwen4exp_verify_supported(*c) || rows > c->mtp_draft + 1 || c->kvflash ||
+            positions[s] < 0 || positions[s] + rows > c->max_ctx ||
+            c->linear_layer_ids != caches[0]->linear_layer_ids || c->full_layer_ids != caches[0]->full_layer_ids ||
+            c->ple_layer_ids != caches[0]->ple_layer_ids) return false;
+        for (int prev = 0; prev < s; ++prev) if (caches[prev] == c) return false;
+        for (int j = 0; j < rows; ++j)
+            if (qsa_mode(w, *c, 1, positions[s] + j, w.qsa) != QSA_DENSE) return false;
+    }
+    return true;
+}
+
+Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen4ExpWeights & w,
+        Qwen4ExpCache * const * caches, const int32_t * tokens, const int32_t * positions, int n_slots, int R,
+        Qwen4ExpBatchedDecodeWorkspace & ws, Qwen4ExpRowOutputs & out, std::vector<float> & hidden) {
+    Qwen4ExpForwardResult result;
+    const int top_n = std::max(0, out.top_n);
+    out.on_device = false;
+    out.greedy.clear();
+    out.top_vals.clear();
+    out.top_ids.clear();
+    hidden.clear();
+    if (!backend || !caches || !tokens || !positions ||
+        !qwen4exp_verify_batched_supported(w, caches, positions, n_slots, R)) return result;
+    const bool split = w.expert_backend != nullptr;
+    const Qwen4ExpCudaScope profile(w.gfx1151 || w.expert_gfx1151);
+    const bool has_ple = w.ple_reader.available() && !caches[0]->ple_layer_ids.empty();
+    const int64_t T = (int64_t) n_slots * R;
+
+    // Each slot's embeddings and PLE rows (as its solo verify prepares them), and its rows' PLE n-gram tails for the
+    // rollback to keep.
+    std::vector<float> emb, ple;
+    emb.reserve((size_t) w.n_embd * T);
+    for (int s = 0; s < n_slots; ++s) {
+        Qwen4ExpCache & cache = *caches[s];
+        const int32_t * tok = tokens + (size_t) s * R;
+        const Qwen4ExpInputs in = qwen4exp_prepare_inputs(w, tok, R, cache.ple_prev);
+        if (!in.ok || in.emb.size() != (size_t) w.n_embd * R) return result;
+        emb.insert(emb.end(), in.emb.begin(), in.emb.end());
+        ple.insert(ple.end(), in.ple.begin(), in.ple.end());
+        cache.spec_tokens = 0;
+        auto prev = cache.ple_prev;
+        for (int t = 0; t < R; ++t) {
+            if (has_ple) {
+                prev.push_back(tok[t]);
+                if ((int) prev.size() >= w.ple_ngram_size) prev.erase(prev.begin());
+            }
+            cache.spec_ple_prev[(size_t) t] = prev;
+        }
+    }
+    if (has_ple && ple.size() != (size_t) w.ple_head_dim * w.ple_n_heads * T) return result;
+
+    const std::vector<int64_t> spans = verify_row_spans(caches, positions, n_slots, R);
+    const bool replay = ws.gf && ws.rows == R && ws.top_n == top_n &&
+        !stable_workspace_stale(ws, backend, w, caches[0]->max_ctx) &&
+        ws.spans == spans && ws.caches == std::vector<const Qwen4ExpCache *>(caches, caches + n_slots);
+    if (!replay) {
+        ggml_context * ctx = graph_context(&ws, backend, w, caches[0]->max_ctx, /*verify=*/true);
+        if (!ctx || !build_batched_verify_nodes(ctx, w, caches, n_slots, R, has_ple, spans, top_n, ws)) {
+            clear_qwen4exp_batched_decode_workspace(ws);
+            return result;
+        }
+        int64_t kv_len = 0;
+        for (const int64_t span : spans) kv_len = std::max(kv_len, span);
+        ggml_backend_sched_t sched = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        if (!allocate_graph(backend, w, *caches[0], &ws, /*verify=*/true, ws.gf, ws.expert_nodes, T, kv_len,
+                            sched, galloc)) {
+            clear_qwen4exp_batched_decode_workspace(ws);
+            return result;
+        }
+        ws.caches.assign(caches, caches + n_slots);
+        ws.spans = spans;
+    }
+    ++(replay ? ws.replays : ws.builds);
+
+    ggml_backend_tensor_set(ws.inp_emb, emb.data(), 0, emb.size() * sizeof(float));
+    if (ws.ple_in) ggml_backend_tensor_set(ws.ple_in, ple.data(), 0, ple.size() * sizeof(float));
+    for (const auto & G : ws.groups) {
+        if (!G.positions) continue;
+        std::vector<int32_t> p((size_t) 4 * G.n, 0);
+        for (int j = 0; j < G.n; ++j) {
+            const int r = G.s0 + j;
+            for (int section = 0; section < 3; ++section) p[(size_t) section * G.n + j] = positions[r / R] + r % R;
+        }
+        ggml_backend_tensor_set(G.positions, p.data(), 0, p.size() * sizeof(int32_t));
+    }
+    for (int s = 0; s < n_slots; ++s) {
+        std::vector<int32_t> rows((size_t) R);
+        for (int j = 0; j < R; ++j) rows[(size_t) j] = qwen4exp_kv_row(*caches[s], positions[s] + j);
+        ggml_backend_tensor_set(ws.kv_rows[(size_t) s], rows.data(), 0, rows.size() * sizeof(int32_t));
+    }
+    for (size_t g = 0; g < ws.groups.size(); ++g) {
+        // Column j: row G.s0 + j's causal mask over its span; past the span nothing reads.
+        const auto & G = ws.groups[g];
+        ggml_tensor * m = ws.masks[g];
+        const int64_t cols = m->ne[0];
+        std::vector<ggml_fp16_t> mask((size_t) (cols * G.n), ggml_fp32_to_fp16(-INFINITY));
+        for (int j = 0; j < G.n; ++j) {
+            const int r = G.s0 + j;
+            qwen4exp_causal_mask(*caches[r / R], mask.data() + (size_t) j * cols, spans[(size_t) r],
+                                 positions[r / R] + r % R);
+        }
+        ggml_backend_tensor_set(m, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
+    if (split && w.hot) w.hot->tick(backend, w);
+    const ggml_status status = split ? ggml_backend_sched_graph_compute(ws.sched, ws.gf)
+                                     : ggml_backend_graph_compute(backend, ws.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[qwen4exp] batched verify compute failed\n");
+        clear_qwen4exp_batched_decode_workspace(ws);
+        return result;
+    }
+    out.greedy.resize((size_t) T);
+    out.top_vals.resize((size_t) T * top_n);
+    out.top_ids.resize((size_t) T * top_n);
+    for (const auto & G : ws.groups) {
+        ggml_backend_tensor_get(G.greedy, out.greedy.data() + G.s0, 0, (size_t) G.n * sizeof(int32_t));
+        if (top_n == 0) continue;
+        ggml_backend_tensor_get(G.top_vals, out.top_vals.data() + (size_t) G.s0 * top_n, 0,
+                                (size_t) G.n * top_n * sizeof(float));
+        ggml_backend_tensor_get(G.top_ids, out.top_ids.data() + (size_t) G.s0 * top_n, 0,
+                                (size_t) G.n * top_n * sizeof(int32_t));
+    }
+    out.on_device = true;
+    const size_t hd = (size_t) w.n_embd * w.n_hc;
+    if ((size_t) ggml_nelements(ws.hidden) != hd * (size_t) T) return result;
+    hidden.resize(hd * (size_t) T);
+    ggml_backend_tensor_get(ws.hidden, hidden.data(), 0, hidden.size() * sizeof(float));
+    for (int s = 0; s < n_slots; ++s) {
+        caches[s]->spec_pos = positions[s];
+        caches[s]->spec_tokens = R;
+    }
+    result.ok = true;
+    return result;
+}
+
+bool qwen4exp_verify_batched_row(const Qwen4ExpBatchedDecodeWorkspace & ws, const Qwen4ExpWeights & w, int row,
+                                 std::vector<float> & out) {
+    for (const auto & G : ws.groups) {
+        if (row < G.s0 || row >= G.s0 + G.n || !G.logits) continue;
+        out.resize((size_t) w.n_vocab);
+        const size_t bytes = (size_t) w.n_vocab * sizeof(float);
+        ggml_backend_tensor_get(G.logits, out.data(), (size_t) (row - G.s0) * bytes, bytes);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace luce::common

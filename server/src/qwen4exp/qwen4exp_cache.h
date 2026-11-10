@@ -99,17 +99,22 @@ struct Qwen4ExpCache;
 struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     struct GroupInput {
         ggml_tensor * positions = nullptr;   // I32 [4 * n], the group's M-RoPE sections
-        int s0 = 0, n = 0;
+        int s0 = 0, n = 0;                   // its first row and rows (a decode step: one row per slot)
+        // Batched verify: the group's logits rows, their argmax, and with top_n > 0 each row's top_n candidates.
+        ggml_tensor * logits = nullptr, * greedy = nullptr, * top_ids = nullptr, * top_vals = nullptr;
     };
     std::vector<GroupInput> groups;
+    int rows = 1;   // per slot: 1 for a decode step, the verify width for a batched verify (qwen4exp_verify_batched)
     ggml_tensor * slot_ids = nullptr;            // I32 [n]: each slot's slab of Qwen4ExpSlotStates
-    std::vector<ggml_tensor *> masks, kv_rows;   // per slot: attention mask (dense slots), I32 [1] K/V row
+    // Per slot: attention mask (dense slots) and I32 [1] K/V row. A batched verify: per group, F16 [max span, rows]
+    // with a column per row, and per slot its I32 [rows] K/V rows.
+    std::vector<ggml_tensor *> masks, kv_rows;
     // QSA slots: each one's runtime inputs and [4] M-RoPE positions as its stable T=1 graph has them, views of
     // qsa_params (I32 [10 * n]), qsa_visibility (each QSA slot's blocks in turn) and qsa_positions (I32 [4 * n]).
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa;
     ggml_tensor * qsa_positions = nullptr;
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
-    std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket)
+    std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket); verify: per row
 };
 
 // Recurrent state of every concurrency slot, stacked per linear layer, so one

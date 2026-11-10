@@ -126,7 +126,7 @@ struct Qwen4ExpPrefixTest {
     static void unhook(Qwen4ExpBackend & b) { b.decode_check_ = {}; }
     // Split mode: the hot experts and their lookup tables are resident on the target.
     static bool hot_experts_resident(const Qwen4ExpBackend & b) {
-        return b.weights_.hot && !b.weights_.hot_lut.empty();
+        return b.weights_.hot != nullptr;
     }
     static size_t limit(Qwen4ExpBackend & b, size_t bytes) {
         return std::exchange(b.snapshot_budget_, bytes);

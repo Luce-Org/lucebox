@@ -589,6 +589,7 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_graph.cpp
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
+    src/qwen4exp/qwen4exp_hot.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
