@@ -165,3 +165,17 @@ TEST_CASE(KvflashAdmitPlanFixture, the_two_opencode_compaction_requests_resolve_
     CHECK(q.action == A::cold);
     CHECK(q.slot == -1);
 }
+
+// A summary-cold request keeps its sid's parked slot; with nothing live to wait for, a refusal there can never clear, so the keep is given up.
+TEST_CASE(KvflashAdmitPlanFixture, cold_slot_gives_up_the_kept_session_when_nothing_is_live) {
+    std::vector<int> asked;
+    auto only_slot0 = [&](int keep) { asked.push_back(keep); return keep == 0 ? -1 : 0; };   // one parked slot, and it is the kept one
+    CHECK(kvflash_evict_for_cold(only_slot0, 0, false) == 0);
+    CHECK(asked == (std::vector<int>{0, -1}));
+    asked.clear();
+    CHECK(kvflash_evict_for_cold(only_slot0, 0, true) == -1);    // a live request will retire: wait, keep the session
+    CHECK(asked == (std::vector<int>{0}));
+    asked.clear();
+    CHECK(kvflash_evict_for_cold(only_slot0, -1, false) == 0);   // no keep: one ask
+    CHECK(asked == (std::vector<int>{-1}));
+}
