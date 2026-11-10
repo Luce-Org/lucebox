@@ -1253,9 +1253,8 @@ struct ServerJob {
     // The learned shared-prefix cut, found at the first admission attempt
     // (before the request's own region joins the ring); -1 until then.
     int           shared_prefix_cut = -1;
-    // First concurrent-scheduler attempt; retained across busy deferrals so
-    // server-side prefill/elapsed telemetry does not erase queueing delay.
-    std::chrono::steady_clock::time_point parallel_started_at{};
+    // When enqueue() took the request: its queue wait and its elapsed time count from here.
+    std::chrono::steady_clock::time_point arrived_at{};
     // Concurrent PFlash (scheduler.cpp): the job came back from the
     // compression thread. When it was compressed, req.prompt_tokens holds the
     // served prompt and req.client_prompt_tokens the client prompt's size.

@@ -18370,6 +18370,22 @@ TEST_CASE(ServerUnitFixture, test_admit_timing_prefill_excludes_the_deferred_wai
     TEST_ASSERT(n.queue_s == 0.0 && n.prefill_s == 7.0);
 }
 
+// The wait a request reports starts when it arrives. With every slot decoding the scheduler does not dequeue, and a request
+// that then waited 30 s in the queue reported queue_ms 0: the clock used to start at the scheduler's first look at the job.
+TEST_CASE(ServerUnitFixture, test_enqueue_stamps_the_request_arrival) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    LuceEngine engine(std::make_unique<ShortInlineSnapshotBackend>());
+    ServerJob job;   // outlives the server, whose queue holds it
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    const auto before = std::chrono::steady_clock::now();
+    SchedulerTestHarness::enqueue(server, &job);
+    TEST_ASSERT(job.arrived_at >= before);
+    TEST_ASSERT(job.arrived_at <= std::chrono::steady_clock::now());
+}
+
 // A sticky resume at L prefills only the tokens past L: the usage timings, the perf record and the step planner count them as cached.
 TEST_CASE(ServerUnitFixture, test_admit_cached_tokens_counts_a_sticky_resume) {
     using luce::common::admit_cached_tokens;

@@ -50,7 +50,7 @@ struct SchedSlot {
     int prompt_left = 0;
     int prompt_new = 0;
     uint64_t admission_order = 0;
-    // started_at: the first admit attempt (total wall, DONE elapsed). admitted_at: the successful attempt, where prefill_s starts;
+    // started_at: the request's arrival (total wall, DONE elapsed). admitted_at: the successful attempt, where prefill_s starts;
     // the wait between them is queue_s (see admit_timing.h).
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point admitted_at{};
@@ -486,14 +486,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
     auto admit_job = [&](ServerJob * job) -> AdmissionDisposition {
         const ParsedRequest & req = job->req;
-        if (job->parallel_started_at ==
-                std::chrono::steady_clock::time_point{}) {
-            job->parallel_started_at = std::chrono::steady_clock::now();
-        }
-        const auto started_at = job->parallel_started_at;
-        // ponytail: a PFlash job stamps parallel_started_at when staged for the drafter, so its compression time now reads as queue_ms
-        // (its own compress_ms is in timings.pflash); prefill_ms no longer includes it.
-        // This attempt, if it is admitted, is where prefill starts: a Deferred retry's wait is queue, not prefill.
+        const auto started_at = job->arrived_at;
+        // Everything before this attempt is queue_ms: the HTTP queue, Deferred retries, a shared-prefix wait and PFlash
+        // compression (its own compress_ms is in timings.pflash). This attempt, if it is admitted, is where prefill starts.
         const auto attempt_at = std::chrono::steady_clock::now();
 
         // Same thinking-budget n_gen math as the classic worker loop.
@@ -1028,10 +1023,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 continue;
             }
             if (pflash_wants(job)) {
-                if (job->parallel_started_at ==
-                        std::chrono::steady_clock::time_point{}) {
-                    job->parallel_started_at = std::chrono::steady_clock::now();
-                }
                 job->req.pflash_cached_prefix = restorable_prefix_tokens(
                     job->req.prompt_tokens, job->req.disk_cache_policy);
                 {
@@ -1050,10 +1041,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (leader >= 0) {
                     const SchedSlot & l = slots[(size_t)leader];
                     const auto now = std::chrono::steady_clock::now();
-                    if (job->parallel_started_at ==
-                            std::chrono::steady_clock::time_point{}) {
-                        job->parallel_started_at = now;
-                    }
                     PrefixWaiter w;
                     w.job = job;
                     w.leader = leader;
