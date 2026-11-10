@@ -127,26 +127,4 @@ private:
     ggml_backend_t backend_ = nullptr;
 };
 
-// Synchronizes `backend` when it leaves scope, so every exit of a phase that
-// queued stage copies (an early error return included) waits for them before
-// the stage or the host data behind them is touched again.
-class BackendDrain {
-public:
-    explicit BackendDrain(ggml_backend_t backend) : backend_(backend) {}
-    BackendDrain(const BackendDrain &) = delete;
-    BackendDrain & operator=(const BackendDrain &) = delete;
-    ~BackendDrain() { now(); }
-
-    // Synchronize here instead of at scope exit.
-    void now() {
-        if (backend_) ggml_backend_synchronize(backend_);
-        backend_ = nullptr;
-    }
-    // The phase already synchronized: skip the wait at scope exit.
-    void disarm() { backend_ = nullptr; }
-
-private:
-    ggml_backend_t backend_ = nullptr;
-};
-
 }  // namespace luce::common

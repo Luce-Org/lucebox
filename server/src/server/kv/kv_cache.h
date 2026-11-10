@@ -25,6 +25,8 @@
 #include "server/kv/checkpoint_store.h"
 #include "server/kv/parallel_prefix_txn.h"
 #include "server/kv/prefix_cache.h"
+#include "server/kv/prefix_pins.h"
+#include "server/kv/shared_prefixes.h"
 
 #include <atomic>
 #include <chrono>
@@ -83,6 +85,8 @@ struct KvMatchQuery {
     // An exact entry the prompt transforms already found (PFlash).
     Checkpoint exact_hit;
     int exact_hit_len = 0;
+    // The client (User-Agent product) recorded with a pin.
+    const std::string * client = nullptr;
     // A forced capture cut (a PPP pin): also a restore point of a scoped
     // prefill.
     int forced_cut = 0;
@@ -96,6 +100,9 @@ struct KvAdmitQuery {
     // (select_inline_snapshot_boundary's prefer_head).
     bool prefer_head = false;
     int forced_cut = 0;
+    // The forced cut is the learned shared-prefix cut (it yields to the
+    // deep-first rule; an explicit pin does not).
+    bool learned_cut = false;
     // False for a prompt that never comes back (a tool-checks note pass):
     // no capture at all.
     bool keep_checkpoints = true;
@@ -129,6 +136,9 @@ struct KvPlanQuery {
     // Capture the system/tools head until it is restored (a request with tools).
     bool prefer_head = false;
     int forced_cut = 0;
+    bool learned_cut = false;  // see KvAdmitQuery::learned_cut
+    // Never capture in place of a pinned prefix (a warm: warm_next_on_engine).
+    bool spare_pins = false;
     // The prefix the queued requests share with this prompt
     // (HttpServer::queued_shared_prefix), asked only when it matters, and
     // the least it must add to be captured instead of the request's own cut.
@@ -196,9 +206,10 @@ public:
     // not ask; the capture is cancelled then, and when the engine refused it.
     std::string admitted(KvPlan & plan, const PrefixStoreAdmission & admission,
                          bool admission_ok, const char * request_id);
-    // A RAM restore the engine carried out promotes its entry.
+    // A RAM restore the engine carried out promotes its entry, and may pin
+    // it (consider_pin; written by flush_pins).
     void restored(const KvPlan & plan, const PrefixStoreAdmission & admission,
-                  size_t prompt_len);
+                  const std::vector<int32_t> & prompt, const std::string & client);
     // The engine's capture event: commit or drop the capture; the payloads
     // that left RAM with it (the one it displaced, those its budget plan
     // evicted) are written out when worth keeping and freed; a saved entry
@@ -215,6 +226,48 @@ public:
     // Dropped reads still running: an idle scheduler polls to reap them.
     bool reads_to_reap() const { return !finished_reads_.empty(); }
     ~KvCache() { join_reads(); }
+
+    // ── Shared prefixes ─────────────────────────────────────────────
+
+    // The shared prefixes and the pins this cache keeps (owned by the server).
+    void attach_shared_prefixes(SharedPrefixes & shared, PrefixPins & pins);
+    // After `prompt` restored the RAM entry in `slot`: a pinned prefix
+    // counts the hit; a shared prefix restored by another conversation is
+    // pinned, at a chat boundary at once, inside a message once its cut
+    // recurs (SharedPrefixes::recurrences). Only while the shared prefixes
+    // learn, and only an entry with a disk key. Its KV goes to disk at the
+    // next flush_pins.
+    void consider_pin(int slot, const std::vector<int32_t> & prompt, const std::string & client);
+    // Write the KV of the prefixes pinned since the last call (after the
+    // response, or when the scheduler is idle), drop pins idle for too
+    // long, and save the pins file when due (`force`: now).
+    void flush_pins(bool force = false);
+    // Drop pin `id` (the HTTP DELETE; any thread): its disk file falls under
+    // the TTL again, and its RAM entry is unpinned at the next flush_pins.
+    bool unpin(const std::string & id);
+    // Remember a request's prefix region in the ring (SharedPrefixes), and
+    // in the pins file with it.
+    void remember_prefix(const std::vector<int32_t> & prompt, const std::vector<int> & boundaries);
+
+    // At startup. A pin with a disk file for these settings is served by
+    // disk hits. On the concurrent path the others (an engine without a
+    // disk tier, or after a settings change) are queued to warm, within
+    // `ram_cap` bytes of pins in RAM. A pin that does not fit in `max_ctx`
+    // (> 0) is neither (it stays for settings that can serve it). This
+    // layout's pinned files no pin lists are unpinned (a crash between the
+    // mark and the catalog's save).
+    void load_pins(size_t ram_cap, int max_ctx);
+    // Idle work on the concurrent path, while no sequence is live: the next
+    // queued pin's prompt goes through plan/admitted/captured on the engine
+    // alone, which captures it at its cut as a request's prefill would (the
+    // prompt runs one token past the cut, so the capture lies inside it),
+    // and the sequence retires at the capture. `cancel` is asked between
+    // engine steps: one step can be a whole head (DeepSeek's staged prefill
+    // runs up to 2048 rows), so a request arriving meanwhile waits for it.
+    // Each pin is tried once per process; a preempted warm is dropped. False
+    // when nothing is queued, or the warm was preempted.
+    bool warm_next_on_engine(const CancellationProbe & cancel);
+    bool warm_pending() const { return !to_warm_.empty(); }
 
     // ── Captures outside a request's prefill (a generated turn, a replay) ──
 
@@ -277,6 +330,44 @@ private:
     BackendCheckpoints & checkpoints_;
     int disk_keep_max_tokens_;
     int disk_min_tokens_;
+
+    // Shared prefixes.
+    SharedPrefixes * shared_ = nullptr;
+    PrefixPins * pins_ = nullptr;
+    struct PendingPin {
+        int slot = -1;
+        std::vector<int32_t> ids;
+        std::vector<int32_t> disk_key;
+        std::string aux;
+        std::string client;
+    };
+    std::vector<PendingPin> pending_pins_;
+    std::vector<std::string> to_warm_;  // pin ids, most recently hit first
+    size_t pin_ram_cap_ = 0;            // load_pins' allowance for warmed pins
+    void unpin_files(const SharedPrefixPin & pin);
+    // A pin (or some of its files) dropped at the caps or by age.
+    void drop_pinned(const SharedPrefixPin & dropped);
+    // This layout's file keyed by `key`, for a pin; its path is empty when
+    // the file is not there. The file is marked pinned on disk only once
+    // the catalog lists it (disk_.pin), so a concurrent unpin of another
+    // pin sharing it (PrefixPins::remove) cannot clear a mark it still needs.
+    SharedPrefixPin::File pin_file(const std::vector<int32_t> & key);
+    // The disk tier serves this model's checkpoints (pins have files).
+    bool pins_have_files() const { return !disk_.disabled() && (!engine_ || concurrent_disk_); }
+    // A warmed prefix's file, added to its pin (written to disk when the
+    // engine has a tier). False when the pin is gone meanwhile (deleted, or
+    // dropped at another model's caps): the caller unpins its RAM entry.
+    bool record_warm(const SharedPrefixPin & pin, Checkpoint checkpoint, int saved,
+                     double seconds, const char * where);
+    uint64_t next_warm_id_ = 1;
+    // The pin whose file (this layout) is keyed by `key`: a disk hit on it
+    // counts as the pin's hit.
+    std::optional<SharedPrefixPin> pinned_file(const std::vector<int32_t> & key) const;
+    // The reservation would replace a pinned prefix.
+    bool takes_a_pin(const PrefixCache::InlineReservation & reservation) const;
+    // A checkpoint's bytes as the index counts them: the engine's estimate
+    // on the concurrent path, the backend's on the single one.
+    size_t estimate_bytes(int tokens) const;
 
     // Concurrent path.
     EngineCheckpoints * engine_ = nullptr;

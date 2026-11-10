@@ -433,6 +433,10 @@ bool run_case(ggml_backend_t backend,
                 sizes, tree->tree_sizes.data(), 0,
                 tree->tree_sizes.size() * sizeof(tree->tree_sizes[0]));
         }
+        // Poison the output first, so a row the kernel fails to write shows
+        // up as a mismatch instead of whatever the allocator left there.
+        const std::vector<float> poison(ggml_nelements(output), 1.0e30f);
+        ggml_backend_tensor_set(output, poison.data(), 0, ggml_nbytes(output));
         const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
         wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
@@ -647,6 +651,22 @@ TEST_CASE(PagedAttention, ActiveSlotsMatchReference) {
         {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
         true,
     }, {10, 9, -1, 4});
+}
+
+TEST_CASE(PagedAttention, CompactThreeSlotBucketDirectPathMatchesReference) {
+    // Same padded bucket with one partition: the direct path must zero the
+    // padding row itself. The variable is read once per process, so this
+    // holds when ctest runs the case alone.
+    luce_test::ScopedEnvVar force_partitions(
+        "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS",
+        "1"
+    );
+    run_active_slot_case({
+        "compact-3-direct",
+        2,
+        {1, 17, 31},
+        false,
+    }, {2, 1, 0, -1});
 }
 
 TEST_CASE(PagedAttention, CompactThreeSlotBucketMatchesReference) {

@@ -85,7 +85,7 @@ struct DiskCacheHeader {
     uint8_t  token_hash[16];   // SHA-1 of prompt token IDs (same as PrefixHash)
     uint64_t payload_bytes;    // total tensor data bytes
     uint64_t created_at;       // unix seconds
-    uint64_t last_used;        // unix seconds (updated on hit)
+    uint64_t last_used;        // unix seconds (updated on hit) | DISK_CACHE_PINNED_BIT
     int32_t  last_tok;         // last prefill token (needed for decode seeding)
     uint8_t  identity_salt[16]; // model/KV-type/config identity (v4)
 };
@@ -95,6 +95,11 @@ struct DiskCacheHeader {
 static constexpr size_t DISK_CACHE_HEADER_SIZE = 96;
 // Byte offset of last_used, rewritten in place when a hit touches a file.
 static constexpr long DISK_CACHE_LAST_USED_OFFSET = 68;
+// The top bit of the stored last_used marks a pinned file (a pinned shared
+// prefix, kv/prefix_pins.h): exempt from the TTL, the LRU and ancestor
+// pruning. Rewritten in place like last_used, outside the checksum; a
+// reader without it sees a file used in the far future.
+static constexpr uint64_t DISK_CACHE_PINNED_BIT = 1ull << 63;
 // v3: ggml_type id 42 changed meaning (TQ3_0 -> Q2_0).
 // v4: identity salt in the header and the key token ids after the tensor
 // table.
@@ -183,6 +188,7 @@ public:
         std::string path;
         uint64_t created_at = 0;
         uint64_t last_used = 0;  // the entry's, when the write started
+        bool pinned = false;     // likewise
         std::array<uint8_t, 16> layout_id{};
         std::array<uint8_t, 16> salt{};  // the writing model's identity salt
     };
@@ -198,6 +204,7 @@ public:
         uint32_t    cur_pos     = 0;
         uint64_t    file_size   = 0;
         uint64_t    last_used   = 0;
+        bool        pinned      = false;  // DISK_CACHE_PINNED_BIT
         std::shared_ptr<PendingWrite> pending;  // non-null until on disk
     };
 
@@ -219,6 +226,9 @@ public:
     std::condition_variable writer_cv_;   // work for the writer
     std::condition_variable done_cv_;     // a write finished
     DiskCacheStats stats_;
+    bool pinned_locked(const DiskEntry & e) const { return e.pinned; }
+    // Pin or unpin `e`, rewriting its header in place when it is on disk.
+    void set_pinned_locked(DiskEntry & e, bool on);
 
     // Helpers (the _locked ones need mu_).
     uint64_t now() const;
@@ -227,7 +237,8 @@ public:
     void expire_locked();
     uint64_t budget_locked();
     // Evict least-recently-used files until `incoming` more bytes fit.
-    void make_room_locked(uint64_t incoming);
+    // Pinned files are never evicted: false when they leave no room.
+    bool make_room_locked(uint64_t incoming);
     void release_pending_locked(DiskEntry & e);
     void touch_locked(DiskEntry & e);
     int find_entry_id(uint64_t id) const;

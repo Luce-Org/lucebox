@@ -979,6 +979,171 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
     ggml_free(ctx);
     return ok;
 }
+
+// The host-validated, batched transaction commits the same bits
+// as ggml_backend_cuda_tree_commit_transaction, over several layers, lanes
+// (one inactive), partial and empty accepted prefixes, 16-byte and unaligned
+// K/V rows; and a refused host preflight changes nothing.
+bool test_tree_commit_host_matches_parent(ggml_backend_t backend, int cache_ne0) {
+    constexpr int state_size = 128;
+    constexpr int heads = 6;
+    constexpr int tokens = 8;
+    constexpr int sequences = 4;
+    constexpr int state_slots = 6;
+    constexpr int layers = 3;
+    constexpr int conv_window = 3;
+    constexpr int conv_channels = 40;
+    constexpr int n_caches = 4;
+    constexpr int cache_rows = 96;  // >= scratch_base + 5*scratch_stride + tokens
+    constexpr int cache_heads = 2;
+    constexpr int scratch_base = 32;
+    constexpr int scratch_stride = 8;
+    constexpr int feature_width = 8;
+    constexpr int feature_dest_rows = 40;
+
+    ggml_init_params params{};
+    params.mem_size = 4*1024*1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * caches[n_caches];
+    for (ggml_tensor *& cache : caches) {
+        cache = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cache_ne0, cache_rows, cache_heads, 1);
+    }
+    ggml_tensor * commit_rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, tokens, sequences);
+    ggml_tensor * active_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+    ggml_tensor * accepted = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+    ggml_tensor * feature_source = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, feature_width, tokens*sequences);
+    ggml_tensor * feature_destination = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, feature_width, feature_dest_rows);
+    ggml_tensor * feature_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens*sequences);
+    ggml_tensor * replay_logs[layers];
+    ggml_tensor * states[layers];
+    ggml_tensor * conv_inputs[layers];
+    ggml_tensor * conv_states[layers];
+    for (int l = 0; l < layers; ++l) {
+        replay_logs[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*state_size + 1, heads, tokens, sequences);
+        states[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, state_size, state_size, heads, state_slots);
+        conv_inputs[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, conv_window + tokens, conv_channels, sequences, 1);
+        conv_states[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, conv_window, conv_channels, state_slots, 1);
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::mt19937 rng(1234u + (unsigned) cache_ne0);
+    std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> gate(0.5f, 1.0f);
+    const auto fill = [&](ggml_tensor * t) {
+        std::vector<float> values((size_t) ggml_nelements(t));
+        for (float & v : values) v = unit(rng);
+        ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+    };
+    const auto fill_log = [&](ggml_tensor * t) {
+        std::vector<float> values((size_t) ggml_nelements(t));
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = i % (2*state_size + 1) == 0 ? gate(rng) : 0.25f*unit(rng);
+        }
+        ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+    };
+    for (ggml_tensor * cache : caches) fill(cache);
+    for (int l = 0; l < layers; ++l) {
+        fill_log(replay_logs[l]);
+        fill(states[l]);
+        fill(conv_inputs[l]);
+        fill(conv_states[l]);
+    }
+    {
+        std::vector<uint16_t> bits((size_t) ggml_nelements(feature_source));
+        for (uint16_t & b : bits) b = (uint16_t) (rng() & 0x7f7f);
+        ggml_backend_tensor_set(feature_source, bits.data(), 0, bits.size()*sizeof(uint16_t));
+        std::vector<uint16_t> dest((size_t) ggml_nelements(feature_destination), 0x3f80);
+        ggml_backend_tensor_set(feature_destination, dest.data(), 0, dest.size()*sizeof(uint16_t));
+    }
+    const std::vector<int32_t> host_accepted = {3, 0, 8, 5};
+    const std::vector<int32_t> host_slots = {2, 5, -1, 0};
+    std::vector<int64_t> host_rows((size_t) tokens*sequences, -1);
+    std::vector<int32_t> host_feature((size_t) tokens*sequences, -1);
+    int next_row = 0;
+    for (int lane = 0; lane < sequences; ++lane) {
+        for (int node = 0; node < host_accepted[(size_t) lane]; ++node) {
+            if (host_slots[(size_t) lane] < 0) continue;
+            host_rows[(size_t) lane*tokens + node] = next_row;
+            host_feature[(size_t) lane*tokens + node] = next_row % feature_dest_rows;
+            ++next_row;
+        }
+    }
+    ggml_backend_tensor_set(accepted, host_accepted.data(), 0, host_accepted.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(active_slots, host_slots.data(), 0, host_slots.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(commit_rows, host_rows.data(), 0, host_rows.size()*sizeof(int64_t));
+    ggml_backend_tensor_set(feature_rows, host_feature.data(), 0, host_feature.size()*sizeof(int32_t));
+
+    // Every mutable tensor's bytes, in order.
+    std::vector<ggml_tensor *> outputs(caches, caches + n_caches);
+    outputs.push_back(feature_destination);
+    for (int l = 0; l < layers; ++l) {
+        outputs.push_back(states[l]);
+        outputs.push_back(conv_states[l]);
+    }
+    const auto snapshot = [&]() {
+        std::vector<std::vector<uint8_t>> bytes;
+        for (ggml_tensor * t : outputs) {
+            bytes.emplace_back(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, bytes.back().data(), 0, bytes.back().size());
+        }
+        return bytes;
+    };
+    const auto restore = [&](const std::vector<std::vector<uint8_t>> & bytes) {
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            ggml_backend_tensor_set(outputs[i], bytes[i].data(), 0, bytes[i].size());
+        }
+    };
+    const std::vector<std::vector<uint8_t>> before = snapshot();
+    const ggml_tensor * const_logs[layers];
+    const ggml_tensor * const_conv_inputs[layers];
+    for (int l = 0; l < layers; ++l) {
+        const_logs[l] = replay_logs[l];
+        const_conv_inputs[l] = conv_inputs[l];
+    }
+
+    const bool parent_ok = ggml_backend_cuda_tree_commit_transaction(
+        caches, n_caches, feature_source, feature_destination, feature_rows,
+        const_logs, states, const_conv_inputs, conv_states, layers,
+        commit_rows, accepted, active_slots, scratch_base, scratch_stride);
+    const std::vector<std::vector<uint8_t>> parent = snapshot();
+    restore(before);
+    const size_t count_before = ggml_backend_cuda_get_tree_commit_host_count();
+    const bool host_ok = ggml_backend_cuda_tree_commit_transaction_host(
+        caches, n_caches, feature_source, feature_destination, feature_rows,
+        const_logs, states, const_conv_inputs, conv_states, layers,
+        commit_rows, accepted, active_slots, scratch_base, scratch_stride,
+        host_rows.data(), host_accepted.data(), host_slots.data(), host_feature.data());
+    const bool host_counted = ggml_backend_cuda_get_tree_commit_host_count() == count_before + 1;
+    const std::vector<std::vector<uint8_t>> host = snapshot();
+    bool changed = false;
+    for (size_t i = 0; i < before.size(); ++i) changed = changed || before[i] != parent[i];
+
+    restore(before);
+    std::vector<int32_t> bad_accepted = host_accepted;
+    bad_accepted[3] = tokens + 1;
+    const bool refused = !ggml_backend_cuda_tree_commit_transaction_host(
+        caches, n_caches, feature_source, feature_destination, feature_rows,
+        const_logs, states, const_conv_inputs, conv_states, layers,
+        commit_rows, accepted, active_slots, scratch_base, scratch_stride,
+        host_rows.data(), bad_accepted.data(), host_slots.data(), host_feature.data());
+    const bool untouched = snapshot() == before;
+
+    const bool ok = parent_ok && host_ok && host_counted && changed &&
+        host == parent && refused && untouched;
+    std::printf("gdn tree commit host == parent (row %3d B): %s (parent %d host %d counted %d changed %d same %d refused %d untouched %d)\n",
+                cache_ne0*4, ok ? "PASS" : "FAIL", parent_ok, host_ok, host_counted, changed,
+                host == parent, refused, untouched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1013,6 +1178,8 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, false, true, "scalar") && ok;
     ggml_backend_cuda_set_gdn_route_override(-1);
     ok = test_tree_commit_preflight_is_non_mutating(backend) && ok;
+    ok = test_tree_commit_host_matches_parent(backend, 68) && ok;  // 272-byte rows: 16-byte copies
+    ok = test_tree_commit_host_matches_parent(backend, 3) && ok;   // 12-byte rows: byte copies
     ggml_backend_free(backend);
     return ok ? 0 : 1;
 }

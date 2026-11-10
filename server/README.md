@@ -340,6 +340,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
 | `--kv-cache-cold-max <N>` | `10240` | A session's disk files keep their ancestors up to N tokens (the shared head). |
 | `--disk-prefix-cache off\|full\|N` | `full` | Default disk prefix policy (`auto` and `auto:N` are retired and read as `full`). |
+| `--shared-prefix auto\|freeze\|off` | `auto` | The tools and system prompt a client repeats: captured where requests agree, pinned when another conversation restores them, kept on disk past the TTL and the LRU, and warmed at idle on the concurrent path when there is no file for these settings. `freeze` keeps the known cuts and pins still (benchmarks); `off` is plain prefix caching. See [PREFIX_CACHE.md](docs/PREFIX_CACHE.md#shared-prefixes). |
 
 Decode-pressure suspension defaults to `auto`. After all models load, the
 server shares 25% of available host RAM across eligible models, subtracting

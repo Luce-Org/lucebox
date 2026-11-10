@@ -429,7 +429,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int restore_source_slot,
         InlineSnapshotSize estimate_bytes,
         int reachable_from,
-        int restore_point_spacing) {
+        int restore_point_spacing,
+        bool forced_cut_learned) {
     if (disabled_) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
@@ -447,10 +448,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     // (default 2048). LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers
     // it (default 4096 tokens; 0 keeps the head pin). Values that are not a
     // whole non-negative integer keep the defaults.
-    // A forced pin still ahead of the restored prefix (an explicit pin_end, or
-    // PPP's pin of a head seen before) wins and keeps its protection, and a
-    // prompt the resident budget could never hold keeps the head pin instead
-    // of saving nothing.
+    // An explicit forced pin still ahead of the restored prefix (pin_end)
+    // wins and keeps its protection; a learned one (the shared-prefix cut)
+    // yields like the head. A prompt the resident budget could never hold
+    // keeps the head pin instead of saving nothing.
     static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
     static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
     const auto whole_prompt_fits = [&]() {
@@ -460,12 +461,13 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     };
     if (deep_first_min > 0 && prefer_head && !candidates.empty() &&
         restored_prefix_len <= candidates.front() &&
-        forced_cut <= restored_prefix_len &&
+        (forced_cut <= restored_prefix_len || forced_cut_learned) &&
         candidates.front() <= deep_first_max_head &&
         (int) prompt_ids.size() - candidates.front() >= deep_first_min &&
         whole_prompt_fits()) {
         prefer_head = false;
         prefer_tools_boundary = false;
+        if (forced_cut_learned) forced_cut = 0;
     }
     int target_cut = 0;
     bool forced = false;
@@ -789,6 +791,13 @@ void PrefixCache::replace_inline_entry(
         prompt_ids.begin(), prompt_ids.begin() + target_cut);
     entries_.push_back(
         {key, slot, std::move(ids), protect, resident_bytes});
+    if (protect) {
+        const auto boundaries = find_all_boundaries(prompt_ids, markers_);
+        int len = (int)prompt_ids.size();
+        if (!boundaries.empty() && boundaries.back() > target_cut) len = boundaries.back();
+        entries_.back().capture_len = len;
+        entries_.back().capture_hash = hash_prefix(prompt_ids.data(), len);
+    }
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
     resident_bytes_ += resident_bytes;
     resident_bytes_count_.store(
@@ -1051,6 +1060,52 @@ void PrefixCache::mark_agent_turn(int slot) {
 bool PrefixCache::agent_turn(int slot) const {
     const int idx = find_slot_entry(slot);
     return idx >= 0 && entries_[(size_t)idx].agent_turn;
+}
+
+bool PrefixCache::shared_prefix(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].protect;
+}
+
+bool PrefixCache::restored_by_another_conversation(
+        int slot, const std::vector<int32_t> & prompt) const {
+    const int idx = find_slot_entry(slot);
+    if (idx < 0 || !entries_[(size_t)idx].protect) return false;
+    const LruEntry & e = entries_[(size_t)idx];
+    if (e.capture_len <= (int)e.ids.size()) return false;  // no capturing request known
+    if ((int)prompt.size() < e.capture_len) return true;
+    return hash_prefix(prompt.data(), e.capture_len) != e.capture_hash;
+}
+
+void PrefixCache::set_pinned(int slot, bool pinned) {
+    const int idx = find_slot_entry(slot);
+    if (idx >= 0) entries_[(size_t)idx].pinned = pinned;
+}
+
+bool PrefixCache::pinned(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx >= 0 && entries_[(size_t)idx].pinned;
+}
+
+size_t PrefixCache::pinned_bytes() const {
+    size_t bytes = 0;
+    for (const auto & e : entries_) {
+        if (e.pinned) bytes += e.resident_bytes;
+    }
+    return bytes;
+}
+
+std::vector<int> PrefixCache::pinned_slots() const {
+    std::vector<int> out;
+    for (const auto & e : entries_) {
+        if (e.pinned) out.push_back(e.slot);
+    }
+    return out;
+}
+
+int PrefixCache::slot_of(const std::vector<int32_t> & ids) const {
+    const int idx = find_entry(hash_prefix(ids.data(), (int)ids.size()));
+    return idx >= 0 ? entries_[(size_t)idx].slot : -1;
 }
 
 void PrefixCache::record_eviction(int idx) {

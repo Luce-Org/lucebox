@@ -119,6 +119,14 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_row
 // compare them bit for bit with the parent tiles. Both are on by default.
 GGML_BACKEND_API void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows32);
 
+// While on (for the calling thread), the RDNA4 64-row MMQ twins split k for
+// calls of 17-48 columns whose grid would leave the GPU short of workgroups,
+// at 16 or more k-iterations per split on average. A split sum is not
+// bit-exact against the unsplit one, so only a caller that already accepts
+// batch-dependent results turns it on: the concurrent (C>1) batched verify,
+// around its graph. Off by default; single-request paths never set it.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmq_splitk_scope(bool on);
+
 // Calling-thread launch counters for the scalar and grouped-column GDN
 // kernels. Focused qualification tests use these to reject silent fallback.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
@@ -360,26 +368,12 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
         int tree_scratch_base,
         int tree_scratch_stride);
 
-// The host's own copy of a tree commit's index tensors: the bytes the device
-// tensors hold when the commit kernels read them.
-struct ggml_cuda_tree_commit_host_maps {
-    const int64_t * commit_rows;        // ggml_nelements(commit_rows)
-    const int32_t * accepted_prefixes;  // ggml_nelements(accepted_prefixes)
-    const int32_t * active_slot_ids;    // ggml_nelements(active_slot_ids)
-    const int32_t * feature_rows;       // ggml_nelements(feature_destination_rows)
-};
-
-// ggml_backend_cuda_tree_commit_transaction, stream-ordered on `backend`.
-// It runs the same preflight on `host` instead of reading the index tensors
-// back, checks device placement once per set of tensor addresses, commits
-// every cache, the feature rows and every layer in a few launches (the same
-// per-element copies and recurrences) on the backend's stream, and returns
-// without synchronizing. Write the index tensors on the backend's stream or
-// before the call. Synchronize the backend before the host or another stream
-// reads or writes a committed tensor. Every tensor must live on the
-// backend's device.
-GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_async(
-        ggml_backend_t backend,
+// ggml_backend_cuda_tree_commit_transaction validated from the caller's host
+// copies of commit_rows, accepted_prefixes, active_slot_ids and
+// feature_destination_rows (the values it uploaded), with one launch per
+// commit kind. Same fail-closed contract; same committed bits. The count is
+// the calling thread's transactions committed this way.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_host(
         struct ggml_tensor * const * caches,
         int n_caches,
         const struct ggml_tensor * feature_source,
@@ -395,7 +389,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction_async(
         const struct ggml_tensor * active_slot_ids,
         int tree_scratch_base,
         int tree_scratch_stride,
-        const struct ggml_cuda_tree_commit_host_maps * host);
+        const int64_t * host_commit_rows,
+        const int32_t * host_accepted,
+        const int32_t * host_slots,
+        const int32_t * host_feature_rows);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_tree_commit_host_count(void);
 
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the

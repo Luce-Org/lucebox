@@ -31,8 +31,6 @@
 
 namespace luce::common {
 
-class PinnedStage;
-
 struct DraftKvState {
     DraftKvState() = default;
     // Owns raw ggml contexts/buffers/graphs: copying would double-free.
@@ -112,21 +110,6 @@ bool draft_kv_begin_step(DraftKvState & st,
                          int committed,
                          int width = 0);
 
-// draft_kv_begin_step with every input upload and the feature copy queued on
-// `backend`'s stream through `stage` (pinned slices, see pinned_stage.h).
-// Nothing is synchronized: the caller keeps the stage untouched until it
-// synchronized the backend. Uploads that do not fit the stage block.
-bool draft_kv_begin_step_async(DraftKvState & st,
-                               const DraftWeights & dw,
-                               ggml_backend_t backend,
-                               const DraftFeatureMirror & ring,
-                               int committed,
-                               int width,
-                               PinnedStage & stage);
-
-// Stage bytes one lane's step inputs take (inp_embed included).
-size_t draft_kv_step_upload_bytes(const DraftKvState & st);
-
 struct DraftKvBatchGraph {
     DraftKvBatchGraph() = default;
     DraftKvBatchGraph(const DraftKvBatchGraph &) = delete;
@@ -161,16 +144,6 @@ bool draft_kv_batch_compute(
     ggml_backend_t backend,
     const std::vector<DraftKvState *> & lane_states,
     std::vector<std::vector<float>> & hidden_by_lane,
-    int width = 0);
-
-// draft_kv_batch_compute without the readback and the wait: the graph is
-// queued on `backend`'s stream and the lane hidden states stay on the device
-// in batch.hidden_by_lane until the next compute.
-bool draft_kv_batch_compute_async(
-    DraftKvBatchGraph & batch,
-    const DraftWeights & dw,
-    ggml_backend_t backend,
-    const std::vector<DraftKvState *> & lane_states,
     int width = 0);
 
 }  // namespace luce::common

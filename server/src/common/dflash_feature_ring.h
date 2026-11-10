@@ -143,18 +143,6 @@ bool copy_feature_ring_range_to_tensor(
     int start_pos,
     int n_tokens);
 
-// The same copy queued on `backend`'s stream without waiting, for a consumer
-// that runs on that stream (the draft graph). The ring must live on the
-// backend's device and `dst` must be contiguous rows; otherwise this takes
-// the synchronous copy above. Work on that stream ordered before the call
-// (a commit into the ring) is seen by the copy.
-bool copy_feature_ring_range_to_tensor_async(
-    const DraftFeatureMirror & feature_ring,
-    ggml_tensor * dst,
-    int start_pos,
-    int n_tokens,
-    ggml_backend_t backend);
-
 bool copy_feature_ring_range_to_host_f32(
     const DraftFeatureMirror & feature_ring,
     int start_pos,
