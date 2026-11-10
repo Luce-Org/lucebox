@@ -52,6 +52,7 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
+#include "server/crash_record.h"
 #include "pflash/pflash_drafter.h"
 #include "qwen3_model.h"
 #include "pflash/pflash_compress.h"
@@ -18538,6 +18539,65 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_answ
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text() == "The output is </parameter> end.");
 }
+
+#if defined(__linux__)
+#include <csignal>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+namespace {
+
+std::string read_crash_file(const std::filesystem::path & path) {
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_crash_record_names_the_signal_frames_and_map) {
+    const auto path = std::filesystem::temp_directory_path() / ("crash-format-" + std::to_string(getpid()) + ".txt");
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT(fd >= 0);
+    void * frames[] = {(void *)0xabc, (void *)0xdef0};
+    write_crash_record(fd, SIGSEGV, (void *)0x1234, frames, 2);
+    ::close(fd);
+    const std::string record = read_crash_file(path);
+    std::filesystem::remove(path);
+    TEST_ASSERT(record.find("signal 11\nname SIGSEGV\naddress 0x1234\nframes\n0xabc\n0xdef0\nmaps\n") != std::string::npos);
+    // The map is the process's own: the addresses resolve against it offline.
+    TEST_ASSERT(record.find("[stack]") != std::string::npos);
+    TEST_ASSERT(record.size() > 4 && record.compare(record.size() - 4, 4, "end\n") == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_crash_record_is_written_when_the_process_dies) {
+    const auto dir = std::filesystem::temp_directory_path() / ("crash-dir-" + std::to_string(getpid()));
+    std::filesystem::create_directories(dir);
+    const pid_t child = fork();
+    TEST_ASSERT(child >= 0);
+    if (child == 0) {
+        alarm(5);  // a hung child fails the test instead of stalling it
+        if (!install_crash_record(dir.c_str(), "test build")) _exit(3);
+        volatile int * nowhere = nullptr;
+        *nowhere = 1;
+        _exit(4);
+    }
+    int status = 0;
+    TEST_ASSERT(waitpid(child, &status, 0) == child);
+    TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);  // it still dies as it would have
+    std::string record;
+    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().rfind("crash-" + std::to_string(child) + "-", 0) == 0) {
+            record = read_crash_file(entry.path());
+        }
+    }
+    std::filesystem::remove_all(dir);
+    TEST_ASSERT(record.rfind("luce crash record 1\nbinary /", 0) == 0);
+    TEST_ASSERT(record.find("\ntest build\n") != std::string::npos);
+    TEST_ASSERT(record.find("name SIGSEGV\naddress 0x0\nframes\n0x") != std::string::npos);
+    TEST_ASSERT(record.find("\nend\n") != std::string::npos);
+    TEST_ASSERT(!install_crash_record("", "") && !install_crash_record("/nonexistent/folder", ""));
+}
+#endif
 
 TEST_CASE(ServerUnitFixture, test_escape_for_logging) {
     // Standard escapes
