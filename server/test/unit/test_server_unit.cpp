@@ -13021,20 +13021,27 @@ TEST_CASE(ServerUnitFixture, test_session_headers_travel_the_socket_path_into_th
     TEST_ASSERT(r.admits == 1 && r.meta.sid.empty() && r.meta.client.empty());
 }
 
-TEST_CASE(ServerUnitFixture, test_an_oversized_session_id_is_a_400_at_the_http_boundary_and_the_next_request_is_served) {
-    json too_long = {{"model", "m"}, {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}, {"max_tokens", 4},
+TEST_CASE(ServerUnitFixture, test_an_unusable_session_id_is_no_identity_at_the_http_boundary_and_the_request_is_served) {
+    const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+    json too_long = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4},
                      {"session_id", std::string(luce::common::kKvFlashSidMax + 1, 's')}};
-    const std::string ok = json({{"model", "m"}, {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}, {"max_tokens", 4}}).dump();
-    // body identity: refused, never admitted
+    json control = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}, {"session_id", std::string("a\x01" "b")}};
+    const std::string ok = json({{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}}).dump();
+    // body identity over the bound: served without an identity, not refused
     auto r = admitted_over_socket({"", too_long.dump()});
-    TEST_ASSERT(r.admits == 0);
-    TEST_ASSERT(r.response.find(" 400 ") != std::string::npos);
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
     // header identity over the bound: the same
     r = admitted_over_socket({"X-Session-Id: " + std::string(luce::common::kKvFlashSidMax + 100, 'h') + "\r\n", ok});
-    TEST_ASSERT(r.admits == 0 && r.response.find(" 400 ") != std::string::npos);
-    // the refusal does not poison the server: the next request, on the same server, is admitted
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // a control character in the id: the same, it never reaches the log
+    r = admitted_over_socket({"", control.dump()});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // the next request, on the same server, keeps its own identity (both requests of the pair are admitted)
     r = admitted_over_socket({"", too_long.dump(), "X-Session-Id: fine\r\n", ok});
-    TEST_ASSERT(r.admits == 1);
+    TEST_ASSERT(r.admits == 2);
     TEST_ASSERT(r.meta.sid == "fine" && r.meta.client == "header");
 }
 
