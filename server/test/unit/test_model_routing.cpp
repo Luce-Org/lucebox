@@ -1358,5 +1358,30 @@ TEST_CASE(ModelRoutingFixture, test_status_subscriber_33_gets_503_and_the_first_
     ROUTING_CHECK(recv(subscribers[0].get(), &byte, 1, MSG_PEEK) == 1);   // still open, not closed
 }
 
+// A closed status page (a reload) keeps its subscriber slot until a send to it fails: an event, or the second idle
+// heartbeat 60 s later. At the cap the closed ones leave before a new subscriber is refused.
+TEST_CASE(ModelRoutingFixture, test_a_status_subscriber_is_admitted_when_the_cap_is_held_by_closed_pages) {
+    RunningModels models(false, false, false);
+    std::vector<Socket> subscribers;
+    for (int i = 0; i < 32; ++i) {
+        subscribers.push_back(models.connect_client());
+        subscribers.back().send("GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        pollfd pfd{subscribers.back().get(), POLLIN, 0};
+        ROUTING_CHECK(poll(&pfd, 1, 2000) == 1);
+    }
+    std::this_thread::sleep_for(200ms);   // the handlers register right after their first event
+    for (int i = 1; i < 32; ++i) subscribers[i].close();   // 31 pages reloaded, one still open
+    std::this_thread::sleep_for(100ms);
+    auto extra = models.connect_client();
+    extra.send("GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    pollfd pfd{extra.get(), POLLIN, 0};
+    ROUTING_CHECK(poll(&pfd, 1, 2000) == 1);
+    char head[12];
+    ROUTING_CHECK(recv(extra.get(), head, sizeof head, MSG_WAITALL) == (ssize_t)sizeof head);
+    ROUTING_CHECK(std::string(head, sizeof head) == "HTTP/1.1 200");
+    char byte;
+    ROUTING_CHECK(recv(subscribers[0].get(), &byte, 1, MSG_PEEK) == 1);   // the open page keeps its stream
+}
+
 #undef ROUTING_CHECK
 #endif
