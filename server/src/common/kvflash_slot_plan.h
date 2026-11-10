@@ -104,8 +104,8 @@ inline int kvflash_quota_chunks(int pool_tokens, int chunk_tokens = kKvFlashChun
 
 // ── Admission ───────────────────────────────────
 
-// HostTooSmall is permanent: the request alone (plus the global transient)
-// exceeds the whole host budget, so queueing it as BusyHost would wait forever.
+// HostTooSmall is permanent: the request alone exceeds the whole host budget,
+// so queueing it as BusyHost would wait forever.
 enum class KvFlashAdmit { Ok, BusySlot, BusyHost, PromptTooLong, BadQuota, HostTooSmall };
 
 struct KvFlashAdmitInput {
@@ -115,7 +115,6 @@ struct KvFlashAdmitInput {
     int     chunk_tokens = kKvFlashChunkTokens;
     int64_t chunk_bytes = 0;                 // host backing per chunk
     int64_t ladder_bytes = 0;                // rungs x live state this slot will hold
-    int64_t transient_reserve_bytes = 0;     // global: max(scorer staging, serialize)
     int64_t host_used_bytes = 0, host_budget_bytes = 0;
 };
 
@@ -142,7 +141,7 @@ inline KvFlashAdmit kvflash_admit(const KvFlashAdmitInput & in) {
     KvFlashConfig cfg; cfg.chunk_tokens = in.chunk_tokens;
     if (!kvflash_headroom_ok(in.quota_chunks, in.headroom_blocks, cfg)) return KvFlashAdmit::BadQuota;
     if (in.prompt_tokens > in.max_ctx) return KvFlashAdmit::PromptTooLong;
-    const int64_t alone = kvflash_host_need_bytes(in) + in.transient_reserve_bytes;
+    const int64_t alone = kvflash_host_need_bytes(in);
     if (alone > in.host_budget_bytes) return KvFlashAdmit::HostTooSmall;
     if (!in.slot_free) return KvFlashAdmit::BusySlot;
     if (in.host_used_bytes + alone > in.host_budget_bytes) return KvFlashAdmit::BusyHost;
@@ -151,20 +150,17 @@ inline KvFlashAdmit kvflash_admit(const KvFlashAdmitInput & in) {
 
 // Host RESERVATIONS, apart from allocated bytes: admit takes a request's
 // worst-case backing (kvflash_host_need_bytes), release gives it back and is
-// called on EVERY exit (finish, cancel, error, abort_step). The global
-// transient is charged once, not per request. Not thread-safe: the engine
-// thread owns it.
+// called on EVERY exit (finish, cancel, error, abort_step). Not thread-safe:
+// the engine thread owns it.
 class KvFlashHostLedger {
 public:
-    KvFlashHostLedger(int64_t budget_bytes, int64_t transient_reserve_bytes)
-        : budget_(budget_bytes), transient_(transient_reserve_bytes) {}
+    explicit KvFlashHostLedger(int64_t budget_bytes) : budget_(budget_bytes) {}
 
-    // `in.host_*` and `in.transient_reserve_bytes` are overwritten from the ledger.
+    // `in.host_*` are overwritten from the ledger.
     // A request id already holding a reservation is refused (BusySlot), never charged twice.
     KvFlashAdmit admit(uint64_t request_id, KvFlashAdmitInput in) {
         if (reserved_.count(request_id)) return KvFlashAdmit::BusySlot;
         in.host_budget_bytes = budget_;
-        in.transient_reserve_bytes = transient_;
         in.host_used_bytes = used_;
         const KvFlashAdmit v = kvflash_admit(in);
         if (v == KvFlashAdmit::Ok) {
@@ -177,7 +173,6 @@ public:
     // What admit() would answer for a request that holds no reservation yet, charging nothing.
     KvFlashAdmit would_admit_new(KvFlashAdmitInput in) const {
         in.host_budget_bytes = budget_;
-        in.transient_reserve_bytes = transient_;
         in.host_used_bytes = used_;
         return kvflash_admit(in);
     }
@@ -192,7 +187,7 @@ public:
     int64_t reserved_of(uint64_t request_id) const { const auto it = reserved_.find(request_id); return it == reserved_.end() ? 0 : it->second; }
 
 protected:   // the test fixture counts reservations
-    int64_t budget_, transient_, used_ = 0;
+    int64_t budget_, used_ = 0;
     std::unordered_map<uint64_t, int64_t> reserved_;
 };
 

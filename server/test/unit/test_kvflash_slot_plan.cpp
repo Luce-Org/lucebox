@@ -26,7 +26,6 @@ KvFlashAdmitInput base_admit() {
     in.max_ctx = 131072;
     in.chunk_tokens = 64;
     in.chunk_bytes = kChunkBytes;
-    in.transient_reserve_bytes = 0;
     in.host_used_bytes = 0;
     in.host_budget_bytes = 16 * kChunkBytes;
     return in;
@@ -143,19 +142,15 @@ TEST_CASE(KvflashSlotPlanFixture, admission_host_budget_boundary_is_exact) {
     CHECK(kvflash_admit(in) == KvFlashAdmit::BusyHost);
 }
 
-TEST_CASE(KvflashSlotPlanFixture, admission_counts_the_global_transient_reserve) {
+TEST_CASE(KvflashSlotPlanFixture, the_ladder_is_part_of_what_the_request_alone_needs) {
     KvFlashAdmitInput in = base_admit();
     in.host_budget_bytes = 16 * kChunkBytes + 100;
-    in.transient_reserve_bytes = 100;                                // fits exactly
+    in.ladder_bytes = 100;                                           // fits exactly
     CHECK(kvflash_admit(in) == KvFlashAdmit::Ok);
-    in.transient_reserve_bytes = 101;
-    CHECK(kvflash_admit(in) == KvFlashAdmit::HostTooSmall);          // permanent: nothing else is reserved
-    in.host_used_bytes = 2; in.transient_reserve_bytes = 100; in.host_budget_bytes += 1;
-    CHECK(kvflash_admit(in) == KvFlashAdmit::BusyHost);              // fits alone, waits for others
-    in = base_admit();
-    in.host_budget_bytes = 16 * kChunkBytes + 100;
     in.ladder_bytes = 101;
-    CHECK(kvflash_admit(in) == KvFlashAdmit::HostTooSmall);          // the ladder is part of what the request alone needs
+    CHECK(kvflash_admit(in) == KvFlashAdmit::HostTooSmall);          // permanent: nothing else is reserved
+    in.host_used_bytes = 2; in.ladder_bytes = 100; in.host_budget_bytes += 1;
+    CHECK(kvflash_admit(in) == KvFlashAdmit::BusyHost);              // fits alone, waits for others
 }
 
 TEST_CASE(KvflashSlotPlanFixture, the_ladder_charge_is_one_slab_per_rung_and_one_for_a_recall_turns_snapshot) {
@@ -231,7 +226,7 @@ TEST_CASE(KvflashSlotPlanFixture, a_request_that_can_never_fit_is_refused_not_qu
 }
 
 TEST_CASE(KvflashSlotPlanFixture, the_ledger_reserves_at_admit_and_releases_on_every_exit) {
-    KvFlashTestLedger led(40 * kChunkBytes, 0);
+    KvFlashTestLedger led(40 * kChunkBytes);
     KvFlashAdmitInput in = base_admit();                             // needs 16 chunks
     in.host_budget_bytes = 0;                                        // the ledger owns the budget and used bytes
     CHECK(led.admit(1, in) == KvFlashAdmit::Ok);
@@ -252,20 +247,20 @@ TEST_CASE(KvflashSlotPlanFixture, the_ledger_reserves_at_admit_and_releases_on_e
     CHECK(led.used_bytes() == 0);
 }
 
-TEST_CASE(KvflashSlotPlanFixture, the_ledger_never_double_counts_a_request_id_and_counts_the_transient_once) {
-    KvFlashTestLedger led(40 * kChunkBytes, 8 * kChunkBytes);        // 8 chunks of global transient
+TEST_CASE(KvflashSlotPlanFixture, the_ledger_never_double_counts_a_request_id) {
+    KvFlashTestLedger led(40 * kChunkBytes);
     KvFlashAdmitInput in = base_admit();
-    in.host_budget_bytes = 0; in.transient_reserve_bytes = 0;
+    in.host_budget_bytes = 0;
     CHECK(led.admit(1, in) == KvFlashAdmit::Ok);
     CHECK(led.admit(1, in) == KvFlashAdmit::BusySlot);               // same id twice: refused, not charged again
     CHECK(led.used_bytes() == 16 * kChunkBytes);
-    CHECK(led.admit(2, in) == KvFlashAdmit::Ok);                     // 16 + 16 + 8 transient = 40: exact fit
-    CHECK(led.admit(3, in) == KvFlashAdmit::BusyHost);               // the transient was charged once, not per slot
+    CHECK(led.admit(2, in) == KvFlashAdmit::Ok);                     // 16 + 16 = 32
     KvFlashAdmitInput small = in; small.prompt_tokens = 500; small.max_new_tokens = 12;   // 8 chunks
-    CHECK(led.admit(5, small) == KvFlashAdmit::BusyHost);            // 32 + 8 + 8 > 40: only the transient makes the difference
+    CHECK(led.admit(5, small) == KvFlashAdmit::Ok);                  // 32 + 8 = 40: exact fit
+    CHECK(led.admit(3, small) == KvFlashAdmit::BusyHost);
     in.prompt_tokens = 100000;
     CHECK(led.admit(4, in) == KvFlashAdmit::HostTooSmall);           // bigger than the whole budget
-    CHECK(led.reservation_count() == 2);
+    CHECK(led.reservation_count() == 3);
 }
 
 TEST_CASE(KvflashSlotPlanFixture, auto_budget_is_split_across_slots_and_the_reserve_is_held_once) {

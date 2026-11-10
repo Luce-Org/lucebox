@@ -21,7 +21,7 @@ struct World {
     KvFlashTestSlots s;
     KvFlashTestLedger ledger;
     std::unique_ptr<KvFlashSlotKv> kv;
-    explicit World(int64_t host_budget = 1000000) : ledger(host_budget, 0) {
+    explicit World(int64_t host_budget = 1000000) : ledger(host_budget) {
         arena.set_host_wait([] {});
         s = kvflash_test_slots(kN, kQ, kvflash_test_config(2, kChunk), &arena);
         const auto raw = kvflash_test_raw(s);
