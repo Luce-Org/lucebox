@@ -110,8 +110,7 @@ void Qwen35SeqEngine::init_slots_() {
     book_.init(n_slots);
     recall_on_ = kvf_ && b_.kvflash_slot_recall_profile();
     if (kvf_) {
-        const char * env = std::getenv("LUCE_KVFLASH_SLOT_STICKY");
-        sticky_on_ = !(env && env[0] == '0' && env[1] == '\0');
+        sticky_on_ = kvflash_slot_sticky_env();
         const char * rung = std::getenv("LUCE_KVFLASH_END_RUNG_MIN");
         end_rung_min_ = rung && *rung ? std::atoi(rung) : -1;
         const KvFlashParkCfg pc = kvflash_park_cfg(sticky_on_, std::getenv("LUCE_KVFLASH_PARK_SHORT"), std::getenv("LUCE_KVFLASH_PARK_TAIL"), std::getenv("LUCE_KVFLASH_PARK_DECODE"));
@@ -717,16 +716,12 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                 set_feat_from_(result.slot, L);   // KV and state are the session's; the ring still holds the last occupant's features below L
                 std::fprintf(stderr, "[kvflash] slot %d resume L=%d history=%d new=%d rungs=%d/%d/%d\n",
                              result.slot, L, history, (int)prompt.size() - L, rr.ckpt, rr.trunk, extra_[(size_t)result.slot].pos);
-                if (begin_resume_(result.slot)) {
-                    plan_slot_turn_(result.slot, prompt, L);
-                    result.resumed_tokens = L;
-                    return result;
-                }
-                slots_.retire(result.slot);   // the page work failed: the session is gone, admit cold below
-                drop_session_(pick.slot, "resume page work failed");
-            } else {
-                drop_session_(pick.slot, result.error.c_str());   // the pool refused (host budget): cold below
+                begin_resume_(result.slot);
+                plan_slot_turn_(result.slot, prompt, L);
+                result.resumed_tokens = L;
+                return result;
             }
+            drop_session_(pick.slot, result.error.c_str());   // the pool refused (host budget): cold below
         } else {
             drop_session_(pick.slot, "checkpoint rewind failed");
         }
@@ -789,12 +784,10 @@ void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
 // With no storage tier the oldest parked session other than `keep` is dropped: its next turn prefills cold.
 int Qwen35SeqEngine::evict_oldest_(const char * why, int keep) {
     std::vector<KvFlashParkedSession> list;
-    for (const auto & o : parked_list_()) list.push_back(o.parked);
-    const KvFlashEvicted r = kvflash_evict_oldest(list, [&](int slot) { drop_session_(slot, why); return true; }, [&](int slot) {
-        std::fprintf(stderr, "[kvflash] slot %d session dropped from host memory: its park cannot be kept, the next turn prefills cold (%s)\n", slot, why);
-        drop_session_(slot, why);   // the park was refused: the parked set is a cache and never blocks service
-    }, keep);
-    return r.slot;
+    for (const auto & o : parked_list_()) if (o.parked.slot != keep) list.push_back(o.parked);
+    const int slot = kvflash_oldest_session(list);
+    if (slot >= 0) drop_session_(slot, why);
+    return slot;
 }
 
 bool Qwen35SeqEngine::any_slot_live_() const {
@@ -871,16 +864,15 @@ void Qwen35SeqEngine::take_ckpt_(int slot, int pos) {
 // A resumed turn starts from the recent residency (the newest chunks), as the
 // single-slot SCORE_POOL_RECENT does, so its first pass and scores do not depend
 // on the previous turn's picks. Deferred frees are drained around the page work.
-bool Qwen35SeqEngine::begin_resume_(int slot) {
+void Qwen35SeqEngine::begin_resume_(int slot) {
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
     p.synchronize_paging();
     kvf_->complete_all();
-    if (!recall_on_) return true;
+    if (!recall_on_) return;
     p.set_deferred_free(false);
     p.reselect_recent();
     p.set_deferred_free(true);
     p.synchronize_paging();
-    return true;
 }
 
 // C1.4: the slot's turn (kvflash_slot_turn.h). R > kv_offset snapshots at the

@@ -350,7 +350,7 @@ private:
     int evict_oldest_(const char * why, int keep = -1);   // the oldest parked session (but `keep`) that can be evicted: its slot, -1 when none
     std::vector<bool> active_slots_() const;          // which slots decode a request now
     std::vector<KvFlashOwnedSession> parked_list_() const;   // every parked session with its owner
-    bool begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
+    void begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
     std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
     int capture_rows_ = 0;                            // query rows the graph captured this step
     void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset);

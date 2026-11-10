@@ -1824,8 +1824,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         int64_t slab = 0;
         for (const ggml_tensor * t : cache_.ssm_state)  if (t) slab += (int64_t)ggml_nbytes(t) / n_slots;
         for (const ggml_tensor * t : cache_.conv_state) if (t) slab += (int64_t)ggml_nbytes(t) / n_slots;
-        const char * sticky = std::getenv("LUCE_KVFLASH_SLOT_STICKY");
-        const bool sticky_on = !(sticky && sticky[0] == '0' && sticky[1] == '\0');
+        const bool sticky_on = luce::common::kvflash_slot_sticky_env();
         kc.ladder_bytes = kvflash_ladder_bytes(slab, kvflash_slot_recall_profile() && kvflash_prefill_reselect_ != 5, sticky_on);
         std::fprintf(stderr, "[kvflash] per-slot ladder: %d rungs x slab %lld B = %lld B (%.1f MiB)\n", sticky_on ? kKvFlashLadderRungs : 0,
                      (long long)slab, (long long)kc.ladder_bytes, kc.ladder_bytes / 1048576.0);
