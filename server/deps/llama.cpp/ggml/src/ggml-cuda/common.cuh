@@ -1526,6 +1526,8 @@ struct ggml_backend_cuda_context {
     // The split boundary's mix rows ([64][32] floats) and per-token block
     // counts (64 uints), allocated with the barrier.
     void * ds4_hc_split_scratch = nullptr;
+    // Split-k tile counters of the MMQ prefetching kernel (launch_mul_mat_q_pf).
+    int * mmq_splitk_counters = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

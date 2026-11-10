@@ -35,6 +35,17 @@ extern "C" void ggml_backend_cuda_set_mmq_twins_override(bool rows64, bool rows3
     g_mmq_twin_rows32_on.store(rows32, std::memory_order_relaxed);
 }
 
+// Split k in the 64-row twins' prefetching kernel (ggml-cuda.h), per calling
+// thread: graph_compute dispatches on the caller's thread, so one engine's
+// scope never reaches another's calls. Inside the scope a split call aims for
+// this many workgroups (4 per CU on a 64-CU R9700).
+static thread_local bool g_mmq_splitk_scope = false;
+static constexpr int MMQ_SPLITK_GRID = 256;
+
+extern "C" void ggml_backend_cuda_set_mmq_splitk_scope(bool on) {
+    g_mmq_splitk_scope = on;
+}
+
 extern "C" size_t ggml_backend_cuda_get_mmq_twin_launch_count(int tile_rows) {
     return tile_rows == 64 ? g_mmq_twin_rows64_launch_count :
            tile_rows == 32 ? g_mmq_twin_rows32_launch_count : 0;
@@ -271,25 +282,31 @@ static bool lucebox_mmq_big_tile_take(const ggml_type type, const int64_t ncols_
 // devices) run the parent dispatch below unchanged.
 namespace {
 
-bool luce_mmq_twin_launch_rows64(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+// The twin's entry (mmq_tile_twins.h); false when it does not take the call.
+bool luce_mmq_twin_launch(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+                          const bool rows32, const int mmq_x) {
     const void * a = &args;
-    switch (args.type_x) {
-        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows64_iq3_s  (ctx, a, stream);
-        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows64_iq3_xxs(ctx, a, stream);
-        default:                return false;
+    if (rows32) {
+        switch (args.type_x) {
+            case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows32_iq4_xs (ctx, a, stream, mmq_x);
+            case GGML_TYPE_Q4_K:    return mul_mat_q_case_rows32_q4_k   (ctx, a, stream, mmq_x);
+            case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows32_q5_k   (ctx, a, stream, mmq_x);
+            case GGML_TYPE_Q6_K:    return mul_mat_q_case_rows32_q6_k   (ctx, a, stream, mmq_x);
+            case GGML_TYPE_Q8_0:    return mul_mat_q_case_rows32_q8_0   (ctx, a, stream, mmq_x);
+            case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows32_iq3_s  (ctx, a, stream, mmq_x);
+            case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows32_iq3_xxs(ctx, a, stream, mmq_x);
+            case GGML_TYPE_Q3_K:    return mul_mat_q_case_rows32_q3_k   (ctx, a, stream, mmq_x);
+            case GGML_TYPE_IQ2_S:   return mul_mat_q_case_rows32_iq2_s  (ctx, a, stream, mmq_x);
+            default:                return false;
+        }
     }
-}
-
-bool luce_mmq_twin_launch_rows32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const void * a = &args;
     switch (args.type_x) {
-        case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows32_iq4_xs (ctx, a, stream);
-        case GGML_TYPE_Q4_K:    return mul_mat_q_case_rows32_q4_k   (ctx, a, stream);
-        case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows32_q5_k   (ctx, a, stream);
-        case GGML_TYPE_Q6_K:    return mul_mat_q_case_rows32_q6_k   (ctx, a, stream);
-        case GGML_TYPE_Q8_0:    return mul_mat_q_case_rows32_q8_0   (ctx, a, stream);
-        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows32_iq3_s  (ctx, a, stream);
-        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows32_iq3_xxs(ctx, a, stream);
+        case GGML_TYPE_IQ3_S:   return mul_mat_q_case_rows64_iq3_s  (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ3_XXS: return mul_mat_q_case_rows64_iq3_xxs(ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ4_XS:  return mul_mat_q_case_rows64_iq4_xs (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q5_K:    return mul_mat_q_case_rows64_q5_k   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_Q3_K:    return mul_mat_q_case_rows64_q3_k   (ctx, a, stream, mmq_x);
+        case GGML_TYPE_IQ2_S:   return mul_mat_q_case_rows64_iq2_s  (ctx, a, stream, mmq_x);
         default:                return false;
     }
 }
@@ -314,9 +331,11 @@ bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaS
         return false;
     }
     const bool rows32 = choice.tile == mmq_twin_tile::rows32;
+    // Only the 64-row twins' prefetching kernel (17-48 columns) reads it.
+    mmq_args twin_args = args;
+    twin_args.split_k_grid = !rows32 && call.ncols > MMQ_TWIN_MAX_COLS && g_mmq_splitk_scope ? MMQ_SPLITK_GRID : 0;
     // A twin that cannot serve the call launches nothing; the parent runs.
-    if (!(rows32 ? luce_mmq_twin_launch_rows32(ctx, args, stream)
-                 : luce_mmq_twin_launch_rows64(ctx, args, stream))) {
+    if (!luce_mmq_twin_launch(ctx, twin_args, stream, rows32, choice.mmq_x)) {
         return false;
     }
     ++(rows32 ? g_mmq_twin_rows32_launch_count : g_mmq_twin_rows64_launch_count);
