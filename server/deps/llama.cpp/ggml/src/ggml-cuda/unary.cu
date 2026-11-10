@@ -46,7 +46,7 @@ static __device__ __forceinline__ float op_relu(float x) {
 }
 
 static __device__ __forceinline__ float op_sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
+    return ggml_cuda_op_sigmoid_single(x);
 }
 
 static __device__ __forceinline__ float op_hardsigmoid(float x) {

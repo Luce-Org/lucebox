@@ -757,6 +757,8 @@ add_library(luce_common STATIC
     src/server/kv/checkpoint_store.cpp
     src/server/kv/cuts.cpp
     src/server/kv/kv_cache.cpp
+    src/server/kv/shared_prefixes.cpp
+    src/server/kv/prefix_pins.cpp
     src/server/kv/prefix_hash.cpp
     src/server/kv/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
@@ -1789,6 +1791,16 @@ if(LUCE_TESTS)
         set_tests_properties(test_cuda_copy_batch_disabled PROPERTIES
             SKIP_RETURN_CODE 77
             ENVIRONMENT "GGML_CUDA_DISABLE_COPY_BATCH=1")
+        # Hop copies kept off the peer copy kernel by the environment, also
+        # for the Qwen3.8 graphs that take it by default.
+        add_test(NAME test_cuda_copy_batch_peer_kernel_off COMMAND test_cuda_copy_batch)
+        set_tests_properties(test_cuda_copy_batch_peer_kernel_off PROPERTIES
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "GGML_CUDA_PEER_COPY_KERNEL=0")
+        add_test(NAME test_cuda_copy_batch_peer_batch_off COMMAND test_cuda_copy_batch)
+        set_tests_properties(test_cuda_copy_batch_peer_batch_off PROPERTIES
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "GGML_BATCH_PEER_COPIES=0")
     endif()
     # GPU F32 copy into a strided view (the PFlash scorer's chunked logits
     # copy; a one-key-wide last chunk used to take the dense transpose

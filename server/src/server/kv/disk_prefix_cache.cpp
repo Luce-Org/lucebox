@@ -306,7 +306,8 @@ OwnedSnapshot DiskPrefixCache::load(const std::vector<int32_t> & prompt_ids) {
         layout = layout_id_;
         const int idx = find_entry(hash);
         if (idx < 0) return {};
-        if (disk_->expired(disk_->entries_[(size_t)idx], disk_->now())) {
+        if (disk_->expired(disk_->entries_[(size_t)idx], disk_->now()) &&
+            !disk_->pinned_locked(disk_->entries_[(size_t)idx])) {
             disk_->remove_entry((size_t)idx, "ttl expired");
             return {};
         }
@@ -414,7 +415,8 @@ DiskPrefixCache::PrefixProbe DiskPrefixCache::longest_prefix(
     const uint64_t t = disk_->now();
     std::vector<uint32_t> lengths;
     for (const auto & e : disk_->entries_) {
-        if (e.layout_id != layout_id_ || disk_->expired(e, t)) continue;
+        if (e.layout_id != layout_id_ ||
+            (disk_->expired(e, t) && !disk_->pinned_locked(e))) continue;
         if (e.token_count > prompt_ids.size()) continue;
         if ((int)e.token_count < config_.min_tokens) continue;
         if (allowed_lengths &&
@@ -447,6 +449,7 @@ int DiskPrefixCache::prune_ancestors(const std::vector<int32_t> & tokens,
     for (size_t i = 0; i < disk_->entries_.size(); ++i) {
         const DiskStore::DiskEntry & e = disk_->entries_[i];
         if (e.layout_id != layout_id_ || e.token_count >= tokens.size()) continue;
+        if (e.pinned) continue;  // a pinned shared prefix stays
         if (hash_prefix(tokens.data(), (int)e.token_count) != e.token_hash) continue;
         if ((int)e.token_count <= keep_max) {
             head_kept = true;
@@ -467,6 +470,65 @@ int DiskPrefixCache::prune_ancestors(const std::vector<int32_t> & tokens,
         ++removed;
     }
     return removed;
+}
+
+std::string DiskPrefixCache::pin(const std::vector<int32_t> & tokens, bool on) {
+    if (off() || tokens.empty()) return {};
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    if (!layout_known_) return {};
+    const PrefixHash hash = hash_prefix(tokens.data(), (int)tokens.size());
+    const int idx = find_entry(hash);
+    if (idx < 0) return {};
+    disk_->set_pinned_locked(disk_->entries_[(size_t)idx], on);
+    return hex_string(layout_id_.data(), 16) + "/" + hex_string(hash.data(), 16) + ".dkv";
+}
+
+std::string DiskPrefixCache::file_path(const std::vector<int32_t> & tokens) {
+    if (off() || tokens.empty()) return {};
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    if (!layout_known_) return {};
+    const PrefixHash hash = hash_prefix(tokens.data(), (int)tokens.size());
+    if (find_entry(hash) < 0) return {};
+    return hex_string(layout_id_.data(), 16) + "/" + hex_string(hash.data(), 16) + ".dkv";
+}
+
+std::vector<std::string> DiskPrefixCache::pinned_files() {
+    std::vector<std::string> out;
+    if (off()) return out;
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    if (!layout_known_) return out;
+    const std::string layout = hex_string(layout_id_.data(), 16);
+    for (const auto & e : disk_->entries_) {
+        if (e.layout_id != layout_id_ || !disk_->pinned_locked(e)) continue;
+        out.push_back(layout + "/" + hex_string(e.token_hash.data(), 16) + ".dkv");
+    }
+    return out;
+}
+
+void DiskPrefixCache::unpin_file(const std::string & relative) {
+    if (off() || relative.empty()) return;
+    const fs::path rel(relative);
+    const std::string layout = rel.parent_path().filename().string();
+    const std::string name = rel.filename().string();
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    for (auto & e : disk_->entries_) {
+        const fs::path p(e.path);
+        if (p.filename() == name && p.parent_path().filename() == layout) {
+            disk_->set_pinned_locked(e, false);
+        }
+    }
+}
+
+std::string DiskPrefixCache::layout_name() const {
+    if (!disk_) return {};
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    return layout_known_ ? hex_string(layout_id_.data(), 16) : std::string();
+}
+
+bool DiskPrefixCache::contains(const std::vector<int32_t> & tokens) {
+    if (off() || tokens.empty()) return false;
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    return layout_known_ && find_entry(hash_prefix(tokens.data(), (int)tokens.size())) >= 0;
 }
 
 // ─── Save ───────────────────────────────────────────────────────────────
@@ -529,7 +591,11 @@ bool DiskPrefixCache::save_async(OwnedSnapshot snap,
                      mib(est_size));
         return false;
     }
-    disk_->make_room_locked(est_size);
+    if (!disk_->make_room_locked(est_size)) {
+        std::fprintf(stderr, "[disk-cache] skip save: %.1f MB does not fit beside "
+                     "the pinned files\n", mib(est_size));
+        return false;
+    }
 
     auto job = std::make_shared<DiskStore::PendingWrite>();
     job->snap = std::move(snap);

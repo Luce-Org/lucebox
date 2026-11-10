@@ -43,10 +43,11 @@ static __device__ __forceinline__ void hc_q8_1_pair(block_q8_1 * q8, const int64
 }
 
 // two elements per thread per iteration, packed 32-bit accesses. q81: xn's q8_1 rows too ([hc * n_embd, T], the HC
-// down projection's MMVQ input; hc * n_embd a multiple of MATRIX_ROW_PADDING, so no padding blocks).
+// down projection's MMVQ input; hc * n_embd a multiple of MATRIX_ROW_PADDING, so no padding blocks). block_out2 set:
+// the block output is block_out + block_out2, added as binbcast.cu's op_add adds them.
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
-        const float * block_out, const float * gamma,
+        const float * block_out, const float * block_out2, const float * gamma,
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps, int8_t * q8,
         block_q8_1 * q81) {
@@ -59,6 +60,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     const float * res = residual  + row * n_embd;
     float *       dst = out_res   + row * n_embd;
     const float * blk = block_out + (int64_t) t * n_embd;
+    const float * blk2 = block_out2 ? block_out2 + (int64_t) t * n_embd : nullptr;
     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
     float xs[2 * KP];
     float tmp = 0.0f;
@@ -68,14 +70,19 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
         xs[2 * k] = 0.0f; xs[2 * k + 1] = 0.0f;
         if (col + 1 < n_embd) {
             const float2 r = *(const float2 *)(res + col);
-            const float2 m = *(const float2 *)(blk + col);
+            float2 m = *(const float2 *)(blk + col);
+            if (blk2) {
+                const float2 m2 = *(const float2 *)(blk2 + col);
+                m = make_float2(q4x_add_rn(m.x, m2.x), q4x_add_rn(m.y, m2.y));
+            }
             const float a0 = q4x_add_rn(r.x, q4x_mul_rn(m.x, w));
             const float a1 = q4x_add_rn(r.y, q4x_mul_rn(m.y, w));
             *(float2 *)(dst + col) = make_float2(a0, a1);
             xs[2 * k] = a0; xs[2 * k + 1] = a1;
             tmp += a0 * a0 + a1 * a1;
         } else if (col < n_embd) {
-            const float a0 = q4x_add_rn(res[col], q4x_mul_rn(blk[col], w));
+            const float mb = blk2 ? q4x_add_rn(blk[col], blk2[col]) : blk[col];
+            const float a0 = q4x_add_rn(res[col], q4x_mul_rn(mb, w));
             dst[col] = a0;
             xs[2 * k] = a0;
             tmp += a0 * a0;
@@ -247,10 +254,13 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     GGML_ASSERT(ggml_nelements(a.out_res) == ggml_nelements(a.out_xn) && ggml_are_same_shape(a.out_res, a.residual));
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
                 ggml_nelements(a.inject) == hc * n_tokens);
+    GGML_ASSERT(!a.block_out2 || (ggml_are_same_shape(a.block_out, a.block_out2) && ggml_is_contiguous(a.block_out) &&
+                                   ggml_is_contiguous(a.block_out2) && a.block_out2->type == GGML_TYPE_F32));
 
     hc_combine_norm_f32_b256<<<dim3((unsigned) hc, (unsigned) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream()>>>(
         (const float *) a.inject->data, (const float *) a.residual->data,
-        (const float *) a.block_out->data, (const float *) a.gamma->data,
+        (const float *) a.block_out->data, a.block_out2 ? (const float *) a.block_out2->data : nullptr,
+        (const float *) a.gamma->data,
         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
         (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.out_q8, (block_q8_1 *) a.out_q8_1);
     CUDA_CHECK(cudaGetLastError());

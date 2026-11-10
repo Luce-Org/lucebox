@@ -23,6 +23,11 @@ extern "C" { GGML_BACKEND_API int ggml_cuda_test_rms_norm_scale(const float * x,
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
                                  void * q8_out = nullptr, int ncols_q8 = 0);
 
+// The GDN output gate in one launch: gated = (rms_norm(x) * w) * sigmoid(z), the
+// values RMS_NORM, MUL, SIGMOID and MUL write; q8_out as above.
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+                                 ggml_tensor * sig, ggml_tensor * gated, void * q8_out = nullptr, int ncols_q8 = 0);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,

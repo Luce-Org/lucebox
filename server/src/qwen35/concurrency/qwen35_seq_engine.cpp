@@ -20,6 +20,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1330,8 +1331,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
     staged_round.device_lengths_dirty = true;
-    if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
-        GGML_STATUS_SUCCESS) {
+    // A batched verify of two or more lanes may split k in its MMQ calls
+    // (ggml_backend_cuda_set_mmq_splitk_scope): not bit-exact against the
+    // unsplit sum, which a batch of concurrent requests never was. A single
+    // lane keeps the unsplit kernels. The launches happen inside
+    // graph_compute, so the scope closes after it.
+    ggml_backend_cuda_set_mmq_splitk_scope(spec_count >= 2);
+    const ggml_status verify_status =
+        ggml_backend_graph_compute(b_.target_backend_, graph.gf);
+    ggml_backend_cuda_set_mmq_splitk_scope(false);
+    if (verify_status != GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
         return result;
     }
@@ -1570,7 +1579,38 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         return result;
     }
 
-    if (!ggml_backend_cuda_tree_commit_transaction(
+    // Validate from the host copies just uploaded (no read-back) and commit
+    // with one launch per kind. A refused preflight changes nothing, so the
+    // device-validated transaction then runs as before.
+    bool committed = false;
+    if (static_cast<int64_t>(accepted_prefixes.size()) ==
+            ggml_nelements(graph.accepted_prefixes) &&
+        static_cast<int64_t>(commit_slots.size()) ==
+            ggml_nelements(graph.commit_slot_ids) &&
+        static_cast<int64_t>(commit_rows.size()) ==
+            ggml_nelements(graph.commit_rows) &&
+        static_cast<int64_t>(feature_commit_rows.size()) ==
+            ggml_nelements(graph.feature_commit_rows)) {
+        committed = ggml_backend_cuda_tree_commit_transaction_host(
+            caches.data(), static_cast<int>(caches.size()),
+            graph.tree_features, b_.cache_.target_feat,
+            graph.feature_commit_rows,
+            replay_logs.data(), states.data(), conv_inputs.data(),
+            conv_states.data(), static_cast<int>(n_delta),
+            graph.commit_rows, graph.accepted_prefixes,
+            graph.commit_slot_ids,
+            fixed_chain_.scratch_base, fixed_chain_.scratch_stride,
+            commit_rows.data(), accepted_prefixes.data(),
+            commit_slots.data(), feature_commit_rows.data());
+        static std::atomic<bool> warned{false};
+        if (!committed && !warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] host-validated commit preflight refused; "
+                "using the device-validated commit transaction\n");
+        }
+    }
+    if (!committed &&
+        !ggml_backend_cuda_tree_commit_transaction(
             caches.data(), static_cast<int>(caches.size()),
             graph.tree_features, b_.cache_.target_feat,
             graph.feature_commit_rows,

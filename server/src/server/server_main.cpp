@@ -140,6 +140,7 @@ static void print_usage(const char * prog) {
         "  --draft <path>       Draft model for speculative decode (DFlash for Qwen,\n"
         "                       Gemma and Laguna; DSpark for DeepSeek4; MTP for Qwen4Exp).\n"
         "                       Qwen4Exp auto-discovers <model repo>/MTP/mtp-*.gguf.\n"
+        "  --no-draft           Disable draft model and speculative decoding (target only)\n"
         "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
         "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --text-encoder <path> Qwen3.5-9B GGUF for a moss-image (text-to-image) model,\n"
@@ -280,6 +281,7 @@ static void print_usage(const char * prog) {
         "  --specla-top-k <K>  SpecLA draft-tree width (default: 4)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --budget <N>         Alias for --ddtree-budget (<=0 disables speculative decode)\n"
         "  --ddtree-tau <T>     Confidence margin on cumulative log-prob\n"
         "                       (default: 6 with --specla; otherwise off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
@@ -376,6 +378,11 @@ static void print_usage(const char * prog) {
         "                              Default disk prefix-cache policy (default: full).\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "                              Needs RAM prefix slots to write new entries.\n"
+        "  --shared-prefix auto|freeze|off\n"
+        "                              The tools and system prompt a client repeats in\n"
+        "                              every request (default: auto). auto captures it\n"
+        "                              where requests agree, freeze keeps the known cuts\n"
+        "                              still (benchmarks), off is plain prefix caching.\n"
         "\n"
         "Chat template (optional, overrides the model-family renderer):\n"
         "  --chat-template-file <path>  Load a Jinja chat template file.\n"
@@ -559,6 +566,9 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--no-draft") == 0) {
+            bargs.draft_path = std::nullopt;
+            bargs.fast_rollback = false;
         } else if (std::strcmp(argv[i], "--mmproj") == 0) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "[server] --mmproj needs a projector GGUF path\n");
@@ -919,8 +929,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
-        } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
+        } else if ((std::strcmp(argv[i], "--ddtree-budget") == 0 ||
+                    std::strcmp(argv[i], "--budget") == 0) && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+            if (bargs.ddtree_budget <= 0) {
+                bargs.ddtree_mode = false;
+                bargs.fast_rollback = false;
+            }
         } else if (std::strcmp(argv[i], "--ddtree-tau") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             char * end = nullptr;
@@ -1176,6 +1191,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             sconfig.disk_cache_policy = policy;
+        } else if (std::strcmp(argv[i], "--shared-prefix") == 0 && i + 1 < argc) {
+            if (!parse_shared_prefix_mode(argv[++i], sconfig.shared_prefix)) {
+                std::fprintf(stderr, "[server] --shared-prefix must be auto, freeze or off\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
             std::fprintf(stderr, "[server] --disk-prefix-cache-compress is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {

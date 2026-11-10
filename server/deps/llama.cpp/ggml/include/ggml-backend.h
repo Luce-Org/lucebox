@@ -348,6 +348,10 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // The next allocation plans its graph afresh. Without this a graph with the previous one's node and leaf counts
+    // reuses the previous plan by node index whenever every tensor fits, which is only right for the same topology.
+    GGML_API void                 ggml_backend_sched_replan(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

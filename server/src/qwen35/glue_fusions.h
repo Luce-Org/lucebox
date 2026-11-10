@@ -66,7 +66,7 @@ struct StridedGdnFacts {
     bool fused_chain = false;      // dense single-sequence chain on the fused sequential CUDA
                                    // kernels (not tree, mapped, compact, ragged, chunked, SpecLA)
     bool raw_gates = false;        // the GDN kernel derives the gates (ssm_gate_ba)
-    bool mapped_verify = false;    // concurrent mapped verify: already reads the stack
+    bool mapped_verify = false;    // concurrent mapped verify: already reads the ba stack
     bool stacked_z = false;        // z is a row slice of the attn_gate|qkv stack
     bool z_copy = false;           // the parent copies that slice (non-contiguous, T > 1)
     bool cuda_backend = false;     // CUDA/HIP (the fused silu*mul kernel reads strides)
@@ -87,15 +87,18 @@ inline StridedGdnPlan strided_gdn_plan(const StridedGdnFacts & f) {
     const bool ba_copied = f.stacked_ba && f.ba_copy && !f.mapped_verify;
     const bool z_copied = f.stacked_z && f.z_copy;
     p.gates = ba_copied && f.fused_chain && f.raw_gates;
-    p.z = z_copied && f.fused_chain && f.cuda_backend && f.fusion_enabled;
+    // The concurrent mapped verify's GDN output is the same contiguous
+    // [d_inner, T] rows as the chain's, so the fused silu*mul reads its z in
+    // place too.
+    p.z = z_copied && (f.fused_chain || f.mapped_verify) && f.cuda_backend && f.fusion_enabled;
     if (!(ba_copied && !p.gates) && !(z_copied && !p.z)) return p;
     if (!f.cuda_backend) {
         p.inert_why = "copies stay: not a CUDA/HIP backend";
-    } else if (!f.fused_chain) {
+    } else if (!f.fused_chain && !f.mapped_verify) {
         p.inert_why = "copies stay: only the dense single-sequence chain (single-request prefill and "
-                      "capture verify on the fused kernels) reads the stacks in place; tree verify, "
-                      "concurrent mapped verify, compact multi-sequence decode, ragged prefill, chunked, "
-                      "SpecLA and LUCE_QWEN35_NO_FUSED_KERNELS keep them";
+                      "capture verify on the fused kernels) and the concurrent mapped verify read the "
+                      "stacks in place; tree verify, compact multi-sequence decode, ragged prefill, "
+                      "chunked, SpecLA and LUCE_QWEN35_NO_FUSED_KERNELS keep them";
     } else if (ba_copied && !p.gates) {
         p.inert_why = "beta/alpha copies stay: no raw-gate kernel on this layer (ssm_gate_ba missing)";
     } else {

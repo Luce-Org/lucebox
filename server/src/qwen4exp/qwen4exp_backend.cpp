@@ -25,6 +25,89 @@
 
 namespace luce::common {
 
+// The expert device's read-ahead of each split layer's picks (qwen4exp_graph.cpp, kReadAheadPicks): per layer with
+// hot experts, the cold experts' router rows as Q8_0 [n_embd, n_cold] and their expert ids, on the expert device.
+// A layer without them (or a failed allocation) only loses the read-ahead: the output does not depend on it.
+static void load_qwen4exp_read_ahead(Qwen4ExpWeights & w) {
+    const int64_t qk = ggml_blck_size(GGML_TYPE_Q8_0);
+    std::vector<std::vector<int32_t>> cold_ids((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const ggml_tensor * R = w.layers[(size_t) il].ffn_gate_inp;
+        if (!w.hot_lut[(size_t) il] || !R || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) ||
+            R->ne[0] != w.n_embd || R->ne[1] != w.n_expert || w.n_embd % qk != 0) continue;
+        const std::vector<int32_t> & hot = w.hot->layers[(size_t) il].hot_local_by_global;
+        for (int e = 0; e < w.n_expert; ++e) if (hot[(size_t) e] < 0) cold_ids[(size_t) il].push_back(e);
+    }
+    w.ahead_router.assign((size_t) w.n_layer, nullptr);
+    w.ahead_ids.assign((size_t) w.n_layer, nullptr);
+    ggml_context * ctx = w.derived.open(2 * (size_t) w.n_layer);
+    for (int il = 0; ctx && il < w.n_layer; ++il) {
+        const int64_t n_cold = (int64_t) cold_ids[(size_t) il].size();
+        if (n_cold == 0) continue;
+        w.ahead_router[(size_t) il] = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, w.n_embd, n_cold);
+        w.ahead_ids[(size_t) il] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cold);
+    }
+    if (!ctx || !w.derived.commit(w.expert_backend)) {
+        w.ahead_router.clear();
+        w.ahead_ids.clear();
+        std::fprintf(stderr, "[qwen4exp] read-ahead: allocation failed, off\n");
+        return;
+    }
+    std::vector<float> all((size_t) w.n_embd * (size_t) w.n_expert), rows;
+    std::vector<uint8_t> q;
+    size_t bytes = 0;
+    int layers = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (!w.ahead_router[(size_t) il]) continue;
+        const std::vector<int32_t> & ids = cold_ids[(size_t) il];
+        ggml_backend_tensor_get(w.layers[(size_t) il].ffn_gate_inp, all.data(), 0, all.size() * sizeof(float));
+        rows.resize(ids.size() * (size_t) w.n_embd);
+        for (size_t j = 0; j < ids.size(); ++j) {
+            std::memcpy(rows.data() + j * (size_t) w.n_embd, all.data() + (size_t) ids[j] * (size_t) w.n_embd,
+                        (size_t) w.n_embd * sizeof(float));
+        }
+        q.resize(ggml_nbytes(w.ahead_router[(size_t) il]));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, rows.data(), q.data(), 0, (int64_t) ids.size(), w.n_embd, nullptr);
+        ggml_backend_tensor_set(w.ahead_router[(size_t) il], q.data(), 0, q.size());
+        ggml_backend_tensor_set(w.ahead_ids[(size_t) il], ids.data(), 0, ids.size() * sizeof(int32_t));
+        bytes += q.size() + ids.size() * sizeof(int32_t);
+        ++layers;
+    }
+    std::fprintf(stderr, "[qwen4exp] read-ahead: cold routers of %d layers on the expert device (%.1f MiB)\n", layers,
+                 bytes / 1048576.0);
+}
+
+// Split mode: the LM head's last rows on the expert device, which computes their logits while the target computes
+// the others (qwen4exp_graph.cpp, build_lm_head). The verify head (248320 Q8_0 rows) is the round's largest matrix
+// and the expert device idles meanwhile. Both GPUs run those products on the RDNA4 Q8_0 matvec
+// (ggml_backend_cuda_mul_mat_rdna4_rows), so every logit keeps the bits of the target's single product; without
+// that kernel on both, or without room for the rows, the target computes them all.
+// The expert device's share. The Strix streams Q8_0 rows at ~230 GB/s against the R9700's ~640, which alone would
+// balance at ~26%, but its part also pays the hop in, its wake and the logits back. Measured on an R9700 + Ryzen AI
+// Max+ PRO 495 (split decode, same text at every share): 10% +0.14%, 15% +0.39%, 20% +0.54%, 25% +0.05%, 30% -0.6%.
+static constexpr int kLmHeadTailPercent = 20;
+
+static void load_qwen4exp_output_tail(Qwen4ExpWeights & w, ggml_backend_t target) {
+    const ggml_tensor * out = w.output;
+    if (!w.expert_backend || !out || out->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(out) || out->ne[2] != 1 ||
+        out->ne[3] != 1 || !ggml_backend_cuda_rdna4_rows_device(ggml_backend_cuda_get_device_id(target)) ||
+        !ggml_backend_cuda_rdna4_rows_device(ggml_backend_cuda_get_device_id(w.expert_backend))) return;
+    const int64_t rows = out->ne[1], tail = rows * kLmHeadTailPercent / 100;
+    if (tail <= 0 || tail >= rows) return;
+    ggml_context * ctx = w.derived.open(1);
+    ggml_tensor * t = ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, out->ne[0], tail) : nullptr;
+    if (!t || !w.derived.commit(w.expert_backend)) {
+        std::fprintf(stderr, "[qwen4exp] LM head: no room for its last rows on the expert device\n");
+        return;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(t));   // through the host: the two GPUs need not reach each other
+    ggml_backend_tensor_get(out, bytes.data(), (size_t) (rows - tail) * out->nb[1], bytes.size());
+    ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+    w.output_tail = t;
+    std::fprintf(stderr, "[qwen4exp] LM head: rows %lld..%lld of %lld on the expert device (%.1f MiB)\n",
+                 (long long) (rows - tail), (long long) rows - 1, (long long) rows, bytes.size() / 1048576.0);
+}
+
 // Split mode: copy the most-routed experts of the routing-stats CSV, up to
 // `budget` bytes of them, to the target, plus the per-layer lookup tables that
 // send each pick to one device.
@@ -95,6 +178,7 @@ static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & 
         ggml_backend_tensor_set(w.hot_lut[(size_t) il], hot.data(), 0, hot.size() * sizeof(int32_t));
         ggml_backend_tensor_set(w.cold_lut[(size_t) il], cold.data(), 0, cold.size() * sizeof(int32_t));
     }
+    load_qwen4exp_read_ahead(w);
     std::fprintf(stderr, "[qwen4exp] hot experts: %d of %d (%.2f GiB) on the target, %.1f%% of the profiled picks\n",
                  placement.total_hot, w.n_layer * w.n_expert, hot_bytes / (1ull << 30),
                  routes ? 100.0 * (double) hot_routes / (double) routes : 0.0);
@@ -369,6 +453,7 @@ bool Qwen4ExpBackend::load_target() {
                      luce_last_error());
         return false;
     }
+    load_qwen4exp_output_tail(weights_, backend_);
     size_kvflash_pool();
     if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");

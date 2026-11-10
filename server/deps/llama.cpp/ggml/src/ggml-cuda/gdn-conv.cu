@@ -202,3 +202,97 @@ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
         m.qk_channels, m.norm_eps, m.norm_scale, m.norm_bias, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
 }
+
+#if defined(GGML_USE_HIP)
+// One thread per channel, 128 per block, so a block holding q/k channels is one head. The concat row (history, then
+// the T inputs) stays in registers; the history and window copies write slices of it. The conv is ssm_conv_f32's
+// expression; the norm is gdn_conv_direct_norm_kernel's epilogue with one head per block: the four warp partials
+// combine as (p0+p2)+(p1+p3), as rms_norm_f32<256> combines them for a 128-wide row. blockIdx.y is the slot (one
+// with no slot ids).
+template <int T>
+static __global__ void __launch_bounds__(128) gdn_conv_step_kernel(const ggml_cuda_gdn_conv_step_args a) {
+    constexpr int ncols = 128;
+    const int c = blockIdx.x * 128 + threadIdx.x;
+    const int s = blockIdx.y;
+    const size_t slab = a.slot_ids ? (size_t) a.slot_ids[s] * a.slab : 0;
+    const float * hist = a.hist + slab;
+    float * state = a.state + slab;
+    const float * x = a.x + (size_t) s * a.x_slot;
+    float * y = a.y + (size_t) s * a.y_slot;
+    float row[3 + T];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) row[j] = hist[(size_t) c * 3 + j];
+#pragma unroll
+    for (int t = 0; t < T; ++t) row[3 + t] = x[(size_t) t * a.x_stride + c];
+    float wr[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) wr[j] = a.w[(size_t) c * 4 + j];
+    if (a.ci) {
+#pragma unroll
+        for (int j = 0; j < 3 + T; ++j) a.ci[(size_t) c * (3 + T) + j] = row[j];
+    }
+#pragma unroll
+    for (int k = 0; k < 3; ++k) state[(size_t) c * 3 + k] = row[T + k];
+    if (a.win) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) a.win[(size_t) t * a.win_s2 + (size_t) c * a.win_s1 + k] = row[t + 1 + k];
+        }
+    }
+    float yb[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sumf += row[t + j] * wr[j];
+        yb[t] = ggml_cuda_op_silu_single(sumf);
+        y[(size_t) t * a.y_stride + c] = yb[t];
+    }
+    if ((int) blockIdx.x * 128 >= a.qk_channels) return;   // the same for the whole block
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float s_part[T][4];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        float tmp;
+        {
+#pragma clang fp contract(off)   // as in gdn_conv_direct_norm_kernel: a plain square, not an fma into the first add
+            tmp = yb[t] * yb[t];
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (lane == 0) s_part[t][warp] = tmp;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        const float sum = (s_part[t][0] + s_part[t][2]) + (s_part[t][1] + s_part[t][3]);
+        float scale;
+        {
+#pragma clang fp contract(off)   // sum / 128 becomes a multiply; keep it out of an fma with eps
+            scale = rsqrtf(sum / ncols + a.eps);
+        }
+        const float normalized = __fmul_rn(scale, yb[t]);
+        a.qk[(size_t) s * a.qk_slot + (size_t) t * a.qk_stride + c] = a.post_scale * normalized + a.bias;
+    }
+}
+
+void ggml_cuda_gdn_conv_step(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_step_args & a) {
+    GGML_ASSERT(a.C > 0 && a.C % 128 == 0 && a.T >= 1 && a.T <= GGML_CUDA_GDN_CONV_STEP_MAX_T);
+    GGML_ASSERT(a.qk_channels >= 0 && a.qk_channels <= a.C && a.qk_channels % 128 == 0 && (a.qk_channels == 0 || a.qk));
+    GGML_ASSERT(a.S >= 1 && a.S <= 65535 && (a.S == 1 || (a.slot_ids && a.T == 1 && !a.ci && !a.win)));
+    const dim3 grid((unsigned) (a.C / 128), (unsigned) a.S);
+    cudaStream_t stream = ctx.stream();
+    switch (a.T) {
+        case 1: gdn_conv_step_kernel<1><<<grid, 128, 0, stream>>>(a); break;
+        case 2: gdn_conv_step_kernel<2><<<grid, 128, 0, stream>>>(a); break;
+        case 3: gdn_conv_step_kernel<3><<<grid, 128, 0, stream>>>(a); break;
+        case 4: gdn_conv_step_kernel<4><<<grid, 128, 0, stream>>>(a); break;
+        case 5: gdn_conv_step_kernel<5><<<grid, 128, 0, stream>>>(a); break;
+        case 6: gdn_conv_step_kernel<6><<<grid, 128, 0, stream>>>(a); break;
+        case 7: gdn_conv_step_kernel<7><<<grid, 128, 0, stream>>>(a); break;
+        case 8: gdn_conv_step_kernel<8><<<grid, 128, 0, stream>>>(a); break;
+        default: GGML_ABORT("gdn conv step: T out of range");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif // defined(GGML_USE_HIP)

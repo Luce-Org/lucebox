@@ -5,7 +5,9 @@
 #include "ggml-cuda/vecdotq.cuh"
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-fused-combine.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -472,6 +474,110 @@ static void launch_moe_combine(
         experts_nb0, experts_nb1, experts_nb2,
         weights_nb0, weights_nb1, output_nb0, output_nb1,
         value_scale);
+}
+
+// GGML_MOE_FUSED_PREFETCH: reads the ranges so the device's last-level cache holds them for the nodes that follow
+// (the R9700's 64 MB Infinity Cache keeps 56 MB read this way: a warm 48 MB read takes 39 us, a cold one 90-100).
+// Nothing the graph reads is written: the loads feed an XOR that only the first thread stores, into the node's own
+// one-element output.
+struct moe_prefetch_ranges {
+    const uint4 * p[GGML_MAX_SRC];
+    int64_t       n[GGML_MAX_SRC];   // 16-byte words
+    int           count;
+};
+
+static __global__ void moe_prefetch_kernel(const moe_prefetch_ranges r, uint32_t * sink) {
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    uint32_t acc = 0;
+    for (int k = 0; k < r.count; ++k) {
+        const uint4 * p = r.p[k];
+        const int64_t n = r.n[k];
+        int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+        for (; i + 3 * stride < n; i += 4 * stride) {   // four loads in flight per thread
+            const uint4 a = p[i], b = p[i + stride], c = p[i + 2 * stride], d = p[i + 3 * stride];
+            acc ^= a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w ^ c.x ^ c.y ^ c.z ^ c.w ^ d.x ^ d.y ^ d.z ^ d.w;
+        }
+        for (; i < n; i += stride) {
+            const uint4 a = p[i];
+            acc ^= a.x ^ a.y ^ a.z ^ a.w;
+        }
+    }
+    if (acc == 0x9e3779b9u) {   // every thread's loads stay live; the store almost never runs
+        sink[0] = acc;
+    }
+}
+
+#if defined(GGML_USE_HIP)
+// GGML_MOE_FUSED_WAKE_HOLD: one lane sleeps between polls of the router's post count until it moves past the count
+// this slot's last hold saw, or max_ticks of the constant-rate wall clock pass; then records what it saw. A post that
+// came before the hold ends it at once; a post with no hold after it (the hold was not reached) is absorbed by the
+// next hold of the slot, which then passes at once.
+static __global__ void k_wake_hold(const uint32_t * post, uint32_t * seen, const long long max_ticks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const uint32_t s = __hip_atomic_load(seen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    const long long t0 = wall_clock64();
+    uint32_t p = __hip_atomic_load(post, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    while (p == s && wall_clock64() - t0 < max_ticks) {
+        __builtin_amdgcn_s_sleep(2);
+        p = __hip_atomic_load(post, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __hip_atomic_store(seen, p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+#endif // defined(GGML_USE_HIP)
+
+// GGML_MOE_FUSED_PREFETCH_ROWS: every block builds the same expert list in shared memory (rank order, each expert
+// once, at most max_experts), then blockIdx.y takes one expert and blockIdx.x a share of its slices.
+// The sink is written only when a thread's XOR hits a fixed value, so every thread's loads stay live.
+struct moe_prefetch_stacks {
+    const char * base[GGML_MAX_SRC];
+    int64_t      slice[GGML_MAX_SRC];      // bytes per expert (nb[2]), a multiple of 16
+    int64_t      n_expert[GGML_MAX_SRC];
+    int          count;
+};
+
+static __global__ void moe_prefetch_rows_kernel(
+        const int32_t * picks, const int k, const int n_rows, const int ne1, const int64_t stride1, const int64_t stride2,
+        const int32_t * map, const int n_map, const moe_prefetch_stacks s, const int max_experts, uint32_t * sink) {
+    __shared__ int list[64];
+    __shared__ int n_list;
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int r = 0; r < k && n < max_experts; ++r) {
+            for (int t = 0; t < n_rows && n < max_experts; ++t) {
+                int e = picks[(int64_t) (t % ne1) * stride1 + (int64_t) (t / ne1) * stride2 + r];
+                if (map) e = e >= 0 && e < n_map ? map[e] : -1;
+                if (e < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < n; ++j) seen |= list[j] == e;
+                if (!seen) list[n++] = e;
+            }
+        }
+        n_list = n;
+    }
+    __syncthreads();
+    if ((int) blockIdx.y >= n_list) return;
+    const int e = list[blockIdx.y];
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    uint32_t acc = 0;
+    for (int q = 0; q < s.count; ++q) {
+        if (e >= s.n_expert[q]) continue;
+        const uint4 * p = (const uint4 *) (s.base[q] + (int64_t) e * s.slice[q]);
+        const int64_t n = s.slice[q] / (int64_t) sizeof(uint4);
+        int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+        for (; i + 3 * stride < n; i += 4 * stride) {
+            const uint4 a = p[i], b = p[i + stride], c = p[i + 2 * stride], d = p[i + 3 * stride];
+            acc ^= a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w ^ c.x ^ c.y ^ c.z ^ c.w ^ d.x ^ d.y ^ d.z ^ d.w;
+        }
+        for (; i < n; i += stride) {
+            const uint4 a = p[i];
+            acc ^= a.x ^ a.y ^ a.z ^ a.w;
+        }
+    }
+    if (acc == 0x9e3779b9u) {
+        sink[0] = acc;
+    }
 }
 
 static __global__ void ds4_peer_copy_f32_kernel(
@@ -1035,6 +1141,69 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                                        cudaMemcpyDeviceToDevice, ctx.stream()));
         }
         fn(user, dst->data, n, (void *) ctx.stream());
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_WAKE_HOLD) {
+#if defined(GGML_USE_HIP)
+        static int khz[GGML_CUDA_MAX_DEVICES] = {};
+        if (khz[ctx.device] == 0) {
+            int wc = 0;
+            khz[ctx.device] = hipDeviceGetAttribute(&wc, hipDeviceAttributeWallClockRate, ctx.device) == hipSuccess &&
+                    wc >= 1000 ? wc : 100000;
+        }
+        const int slot = ggml_get_op_params_i32(dst, 1) - 1;
+        GGML_ASSERT(slot >= 0 && slot < GGML_MOE_FUSED_WAKE_SLOTS);
+        const long long ticks = (long long) ggml_get_op_params_i32(dst, 2) * (khz[ctx.device] / 1000);
+        uint32_t * f = ggml_cuda_wake_flags();
+        k_wake_hold<<<1, 32, 0, ctx.stream()>>>(f + slot, f + GGML_MOE_FUSED_WAKE_SLOTS + slot, ticks);
+        CUDA_CHECK(cudaGetLastError());
+#endif // defined(GGML_USE_HIP)
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_PREFETCH_ROWS) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == 1);
+        const ggml_tensor * picks = dst->src[0];
+        const ggml_tensor * map = dst->src[1];
+        GGML_ASSERT(picks && picks->type == GGML_TYPE_I32 && picks->ne[3] == 1);
+        const int max_experts = std::min(ggml_get_op_params_i32(dst, 1), 64);
+        moe_prefetch_stacks st = {};
+        for (int i = 2; i < GGML_MAX_SRC && dst->src[i] != nullptr; ++i) {
+            const ggml_tensor * t = dst->src[i];
+            GGML_ASSERT(t->nb[2] % sizeof(uint4) == 0);
+            st.base[st.count] = (const char *) t->data;
+            st.slice[st.count] = (int64_t) t->nb[2];
+            st.n_expert[st.count] = t->ne[2];
+            st.count++;
+        }
+        if (st.count == 0 || max_experts < 1) {
+            return;
+        }
+        const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        const dim3 grid((4 * nsm + max_experts - 1) / max_experts, max_experts);
+        moe_prefetch_rows_kernel<<<grid, 256, 0, ctx.stream()>>>(
+            (const int32_t *) picks->data, (int) picks->ne[0], (int) (picks->ne[1] * picks->ne[2]), (int) picks->ne[1],
+            (int64_t) (picks->nb[1] / sizeof(int32_t)), (int64_t) (picks->nb[2] / sizeof(int32_t)),
+            map ? (const int32_t *) map->data : nullptr, map ? (int) ggml_nelements(map) : 0, st, max_experts,
+            (uint32_t *) dst->data);
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_PREFETCH) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == 1);
+        uint64_t left = 0;
+        memcpy(&left, &dst->op_params[2], sizeof(left));
+        moe_prefetch_ranges r = {};
+        for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr && left >= sizeof(uint4); ++i) {
+            const uint64_t bytes = std::min<uint64_t>(ggml_nbytes(dst->src[i]), left);
+            r.p[r.count] = (const uint4 *) dst->src[i]->data;
+            r.n[r.count] = (int64_t) (bytes / sizeof(uint4));
+            r.count++;
+            left -= bytes;
+        }
+        if (r.count == 0) {
+            return;
+        }
+        moe_prefetch_kernel<<<4 * ggml_cuda_info().devices[ctx.device].nsm, 256, 0, ctx.stream()>>>(
+            r, (uint32_t *) dst->data);
         return;
     }
     if (mode == GGML_MOE_FUSED_DEFERRED_PEER_COPY) {

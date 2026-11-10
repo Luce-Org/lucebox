@@ -582,6 +582,40 @@ struct rope_norm_args {
     float         eps = 0.0f;
 };
 
+// One head row of the fused chain, called by every thread of a 256-thread block (it holds two block barriers):
+// rms_norm_f32<256, true>'s reduction (one column per thread, block_reduce), (scale * x) * gamma into LDS, then this
+// thread's pair j rotated with rope_multi's FMA form (rot) or copied (pair && !rot).
+static __device__ __forceinline__ void norm_rope_row(const float * xr, float * dr, const float * g, const int ne00,
+        const int n_dims, const float eps, const int j, const bool pair, const bool rot, const float cos_theta,
+        const float sin_theta, float * s_sum, float * row) {
+    const int tid = threadIdx.x;
+    float tmp = 0.0f;
+    for (int col = tid; col < ne00; col += 256) {
+        const float xi = xr[col];
+        tmp += xi * xi;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float mean  = tmp / ne00;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ne00; col += 256) {
+        row[col] = scale * xr[col] * g[col];
+    }
+    __syncthreads();
+    if (pair) {
+        const int i0 = 2 * j;
+        if (!rot) {
+            dr[i0 + 0] = row[i0 + 0];
+            dr[i0 + 1] = row[i0 + 1];
+        } else {
+            const float x0 = row[j];
+            const float x1 = row[j + n_dims/2];
+            dr[j]            = fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
+            dr[j + n_dims/2] = fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
+        }
+    }
+    __syncthreads();
+}
+
 template <bool forward, bool has_ff, bool use_tab>
 static __global__ void __launch_bounds__(256) rope_multi_heads_norm(const float * x, float * dst, const int ne00,
         const int ne01, const int ne02, const int s01, const int s02, const int s03, const int s1, const int s2,
@@ -589,11 +623,10 @@ static __global__ void __launch_bounds__(256) rope_multi_heads_norm(const float 
         const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
         const mrope_sections sections, const bool is_imrope, const float2 * tab, const rope_norm_args na) {
     const uint32_t i2 = blockIdx.x, i3 = blockIdx.y;
-    const int tid = threadIdx.x;
     __shared__ float s_sum[32];
     __shared__ float row[256];
     // this thread's rotation pair (same angle source as rope_multi_heads: the per-forward table or the FP64 code)
-    const int  j   = tid, i0 = 2 * j;
+    const int  j   = threadIdx.x, i0 = 2 * j;
     const bool pair = j < ne00 / 2, rot = pair && i0 < n_dims;
     float cos_theta = 0.0f, sin_theta = 0.0f;
     if (rot) {
@@ -607,43 +640,47 @@ static __global__ void __launch_bounds__(256) rope_multi_heads_norm(const float 
         }
     }
     for (int i1 = 0; i1 < ne01; ++i1) {
-        const float * xr = x + i1 * s01 + i2 * s02 + i3 * s03;
-        float tmp = 0.0f;
-        for (int col = tid; col < ne00; col += 256) {
-            const float xi = xr[col];
-            tmp += xi * xi;
-        }
-        tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
-        const float mean  = tmp / ne00;
-        const float scale = rsqrtf(mean + na.eps);
         const float * g = na.gamma + (na.gamma_heads > 1 ? (int64_t) i1 * ne00 : 0);
-        for (int col = tid; col < ne00; col += 256) {
-            row[col] = scale * xr[col] * g[col];
-        }
-        __syncthreads();
-        if (pair) {
-            const int idst = i1 * s1 + i2 * s2 + i3 * s3;
-            if (!rot) {
-                dst[idst + i0 + 0] = row[i0 + 0];
-                dst[idst + i0 + 1] = row[i0 + 1];
-            } else {
-                const float x0 = row[j];
-                const float x1 = row[j + n_dims/2];
-                dst[idst + j]            = fmaf(x0, cos_theta, -__fmul_rn(x1, sin_theta));
-                dst[idst + j + n_dims/2] = fmaf(x1, cos_theta, __fmul_rn(x0, sin_theta));
-            }
-        }
-        __syncthreads();
+        norm_rope_row(x + i1 * s01 + i2 * s02 + i3 * s03, dst + i1 * s1 + i2 * s2 + i3 * s3, g, ne00, n_dims,
+            na.eps, j, pair, rot, cos_theta, sin_theta, s_sum, row);
     }
 }
 
-// The fused kernel is rope_multi_cuda's per-token path, which runs only for qwen4exp on HIP RDNA3.5. Other q/k-norm
-// M-RoPE graphs (Qwen3.5, CUDA builds) keep the separate kernels.
-bool ggml_cuda_norm_rope_enabled() {
+// The same chain wherever the unfused graph runs rope_multi's per-row blocks (every step on both split devices,
+// and the R9700's prompt chunks): one block per (head, token, sample) row, the angle from rope_multi's own code. A
+// full-attention layer's Q, K and indexer q then take one launch each instead of two.
+template <bool forward, bool has_ff>
+static __global__ void __launch_bounds__(256) rope_multi_rows_norm(const float * x, float * dst, const int ne00,
+        const int ne02, const int s01, const int s02, const int s03, const int s1, const int s2, const int s3,
+        const int n_dims, const int32_t * pos, const float freq_scale, const float ext_factor,
+        const float attn_factor, const rope_corr_dims corr_dims, const float theta_scale, const float * freq_factors,
+        const mrope_sections sections, const bool is_imrope, const rope_norm_args na) {
+    const uint32_t i1 = blockIdx.x, i2 = blockIdx.y, i3 = blockIdx.z;
+    __shared__ float s_sum[32];
+    __shared__ float row[256];
+    const int  j    = threadIdx.x, i0 = 2 * j;
+    const bool pair = j < ne00 / 2, rot = pair && i0 < n_dims;
+    float cos_theta = 0.0f, sin_theta = 0.0f;
+    if (rot) {
+        rope_multi_cs<forward, has_ff>(i0, pos, i2, ne02, freq_scale, ext_factor, attn_factor, corr_dims,
+            theta_scale, freq_factors, sections, is_imrope, cos_theta, sin_theta);
+    }
+    const float * g = na.gamma + (na.gamma_heads > 1 ? (int64_t) i1 * ne00 : 0);
+    norm_rope_row(x + i1 * s01 + i2 * s02 + i3 * s03, dst + i1 * s1 + i2 * s2 + i3 * s3, g, ne00, n_dims, na.eps, j,
+        pair, rot, cos_theta, sin_theta, s_sum, row);
+}
+
+// The fused kernels run on HIP for every q/k-norm M-RoPE graph (qwen4exp, and the Qwen3.5 family's interleaved
+// M-RoPE): per-token blocks where the unfused rope takes them (the qwen4exp Strix's prompt chunks), per-row blocks
+// otherwise. They rotate with explicit fmaf, which is how the compiler contracts the separate rope's a*c - b*s on the
+// RDNA3.5 and RDNA4 targets the tests compare bit for bit; other devices and CUDA builds keep the separate kernels.
+bool ggml_cuda_norm_rope_enabled(int device) {
 #if defined(GGML_USE_HIP)
     static const bool enabled = [] { const char * e = getenv("LUCE_ATTN_FUSE_LEGACY"); return !(e && atoi(e)); }();
-    return enabled && ggml_cuda_qwen4exp_enabled();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return enabled && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
 #else
+    GGML_UNUSED(device);
     return false;
 #endif
 }
@@ -922,10 +959,23 @@ static void rope_multi_cuda(const T *            x,
 #else
     const bool per_token = false;
 #endif
-    if (norm != nullptr) {   // fused RMS_NORM -> MUL -> ROPE (the matcher only admits the per-token F32 case)
-        GGML_ASSERT(per_token && ne00 <= 256);
+    if (norm != nullptr) {   // fused RMS_NORM -> MUL -> ROPE (the matcher admits F32 rows of at most 256 on HIP)
+        GGML_ASSERT(ne00 <= 256);
         if constexpr (std::is_same_v<T, float>) {
             const int ne03 = nr / (ne01 * ne02);
+            if (!per_token) {
+                const dim3 rg(ne01, ne02, ne03);
+                if (freq_factors == nullptr) {
+                    rope_multi_rows_norm<forward, false><<<rg, 256, 0, stream>>>(x, dst, ne00, ne02, s01, s02, s03,
+                        s1, s2, s3, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                        freq_factors, sections, is_imrope, *norm);
+                } else {
+                    rope_multi_rows_norm<forward, true><<<rg, 256, 0, stream>>>(x, dst, ne00, ne02, s01, s02, s03,
+                        s1, s2, s3, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+                        freq_factors, sections, is_imrope, *norm);
+                }
+                return;
+            }
             const dim3 hg(ne02, ne03, 1);
             const float2 * tab = rope_multi_table_get<forward>(pos_node, pos, ne02, n_dims, freq_scale, ext_factor,
                 attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, stream);
