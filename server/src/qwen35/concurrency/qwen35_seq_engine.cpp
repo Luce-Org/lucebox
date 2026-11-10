@@ -960,7 +960,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     rc.scores.clear();
     if (uq_queries_ > 0) {
         const KvFlashUqStore & st = uq_store_[(size_t)slot];
-        b_.kvflash_uq_append(p, kvflash_uq_holds(st, rc.uq.cut, rc.uq_hash) ? &st : nullptr, rc.uq_miss, qs, sealed, qsize, qs.size());
+        kvflash_uq_join(qs, kvflash_uq_holds(st, rc.uq.cut, rc.uq_hash) ? &st : nullptr, rc.uq_miss, qsize, qs.size());
     }
     if (!qs.empty()) {
         std::vector<std::vector<float>> o;

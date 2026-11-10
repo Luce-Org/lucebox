@@ -3651,38 +3651,6 @@ bool Qwen35Backend::kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, co
     return false;
 }
 
-// LUCE_KVFLASH_UQ_QUERIES: append the rows of the latest human question (`store`: the one holding this
-// request's question, null when there is none and `miss` says why) to the queries of pager `p`'s scorer
-// call, when the call still fits in VRAM on the GPU scorer. Logs one hit or miss line per reselect.
-void Qwen35Backend::kvflash_uq_append(luce::common::KvFlashPager & p, const luce::common::KvFlashUqStore * store, const char * miss,
-                                      std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2) {
-    static const luce::common::KvFlashUqStore kNone;
-    const auto & st = store ? *store : kNone;
-    const char * why = nullptr;
-    std::string reason;
-    if (n_v2 == 0) why = "no-v2-selector";
-    else if (st.empty() || st.rows.size() != (size_t)st.n * qsize)
-        why = *miss ? miss : "no-store";
-    else if (!kvflash_gpu_failed_ && target_backend_ && !cache_.attn_k.empty()) {
-        if (!kvflash_gpu_mass_) kvflash_gpu_mass_ = std::make_unique<luce::common::KvFlashGpuMass>(target_backend_);
-        const int ct = p.chunk_tokens();
-        const ggml_tensor * k0 = cache_.attn_k[0];
-        const int n_ev = sealed - kvflash_residency(p, sealed).n_resident;
-        size_t need = 0;
-        if (!kvflash_gpu_mass_->fits_now(kvflash_exact_dims(), k0->type, ct, (int)(k0->ne[1] / ct), n_ev,
-                                         (int)qs.size() + st.n, &need)) {
-            reason = "gpu-vram need " + std::to_string(need >> 20) + " MiB";
-            why = reason.c_str();
-        }
-    }
-    if (why) {
-        std::fprintf(stderr, "[kvflash] uq miss reason=%s\n", why);
-        return;
-    }
-    luce::common::kvflash_uq_append_queries(qs, st, qsize);
-    std::fprintf(stderr, "[kvflash] uq hit lo=%d hi=%d n=%d\n", st.lo, st.hi, st.n);
-}
-
 // LUCE_KVFLASH_PREFILL_RESELECT: score the chunks sealed before `sealed_tokens`
 // with the query held in cache_.q_cap.
 bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) {
@@ -3708,7 +3676,7 @@ bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) 
     }
     if (kvflash_uq_queries_ > 0) {
         const int found = luce::common::kvflash_uq_find(kvflash_uq_stores_, kvflash_uq_req_hi_, kvflash_uq_req_hash_);
-        kvflash_uq_append(kvflash_pager_, found >= 0 ? &kvflash_uq_stores_[(size_t)found] : nullptr, kvflash_uq_miss_.c_str(), qs, sealed, qsize, n_v2);
+        luce::common::kvflash_uq_join(qs, found >= 0 ? &kvflash_uq_stores_[(size_t)found] : nullptr, kvflash_uq_miss_.c_str(), qsize, n_v2);
     }
     std::vector<std::vector<float>> o;
     std::vector<luce::common::KvFlashMassPlanes> planes;

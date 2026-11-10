@@ -175,7 +175,7 @@ TEST_CASE(KvflashUqFixture, rewind_below_the_window_recaptures) {
 }
 
 // ---- scorer: an extra aligned query raises that chunk -----------------------
-TEST_CASE(KvflashUqFixture, extra_query_raises_its_chunk_in_the_cpu_selector) {
+TEST_CASE(KvflashUqFixture, the_question_rows_join_by_the_store_and_selector_alone_and_raise_their_chunk) {
     SynthCfg c;
     c.L = 2; c.HK = 2; c.G = 3; c.D = 64; c.CT = 16; c.NB = 24; c.KT = GGML_TYPE_Q8_0;
     c.sealed = 100; c.N = 8; c.keep_newest = 4; c.tail = 16;
@@ -202,16 +202,20 @@ TEST_CASE(KvflashUqFixture, extra_query_raises_its_chunk_in_the_cpu_selector) {
     st.n = 1; st.rows.assign(s.qs.begin() + (long)hot * (long)s.QS, s.qs.begin() + (long)(hot + 1) * (long)s.QS);
 
     std::vector<const float *> with_uq = base;
-    kvflash_uq_append_queries(with_uq, st, s.QS);
+    CHECK(kvflash_uq_join(with_uq, &st, "", s.QS, base.size()) == nullptr);
     REQUIRE(with_uq.size() == base.size() + 1);
     const auto sel_base = select(base), sel_uq = select(with_uq);
     CHECK(sel_uq[(size_t)chunk] > sel_base[(size_t)chunk] * 1.5f);
     // Monotone: max over queries never lowers any chunk.
     for (size_t i = 0; i < sel_base.size(); i++) CHECK(sel_uq[i] >= sel_base[i]);
-    // N = 0 (empty store): the query list is untouched, byte for byte.
+    // No store, an empty one, rows of another shape or no selector queries: the reason is named and the query list
+    // is untouched, byte for byte. The store and the selector decide alone: nothing about the device does.
     KvFlashUqStore none;
     std::vector<const float *> same = base;
-    kvflash_uq_append_queries(same, none, s.QS);
+    CHECK(std::string(kvflash_uq_join(same, &none, "", s.QS, base.size())) == "no-store");
+    CHECK(std::string(kvflash_uq_join(same, nullptr, "window-not-in-prefill", s.QS, base.size())) == "window-not-in-prefill");
+    CHECK(std::string(kvflash_uq_join(same, &st, "", s.QS + 1, base.size())) == "no-store");
+    CHECK(std::string(kvflash_uq_join(same, &st, "", s.QS, 0)) == "no-v2-selector");
     CHECK((same == base));
 }
 
