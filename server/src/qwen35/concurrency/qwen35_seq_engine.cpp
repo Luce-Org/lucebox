@@ -650,7 +650,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
             if (w.slot == o.parked.slot) pick = w;
         }
     KvFlashAdmitIn plan_in;
-    plan_in.e_role = e_role;   // no storage tier: a session that cannot resume is dropped
+    plan_in.e_role = e_role;
     if (pick.exact()) {
         const ParkedSession & ps = parked_[(size_t)pick.slot];
         plan_in.pick_slot = pick.slot; plan_in.lcp = pick.lcp;
@@ -734,8 +734,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         plan = kvflash_admit_plan(plan_in);
     } else if (pick.exact() && plan.action != KvFlashAdmitAction::summary_cold) {
         const ParkedSession & ps = parked_[(size_t)pick.slot];
-        std::fprintf(stderr, "[kvflash] slot %d session not resumable: lcp=%d history=%d ckpt=%d trunk=%d third=%d prompt=%zu\n",
-                     pick.slot, pick.lcp, (int)ps.history.size(), ps.ckpt.pos, ps.trunk.pos, ps.extra.pos, prompt.size());
+        std::fprintf(stderr, "[kvflash] slot %d session not resumable: lcp=%d history=%d ckpt=%d trunk=%d third=%d prompt=%zu%s\n",
+                     pick.slot, pick.lcp, (int)ps.history.size(), ps.ckpt.pos, ps.trunk.pos, ps.extra.pos, prompt.size(),
+                     plan.slot >= 0 ? " (replaced by this request: the first to leave)" : "");
+        // Not dropped here: under one sid for several conversations (a gateway's constant header) each would drop the other.
+        if (plan.slot >= 0) parked_[(size_t)plan.slot].tick = 0;   // older than every park (ticks start at 1)
     }
     // Cold: a slot with no session, else the oldest session's slot. A summary-generation request leaves the sid's parked instance alone.
     const int keep_slot = plan.action == KvFlashAdmitAction::summary_cold ? plan.slot : -1;
