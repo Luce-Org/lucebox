@@ -20,7 +20,7 @@ struct KvflashSpecSerialFixture {};
 
 using namespace luce::common;
 
-// F1: DDTree commits every accepted token before it checks termination and
+// DDTree commits every accepted token before it checks termination and
 // never settles, so on EOS/cancel/budget end it finishes one position past AR.
 // --ddtree with KVFlash fails closed. Launchers do add it (the container
 // entrypoint, harness/clients/common.sh), so the check sits in luce_server
@@ -43,7 +43,7 @@ TEST_CASE(KvflashSpecSerialFixture, ddtree_refusal_is_one_line_naming_both_flags
     CHECK(m.find('\n') == std::string::npos);
 }
 
-// F2: a plain-decode (adaptive one-token) step used to skip the snapshot when
+// a plain-decode (adaptive one-token) step used to skip the snapshot when
 // the budget was settled and ample. io.emit can still end the request on that
 // step (cancel, stop string), and the repair restores the snapshot. Every
 // terminal one-token step must repair to AR's state: the emitted token is
@@ -66,7 +66,7 @@ TEST_CASE(KvflashSpecSerialFixture, one_token_step_that_keeps_going_needs_no_rep
     CHECK(s.new_committed == 701);
 }
 
-// F3/F4/F5: a verify span never contains a reselect point except at its first
+// a verify span never contains a reselect point except at its first
 // row, and never reaches into a chunk that is not allocated yet except p0's
 // own. The step starting at the reselect point then reselects first, exactly
 // where AR does, from the query of the last row before it.
@@ -173,7 +173,7 @@ TEST_CASE(KvflashSpecSerialFixture, q_cap_after_k_of_n_accepted_equals_q_cap_aft
     }
 }
 
-// F5: the seed's own chunk is exempt from the span cap (the first row always
+// the seed's own chunk is exempt from the span cap (the first row always
 // allocates it, as AR does), but AR allocates it only after it emitted the
 // seed. A request that ends on that emission leaves the pager untouched in AR;
 // a spec step that verifies first allocates (and evicts) before the emit loop,
@@ -315,7 +315,7 @@ TEST_CASE(KvflashSpecSerialFixture, seed_takes_the_ar_step_only_where_it_opens_a
     CHECK(!kvflash_seed_takes_ar_step(512, 0, upto7));     // no KVFlash
 }
 
-// F1: the legacy daemon (test_dflash --daemon --ddtree, launched by
+// the legacy daemon (test_dflash --daemon --ddtree, launched by
 // pflash/dflash_client.py with LUCE_KVFLASH inherited) reaches the backend
 // without passing luce_server's startup check. It must refuse the same
 // combination with exit 2 before it loads anything: the bogus target path
@@ -393,7 +393,7 @@ TEST_CASE(KvflashSpecSerialFixture, reselect_history_keeps_the_seed_when_the_bud
 
 // The AR hop ends before the span computation, so a step that starts after it
 // sees the same inputs as any other step: g0 counts the tokens emitted before
-// the seed, the seed is not in out_tokens. Codex's counterexample: hist0 = 450,
+// the seed, the seed is not in out_tokens. Example: hist0 = 450,
 // seed at the chunk start 512, 62 generated, tau 64. The seed is token 63; with
 // the seed counted twice g0 would be 63 and the reselect at g = 64 would fall
 // on a different row.
