@@ -1538,20 +1538,21 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     // The shipped KVFlash recall settings come first, so an explicit
-    // --kvflash-policy below still replaces the policy default. Mode 5 when the
-    // drafter (flag or env) and its PFlash GGUFs are set, else mode 4.
+    // --kvflash-policy below still replaces the policy default. Mode 4 unless
+    // LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter (flag or env)
+    // and its PFlash GGUFs are set.
     if (!model.kvflash_pool.empty()) {
         const std::string drafter_flag = model.sconfig.pflash_drafter_path;
-        const bool drafter_ready = luce::server::kvflash_drafter_ready([&](const char * k) {
+        const bool mode5 = luce::server::kvflash_mode5_requested([&](const char * k) {
             if (drafter_flag.size() && std::string_view(k) == "LUCE_KVFLASH_DRAFTER") return drafter_flag;
             const char * v = std::getenv(k);
             return std::string(v ? v : "");
         });
-        std::fprintf(stderr, "[kvflash] recall profile: %s\n", drafter_ready
+        std::fprintf(stderr, "[kvflash] recall profile: %s\n", mode5
             ? "mode 5 (PFlash 2.0 drafter scorer)"
-            : "mode 4 (exact scorer; mode 5 needs the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)");
+            : "mode 4 (exact scorer; mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)");
         apply_env_defaults("KVFlash recall",
-            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, drafter_ready));
+            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, mode5));
     }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
