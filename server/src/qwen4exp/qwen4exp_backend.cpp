@@ -217,7 +217,6 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         if (t) draft_kv += ggml_nbytes(t);
     }
     if (cache.spec_ple) rollback += ggml_nbytes(cache.spec_ple);
-    for (const ggml_tensor * t : cache.spec_ssm) rollback += ggml_nbytes(t);
     for (const ggml_tensor * t : cache.spec_conv) rollback += ggml_nbytes(t);
     const size_t mtp_state = draft_kv + rollback;
     const bool mtp = qwen4exp_verify_supported(cache);

@@ -114,8 +114,9 @@ bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
 // verify (MTP speculation, 2 <= n_tokens <= k+1, qwen4exp_verify_supported): each
 // token is computed exactly as a T=1 forward at its position computes it
 // (batch-invariant matmuls, per-token attention), out_logits holds all rows,
-// and the cache keeps the state after every token for
-// qwen4exp_verify_rollback.
+// and the cache keeps what qwen4exp_verify_rollback needs to retain any accepted
+// prefix (the recurrent state as it was plus each token's replay log, and the
+// conv/PLE history after every token).
 // mtp_prefill (n_tokens > 1, contiguous prompt chunks): append K/V-only MTP
 // slices to this graph. out_hidden receives only the last pending trunk row.
 // out_rows (T=1 decode and verify): the rows stay on the device (result.logits)
@@ -253,7 +254,7 @@ Qwen4ExpGraphMemory qwen4exp_batched_verify_graph_memory(ggml_backend_t backend,
 // Every decoding slot's MTP verify in one graph: slot s feeds `rows` tokens (its pending token, then rows - 1 drafts),
 // slot-major in `tokens`, at positions[s] onward. Each row computes what a T=1 decode at its position computes (the
 // slot groups' batch-invariant products, each row's own T=1 attention, each slot's recurrence over its rows), and every
-// slot keeps its per-row rollback states as a solo verify does (qwen4exp_verify_rollback). Needs every cache with the
+// slot keeps what its rollback needs as a solo verify does (qwen4exp_verify_rollback). Needs every cache with the
 // MTP rollback state (qwen4exp_verify_supported), dense attention for every row and no KVFlash pool. False: not run
 // (the caller decodes the step plainly). `out` (Qwen4ExpRowOutputs, top_n in) receives each row's argmax and, with
 // top_n > 0, its top_n candidates; the logits rows stay on the device until the next call

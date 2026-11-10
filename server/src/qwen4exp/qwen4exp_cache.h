@@ -72,6 +72,9 @@ struct Qwen4ExpDecodeWorkspace {
     // Verify: each row's dense span (0 = QSA) and its mask or M-RoPE positions input.
     std::vector<int64_t> row_spans;
     std::vector<ggml_tensor *> row_inputs;
+    // Verify: each linear layer's GDN replay log, F32 [2*S_v + 1, H_v, rows], read in place from this graph's buffer
+    // by the rollback that follows it (slot-major in a batched verify).
+    std::vector<ggml_tensor *> spec_log;
     uint64_t builds = 0;      // smoke-test evidence: metadata addresses can be recycled
     uint64_t replays = 0;
     int qsa_budget = 0;
@@ -193,13 +196,17 @@ struct Qwen4ExpCache {
     // for the host-side PLE n-gram hash across decode steps.
     std::vector<int32_t> ple_prev;
 
-    // Allocated once per cache: token-major snapshots after all k+1 verify
-    // inputs. Fixed views let rollback enqueue device copies without allocation.
+    // Allocated once per cache: the conv and PLE histories after each of the k+1 verify inputs, token-major. Fixed
+    // views let rollback enqueue device copies without allocation. The recurrent state keeps no snapshots: a verify
+    // reads it in place (spec_slot0 maps the verify onto its own slab) and records each row's GDN replay log
+    // (spec_log), from which rollback replays the kept rows onto it.
     int mtp_draft = 1;
     int spec_pos = -1, spec_tokens = 0;
-    std::vector<ggml_tensor *> spec_ssm, spec_conv;
+    std::vector<ggml_tensor *> spec_conv;
     using SpecRows = std::array<ggml_tensor *, QWEN4EXP_MTP_MAX_VERIFY>;
-    std::vector<SpecRows> spec_ssm_rows, spec_conv_rows;
+    std::vector<SpecRows> spec_conv_rows;
+    ggml_tensor * spec_slot0 = nullptr;    // I32 [1] = 0
+    std::vector<ggml_tensor *> spec_log;   // the last verify's log per linear layer: its workspace's graph tensors
     ggml_tensor * spec_ple = nullptr;
     SpecRows spec_ple_rows{};
     std::array<std::vector<int32_t>, QWEN4EXP_MTP_MAX_VERIFY> spec_ple_prev;

@@ -8,6 +8,7 @@
 #include "common/cuda_graph_overrides.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
+#include "ggml-cuda-gdn-chain.h"
 
 #include <algorithm>
 #include <array>
@@ -505,12 +506,13 @@ static Qwen4ExpLinearProj linear_attn_proj_rows(ggml_context * c, const Qwen4Exp
 
 // One sequence's linear attention after its input projections: the conv, the recurrence on its state and the gated
 // norm. Returns [d_in, T] for the caller's ssm_out product, or with `project`, the layer output [n_embd, T].
-// spec_states / spec_conv (verify forward): receive the recurrent state after every token and the conv history after
-// every token, so any accepted prefix can be retained.
+// spec_log / spec_conv (verify forward): the recurrence reads the state in place (slab spec_slot0 of it) and writes
+// none; *spec_log receives every token's replay log (qwen4exp_verify_rollback replays the kept ones) and spec_conv the
+// conv history after every token, so any accepted prefix can be retained.
 static ggml_tensor * linear_attn_rows(ggml_context * c, ggml_cgraph * gf, const Qwen4ExpLinearProj & p,
                                       const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-                                      ggml_tensor * ssm_state, ggml_tensor * conv_state,
-                                      ggml_tensor * spec_states, ggml_tensor * spec_conv, bool project) {
+                                      ggml_tensor * ssm_state, ggml_tensor * conv_state, ggml_tensor * spec_slot0,
+                                      ggml_tensor ** spec_log, ggml_tensor * spec_conv, bool project) {
     const int64_t D      = w.ssm_d_state;              // 128
     const int64_t Hk     = w.ssm_n_group;              // 16
     const int64_t Hv     = w.linear_value_heads;       // 48
@@ -625,17 +627,30 @@ static ggml_tensor * linear_attn_rows(ggml_context * c, ggml_cgraph * gf, const 
     ggml_tensor * v_c = ggml_view_3d(c, conv, D, Hv, T, D * esz, tstride, 2 * D * Hk * esz);
 
     ggml_tensor * state4 = ggml_reshape_4d(c, ssm_state, D, D, Hv, 1);
-    // Steps update the recurrent state in place (each kernel block owns its state columns); prompt chunks keep the
-    // packed final state and its copy, which the gfx1151 tiled recurrence (16+ rows) writes.
-    ggml_tensor * gdn = stacked ? ggml_gated_delta_net_shared_gates(c, q_c, k_c, v_c, gate, beta, state4, true)
-                      : step    ? ggml_gated_delta_net_inplace(c, q_c, k_c, v_c, gate, beta, state4)
-                                : ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
-    if (raw_gates) ggml_gated_delta_net_set_raw_gates(gdn, L.ssm_gate_ba);
-    // Only speculative rollback needs per-token intermediate states; skipping keeps the packed result allocatable.
-    ggml_gated_delta_net_set_skip_intermediate(gdn, true);
-    // The kernel writes them straight to spec_states (same F32 transposed layout as the state, token-major); the
-    // packed result stays compact because skip was set first.
-    if (spec_states) gdn->src[7] = spec_states;
+    ggml_tensor * gdn;
+    if (spec_log) {
+        // Verify: the grouped-cols kernel reads the state in place and writes neither a final nor a per-token state;
+        // it records each token's [g | k | delta] instead, which rollback replays (ggml_backend_cuda_gdn_chain_commit)
+        // into the bits the state held after the kept tokens. Its attention output is the in-place kernel's. The log
+        // is read in place, so the result stays a graph output; the compact copy capture returns stays out of the
+        // graph.
+        GGML_ASSERT(step && spec_slot0);
+        gdn = ggml_gated_delta_net_mapped_verify(c, q_c, k_c, v_c, gate, beta, state4, spec_slot0);
+        if (raw_gates) ggml_gated_delta_net_set_raw_gates(gdn, L.ssm_gate_ba);
+        *spec_log = ggml_gated_delta_net_capture_replay_log(c, gdn)->src[0];
+        ggml_set_output(gdn);
+        ggml_set_output(*spec_log);
+        ggml_build_forward_expand(gf, *spec_log);
+    } else {
+        // Steps update the recurrent state in place (each kernel block owns its state columns); prompt chunks keep
+        // the packed final state and its copy, which the gfx1151 tiled recurrence (16+ rows) writes.
+        gdn = stacked ? ggml_gated_delta_net_shared_gates(c, q_c, k_c, v_c, gate, beta, state4, true)
+            : step    ? ggml_gated_delta_net_inplace(c, q_c, k_c, v_c, gate, beta, state4)
+                      : ggml_gated_delta_net(c, q_c, k_c, v_c, gate, beta, state4);
+        if (raw_gates) ggml_gated_delta_net_set_raw_gates(gdn, L.ssm_gate_ba);
+        // No per-token intermediate states; skipping keeps the packed result allocatable.
+        ggml_gated_delta_net_set_skip_intermediate(gdn, true);
+    }
 
     // packed: [ attn S_v*H_v*T | final_state S_v*S_v*H_v (prompt chunks) ]
     ggml_tensor * attn = ggml_view_4d(c, gdn, D, Hv, T, 1,
@@ -668,10 +683,10 @@ static ggml_tensor * linear_attn_rows(ggml_context * c, ggml_cgraph * gf, const 
 
 ggml_tensor * build_linear_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * cur,
                                 const Qwen4ExpLayer & L, const Qwen4ExpWeights & w,
-                                ggml_tensor * ssm_state, ggml_tensor * conv_state,
-                                ggml_tensor * spec_states = nullptr, ggml_tensor * spec_conv = nullptr) {
+                                ggml_tensor * ssm_state, ggml_tensor * conv_state, ggml_tensor * spec_slot0 = nullptr,
+                                ggml_tensor ** spec_log = nullptr, ggml_tensor * spec_conv = nullptr) {
     return linear_attn_rows(c, gf, linear_attn_proj(c, gf, cur, L), L, w, ssm_state, conv_state,
-                            spec_states, spec_conv, /*project=*/true);
+                            spec_slot0, spec_log, spec_conv, /*project=*/true);
 }
 
 // ── Full attention: dense GQA (12 layers) ───────────────────────────────
@@ -1620,6 +1635,7 @@ struct Qwen4ExpLayerBuilder {
     std::vector<ggml_tensor *> & expert_nodes;          // split mode: pinned to the expert device
     const std::vector<Qwen4ExpAttnRow> * rows = nullptr;   // verify: each row's T=1 attention inputs
     const Qwen4ExpDecodeWorkspace * qsa_ws = nullptr;   // stable QSA: the graph's runtime QSA inputs
+    std::vector<ggml_tensor *> * spec_log = nullptr;    // verify: receives each linear layer's replay log
     std::vector<int> lin_idx, full_idx, ple_idx;        // per layer: its index among the linear, full and PLE layers
     Qwen4ExpReadAhead read_ahead;                       // split decode and verify: the expert device's read-ahead
 
@@ -1688,7 +1704,8 @@ struct Qwen4ExpLayerBuilder {
         }
         const int li = lin_idx[il];
         return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
-                                 verify ? cache.spec_ssm[li] : nullptr, verify ? cache.spec_conv[li] : nullptr);
+                                 verify ? cache.spec_slot0 : nullptr, verify ? &spec_log->at((size_t) li) : nullptr,
+                                 verify ? cache.spec_conv[li] : nullptr);
     }
 
     // The last layer's FFN runs on the output row only. Upstream selects output rows before the final HC/FFN, so its
@@ -2652,7 +2669,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
         if (stable_qsa) cache.indexer_blocks = (int) (kv_len / 4);
-        if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; }
+        if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; cache.spec_log = stable_ws.spec_log; }
         cache.ple_prev = inputs->ple_prev;
         res.ok = true;
         return res;
@@ -2665,6 +2682,8 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     Qwen4ExpLayerBuilder lb(ctx, gf, w, cache, verify, split, has_ple, expert_nodes);
     lb.rows = verify ? &rows : nullptr;
     lb.qsa_ws = stable_qsa ? &stable_ws : nullptr;
+    if (verify) stable_ws.spec_log.assign(cache.linear_layer_ids.size(), nullptr);
+    lb.spec_log = verify ? &stable_ws.spec_log : nullptr;
 
     const int64_t graph_kv_len = use_stable_graph && !verify ? stable_kv_bucket : qwen4exp_attn_rows(cache, kv_len);
     const int64_t mask_len = graph_kv_len;
@@ -2874,7 +2893,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     cache.cur_pos = (int) kv_len;
     if (mtp_prefill) cache.mtp_prev_pos = pos0 + n_tokens - 1;
-    if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; }
+    if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; cache.spec_log = stable_ws.spec_log; }
     // The all-keys branch did not pool anything. Leaving this prefix at zero
     // makes the first selected-attention call pool the earlier raw keys too.
     if (pipeline) {
@@ -2904,21 +2923,36 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
 
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache) {
     // The PLE rollback snapshot covers one PLE layer (every published GGUF has one).
-    return cache.mtp_k && !cache.spec_ssm.empty() && cache.ple_conv_state.size() <= 1;
+    return cache.mtp_k && cache.spec_slot0 && cache.ple_conv_state.size() <= 1;
 }
 
 bool qwen4exp_verify_rollback(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                               int pos0, int retained) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     if (pos0 != cache.spec_pos || retained < 1 || retained > cache.spec_tokens ||
-        cache.spec_ssm_rows.size() != cache.ssm_state.size() ||
         cache.spec_conv_rows.size() != cache.conv_state.size()) return false;
     // Device copies queued on the backend stream. All views were allocated at
     // cache creation; rollback never allocates or copies state through the host.
+    // The recurrent state: the verify left it as it found it; one launch on the backend stream replays the kept rows
+    // from the verify's log onto every linear layer's state, in place, into the bits the verify held after them.
+    if (!cache.ssm_state.empty()) {
+        if (cache.spec_log.size() != cache.ssm_state.size()) return false;
+        std::vector<ggml_cuda_gdn_chain_commit_layer> layers;
+        layers.reserve(cache.ssm_state.size());
+        for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+            const ggml_tensor * log = cache.spec_log[i];
+            ggml_tensor * state = cache.ssm_state[i];
+            if (!log || !log->data || !state->data || log->ne[2] != cache.spec_tokens) return false;
+            layers.push_back({(const float *) log->data, (const float *) state->data, (float *) state->data});
+        }
+        const ggml_tensor * s = cache.ssm_state[0];
+        if (!ggml_backend_cuda_gdn_chain_commit(backend, layers.data(), (int) layers.size(), s->ne[0], s->ne[2],
+                                                cache.spec_tokens, retained)) return false;
+    }
     const int row = retained - 1;
     if (retained < cache.spec_tokens) {
         // Most verify steps keep fewer rows than they ran, so this runs about every step: one batched launch for
-        // the ~70 state copies (113 MiB on Qwen3.8-Flash-Next) instead of one blit each, ~15 us of launch gap apiece.
+        // the conv and PLE history copies instead of one blit each, ~15 us of launch gap apiece.
         std::vector<ggml_cuda_copy_desc> batch;
         const bool cuda = ggml_backend_is_cuda(backend);
         ggml_backend_buffer_type_t device_buft = cuda ? ggml_backend_get_default_buffer_type(backend) : nullptr;
@@ -2933,11 +2967,8 @@ bool qwen4exp_verify_rollback(ggml_backend_t backend, const Qwen4ExpWeights & w,
                 ggml_backend_tensor_copy_async(backend, backend, src, dst);
             }
         };
-        batch.reserve(2 * cache.ssm_state.size() + 1);
-        for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
-            copy(cache.spec_ssm_rows[i][row], cache.ssm_state[i]);
-            copy(cache.spec_conv_rows[i][row], cache.conv_state[i]);
-        }
+        batch.reserve(cache.conv_state.size() + 1);
+        for (size_t i = 0; i < cache.conv_state.size(); ++i) copy(cache.spec_conv_rows[i][row], cache.conv_state[i]);
         if (cache.spec_ple) copy(cache.spec_ple_rows[row], cache.ple_conv_state[0]);
         // On the side stream: the next MTP draft does not read these states and runs beside the copies; any other
         // use of the backend waits for them (ggml_backend_cuda_copy_batch_side).
@@ -3936,6 +3967,8 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     }
     ws.masks.clear();
     ws.kv_rows.clear();
+    const size_t n_linear = caches[0]->linear_layer_ids.size();
+    ws.spec_log.assign((size_t) n_slots * n_linear, nullptr);
     for (int s = 0; s < n_slots; ++s) {
         ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, R));
         ggml_set_input(ws.kv_rows.back());
@@ -4023,8 +4056,9 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
             ggml_tensor * rows = nullptr;
             for (int j = 0; j < G.ns; ++j) {
                 ggml_tensor * row = linear_attn_rows(ctx, gf, linear_attn_proj_rows(ctx, p, (int64_t) j * R, R), L, w,
-                    gc[j]->ssm_state[(size_t) li], gc[j]->conv_state[(size_t) li],
-                    gc[j]->spec_ssm[(size_t) li], gc[j]->spec_conv[(size_t) li], per_slot_out);
+                    gc[j]->ssm_state[(size_t) li], gc[j]->conv_state[(size_t) li], gc[j]->spec_slot0,
+                    &ws.spec_log[(size_t) (G.s0 + j) * n_linear + (size_t) li], gc[j]->spec_conv[(size_t) li],
+                    per_slot_out);
                 rows = rows ? ggml_concat(ctx, rows, row, 1) : row;
             }
             cur = per_slot_out ? rows : ggml_reshape_2d(ctx, mm(ctx, L.ssm_out, rows), w.n_embd, n);
@@ -4261,9 +4295,12 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     if ((size_t) ggml_nelements(ws.hidden) != hd * (size_t) T) return result;
     hidden.resize(hd * (size_t) T);
     ggml_backend_tensor_get(ws.hidden, hidden.data(), 0, hidden.size() * sizeof(float));
+    const size_t n_linear = caches[0]->linear_layer_ids.size();
     for (int s = 0; s < n_slots; ++s) {
         caches[s]->spec_pos = positions[s];
         caches[s]->spec_tokens = R;
+        caches[s]->spec_log.assign(ws.spec_log.begin() + (std::ptrdiff_t) (s * n_linear),
+                                   ws.spec_log.begin() + (std::ptrdiff_t) ((s + 1) * n_linear));
     }
     result.ok = true;
     return result;
