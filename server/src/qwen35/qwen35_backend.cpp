@@ -623,7 +623,8 @@ bool Qwen35Backend::init() {
     const bool kvflash_slots = slot_pool && kvflash_active();
     KvFlashArenaSizing arena;
     if (kvflash_slots) {
-        arena = kvflash_arena_sizing(n_slots, kvflash_quota_chunks(kvflash_tokens_), cfg_.kv_pool_tokens);
+        arena = kvflash_arena_sizing(n_slots, kvflash_quota_chunks(kvflash_tokens_), cfg_.kv_pool_tokens,
+                                     /*chunk_tokens=*/64, fixed_chain.enabled ? fixed_chain.scratch_stride : 0);
         if (!arena.error.empty()) { std::fprintf(stderr, "[kvflash] %s\n", arena.error.c_str()); set_last_error(arena.error); return false; }
     }
     if (slot_pool && !kvflash_slots) {
