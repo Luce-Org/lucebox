@@ -3663,11 +3663,16 @@ int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_st
 bool Qwen35Backend::kvflash_q_cap_from_stage(int new_committed) {
     const int row = kvflash_q_stage_row(cache_.q_stage_base, cache_.q_stage_n, new_committed);
     if (row < 0 || !cache_.q_stage || !cache_.q_cap) return false;
-    const size_t bytes = ggml_nbytes(cache_.q_cap);
-    if (cache_.q_stage->nb[3] != bytes) return false;
-    std::vector<uint8_t> q(bytes);
-    ggml_backend_tensor_get(cache_.q_stage, q.data(), (size_t)row * bytes, bytes);
-    ggml_backend_tensor_set(cache_.q_cap, q.data(), 0, bytes);
+    // Row r of every layer plane is one q_cap plane; q_cap is the planes in layer order.
+    const size_t plane = cache_.q_stage->nb[2];
+    const int n_fa = (int)cache_.q_stage->ne[3];
+    if (plane * (size_t)n_fa != ggml_nbytes(cache_.q_cap)) return false;
+    std::vector<uint8_t> q(plane * (size_t)n_fa);
+    for (int fa = 0; fa < n_fa; ++fa) {
+        ggml_backend_tensor_get(cache_.q_stage, q.data() + (size_t)fa * plane,
+                                luce::common::kvflash_q_stage_offset(cache_.q_stage, fa, row), plane);
+    }
+    ggml_backend_tensor_set(cache_.q_cap, q.data(), 0, q.size());
     return true;
 }
 

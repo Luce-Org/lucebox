@@ -7,6 +7,8 @@
 
 #include "kvflash_pool_flag.h"
 
+#include "ggml.h"
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -42,6 +44,26 @@ inline int kvflash_uq_queries() {
 // Only a KVFlash process (LUCE_KVFLASH names a pool) allocates it.
 inline int kvflash_q_stage_rows(int max_verify_tokens) {
     return kvflash_pool_process() ? std::max(max_verify_tokens, 0) : 0;
+}
+
+// The stage is F32 [head_dim, n_head, rows, n_fa]: the head axis is the one the
+// tensor-parallel split cuts (as q_cap's), and the layer axis comes last so a
+// per-layer view strides over rows, which the meta backend can map onto the
+// head split. A layer-major layout (layers before rows) aborts its allocation.
+//
+// The plane of layer fa_idx holding the n_tokens query rows of one verify pass,
+// as [head_dim, n_head, n_tokens].
+inline ggml_tensor * kvflash_q_stage_view(ggml_context * ctx, ggml_tensor * q_stage,
+                                          int fa_idx, int n_tokens) {
+    return ggml_view_3d(ctx, q_stage, q_stage->ne[0], q_stage->ne[1], n_tokens,
+                        q_stage->nb[1], q_stage->nb[2],
+                        (size_t)fa_idx * q_stage->nb[3]);
+}
+
+// Byte offset of row `row` in the plane of layer fa_idx; a plane row is
+// nb[2] bytes (one q_cap plane).
+inline size_t kvflash_q_stage_offset(const ggml_tensor * q_stage, int fa_idx, int row) {
+    return (size_t)fa_idx * q_stage->nb[3] + (size_t)row * q_stage->nb[2];
 }
 
 } // namespace luce::common

@@ -306,7 +306,7 @@ bool create_target_cache_partial(const TargetWeights & w,
         if (const int R = luce::common::kvflash_q_stage_rows(max_verify_tokens); R > 0) {
             out.q_stage_rows = R;
             out.q_stage = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
-                                             head_dim, w.n_head, n_full_attn, R);
+                                             head_dim, w.n_head, R, n_full_attn);
             ggml_set_name(out.q_stage, "q_stage");
         }
 
@@ -2609,12 +2609,10 @@ QwenGraphOutputs build_qwen35_graph(
             }
             if (want_q_stage && q_fa) {
                 // Every row's query, [head_dim, n_tokens, n_head] permuted to
-                // [head_dim, n_head, n_tokens], into plane fa_idx of each row block.
+                // [head_dim, n_head, n_tokens], into layer fa_idx's plane of the stage.
                 ggml_tensor * qp = ggml_permute(ctx, q_fa, 0, 2, 1, 3);
-                ggml_tensor * qd = ggml_view_3d(ctx, cache.q_stage,
-                    cache.q_stage->ne[0], cache.q_stage->ne[1], n_tokens,
-                    cache.q_stage->nb[1], cache.q_stage->nb[3],
-                    (size_t)fa_idx * cache.q_stage->nb[2]);
+                ggml_tensor * qd = luce::common::kvflash_q_stage_view(
+                    ctx, cache.q_stage, fa_idx, n_tokens);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, qp, qd));
             }
             if (want_q_cap && q_fa) {
