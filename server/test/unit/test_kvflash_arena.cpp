@@ -3,6 +3,9 @@
 // device is test_kvflash_pager_cuda_race.cpp.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_slot_world.h"
+#ifdef KVFLASH_HAS_ASYNC_DMA
+#include "ggml-cuda.h"
+#endif
 
 #include <memory>
 #include <stdexcept>
@@ -76,6 +79,7 @@ TEST_CASE(KvflashArenaFixture, a_removed_pager_is_not_touched_and_an_attached_on
 
 TEST_CASE(KvflashArenaFixture, members_share_the_arena_stream_and_batch_submit) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
+    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device: the shared stream needs one");
     World w;
     REQUIRE(w.arena.stream() != nullptr);
     for (auto & x : w.s) CHECK(x->page_stream() == w.arena.stream());
