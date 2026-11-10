@@ -378,6 +378,11 @@ static void print_usage(const char * prog) {
         "                              Default disk prefix-cache policy (default: full).\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "                              Needs RAM prefix slots to write new entries.\n"
+        "  --shared-prefix auto|freeze|off\n"
+        "                              The tools and system prompt a client repeats in\n"
+        "                              every request (default: auto). auto captures it\n"
+        "                              where requests agree, freeze keeps the known cuts\n"
+        "                              still (benchmarks), off is plain prefix caching.\n"
         "\n"
         "Chat template (optional, overrides the model-family renderer):\n"
         "  --chat-template-file <path>  Load a Jinja chat template file.\n"
@@ -1186,6 +1191,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
             sconfig.disk_cache_policy = policy;
+        } else if (std::strcmp(argv[i], "--shared-prefix") == 0 && i + 1 < argc) {
+            if (!parse_shared_prefix_mode(argv[++i], sconfig.shared_prefix)) {
+                std::fprintf(stderr, "[server] --shared-prefix must be auto, freeze or off\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
             std::fprintf(stderr, "[server] --disk-prefix-cache-compress is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {

@@ -412,7 +412,7 @@ public:
         config.decode_kv_offload_bytes = offload_bytes;
         config.default_max_tokens = 4;
         config.prefix_cache_cap = 0;
-        config.ppp_enabled = false;
+        config.shared_prefix = SharedPrefixMode::off;
         config.admission_coalesce_ms = 0;
         config.chat_template_src = "{{ messages[0]['content'] }}";
         config.sampler_defaults.has_temperature = true;

@@ -20,6 +20,7 @@
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
 #include "tokenizer.h"
+#include "server/kv/shared_prefixes.h"
 #include "chat_template.h"
 #include "chat_codec.h"
 #include "tool_memory.h"
@@ -51,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -134,14 +136,19 @@ struct ServerConfig {
     // A request turns them off or on with "tool_checks": false / true.
     bool        tool_checks = true;
 
-    // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
-    // See docs/PIN_FRIENDLY_PROMPT.md. Env: LUCE_PPP=0|1,
-    // LUCE_PPP_REARRANGE=0|1, LUCE_PPP_LCP_WINDOW=N,
-    // LUCE_PPP_MIN_PIN_TOKENS=N, LUCE_PPP_MAX_EPHEMERAL=N.
-    bool        ppp_enabled = true;
+    // Shared prefixes (kv/shared_prefixes.h): --shared-prefix auto|freeze|off.
+    // The ring size and minimum prefix are constants; LUCE_PPP=0,
+    // LUCE_PPP_LCP_WINDOW and LUCE_PPP_MIN_PIN_TOKENS still set them for one
+    // release, with a warning.
+    SharedPrefixMode shared_prefix = SharedPrefixMode::learn;
+    int         shared_prefix_ring = SharedPrefixes::kRingSize;
+    int         shared_prefix_min_tokens = SharedPrefixes::kMinTokens;
+    // Idle time before the concurrent path warms a pin (a client
+    // reconnecting right after a restart comes first). Tests set 0.
+    int         shared_prefix_warm_grace_ms = 5000;
+    // The opt-in DiffPin rewrite (docs/PIN_FRIENDLY_PROMPT.md), needs the
+    // shared prefixes on. Env: LUCE_PPP_REARRANGE=0|1, LUCE_PPP_MAX_EPHEMERAL=N.
     bool        ppp_rearrange = false;
-    int         ppp_lcp_window = 8;
-    int         ppp_min_pin_tokens = 512;
     int         ppp_max_ephemeral_tokens = 256;  // diff hunk relocate cap
 
     // Thinking-budget v2. Applied when a request opts in via
@@ -632,6 +639,8 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    // The client: the User-Agent's product token (e.g. "claude-cli").
+    std::string               client;
     std::string               pflash_query;   // explicit scorer query text (optional request field)
     // Literal strings inside the boundary message that must survive
     // compression (e.g. an answer-format directive embedded in a user
@@ -717,7 +726,6 @@ void apply_request_reasoning(const json & body,
 
 // Sticky tools-boundary pinning is part of PPP and must follow its master
 // toggle. Kept as a small policy helper so the disabled path is testable.
-bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
 
 // Whether the Agent Turn Cache runs. `requested` is --agent-turn-cache
 // (true), --no-agent-turn-cache (false) or neither. The cache replays turns
@@ -815,7 +823,8 @@ private:
                                SocketHandle client_fd = kInvalidSocket,
                                bool * dropped_tool_call = nullptr,
                                bool note_pass = false,
-                               const nlohmann::ordered_json * ordered_tools = nullptr);
+                               const nlohmann::ordered_json * ordered_tools = nullptr,
+                               const std::string & client = {});
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
@@ -967,7 +976,8 @@ private:
     ServerJob * try_dequeue();
     // The longest prefix `prompt` shares with a job still in the queue.
     int queued_shared_prefix(const std::vector<int32_t> & prompt);
-    // Bounded wait used only during an idle-to-busy admission window.
+    // Bounded wait: an idle-to-busy admission window, the grace before a
+    // warm, the disk-read reaper.
     ServerJob * dequeue_for(
         std::chrono::steady_clock::duration timeout);
 
@@ -993,6 +1003,7 @@ private:
         std::string path;
         std::string query;  // raw query string (after '?')
         std::string body;
+        std::string user_agent;
     };
     bool read_http_request(SocketHandle fd, HttpRequest & out);
 
@@ -1134,7 +1145,16 @@ private:
     void publish_memory_report();
     json memory_json() const;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
-    std::vector<std::vector<int32_t>> recent_tool_prefixes_;
+    SharedPrefixes shared_prefixes_{SharedPrefixMode::off, {}};
+    // The process's catalog for this model's token identity (PrefixPins::open),
+    // shared with the other models of that identity.
+    std::shared_ptr<PrefixPins> shared_prefix_pins_;
+    // GET /v1/cache/shared-prefixes: this model's pins.
+    json shared_prefixes_json() const;
+    // RAM for warmed pinned prefixes (concurrent path): min(one checkpoint
+    // of `full_bytes`, the prefix budget less two of them), so a capture and
+    // a tip at full context still fit beside them.
+    size_t shared_prefix_ram_cap(size_t full_bytes) const;
 
     // Immutable model table after run() starts; only reservations mutate under
     // routing_mu_. A reservation spans parsing through job retirement/output
@@ -1197,6 +1217,9 @@ struct ServerJob {
     bool          report_admission = false; // return busy before committing a response
     RoutingAdmission admission = RoutingAdmission::handled; // published with done
     bool          announced = false;
+    // The learned shared-prefix cut, found at the first admission attempt
+    // (before the request's own region joins the ring); -1 until then.
+    int           shared_prefix_cut = -1;
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
