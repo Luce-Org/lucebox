@@ -12,24 +12,31 @@
 
 namespace luce::common {
 
-// Counts are read and swaps planned every kTickGraphs split decode or verify graphs.
+// Counts are read and swaps planned every kTickGraphs split decode or verify graphs: a read costs a small device
+// copy and a host scan of every layer's counters, so reading more often follows a new request sooner for more host
+// time per graph.
 static constexpr int kTickGraphs = 16;
 // A layer's scores lose this share of their weight at each read, so an expert's score is about its last
-// kTickGraphs / (1 - kDecay) graphs of picks (~320 graphs).
+// kTickGraphs / (1 - kDecay) graphs of picks (~320 graphs): a longer memory holds a steadier set and follows a change of
+// request more slowly.
 static constexpr float kDecay = 0.95f;
 // A swap moves in an expert picked more than kSwapRatio times as often as the one it evicts, plus kSwapMargin picks
-// (a copy costs ~1 ms of the link; a swap back and forth on noise would waste it).
+// (a copy costs ~1 ms of the link; a swap back and forth on noise would waste it): lower values follow the picks more
+// closely and spend more of the link on copies.
 static constexpr float kSwapRatio = 1.5f;
 static constexpr float kSwapMargin = 4.0f;
-// At most this many experts are being copied at once (~3 MB each over the R9700's PCIe link).
+// At most this many experts are being copied at once (~3 MB each over the R9700's PCIe link): more fills the slots
+// sooner, and the copies share the link with the decode steps' transfers.
 static constexpr int kMaxCopies = 32;
 // A start-up placement (--expert-placement) counts as this many picks per layer, so a request's own picks outweigh it
-// after a few hundred tokens.
+// after a few hundred tokens: a larger prior keeps the profiled set longer against the served picks.
 static constexpr float kPriorPicks = 2000.0f;
 // A prompt chunk's picks count as at most this many per layer (a 4096-row chunk makes ~41k), so the reply's own
-// picks take over within a few hundred tokens.
+// picks take over within a few hundred tokens: a larger share starts the reply with the prompt's experts and holds
+// them longer.
 static constexpr float kPromptPicks = 2000.0f;
-// Copies a prompt chunk may start (it runs for a second or more; the decode steps' hops are not waiting on the link).
+// Copies a prompt chunk may start (it runs for a second or more; the decode steps' hops are not waiting on the link):
+// more brings the prompt's experts in before the reply, at the cost of copies the reply may not use.
 static constexpr int kMaxPromptCopies = 128;
 
 static bool split_layer(const Qwen4ExpWeights & w, int il) {
@@ -46,6 +53,9 @@ Qwen4ExpHotSet::~Qwen4ExpHotSet() {
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
     for (Batch & b : todo_) if (b.ready) ggml_backend_event_free(b.ready);
+    // The stage's slices must outlive the table writes that read them.
+    if (lut_pending_) ggml_backend_event_synchronize(lut_written_);
+    if (lut_written_) ggml_backend_event_free(lut_written_);
     if (staging_buf_) ggml_backend_buffer_free(staging_buf_);
     if (buf_) ggml_backend_buffer_free(buf_);
     if (ctx_) ggml_free(ctx_);
@@ -104,6 +114,9 @@ bool Qwen4ExpHotSet::init(ggml_backend_t target, const Qwen4ExpWeights & w, uint
     staging_buf_ = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), largest);
     if (!staging_buf_) return false;
     staging_bytes_ = largest;
+    // A tick writes at most every slot's table entry twice (an eviction and a finished copy).
+    lut_written_ = ggml_backend_event_new(ggml_backend_get_device(target));
+    if (!lut_written_ || !lut_stage_.reserve(target, 2 * (size_t) w.n_layer * slots * 64)) return false;
     w_ = &w;
 
     // The start-up placement: each layer's most-picked experts, copied before the first request.
@@ -127,10 +140,8 @@ bool Qwen4ExpHotSet::init(ggml_backend_t target, const Qwen4ExpWeights & w, uint
             }
         }
         share = routes ? (double) hot_routes / (double) routes : 0.0;
-        ggml_backend_tensor_set(lut_all_, host_lut_.data(), 0, host_lut_.size() * sizeof(int32_t));
-    } else {
-        ggml_backend_tensor_set(lut_all_, host_lut_.data(), 0, host_lut_.size() * sizeof(int32_t));
     }
+    ggml_backend_tensor_set(lut_all_, host_lut_.data(), 0, host_lut_.size() * sizeof(int32_t));
     // Lanes for 1.5x a token's mean hot picks (a lane's output crosses the link whether a pick used it or not; a pick
     // past the token's last lane runs on the expert device). Without a start-up profile: half the picks.
     lanes = stats ? (int) std::ceil(1.5 * share * w.n_expert_used) : w.n_expert_used / 2;
@@ -180,7 +191,26 @@ void Qwen4ExpHotSet::copier() {
     }
 }
 
+void Qwen4ExpHotSet::write_lut(ggml_backend_t target, size_t e) {
+    lut_stage_.set(target, lut_all_, &host_lut_[e], e * sizeof(int32_t), sizeof(int32_t));
+    lut_writes_ = true;
+}
+
+void Qwen4ExpHotSet::lut_queued(ggml_backend_t target) {
+    if (!lut_writes_) return;
+    ggml_backend_event_record(lut_written_, target);
+    lut_writes_ = false;
+    lut_pending_ = true;
+}
+
 void Qwen4ExpHotSet::tick(ggml_backend_t target, const Qwen4ExpWeights & w, int prompt_rows) {
+    // The previous tick's table writes ran (they were queued before the graphs since, so this rarely waits): their
+    // slices are free again.
+    if (lut_pending_) {
+        ggml_backend_event_synchronize(lut_written_);
+        lut_pending_ = false;
+    }
+    lut_stage_.reset();
     // Finished copies: their experts' table entries go live with the next graph.
     std::vector<Job> done;
     {
@@ -193,8 +223,9 @@ void Qwen4ExpHotSet::tick(ggml_backend_t target, const Qwen4ExpWeights & w, int 
         slot_expert_[(size_t) j.layer * slots + j.slot] = j.expert;
         filling_[(size_t) j.layer * slots + j.slot] = 0;
         incoming_[e] = 0;
-        ggml_backend_tensor_set_async(target, lut_all_, &host_lut_[e], e * sizeof(int32_t), sizeof(int32_t));
+        write_lut(target, e);
     }
+    lut_queued(target);
     // The counts since the last read: after a prompt chunk (rows_ > 0) they are read at once, before the next graph;
     // otherwise every kTickGraphs decode or verify graphs.
     const int counted_rows = rows_;
@@ -254,13 +285,14 @@ void Qwen4ExpHotSet::tick(ggml_backend_t target, const Qwen4ExpWeights & w, int 
         if (held >= 0) {   // the evicted expert runs on the expert device from the next graph on
             const size_t e = (size_t) s.layer * n_expert_ + held;
             host_lut_[e] = -1;
-            ggml_backend_tensor_set_async(target, lut_all_, &host_lut_[e], e * sizeof(int32_t), sizeof(int32_t));
+            write_lut(target, e);
         }
         slot_expert_[slot] = -1;
         filling_[slot] = 1;
         incoming_[(size_t) s.layer * n_expert_ + s.expert] = 1;
         b.jobs.push_back({s.layer, s.slot, s.expert});
     }
+    lut_queued(target);
     b.ready = ggml_backend_event_new(ggml_backend_get_device(target));
     if (!b.ready) {   // no event: copy nothing, the slots stay empty until the next tick tries again
         for (const Job & j : b.jobs) {

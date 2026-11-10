@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "common/pinned_stage.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -55,6 +56,10 @@ private:
     };
     void copier();
     void copy_expert(const Qwen4ExpWeights & w, const Job & j, uint8_t * staging);
+    // Queue host_lut_[e] for the device table on the target's stream, through a pinned slice of lut_stage_ (the
+    // source of an asynchronous copy must not change before the copy ran); lut_written_ follows each tick's writes.
+    void write_lut(ggml_backend_t target, size_t e);
+    void lut_queued(ggml_backend_t target);
 
     ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
@@ -62,6 +67,10 @@ private:
     ggml_tensor * hist_all_ = nullptr;   // [n_expert, n_layer]
     int n_layer_ = 0, n_expert_ = 0;
     std::vector<int32_t> host_lut_;      // [n_layer][n_expert], what the device table says (or will at the next graph)
+    PinnedStage lut_stage_;              // the table writes of one tick, each from its own slice
+    ggml_backend_event_t lut_written_ = nullptr;   // after the last tick's table writes
+    bool lut_writes_ = false;            // writes queued this tick, not yet behind lut_written_
+    bool lut_pending_ = false;           // lut_written_ follows writes the stream may not have run yet
     std::vector<int32_t> slot_expert_;   // [n_layer][slots], -1: empty or being filled
     std::vector<uint8_t> filling_;       // [n_layer][slots], a copy into the slot is running
     std::vector<uint8_t> incoming_;      // [n_layer][n_expert], the expert is being copied into a slot
