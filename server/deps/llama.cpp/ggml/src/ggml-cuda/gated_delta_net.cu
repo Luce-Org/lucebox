@@ -330,12 +330,12 @@ gated_delta_net_cuda(const float * q,
                 replay_log_t[replay_log_gate_values + S_v + col] = delta_col;
             }
 
-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+            // fused: S[i][col] = fmaf(k[i], delta[col], g * S[i][col]), the replay-log commit form
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = fmaf(k_reg[r], delta_col, g_val * s_shard[r]);
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -367,7 +367,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = fmaf(k_reg[r], delta_col, expf(g_t[i]) * s_shard[r]);
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -818,7 +818,7 @@ gated_delta_net_tiled_cuda(const float * q,
                 // delta[col] = (v[col] - g * kv[col]) * beta
                 const float delta_col = fmaf(-g_val, kv_col, v_shared[tt][colw + c]) * beta_val;
 
-                // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+                // fused: S[i][col] = fmaf(k[i], delta[col], g * S[i][col]), the replay-log commit form
                 // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
                 float attn_partial = 0.0f;
 #pragma unroll
