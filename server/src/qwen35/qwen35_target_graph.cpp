@@ -3028,6 +3028,72 @@ size_t estimate_target_cache_snapshot_bytes(const TargetWeights & w,
     return bytes;
 }
 
+size_t estimate_target_cache_state_bytes(const TargetWeights & w,
+                                         const TargetCache & cache,
+                                         int token_count,
+                                         ggml_backend_buffer_type_t buft) {
+    if (!buft || cache.n_seq_slots > 1 || token_count <= 0) return 0;
+    if (cache.max_ctx > 0) token_count = std::min(token_count, cache.max_ctx);
+    PrefixSnapshot layout;
+    if (!create_dense_snapshot_layout(w, cache, token_count, layout, /*skip_kv=*/true)) return 0;
+    const size_t bytes =
+        ggml_backend_alloc_ctx_tensors_from_buft_size(layout.ctx, buft);
+    free_prefix_snapshot(layout);
+    return bytes;
+}
+
+bool drop_prefix_snapshot_kv(ggml_backend_t backend, PrefixSnapshot & snap) {
+    if (!backend || !snap.ctx || !snap.buf || snap.state_only || snap.is_pooled ||
+        snap.layout != PrefixSnapshot::Layout::dense) {
+        set_last_error("drop_prefix_snapshot_kv: not a plain dense snapshot");
+        return false;
+    }
+    // The same tensors minus K/V, in a buffer of their own: a ggml buffer
+    // cannot give back part of itself.
+    PrefixSnapshot kept;
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)(2 * snap.ssm_state_snap.size() + 1 + 16) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    kept.ctx = ggml_init(ip);
+    if (!kept.ctx) {
+        set_last_error("drop_prefix_snapshot_kv: ggml_init failed");
+        return false;
+    }
+    const auto twin = [&](const ggml_tensor * t) -> ggml_tensor * {
+        if (!t) return nullptr;
+        ggml_tensor * out = ggml_dup_tensor(kept.ctx, t);
+        ggml_set_name(out, t->name);
+        return out;
+    };
+    kept.ssm_state_snap.reserve(snap.ssm_state_snap.size());
+    kept.conv_state_snap.reserve(snap.conv_state_snap.size());
+    for (const ggml_tensor * t : snap.ssm_state_snap)  kept.ssm_state_snap.push_back(twin(t));
+    for (const ggml_tensor * t : snap.conv_state_snap) kept.conv_state_snap.push_back(twin(t));
+    kept.target_feat_snap = twin(snap.target_feat_snap);
+    kept.buf = ggml_backend_alloc_ctx_tensors(kept.ctx, backend);
+    if (!kept.buf) {
+        set_last_error("drop_prefix_snapshot_kv: allocation failed");
+        free_prefix_snapshot(kept);
+        return false;
+    }
+    for (size_t i = 0; i < snap.ssm_state_snap.size(); ++i) {
+        if (snap.ssm_state_snap[i])  ggml_backend_tensor_copy(snap.ssm_state_snap[i],  kept.ssm_state_snap[i]);
+        if (snap.conv_state_snap[i]) ggml_backend_tensor_copy(snap.conv_state_snap[i], kept.conv_state_snap[i]);
+    }
+    if (snap.target_feat_snap) ggml_backend_tensor_copy(snap.target_feat_snap, kept.target_feat_snap);
+    kept.cur_pos         = snap.cur_pos;
+    kept.last_tok        = snap.last_tok;
+    kept.kv_k_type       = snap.kv_k_type;
+    kept.max_ctx         = snap.max_ctx;
+    kept.target_feat_cap = snap.target_feat_cap;
+    kept.layout          = PrefixSnapshot::Layout::dense;
+    kept.state_only      = true;
+    free_prefix_snapshot(snap);
+    snap = std::move(kept);
+    return true;
+}
+
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
@@ -3055,6 +3121,7 @@ bool snapshot_target_cache(const TargetWeights & w,
     const bool needs_alloc = snap.ctx == nullptr ||
         snap.layout != PrefixSnapshot::Layout::dense ||
         snap.is_pooled != skip_kv ||
+        snap.state_only ||
         snap.cur_pos != snap_pos;
     if (needs_alloc) {
         free_prefix_snapshot(snap);
@@ -3125,6 +3192,7 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.target_feat_cap = cache.target_feat_cap;
     snap.layout          = PrefixSnapshot::Layout::dense;
     snap.is_pooled       = skip_kv;
+    snap.state_only      = false;
     if (skip_kv && kvflash_blob) snap.kvflash_blob = *kvflash_blob;
     else                         snap.kvflash_blob.clear();
 
@@ -3153,11 +3221,22 @@ void clear_kv_rows_from(TargetCache & cache, int pos) {
 }
 
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
-                          bool skip_kv) {
+                          bool skip_kv, const PrefixSnapshot * kv_from) {
     if (snap.layout != PrefixSnapshot::Layout::dense) {
         set_last_error("restore_target_cache: snapshot is not dense");
         return false;
     }
+    // A state-only snapshot takes its attention rows from a deeper dense one.
+    if (!snap.state_only) kv_from = nullptr;
+    if (snap.state_only &&
+        (skip_kv || !kv_from || kv_from == &snap || !kv_from->ctx ||
+         kv_from->layout != PrefixSnapshot::Layout::dense || kv_from->is_pooled ||
+         kv_from->state_only || kv_from->cur_pos < snap.cur_pos ||
+         kv_from->kv_k_type != snap.kv_k_type || kv_from->max_ctx != snap.max_ctx)) {
+        set_last_error("restore_target_cache: state-only snapshot without a dense snapshot that covers it");
+        return false;
+    }
+    const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
     if (snap.is_pooled != skip_kv) {
         set_last_error("restore_target_cache: pooled/dense snapshot mismatch");
         return false;
@@ -3178,8 +3257,8 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
     // allocated against. A mismatch (stale snapshot from a different daemon
     // run, or a snap captured before a model swap) would index past
     // cache.attn_k / .ssm_state / .conv_state and silently corrupt memory.
-    if ((!skip_kv && (snap.attn_k_snap.size() != cache.attn_k.size() ||
-                      snap.attn_v_snap.size() != cache.attn_v.size())) ||
+    if ((!skip_kv && (kv.attn_k_snap.size() != cache.attn_k.size() ||
+                      kv.attn_v_snap.size() != cache.attn_v.size())) ||
         snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size()) {
         set_last_error("restore_target_cache: layer-count mismatch (stale snapshot?)");
@@ -3190,21 +3269,26 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
         return false;
     }
 
-    const int n_full_attn = skip_kv ? 0 : (int)snap.attn_k_snap.size();
+    const int n_full_attn = skip_kv ? 0 : (int)kv.attn_k_snap.size();
     const int n_delta     = (int)snap.ssm_state_snap.size();
     const int snap_pos    = snap.cur_pos;
 
     // KV: strip-by-strip copy (skip_kv: restored separately via pager deserialize) from right-sized snapshot into full-size cache.
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_tensor * sk = snap.attn_k_snap[i];
+        ggml_tensor * sk = kv.attn_k_snap[i];
         ggml_tensor * dk = cache.attn_k[i];
-        ggml_tensor * sv = snap.attn_v_snap[i];
+        ggml_tensor * sv = kv.attn_v_snap[i];
         ggml_tensor * dv = cache.attn_v[i];
         if ((!sk || !sv) != (!dk || !dv)) {
             set_last_error("restore_target_cache: KV shard layout mismatch");
             return false;
         }
         if (!sk || !dk || !sv || !dv) continue;
+        // Rows of a deeper snapshot: it must hold at least the restored ones.
+        if (snap_pos > sk->ne[1] || snap_pos > sv->ne[1]) {
+            set_last_error("restore_target_cache: the dense snapshot holds fewer rows than the state");
+            return false;
+        }
         // A bounded KVFlash pool allocates fewer rows than max_ctx: a dense
         // snapshot longer than the pool must not be written into it.
         if (snap_pos > dk->ne[1] || snap_pos > dv->ne[1]) {
@@ -3657,6 +3741,7 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.kv_start        = 0;
     snap.kv_end          = 0;
     snap.is_pooled       = false;
+    snap.state_only      = false;
     snap.kvflash_blob.clear();
     snap.kvflash_blob.shrink_to_fit();
 }

@@ -306,7 +306,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
             s.send_buffer);
         s.pending_tok = tok;
-        if (!cont || engine.token_is_eos(tok) ||
+        if (!cont || (!request_ignores_eos(s.job->req) && engine.token_is_eos(tok)) ||
             (int)s.gen_tokens.size() >= s.n_gen_cap) {
             s.finished = true;
             return;

@@ -474,7 +474,28 @@ Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence
 path frees the ancestors it supersedes, keeping only the shallowest one (the
 shared system/tools head) and protected tool pins. A conversation therefore
-holds about two snapshots instead of one per turn. Chains that are abandoned,
+holds about two snapshots instead of one per turn.
+
+**State backups.** A superseded turn repeats the attention rows of the snapshot
+that supersedes it; only its recurrent state, decode seed and drafter features
+are its own. Where the backend can drop a snapshot's rows
+(`ModelBackend::snapshot_drop_kv`: Qwen3.5/3.6/3.8 single-sequence serving with
+dense snapshots), the superseded turns are therefore kept instead of freed, as
+*state-only backups*: about 370 MB each for Qwen3.8-27B at any length, against
+about 4 GB for a whole snapshot at 100K tokens. A prompt that departs from the
+conversation before its end (an edited or retried last message, a second
+request from the same point, a client that drops its last turns) restores the
+deepest backup it still extends, with the rows of the newer snapshot
+(`[pc] state backup slot=N ... restores with the rows of slot=M`), and
+prefills only what follows. Backups thin out with distance: the previous turn
+is kept, then one at least twice as far behind the newest snapshot as the last
+one kept, and so on, so a conversation holds a number that grows with the
+logarithm of its length and a prompt that departs d tokens back resumes within
+about 2d of its end. A backup is never written to disk and leaves RAM with the
+last snapshot whose rows can restore it. Under the resident limit, the backups
+of the conversation being served are evicted after the leaves of the other
+conversations, not before. Other backends, KVFlash pools and concurrent
+serving keep the previous turn whole while the limit holds it, as before. Chains that are abandoned,
 for example after a client compacts its context, are bounded by
 `--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
 the oldest leaf first. When no single entry makes enough room, it evicts several,
@@ -647,3 +668,21 @@ With right-sized snapshots, typical save/restore transfers are small:
 The old full-size approach (1.5 GB per snapshot) is eliminated. System RAM
 footprint is proportional to actual token count, enabling many more cached
 prefixes with no VRAM cost.
+
+## Measuring the hit rate
+
+`scripts/bench_agentx_cache.py` replays the public coding-agent traces of the AgentX
+benchmark against a running server and reports the share of prompt tokens read from the
+cache, the median tokens a request computed, and where the computed tokens came from: the
+first turn of a session, the previous reply computed again, or new text.
+
+```bash
+python3 server/scripts/bench_agentx_cache.py run --url http://127.0.0.1:8080 \
+    --model qwen3.8-27b --tokenizer Qwen/Qwen3.8-27B --sessions 1 --out results/agentx-1
+```
+
+The traces hold the shape of real Claude Code sessions and no text, so the client sends
+filler text of the recorded lengths and asks for each reply at its recorded length with
+`ignore_eos`. They carry no tool calls: the [Agent Turn Cache](API.md#agent-turn-cache),
+which keeps the state a tool-call turn leaves behind, does not take part, and every turn
+resumes from the end of the previous prompt.

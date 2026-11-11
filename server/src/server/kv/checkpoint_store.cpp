@@ -28,6 +28,18 @@ size_t BackendCheckpoints::estimate_bytes(int tokens) const {
     return backend_.snapshot_bytes_estimate(tokens);
 }
 
+size_t BackendCheckpoints::estimate_state_bytes(int tokens) const {
+    return backend_.snapshot_state_bytes_estimate(tokens);
+}
+
+bool BackendCheckpoints::drop_kv(Checkpoint checkpoint) {
+    return checkpoint.valid() && backend_.snapshot_drop_kv(checkpoint.cache_slot());
+}
+
+bool BackendCheckpoints::state_only(Checkpoint checkpoint) const {
+    return checkpoint.valid() && backend_.snapshot_state_only(checkpoint.cache_slot());
+}
+
 bool BackendCheckpoints::used(Checkpoint checkpoint) const {
     return checkpoint.valid() && backend_.snapshot_used(checkpoint.cache_slot());
 }

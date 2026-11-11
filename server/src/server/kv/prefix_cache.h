@@ -33,8 +33,11 @@ namespace luce::common {
 // of any other — so shared ancestors stay resident. A turn kept between a
 // conversation's head and its newest snapshot (see
 // PrefixCache::prune_superseded_ancestors) goes before any leaf: it only
-// serves an edit of the last message. Pointer overload is the core (no token
-// copies); the value overload is for tests.
+// serves an edit of the last message. The ones behind skip_index, the
+// conversation being served, are the exception: they wait until no leaf of
+// another conversation is left, so the requests in between (subagents, other
+// sessions) do not cost the live conversation its way back. Pointer overload
+// is the core (no token copies); the value overload is for tests.
 //
 // protected_lru (optional, same size): entries marked true go last. When
 // every other leaf is protected, the oldest protected leaf is the victim.
@@ -195,7 +198,10 @@ public:
         InlineSnapshotSize estimate_bytes = {},
         int reachable_from = 0,
         int restore_point_spacing = 0,
-        bool forced_cut_learned = false);
+        bool forced_cut_learned = false,
+        // The snapshot whose rows a state-only restore source takes
+        // (kv_source_slot): never a victim either.
+        int restore_kv_slot = -1);
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.
@@ -213,8 +219,36 @@ public:
     // where an edit of the last message resumes.
     // Returns the dropped slots (and, with `pruned_tokens`, each one's prefix
     // length); the caller frees their snapshot payloads.
+    //
+    // With state backups (set_state_backup_bytes) and a `keep_state` list,
+    // the turns behind the newest snapshot are kept instead, as state-only
+    // backups: each repeats the newest one's attention rows, so it holds only
+    // what its position determines. They thin out with distance: the previous
+    // turn stays, then one at least twice as far behind the newest as the
+    // last one kept, and so on, so a conversation holds a number that grows
+    // with the logarithm of its length and a prompt that departs from it
+    // d tokens back resumes within about 2d of its end. The dense ones among
+    // the kept are returned in `keep_state`: the caller drops their rows and
+    // reports each with mark_state_only(), or frees and invalidates it.
     std::vector<int> prune_superseded_ancestors(
-        int slot, std::vector<int> * pruned_tokens = nullptr);
+        int slot, std::vector<int> * pruned_tokens = nullptr,
+        std::vector<int> * keep_state = nullptr);
+
+    // ── State-only backups ──────────────────────────────────────────
+    // Bytes one state-only snapshot holds (the backend's estimate at the
+    // context limit); 0, the default, keeps none.
+    void set_state_backup_bytes(size_t bytes) { state_backup_bytes_ = bytes; }
+    bool state_backups() const { return state_backup_bytes_ > 0; }
+    // The entry in `slot` now holds its state only, in `resident_bytes`.
+    void mark_state_only(int slot, size_t resident_bytes);
+    bool state_only(int slot) const;
+    // The resident dense entry whose tokens extend the state-only entry in
+    // `slot`, most recently used first: its rows restore it. -1 when `slot`
+    // holds no state-only entry or none is resident.
+    int kv_source_slot(int slot) const;
+    // Erase the state-only entries no resident dense entry extends any more
+    // and return their slots; the caller frees the payloads.
+    std::vector<int> take_orphaned_state_backups();
 
     // Evicts committed entries, pins last and never `keep_slot` or a pinned
     // ancestor of it, until the resident bytes fit the budget again. Returns
@@ -373,6 +407,8 @@ private:
         // Kept behind a deeper snapshot of its conversation only so an
         // edit of the last message can resume (prune_superseded_ancestors).
         bool                 edit_backup = false;
+        // Its payload holds no attention rows (mark_state_only).
+        bool                 state_only = false;
         // See set_disk_key, set_aux and mark_agent_turn.
         int                  disk_key_len = 0;
         std::string          aux;
@@ -407,6 +443,9 @@ private:
     std::vector<ActiveReservation> active_reservations_;
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
+    size_t state_backup_bytes_ = 0;
+    // The reservation being planned restores with this slot's rows.
+    int planning_kv_slot_ = -1;
     bool prunes_superseded_ = false;
     bool record_evictions_ = false;
     std::vector<Evicted> evicted_log_;
@@ -458,6 +497,11 @@ private:
     // Helpers
     int find_entry(const PrefixHash & h) const;
     int find_slot_entry(int slot) const;
+    // Index of the dense entry that extends state-only entries_[idx]; -1 when none.
+    int kv_source_index(int idx) const;
+    // Bytes a commit over entries_[idx] frees: all of it, or what a state
+    // backup of it gives back.
+    size_t superseded_credit(int idx) const;
     // Indices of entries a new entry for ids[0, len) supersedes: its strict
     // prefixes except the shallowest and protected pins.
     std::vector<int> superseded_entries(const int32_t * ids, size_t len) const;
@@ -471,8 +515,10 @@ private:
         bool record_hit);
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
-    // A capture in flight writes this slot or evicts its entry.
+    // A capture in flight writes this slot or evicts its entry
+    // (capture_holds), or the reservation being planned restores with its rows.
     bool slot_reserved(int slot) const;
+    bool capture_holds(int slot) const;
     // A capture in flight counts this slot's entry as freed.
     bool slot_credited(int slot) const;
     const ActiveReservation * find_active_reservation(uint64_t id) const;
