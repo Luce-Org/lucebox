@@ -1,11 +1,13 @@
 // Digest of a session's whole saved state (R3 digest mode, LUCE_KVFLASH_BUNDLE_DIGEST=1): one FNV-1a (the slot-state
-// hash) per component and one over the six, from host bytes alone, so the save (the bytes being staged) and the
+// hash) per component and one over the seven, from host bytes alone, so the save (the bytes being staged) and the
 // restore (the live slot, read back through the same staging) are compared on equal terms.
 //
 // Digested: the token history, the end slab (ssm + conv pack), every materialized chunk's KV bytes in chunk order
 // (each folded with its index), the ledger, the pager header (magic, chunk count, chunk tokens, head count, K/V segment
 // bytes, chunk bytes, K/V types: geometry only, all fixed for a session), and the rungs a next turn can rewind to
-// (ckpt, trunk, third: a presence byte, the position and the slab pack; then the pin position).
+// (ckpt, trunk, third: a presence byte, the position and the slab pack; then the pin position), and the slot's user-question
+// query rows (the window lo/hi, n, the key hash and the row floats; none: nothing folded). A restored slot that scores a question
+// with fewer rows than the live one picks differently while every other component is equal, so the rows are state.
 // Excluded, because a later park of the same state legitimately differs there: the head's gen, log_gen, end_gen and
 // rung gens (a counter per park), log_bytes and the chunk map offsets (where a record landed in an appended or
 // compacted log), the record tags' park generation and crc, and the slab file ids. A chunk the ledger does not
@@ -33,14 +35,14 @@ struct KvFlashDigestRungs {
 };
 
 struct KvFlashStateDigest {
-    uint64_t all = 0, hist = 0, slab = 0, kv = 0, ledger = 0, pager = 0, rung = 0;
+    uint64_t all = 0, hist = 0, slab = 0, kv = 0, ledger = 0, pager = 0, rung = 0, uq = 0;
     uint64_t bytes = 0;   // bytes digested, the chunk index folds not counted
 };
 
 // chunk_at(ci, dst) writes chunk_bytes of chunk ci (KvFlashSlotPager::read_chunk, or a slice of a blob).
 template <class ChunkAt>
 inline KvFlashStateDigest kvflash_state_digest(const std::vector<int32_t> & hist, const std::vector<uint8_t> & slab, const std::vector<uint8_t> & pager_hdr,
-                                               const std::vector<uint8_t> & ledger, const KvFlashDigestRungs & rungs, size_t chunk_bytes, ChunkAt && chunk_at) {
+                                               const std::vector<uint8_t> & ledger, const KvFlashDigestRungs & rungs, size_t chunk_bytes, ChunkAt && chunk_at, const KvFlashUqStore * uq = nullptr) {
     KvFlashStateDigest d;
     d.hist = fnv1a_bytes(kFnvBasis, (const uint8_t *)hist.data(), hist.size() * 4);
     d.slab = fnv1a_bytes(kFnvBasis, slab.data(), slab.size());
@@ -70,7 +72,15 @@ inline KvFlashStateDigest kvflash_state_digest(const std::vector<int32_t> & hist
         d.kv = fnv1a_bytes(d.kv, buf.data(), buf.size());
         d.bytes += chunk_bytes;
     }
-    const uint64_t parts[6] = {d.hist, d.slab, d.kv, d.ledger, d.pager, d.rung};
+    d.uq = kFnvBasis;
+    if (uq && !uq->empty()) {
+        const int32_t meta[3] = {uq->lo, uq->hi, uq->n};
+        d.uq = fnv1a_bytes(d.uq, (const uint8_t *)meta, 12);
+        d.uq = fnv1a_bytes(d.uq, (const uint8_t *)&uq->hash, 8);
+        d.uq = fnv1a_bytes(d.uq, (const uint8_t *)uq->rows.data(), uq->rows.size() * sizeof(float));
+        d.bytes += uq->rows.size() * sizeof(float);
+    }
+    const uint64_t parts[7] = {d.hist, d.slab, d.kv, d.ledger, d.pager, d.rung, d.uq};
     d.all = fnv1a_bytes(kFnvBasis, (const uint8_t *)parts, sizeof parts);
     return d;
 }
@@ -117,10 +127,10 @@ inline std::string kvflash_fault_line(const std::string & kind, const std::strin
 
 // The one log line of both sides; tag is "save" or "restore", sid the session's store key.
 inline std::string kvflash_state_digest_line(const char * tag, const std::string & sid, uint32_t gen, const KvFlashStateDigest & d, double ms) {
-    char b[448];
-    std::snprintf(b, sizeof b, "[kvflash-digest] %s sid=%s gen=%u all=%016llx hist=%016llx slab=%016llx kv=%016llx ledger=%016llx pager=%016llx rung=%016llx bytes=%llu ms=%.1f",
+    char b[512];
+    std::snprintf(b, sizeof b, "[kvflash-digest] %s sid=%s gen=%u all=%016llx hist=%016llx slab=%016llx kv=%016llx ledger=%016llx pager=%016llx rung=%016llx uq=%016llx bytes=%llu ms=%.1f",
                   tag, sid.c_str(), gen, (unsigned long long)d.all, (unsigned long long)d.hist, (unsigned long long)d.slab, (unsigned long long)d.kv,
-                  (unsigned long long)d.ledger, (unsigned long long)d.pager, (unsigned long long)d.rung, (unsigned long long)d.bytes, ms);
+                  (unsigned long long)d.ledger, (unsigned long long)d.pager, (unsigned long long)d.rung, (unsigned long long)d.uq, (unsigned long long)d.bytes, ms);
     return b;
 }
 

@@ -238,3 +238,19 @@ TEST_CASE(KvflashUqFixture, uq_gate_requires_every_id) {
     CHECK(kvflash_uq_gate(S, -1, END, TR) == "user id missing");
     CHECK(kvflash_uq_gate(S, U, -1, TR) == "<|im_end|> id missing");
 }
+
+// A bundle save keeps a slot's rows only when they are the session's own: the slot's store outlives the session that captured it.
+TEST_CASE(KvflashUqFixture, a_store_belongs_to_the_history_it_was_captured_from) {
+    const std::vector<int32_t> ids{5, 6, 7, 8, 9, 10, 11, 12};
+    KvFlashUqStore s;
+    s.lo = 4; s.hi = 7; s.n = 2; s.hash = kvflash_uq_hash(ids, 7); s.rows = {1.f, 2.f, 3.f, 4.f};
+    CHECK(kvflash_uq_belongs(s, ids));
+    auto other = ids; other[2] = 99;                                                       // another session's tokens before the window's end
+    CHECK(!kvflash_uq_belongs(s, other));
+    other = ids; other[7] = 99;                                                            // tokens after it do not matter (the session grew)
+    CHECK(kvflash_uq_belongs(s, other));
+    CHECK(!kvflash_uq_belongs(s, std::vector<int32_t>(ids.begin(), ids.begin() + 6)));   // a history shorter than the window's end
+    KvFlashUqStore t = s; t.n = 4;                    CHECK(!kvflash_uq_belongs(t, ids));   // more rows than the window holds
+    t = s; t.rows.pop_back();                         CHECK(!kvflash_uq_belongs(t, ids));   // ragged rows
+    CHECK(!kvflash_uq_belongs(KvFlashUqStore{}, ids));
+}

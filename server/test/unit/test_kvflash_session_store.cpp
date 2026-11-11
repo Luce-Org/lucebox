@@ -423,7 +423,7 @@ TEST_CASE(KvflashSessionStoreFixture, scan_rebuilds_the_index_from_head_and_meta
     CHECK(ea->last_used == 500);
     CHECK(ea->state == "disk");                    // nothing is in a slot at start
     CHECK(ea->history == (std::vector<int32_t>{1, 2, 3, 4, 5, 6}));
-    CHECK(ea->bytes_live > 0);
+    CHECK(ea->bytes_live == 2 * RB + fs::file_size(store.dir("aaaa") + "/head") + fs::file_size(store.dir("aaaa") + "/" + kvflash_bundle_slab_name(2)));
     CHECK(eb->state == "foreign");                 // no meta: whose it is cannot be proven, so it is listed and never resumed
     CHECK(eb->client == "foreign");
     CHECK(eb->history.empty());

@@ -102,6 +102,13 @@ constexpr size_t kKvFlashUqMaxStores = 8;
 
 // The store holds the rows of the question that ends at hi after the prompt prefix with this hash.
 inline bool kvflash_uq_holds(const KvFlashUqStore & s, int hi, uint64_t hash) { return !s.empty() && s.hi == hi && s.hash == hash; }
+// Is the store the question rows of this prompt's own ids (a session's history)? The window lies in it, n rows fit the window, the
+// rows are whole, and the key is the hash of the ids [0, hi). A slot's store outlives the session that captured it until the next
+// one replaces it; a bundle save keeps only rows that pass this.
+inline bool kvflash_uq_belongs(const KvFlashUqStore & s, const std::vector<int32_t> & ids) {
+    return !s.empty() && s.lo >= 0 && s.lo < s.hi && s.hi <= (int)ids.size() && s.n <= s.hi - s.lo && !s.rows.empty() &&
+           s.rows.size() % (size_t)s.n == 0 && s.hash == kvflash_uq_hash(ids, s.hi);
+}
 
 // LRU of stores, most recent first, keyed by {hi, hash of ids[0, hi)}: the key is the content of the
 // prompt prefix, so a store stays valid whatever the pager or history did since.
