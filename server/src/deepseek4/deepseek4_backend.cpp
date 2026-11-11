@@ -4627,18 +4627,42 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
              (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
         return n_tok >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && i + n_tok < n_total && !at_snap && !capture;
     };
+    // The bands of a pass that a pass sized to the device left for the next.
+    std::vector<int> pass_rest;
     for (int i = 0; i < n_total;) {
         if (io.is_cancelled()) return pos;
 
         if (layer_major_prompt) {
             std::vector<int> bands;
+            bands.swap(pass_rest);
+            const bool rest = !bands.empty();
             int span = 0;
-            while (i + span < n_total) {
+            for (int n : bands) span += n;
+            while (!rest && i + span < n_total) {
                 const int n = plan_chunk(i + span, pos + span, snapshot_saved);
                 if (!plain_chunk(i + span, n, snapshot_saved)) break;
                 if (!bands.empty() && span + n > DS4_LAYER_MAJOR_PROMPT_SPAN) break;
                 bands.push_back(n);
                 span += n;
+            }
+            // Two bands or more run layer-major, as does one with the replay
+            // tail or one split off a pass that ran layer-major.
+            const bool layer_major = bands.size() >= 2 || (!bands.empty() && (replay || rest));
+            // A pass whose residual does not fit on the device runs with it on
+            // the host and without the pipeline, much slower, and later passes
+            // find less free memory than the first. Run the leading bands that
+            // fit, and the rest as the next pass: a split never changes which
+            // bands run layer-major, or how. Cluster ranks plan their passes
+            // alike, so they keep whole passes.
+            const bool cluster_ranks = cache_.cluster_rt && cache_.cluster_rt->size() > 1;
+            if (layer_major && bands.size() > 2 && !cluster_ranks) {
+                const int tail_if_last = replay && i + span == replay_from &&
+                    n_total - replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ? n_total - replay_from : 0;
+                const int run = deepseek4_layer_major_pass_bands(
+                    bands, tail_if_last, deepseek4_layer_major_device_rows(cfg_.device.gpu, w_));
+                pass_rest.assign(bands.begin() + run, bands.end());
+                bands.resize((size_t) run);
+                for (int n : pass_rest) span -= n;
             }
             // The replay rows ride along as the pass's last band for layers
             // [0, cut]; the chunk below then runs only the layers past it.
@@ -4651,7 +4675,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
             if (tail_merged) bands.back() += tail_rows;
             else if (with_tail) bands.push_back(tail_rows);
-            if (bands.size() >= 2 || (replay && !bands.empty())) {
+            if (layer_major) {
                 const int pass_rows = span + tail_rows;
                 std::vector<float> embed((size_t) w_.n_embd * (size_t) pass_rows);
                 if (!w_.embedder.embed(tokens.data() + i, pass_rows, embed.data())) return -1;
