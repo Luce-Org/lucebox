@@ -459,7 +459,6 @@ bool run_case(ggml_backend_t backend,
     bool ok = !k_data.empty() && !v_data.empty() &&
               !k_reference.empty() && !v_reference.empty();
 
-    size_t wmma_launches = 0;
     if (ok) {
         ggml_backend_tensor_set(q, q_data.data(), 0,
                                 q_data.size() * sizeof(q_data[0]));
@@ -494,9 +493,7 @@ bool run_case(ggml_backend_t backend,
         // up as a mismatch instead of whatever the allocator left there.
         const std::vector<float> poison(ggml_nelements(output), 1.0e30f);
         ggml_backend_tensor_set(output, poison.data(), 0, ggml_nbytes(output));
-        const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-        wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
     }
 
     float max_abs_error = INFINITY;
@@ -526,14 +523,7 @@ bool run_case(ggml_backend_t backend,
             max_abs_error =
                 std::max(max_abs_error, std::fabs(actual[i] - expected[i]));
         }
-        // The WMMA route accumulates the VKQ output in f16 (design: mirrors
-        // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
-        // absolute noise against the f32 reference; the decode route
-        // accumulates in f32 (~1e-5). Keyed on the launch counter rather than
-        // the env, so cases that fall back to V_DOT2 (tree mode, ineligible
-        // shapes) keep the strict bound.
-        const float tol = wmma_launches > 0 ? 2.0e-3f : MAX_ABS_ERROR;
-        ok = ok && max_abs_error < tol;
+        ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
     std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
@@ -702,11 +692,13 @@ void run_active_slot_case(const TestCase & test_case,
 
 void run_ragged_case(const TestCase & test_case,
                      const std::vector<int32_t> & active_slot_ids,
-                     const std::vector<int32_t> & query_positions) {
+                     const std::vector<int32_t> & query_positions,
+                     std::vector<std::pair<ggml_type, ggml_type>> kv_types = {{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
-    CHECK(run_case(backend, test_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
-                   &active_slot_ids, &query_positions));
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &active_slot_ids, &query_positions));
+    }
     ggml_backend_free(backend);
 }
 
@@ -797,6 +789,16 @@ TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {
         {33, 1025},
         false,
     }, active_slot_ids, query_positions);
+}
+
+// A KVFlash slot's table has holes where chunks are paged out. Prefill and decode rows (no tree) attend around them
+// on every route: slot 0 has partial-null partitions, slot 1 whole-null ones, slot 2 an all-null table. A hole that
+// enters the softmax as a zero-score token dilutes the row: position 47 of slot 0 sees 16 mapped tokens and 32 holes.
+TEST_CASE(PagedAttention, RaggedRowsOverNullBlocksMatchReference) {
+    const std::vector<int32_t> active_slot_ids{0, 1, 2, 0, 1, 0, 0, -1};
+    const std::vector<int32_t> query_positions{1024, 516, 256, 300, 130, 47, INT32_MAX, -1};
+    run_ragged_case({"ragged-gap", 130, {1025, 517, 257}, false, 4, true, true}, active_slot_ids, query_positions,
+                    {{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}});
 }
 
 // gap_mode: 1 partial-null partitions, 2 whole-null partitions, 3 an all-null table, 4 one mode per slot.
