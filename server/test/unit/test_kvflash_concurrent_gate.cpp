@@ -5,6 +5,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "../../src/common/kvflash_concurrent_gate.h"
 #include "../../src/common/kvflash_arena.h"
+#include "../../src/server/launch_profiles.h"
 #include <cstdlib>
 #include <map>
 #include <utility>
@@ -103,7 +104,6 @@ TEST_CASE(KvflashConcurrentGateFixture, the_concurrent_profile_is_lru_only_by_de
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(p);
     CHECK(ok.ok);
     CHECK(ok.policy == "lru-only");
-    CHECK(ok.suppress_serial_defaults);                   // the recall env defaults must not be installed
     CHECK(!ok.log_line.empty());
     CHECK(ok.log_line.find("lru-only") != std::string::npos);
     for (int with_recall = 0; with_recall < 2; with_recall++) {   // tau, alone or on top of a full recall request
@@ -123,7 +123,6 @@ TEST_CASE(KvflashConcurrentGateFixture, the_recall_profile_needs_every_explicit_
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(full);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    CHECK(ok.suppress_serial_defaults);
     CHECK(ok.log_line.find("recall") != std::string::npos);
     for (int i = 0; i < 7; i++) {                         // a partial request is refused, not completed with defaults
         KvFlashProfileRequest q = full;
@@ -149,7 +148,6 @@ TEST_CASE(KvflashConcurrentGateFixture, mode5_takes_the_pflash2_scorer_in_place_
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(m5);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    CHECK(ok.suppress_serial_defaults);
     for (int i = 0; i < 4; i++) {
         KvFlashProfileRequest q = m5;
         switch (i) {
@@ -164,23 +162,15 @@ TEST_CASE(KvflashConcurrentGateFixture, mode5_takes_the_pflash2_scorer_in_place_
     }
 }
 
-TEST_CASE(KvflashConcurrentGateFixture, qwen35_with_no_recall_env_installs_the_c14_recall_profile_as_defaults) {
+// The values live in kvflash_recall_env and nowhere else: the gate only says whether the server installs them.
+TEST_CASE(KvflashConcurrentGateFixture, qwen35_with_no_recall_env_installs_the_serial_mode_4_profile_as_defaults) {
     KvFlashProfileRequest p;
     p.arch = "qwen35";
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(p);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    CHECK(ok.log_line.find("C1.4 defaults") != std::string::npos);
-    const std::vector<std::pair<std::string, std::string>> want = {
-        {"LUCE_KVFLASH_POLICY", "qk"},
-        {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-        {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
-        {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
-        {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
-        {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-        {"LUCE_KVFLASH_UQ_QUERIES", "0"},                  // uq is refused in concurrent mode
-    };
-    CHECK(ok.env_defaults == want);
+    CHECK(ok.install_recall_defaults);
+    CHECK(ok.log_line.find("mode-4 recall profile") != std::string::npos);
 }
 
 namespace {
@@ -192,7 +182,8 @@ KvFlashLookup lookup_of(const EnvMap & m) {
 EnvMap merged_after_defaults(const EnvMap & user) {
     EnvMap env = user;
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request("qwen35", "", false, false, lookup_of(user)));
-    for (const auto & kv : p.env_defaults) env.emplace(kv.first, kv.second);
+    if (p.install_recall_defaults)
+        for (const auto & e : luce::server::kvflash_recall_env("qwen35", /*mode5=*/false)) env.emplace(e.name, e.value);
     return env;
 }
 std::string merged_error(const EnvMap & user, const std::string & cli_policy = "") {
@@ -203,6 +194,10 @@ std::string merged_error(const EnvMap & user, const std::string & cli_policy = "
 
 TEST_CASE(KvflashConcurrentGateFixture, merged_defaults_resolve_to_recall_through_the_explicit_branch) {
     CHECK(merged_error({}).empty());
+    const EnvMap env = merged_after_defaults({});                          // one slot or many: the same recall settings
+    CHECK(env.at("LUCE_KVFLASH_UQ_QUERIES") == "64");
+    CHECK(env.at("LUCE_KVFLASH_PREAMBLE_ROWS") == "1152");
+    CHECK(merged_after_defaults({{"LUCE_KVFLASH_UQ_QUERIES", "0"}}).at("LUCE_KVFLASH_UQ_QUERIES") == "0");   // a set variable keeps its value
     CHECK(merged_error({{"LUCE_KVFLASH_LOG_RESIDENT", "1"}}).empty());     // an unrelated variable changes nothing
     CHECK(merged_error({{"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
                         {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "3"}}).empty());   // a coherent explicit user value is kept
@@ -241,7 +236,7 @@ TEST_CASE(KvflashConcurrentGateFixture, multi_model_qwen35_with_no_env_is_lru_on
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request("qwen35", "", false, true, lookup_of(none)));
     CHECK(p.ok);
     CHECK(p.policy == "lru-only");
-    CHECK(p.env_defaults.empty());
+    CHECK(!p.install_recall_defaults);
     CHECK(p.log_line.find("single-model") != std::string::npos);
 }
 
@@ -251,7 +246,7 @@ TEST_CASE(KvflashConcurrentGateFixture, multi_model_with_the_full_explicit_mode4
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request("qwen35", "", false, true, lookup_of(env)));
     CHECK(p.ok);
     CHECK(p.policy == "recall");
-    CHECK(p.env_defaults.empty());
+    CHECK(!p.install_recall_defaults);
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, the_request_builder_reads_cli_over_env_and_mirrors_env_set_on) {
@@ -288,7 +283,7 @@ TEST_CASE(KvflashConcurrentGateFixture, explicit_lru_policy_keeps_lru_only_and_i
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(p);
     CHECK(ok.ok);
     CHECK(ok.policy == "lru-only");
-    CHECK(ok.env_defaults.empty());
+    CHECK(!ok.install_recall_defaults);
     CHECK(ok.log_line.find("lru-only") != std::string::npos);
 }
 
@@ -300,7 +295,7 @@ TEST_CASE(KvflashConcurrentGateFixture, explicit_full_mode4_and_mode5_install_no
     KvFlashProfile ok = kvflash_resolve_concurrent_profile(m4);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    CHECK(ok.env_defaults.empty());
+    CHECK(!ok.install_recall_defaults);
     CHECK(ok.log_line.find("explicit env") != std::string::npos);
     KvFlashProfileRequest m5;
     m5.arch = "qwen35";
@@ -309,7 +304,7 @@ TEST_CASE(KvflashConcurrentGateFixture, explicit_full_mode4_and_mode5_install_no
     ok = kvflash_resolve_concurrent_profile(m5);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    CHECK(ok.env_defaults.empty());
+    CHECK(!ok.install_recall_defaults);
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, a_partial_recall_request_is_still_refused) {
@@ -319,7 +314,7 @@ TEST_CASE(KvflashConcurrentGateFixture, a_partial_recall_request_is_still_refuse
     const KvFlashProfile bad = kvflash_resolve_concurrent_profile(part);
     CHECK(!bad.ok);
     CHECK(bad.error.find("together") != std::string::npos);
-    CHECK(bad.env_defaults.empty());
+    CHECK(!bad.install_recall_defaults);
 }
 
 // LUCE_KVFLASH_UQ_QUERIES: the slot engine captures the latest human question's queries for its mode-4 scorer.
@@ -354,7 +349,7 @@ TEST_CASE(KvflashConcurrentGateFixture, other_architectures_stay_lru_only_with_n
         const KvFlashProfile ok = kvflash_resolve_concurrent_profile(p);
         CHECK(ok.ok);
         CHECK(ok.policy == "lru-only");
-        CHECK(ok.env_defaults.empty());
+        CHECK(!ok.install_recall_defaults);
     }
 }
 

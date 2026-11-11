@@ -87,7 +87,7 @@ inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcur
     return std::nullopt;
 }
 
-// ── The concurrent profile: per-slot recall by default on qwen35 (C1.4), LRU on request ──
+// ── The concurrent profile: per-slot recall by default on qwen35, LRU on request ──
 struct KvFlashProfileRequest {
     std::string arch;
     bool explicit_lru_policy = false;   // LUCE_KVFLASH_POLICY=lru or --kvflash-policy lru: the opt-out
@@ -102,9 +102,8 @@ struct KvFlashProfileRequest {
 struct KvFlashProfile {
     bool ok = true;
     std::string policy = "lru-only";
-    bool suppress_serial_defaults = true;   // kvflash_recall_env defaults must not be applied
+    bool install_recall_defaults = false;   // the server installs the serial mode-4 profile (kvflash_recall_env); a set variable keeps its value
     std::string error, log_line;
-    std::vector<std::pair<std::string, std::string>> env_defaults;   // for apply_env_defaults: a set variable keeps its value
 };
 inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileRequest & r) {
     KvFlashProfile p;
@@ -132,15 +131,10 @@ inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileReq
         return p;
     }
     if (r.arch == "qwen35" && !r.explicit_lru_policy && !r.multi_model) {
-        // The profile every per-slot recall run used (C1.4). The serial defaults minus uq: UQ_QUERIES=0.
+        // One slot or many, the same recall settings: mode 4 with the question's queries and the preamble pin.
         p.policy = "recall";
-        p.env_defaults = {
-            {"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
-            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"}, {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-            {"LUCE_KVFLASH_UQ_QUERIES", "0"},
-        };
-        p.log_line = "[kvflash] concurrent profile: per-slot recall (C1.4 defaults installed; "
+        p.install_recall_defaults = true;
+        p.log_line = "[kvflash] concurrent profile: per-slot recall (the mode-4 recall profile installed as defaults; "
                      "LUCE_KVFLASH_POLICY=lru keeps LRU only)";
         return p;
     }
@@ -183,7 +177,7 @@ inline KvFlashProfileRequest kvflash_concurrent_request(const std::string & arch
 inline std::string kvflash_merged_profile_error(const std::string & arch, const std::string & cli_policy,
                                                 bool cli_tau, bool multi_model, const KvFlashLookup & lookup) {
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request(arch, cli_policy, cli_tau, multi_model, lookup));
-    if (p.ok && p.policy == "recall" && p.env_defaults.empty()) return std::string();
+    if (p.ok && p.policy == "recall" && !p.install_recall_defaults) return std::string();
     return "a LUCE_KVFLASH_* value or --kvflash-policy keeps the C1.4 recall defaults from forming a recall profile "
            "(they need POLICY=qk, PREFILL_RESELECT=4, RESELECT_SCORER=exact, RECALL_BLOCKS>0); "
            "unset it, set the full recall env, or set LUCE_KVFLASH_POLICY=lru";

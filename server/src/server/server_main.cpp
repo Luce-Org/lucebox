@@ -1544,9 +1544,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     // The shipped KVFlash recall settings come first, so an explicit
     // --kvflash-policy below still replaces the policy default.
-    // Paged attention with KVFlash is the concurrent engine: per-slot recall on qwen35 (C1.4, the defaults
-    // installed here unless the operator set the full recall env or asked for LRU), LRU otherwise; uq,
-    // preamble pins and tau are refused.
+    // Paged attention with KVFlash is the concurrent engine: per-slot recall on qwen35 (the serial mode-4
+    // profile, installed here unless the operator set the full recall env or asked for LRU), LRU otherwise;
+    // tau is refused.
     const char * env_pool = std::getenv("LUCE_KVFLASH");
     const bool concurrent_kvflash = model.bargs.paged_attention &&
         (!model.kvflash_pool.empty() || luce::common::kvflash_pool_requested(env_pool));
@@ -1561,10 +1561,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             return 2;
         }
         std::fprintf(stderr, "%s\n", profile.log_line.c_str());
-        std::vector<luce::server::LaunchProfileEnv> recall_env;
-        for (const auto & kv : profile.env_defaults) recall_env.push_back({kv.first.c_str(), kv.second.c_str()});
-        apply_env_defaults("KVFlash concurrent recall", recall_env);
-        if (!profile.env_defaults.empty()) {
+        if (profile.install_recall_defaults) {
+            apply_env_defaults("KVFlash concurrent recall", luce::server::kvflash_recall_env(arch, /*mode5=*/false));
             const std::string bad = luce::common::kvflash_merged_profile_error(
                 arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
             if (!bad.empty()) {
