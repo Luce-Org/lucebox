@@ -2463,6 +2463,14 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlashQkDims & d,
                                         int batch_tokens, std::vector<float> & q_all);
 
+bool Qwen35Backend::attach_rollback_storage(int max_verify_tokens, bool enable_specla) {
+    if (cfg_.fast_rollback || cfg_.ddtree_mode) {
+        return migrate_prefill_cache(w_, cfg_.device.max_ctx, max_verify_tokens,
+                                     target_backend_, cache_, enable_specla);
+    }
+    return ensure_ssm_snapshot(cache_, target_backend_);
+}
+
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
@@ -2585,7 +2593,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // Skip KV-cache migration when resuming from a snapshot — the cache was
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state. Also skip when speculative decode cannot run
-    // or fast rollback is disabled (saving ~1.5-5 GB VRAM on 24 GB GPUs).
+    // (saving ~1.5-5 GB VRAM on 24 GB GPUs).
     const bool can_spec = cfg_.draft_path.has_value()
         && !cfg_.paged_attention
         && !draft_parked_
@@ -2594,15 +2602,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             : feature_mirror_.target_feat != nullptr)
         && !cfg_.device.is_tensor_parallel()
         && !sampler_.needs_logit_processing();
-    if (kv_offset == 0 && can_spec && (cfg_.fast_rollback || cfg_.ddtree_mode)) {
+    if (kv_offset == 0 && can_spec) {
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
         const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
-        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
-                                   max_verify_tokens,
-                                   target_backend_, cache_, enable_specla)) {
+        if (!attach_rollback_storage(max_verify_tokens, enable_specla)) {
             std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
                          luce_last_error());
             return -1;
@@ -4144,6 +4150,15 @@ static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
     return kPolicy;
 }
 
+// A snapshot_kv()/restore_kv() that fails ends the decode; say why, so the
+// request's DecodeFailed is never silent.
+static bool spec_kv_state_failed(const char * op) {
+    std::fprintf(stderr,
+        "spec-decode: target %s() failed (the recurrent rollback snapshot is "
+        "missing or does not match the live state); decode aborted\n", op);
+    return false;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -4372,12 +4387,10 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
-    if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+    if (!cache_.rollback_ctx) {
         const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
-        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
-                                   max_verify_tokens,
-                                   target_backend_, cache_, enable_specla)) {
+        if (!attach_rollback_storage(max_verify_tokens, enable_specla)) {
             std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",
                          luce_last_error());
             return false;
@@ -5123,7 +5136,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 const auto profile_snapshot_start = profile_start();
                 if (!target->snapshot_kv()) {
                     step_graph_destroy(draft_sg);
-                    return false;
+                    return spec_kv_state_failed("snapshot_kv");
                 }
                 profile_add(profile_snapshot_s, profile_snapshot_start);
             }
@@ -5249,7 +5262,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 const auto profile_replay_start = profile_start();
                 if (!target->restore_kv()) {
                     step_graph_destroy(draft_sg);
-                    return false;
+                    return spec_kv_state_failed("restore_kv");
                 }
                 int replay_last_tok = -1;
                 if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
@@ -5428,7 +5441,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         const auto profile_snapshot_start = profile_start();
         if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
-            return false;
+            return spec_kv_state_failed("snapshot_kv");
         }
         profile_add(profile_snapshot_s, profile_snapshot_start);
 
@@ -5618,7 +5631,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             //  is the budget-clamped accepted count.)
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
-                return false;
+                return spec_kv_state_failed("restore_kv");
             }
             std::vector<int32_t> replay_batch((size_t)commit_n);
             for (int i = 0; i < commit_n; i++) {
@@ -5721,7 +5734,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         if (floor_to_ar) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
-                return false;
+                return spec_kv_state_failed("restore_kv");
             }
             cache_.cur_pos = committed;
             if (emitted > 0) {
@@ -5843,7 +5856,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             if (settle.repair && !budget_close_fired) {
                 if (!target->restore_kv()) {
                     step_graph_destroy(draft_sg);
-                    return false;
+                    return spec_kv_state_failed("restore_kv");
                 }
                 cache_.cur_pos = committed;
                 if (settle.replay_n > 0) {
@@ -5919,7 +5932,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         if (budget_close_fired) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
-                return false;
+                return spec_kv_state_failed("restore_kv");
             }
             committed = committed_at_step;
             cache_.cur_pos = committed;

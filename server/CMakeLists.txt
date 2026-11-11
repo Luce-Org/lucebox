@@ -3000,7 +3000,8 @@ if(LUCE_TESTS)
             test/smoke/smoke_load_target.cpp
             test/smoke/smoke_load_target_laguna.cpp
             test/unit/test_paged_attention.cpp
-            test/unit/test_decode_kv_offload_gpu.cpp)
+            test/unit/test_decode_kv_offload_gpu.cpp
+            test/unit/test_spec_rollback_storage_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include

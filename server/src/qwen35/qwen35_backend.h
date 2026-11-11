@@ -560,6 +560,12 @@ private:
     // A chunk starts at every absolute `restore_points` position (see
     // GenerateRequest::restore_points), so a snapshot at one is exact and a
     // restore from it reproduces a cold prefill.
+    // Gives the prefill-only cache the storage speculative decode rolls back
+    // with. Every speculative step snapshots the recurrent state, so the
+    // snapshot pair is always attached; the per-token checkpoint buffers
+    // (about 2.4 GB on Qwen3.8-27B at block size 16) only when fast rollback
+    // or DDTree capture into them.
+    bool attach_rollback_storage(int max_verify_tokens, bool enable_specla);
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
