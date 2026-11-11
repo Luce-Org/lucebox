@@ -37,11 +37,12 @@ namespace {
 constexpr int kWarps = 4;      // logical warps per block
 constexpr int kBlocks = 2048;  // independent random cases of kWarps warps each
 
-enum Check { kGroup2, kGroup1, kWarpSum, kWarpMax, kXorLane, kLaneValue, kChecks };
+enum Check { kGroup2, kGroup1, kWarpSum, kWarpMax, kXorLane, kXorLaneFull, kLaneValue, kChecks };
 const char * const kCheckNames[kChecks] = {
     "reduce_group<2> vs warp_reduce_sum", "reduce_group<1> vs warp_reduce_sum",
     "warp_sum vs warp_reduce_sum", "warp_max vs warp_reduce_max",
-    "xor_lane vs __shfl_xor_sync", "lane_value vs __shfl_sync",
+    "xor_lane vs __shfl_xor_sync", "xor_lane<full_warp> vs __shfl_xor_sync",
+    "lane_value vs __shfl_sync",
 };
 
 __device__ void count_mismatch(unsigned int * fails, int check, float got, float want) {
@@ -72,6 +73,9 @@ __global__ void reduce_kernel(const float * in, unsigned int * fails) {
 #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
         count_mismatch(fails, kXorLane, paged_attn_xor_lane(x1, offset),
+                       __shfl_xor_sync(0xFFFFFFFF, x1, offset, WARP_SIZE));
+        // Every lane of the warp is active here.
+        count_mismatch(fails, kXorLaneFull, paged_attn_xor_lane<true>(x1, offset),
                        __shfl_xor_sync(0xFFFFFFFF, x1, offset, WARP_SIZE));
     }
     for (int src = 0; src < WARP_SIZE; ++src) {
