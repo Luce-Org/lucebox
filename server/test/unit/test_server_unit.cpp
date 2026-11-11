@@ -16841,6 +16841,145 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) 
     ggml_free(ctx);
 }
 
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement) {
+    // Overlapping owners (moe_overlap.h) at 2 rows with token-by-token ROCmFP2
+    // owners and a shared expert: every node has an owner, the secondary
+    // owner's nodes come before the main owner's in graph order, the join is
+    // last, and the input crosses to the secondary owner once, not per token.
+    luce_unsetenv("LUCE_MOE_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_DS4_TP_GROUPED_MMVQ");
+
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    constexpr int n_embd = 32;
+    constexpr int n_ff = 32;
+    constexpr int n_expert = 4;
+    constexpr int n_used = 2;
+    constexpr int n_tokens = 2;
+
+    MoeHybridConfig cfg;
+    cfg.n_embd = n_embd;
+    cfg.n_ff_exp = n_ff;
+    cfg.n_expert = n_expert;
+    cfg.n_expert_used = n_used;
+
+    MoeHybridLayerStorage storage;
+    storage.gate_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.gate_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.hot_local_by_global = {0, 1, -1, -1};
+    storage.cold_local_by_global = {-1, -1, 0, 1};
+
+    MoeLayerDesc desc;
+    desc.ffn_gate_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+    desc.ffn_up_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+    desc.ffn_down_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_ff, n_embd);
+    const std::vector<const ggml_tensor *> weights_list = {
+        storage.gate_hot, storage.up_hot, storage.down_hot,
+        storage.gate_cold, storage.up_cold, storage.down_cold,
+        desc.ffn_gate_shexp, desc.ffn_up_shexp, desc.ffn_down_shexp};
+
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
+    MoeHybridGraphInputs out;
+    out.overlap_owners = true;
+    const bool built = build_moe_hybrid_ffn_graph(
+        ctx, gf, cfg, desc, storage, input, ids, weights, n_tokens,
+        out, /*include_shared=*/true, /*allow_fused_combine=*/false,
+        MoeHybridJoinMode::OwnerPartialSums, MoeHybridRouteBalance::Disabled);
+    TEST_ASSERT(built);
+    TEST_ASSERT(out.output != nullptr);
+    TEST_ASSERT(out.join_nodes.size() == 1);
+    ggml_build_forward_expand(gf, out.output);
+
+    const auto in = [](const std::vector<ggml_tensor *> & list, const ggml_tensor * t) {
+        return std::find(list.begin(), list.end(), t) != list.end();
+    };
+    const auto is_view = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+               t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+    };
+    const auto reads_weight = [&](const ggml_tensor * t) {
+        for (const ggml_tensor * src : t->src) {
+            if (src && std::find(weights_list.begin(), weights_list.end(), src) != weights_list.end()) return true;
+        }
+        return false;
+    };
+    const auto cold = [&](const ggml_tensor * t) {
+        return in(out.cold_nodes, t) || in(out.cold_remap_nodes, t);
+    };
+    const auto hot = [&](const ggml_tensor * t) {
+        return in(out.hot_nodes, t) || in(out.hot_remap_nodes, t);
+    };
+
+    // Every node reachable from the output has an owner (or reads a weight,
+    // which places it with that weight).
+    int unplaced = 0;
+    std::vector<const ggml_tensor *> stack{out.output};
+    std::vector<const ggml_tensor *> seen;
+    while (!stack.empty()) {
+        const ggml_tensor * t = stack.back();
+        stack.pop_back();
+        if (!t || std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+        seen.push_back(t);
+        if (t->op != GGML_OP_NONE && !is_view(t) && !cold(t) && !hot(t) &&
+            !in(out.join_nodes, t) && !reads_weight(t)) {
+            std::fprintf(stderr, "unplaced node %s (%s)\n", t->name, ggml_op_name(t->op));
+            ++unplaced;
+        }
+        for (const ggml_tensor * src : t->src) stack.push_back(src);
+    }
+    TEST_ASSERT(unplaced == 0);
+
+    // Graph order: every secondary-owner node before every main-owner expert
+    // or shared-expert node; the join after all of them.
+    int last_cold = -1, first_hot = ggml_graph_n_nodes(gf), last_owner = -1, join_at = -1;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (cold(t)) last_cold = i;
+        if (in(out.hot_nodes, t) && i < first_hot) first_hot = i;
+        if (cold(t) || hot(t)) last_owner = i;
+        if (t == out.join_nodes[0]) join_at = i;
+    }
+    TEST_ASSERT(last_cold >= 0);
+    TEST_ASSERT(last_cold < first_hot);
+    TEST_ASSERT(join_at > last_owner);
+
+    // The input crosses to the secondary owner in one copy; the main owner
+    // reads it in place; no copies per token.
+    const auto count_cont_of_input = [&](const std::vector<ggml_tensor *> & list) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == GGML_OP_CONT && node->src[0] == input) ++count;
+        }
+        return count;
+    };
+    const auto count_op = [](const std::vector<ggml_tensor *> & list, ggml_op op) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == op) ++count;
+        }
+        return count;
+    };
+    TEST_ASSERT(count_cont_of_input(out.cold_nodes) == 1);
+    TEST_ASSERT(count_cont_of_input(out.hot_nodes) == 0);
+    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_CONT) <= 1);
+    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_CONT) == 0);
+    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_MUL_MAT_ID) == 3 * n_tokens);
+    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_MUL_MAT_ID) == 3 * n_tokens);
+
+    ggml_free(ctx);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
