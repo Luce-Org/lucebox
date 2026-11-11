@@ -52,6 +52,8 @@ inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
 // that memory; a longer prompt runs as several passes, each reading the
 // streamed experts once.
 inline constexpr int DS4_LAYER_MAJOR_PROMPT_SPAN = 16384;
+// Free device memory a layer-major pass leaves beside its device residual.
+inline constexpr size_t DS4_LAYER_MAJOR_RESIDUAL_HEADROOM = (size_t) 1536 << 20;
 // Chunks of four rows or fewer take the decode-shaped path, not layer-major.
 inline constexpr int DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS = 5;
 // Staged image prefill rows per batched step, shared by the pending requests.
@@ -940,6 +942,21 @@ bool deepseek4_prefill_layer_major(
     MoeHybridRoutingStats * routing_stats,
     int layer_end = -1,   // run layers [0, layer_end); -1 = every layer
     DeepSeek4LayerMajorTail * tail = nullptr);  // out: the last band's state
+
+// A layer-major pass keeps its rows' residual on the device when they fit
+// beside DS4_LAYER_MAJOR_RESIDUAL_HEADROOM of free memory; else the residual
+// stays on the host and the pass runs without the pipeline, much slower.
+// The rows that fit in `free_b` (rows * row_bytes + headroom < free_b).
+size_t deepseek4_layer_major_residual_rows(size_t free_b, size_t row_bytes);
+// The rows `device` can hold now; 0 when none fit or the residual is not
+// requested on the device.
+int deepseek4_layer_major_device_rows(int device, const DeepSeek4Weights & w);
+// How many leading `bands` of a layer-major pass to run now, given the rows
+// the device holds (`device_rows`, <= 0: no bound): all of them when they and
+// `tail_rows` (the replay rows that join the last band) fit; else the most
+// that fit, two at least; all of them when not even the first two fit, since
+// their residual is on the host either way. The rest run as the next pass.
+int deepseek4_layer_major_pass_bands(const std::vector<int> & bands, int tail_rows, long long device_rows);
 
 // One sequence of a shared prefill pass: `n_tokens` rows of `embed` starting
 // at `kv_start` of `cache`, with the sequence's image spans in its own prompt

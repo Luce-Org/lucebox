@@ -252,6 +252,51 @@ static void test_pipeline_parts_follow_each_band() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_layer_major_passes_fit_the_device() {
+    std::fprintf(stderr, "  test_layer_major_passes_fit_the_device ...");
+    using Bands = std::vector<int>;
+    // The fit rule both the pass planner and the residual placement use:
+    // rows * row_bytes + headroom < free.
+    const size_t H = DS4_LAYER_MAJOR_RESIDUAL_HEADROOM;
+    const size_t rb = 4 * 4096 * sizeof(float);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(0, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + rb, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + rb + 1, rb) == 1);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + 5 * rb, rb) == 4);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + 5 * rb + 1, rb) == 5);
+    for (size_t free_b : {H - 1, H, H + 1, H + rb, H + rb + 1, H + 5 * rb, H + 5 * rb + 1, H + 7 * rb + 3}) {
+        const size_t rows = deepseek4_layer_major_residual_rows(free_b, rb);
+        for (size_t n = 1; n <= 8; ++n) {
+            TEST_ASSERT((n <= rows) == (n * rb + H < free_b));
+        }
+    }
+    const Bands b5(5, 640);
+    // No bound (the device residual off, or no row fits): the whole pass.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 0) == 5);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 128, -1) == 5);
+    // Everything fits, the tail included; equality fits.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 128, 3328) == 5);
+    // The tail joins only the last band: without it four bands fit.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 129, 3328) == 4);
+    // The most bands that fit; equality fits.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 2560) == 4);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 2559) == 3);
+    // Two bands at least ...
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1280) == 2);
+    // ... and when not even two fit, the whole pass (its residual is on the
+    // host either way).
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1279) == 5);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1) == 5);
+    // Passes of two bands or fewer stay whole.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 640}, 0, 100) == 2);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640}, 0, 100) == 1);
+    // Uneven bands.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 512, 700, 640}, 0, 1852) == 3);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 512, 700, 640}, 0, 1851) == 2);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 struct DeepSeek4FixtureOptions {
     bool include_vocab_size = true;
     uint32_t vocab_size = 128;
@@ -9637,6 +9682,7 @@ int main(int argc, char ** argv) {
     test_compressor_pooling_correctness(backend);
     test_moe_expert_major_default_threshold();
     test_pipeline_parts_follow_each_band();
+    test_layer_major_passes_fit_the_device();
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
