@@ -45,23 +45,25 @@ static void rollback_reset() {
     Qwen4ExpCache c;
     c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
     auto tensor = [&]() { return ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16); };
-    c.ssm_state = {tensor()}; c.conv_state = {tensor()}; c.ple_conv_state = {tensor()};
-    c.spec_ssm_rows.resize(1); c.spec_conv_rows.resize(1);
-    c.spec_ssm_rows[0][0] = tensor(); c.spec_conv_rows[0][0] = tensor();
+    // No recurrent layer: its rollback is a device replay (ggml_backend_cuda_gdn_chain_commit, GPU smoke); the
+    // conv and PLE histories are the queued copies this checks.
+    c.conv_state = {tensor()}; c.ple_conv_state = {tensor()};
+    c.spec_conv_rows.resize(1);
+    c.spec_conv_rows[0][0] = tensor();
     c.spec_ple = c.spec_ple_rows[0] = tensor();
     c.buf = ggml_backend_alloc_ctx_tensors_from_buft(c.ctx, ggml_backend_cpu_buffer_type());
     CHECK(c.buf);
     ggml_backend_buffer_clear(c.buf, 0x3f);
     c.spec_pos = 0; c.spec_tokens = 2;
     CHECK(qwen4exp_verify_rollback(&delayed, Qwen4ExpWeights{}, c, 0, 1));
-    CHECK(pending.size() == 3); // the final rejected step is still in flight
+    CHECK(pending.size() == 2); // the final rejected step is still in flight
     reset_qwen4exp_state(&delayed, c);
     ggml_backend_synchronize(&delayed); // any late rollback must not undo reset
-    for (auto * t : {c.ssm_state[0], c.conv_state[0], c.ple_conv_state[0]}) {
+    for (auto * t : {c.conv_state[0], c.ple_conv_state[0]}) {
         CHECK(bytes(t) == std::vector<char>(ggml_nbytes(t), 0));
     }
     free_qwen4exp_cache(c);
-    std::puts("PASS pending MTP rollback completes before recurrent/conv/PLE reset");
+    std::puts("PASS pending MTP rollback completes before conv/PLE reset");
 }
 
 // Test-only readbacks: production checkpoints remain on the device. Report
@@ -126,7 +128,7 @@ struct Qwen4ExpPrefixTest {
     static void unhook(Qwen4ExpBackend & b) { b.decode_check_ = {}; }
     // Split mode: the hot experts and their lookup tables are resident on the target.
     static bool hot_experts_resident(const Qwen4ExpBackend & b) {
-        return b.weights_.hot && !b.weights_.hot_lut.empty();
+        return b.weights_.hot != nullptr;
     }
     static size_t limit(Qwen4ExpBackend & b, size_t bytes) {
         return std::exchange(b.snapshot_budget_, bytes);

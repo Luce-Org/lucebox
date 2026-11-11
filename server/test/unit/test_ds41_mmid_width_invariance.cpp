@@ -270,6 +270,8 @@ static bool check_dense(ggml_backend_t backend, int device, ggml_type type, cons
 
 int main(int argc, char ** argv) {
     const int tokens = argc > 1 ? std::atoi(argv[1]) : 3, experts = argc > 2 ? std::atoi(argv[2]) : 64;
+    // Dense products wider than eight columns stay batch-invariant only under a raised ceiling.
+    if (tokens > 8 && tokens <= 16) ggml_backend_cuda_set_mmvq_invariant_max_ncols(tokens);
     // The contract covers the routed-expert formats DS4.1 plans use. Q8_0 routed experts take another
     // dispatch and are known to differ on CUDA; they are run as a diagnostic, not as part of the exit status.
     struct T { ggml_type type; bool contract; } types[] = {
