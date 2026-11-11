@@ -8123,8 +8123,14 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
+    // The routing and owner arenas persist from 512 rows, and for every
+    // pipelined layer-major part (max(LUCE_DS4_PREFILL_PIPELINE, 2) per caller
+    // band, so often fewer rows):
+    // freeing a per-call cold arena takes milliseconds and sits between one
+    // part's cold owner and the next, which drive the cold device in turn.
+    const bool pipelined_part = device_outputs && device_outputs->defer;
     const bool persistent_owner_alloc =
-        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+        (n_tokens >= 512 || pipelined_part) && device_ffn_input && persistent_owner_requested;
     if (persistent_owner_alloc) {
         static bool logged_persistent_owner_alloc = false;
         if (!logged_persistent_owner_alloc) {
