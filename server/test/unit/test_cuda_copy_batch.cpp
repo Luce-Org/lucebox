@@ -557,3 +557,169 @@ TEST_CASE(CudaCopyBatchFixture, enter_stream_publishes_peer_copies) {
     REQUIRE(after_sync);
     REQUIRE(after_enter);
 }
+
+// A strided hop copy (a verify's top-k expert ids are the first columns of the router's sorted rows) joins the peer
+// copy batch like a contiguous one when both ends share its layout: it is collected, not run, until the destination
+// is synchronized. It then moves the bytes cudaMemcpyPeerAsync would, the ggml_nbytes span from the view's first
+// byte: every viewed element is its source's and no byte before or after the span is written.
+TEST_CASE(CudaCopyBatchFixture, strided_hop_copy_joins_batch) {
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        SKIP("needs two CUDA/HIP devices");
+    }
+    if (hop_copy_kernel_off_by_env()) {
+        SKIP("hop copies are not collected with the peer copy kernel or the batching off");
+    }
+    ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
+    REQUIRE(gpus[0] != nullptr);
+    REQUIRE(gpus[1] != nullptr);
+    if (!is_rocm(gpus[0])) {
+        ggml_backend_free(gpus[0]);
+        ggml_backend_free(gpus[1]);
+        SKIP("hop copies are collected on ROCm only");
+    }
+    const ggml_cuda_qwen4exp_profile profile_before =
+        ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
+    // Columns 1 to 3 of 5 rows of 8: a strided view whose first byte is not 16-byte aligned.
+    constexpr int64_t n_cols = 8, n_rows = 5, first = 1, k = 3, n = n_cols * n_rows;
+    ggml_init_params ip{};
+    ip.mem_size = 2 * ggml_tensor_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx[2] = { ggml_init(ip), ggml_init(ip) };
+    ggml_tensor * rows[2];
+    ggml_tensor * ids[2];
+    for (int d = 0; d < 2; ++d) {
+        rows[d] = ggml_new_tensor_2d(ctx[d], GGML_TYPE_I32, n_cols, n_rows);
+        ids[d]  = ggml_view_2d(ctx[d], rows[d], k, n_rows, rows[d]->nb[1], first * sizeof(int32_t));
+    }
+    ggml_backend_buffer_t buf[2] = { ggml_backend_alloc_ctx_tensors(ctx[0], gpus[0]),
+                                     ggml_backend_alloc_ctx_tensors(ctx[1], gpus[1]) };
+    REQUIRE(buf[0] != nullptr);
+    REQUIRE(buf[1] != nullptr);
+
+    std::vector<int32_t> src(n), zero(n, 0), before(n), after(n);
+    for (int64_t i = 0; i < n; ++i) src[i] = 100 + (int32_t) i;
+    ggml_backend_tensor_set(rows[0], src.data(), 0, ggml_nbytes(rows[0]));
+    ggml_backend_tensor_set(rows[1], zero.data(), 0, ggml_nbytes(rows[1]));
+    const bool strided = !ggml_is_contiguous(ids[0]) && !ggml_is_contiguous(ids[1]);
+    const int64_t span_end = first + (ggml_nbytes(ids[1]) / sizeof(int32_t));   // one past the span's last element
+    ggml_backend_tensor_copy_async(gpus[0], gpus[1], ids[0], ids[1]);
+    // Another thread's waits flush only that thread's collected copies.
+    std::thread([&] {
+        ggml_backend_synchronize(gpus[0]);
+        ggml_backend_synchronize(gpus[1]);
+    }).join();
+    ggml_backend_tensor_get(rows[1], before.data(), 0, ggml_nbytes(rows[1]));
+    ggml_backend_synchronize(gpus[1]);   // publishes the copy and waits for it
+    ggml_backend_tensor_get(rows[1], after.data(), 0, ggml_nbytes(rows[1]));
+
+    ggml_backend_synchronize(gpus[0]);
+    for (int i = 0; i < 2; ++i) {
+        ggml_backend_buffer_free(buf[i]);
+        ggml_free(ctx[i]);
+        ggml_backend_free(gpus[i]);
+    }
+    ggml_backend_cuda_set_qwen4exp_profile(profile_before);
+
+    const bool collected = before == zero;
+    int64_t bad_view = 0, bad_outside = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t col = i % n_cols;
+        if (col >= first && col < first + k) {
+            bad_view += after[i] != src[i];
+        } else if (i < first || i >= span_end) {
+            bad_outside += after[i] != 0;
+        }
+    }
+    std::printf("[cuda-copy-batch] strided hop copy: collected %d, viewed elements wrong %lld, "
+                "elements outside the span written %lld\n",
+                collected, (long long) bad_view, (long long) bad_outside);
+    REQUIRE(strided);
+    REQUIRE(collected);
+    REQUIRE(bad_view == 0);
+    REQUIRE(bad_outside == 0);
+}
+
+// A strided hop through the scheduler, as a verify's top-k ids cross to the expert device: device 0 computes the
+// rows, device 1 reads the first k columns of each (the scheduler copies that view with its strides). With the copy
+// tail on, the copy joins the hop batch and rides at the end of device 0's graph; every step must read that step's
+// rows.
+TEST_CASE(CudaCopyBatchFixture, split_graph_strided_hop) {
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        SKIP("needs two CUDA/HIP devices");
+    }
+    if (hop_copy_kernel_off_by_env()) {
+        SKIP("hop copies are not collected with the peer copy kernel or the batching off");
+    }
+    ggml_backend_t gpus[2] = { ggml_backend_cuda_init(0), ggml_backend_cuda_init(1) };
+    REQUIRE(gpus[0] != nullptr);
+    REQUIRE(gpus[1] != nullptr);
+    if (!is_rocm(gpus[0])) {
+        ggml_backend_free(gpus[0]);
+        ggml_backend_free(gpus[1]);
+        SKIP("hop copies are collected on ROCm only");
+    }
+    const ggml_cuda_qwen4exp_profile profile_before =
+        ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
+    ggml_backend_cuda_set_copy_tail(gpus[0], true);
+    ggml_backend_cuda_set_copy_tail(gpus[1], true);
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);   // the scheduler's last
+    REQUIRE(cpu != nullptr);
+
+    constexpr int64_t n_cols = 64, n_rows = 4, k = 8;
+    constexpr int     kSteps = 16;
+    ggml_init_params ip{};
+    ip.mem_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    REQUIRE(ctx != nullptr);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_rows);
+    ggml_set_input(x);
+    ggml_tensor * rows   = ggml_scale(ctx, x, 2.0f);
+    ggml_tensor * ids    = ggml_view_2d(ctx, rows, k, n_rows, rows->nb[1], 0);
+    ggml_tensor * picked = ggml_cont(ctx, ids);
+    ggml_tensor * out    = ggml_scale_bias(ctx, picked, 1.0f, 1.0f);
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_t backends[3] = { gpus[0], gpus[1], cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 3, 64, true, false);
+    REQUIRE(sched != nullptr);
+    ggml_backend_sched_set_tensor_backend(sched, x, gpus[0]);
+    ggml_backend_sched_set_tensor_backend(sched, rows, gpus[0]);
+    ggml_backend_sched_set_tensor_backend(sched, ids, gpus[0]);      // so device 1's input is the strided view
+    ggml_backend_sched_set_tensor_backend(sched, picked, gpus[1]);
+    ggml_backend_sched_set_tensor_backend(sched, out, gpus[1]);
+    REQUIRE(ggml_backend_sched_alloc_graph(sched, gf));
+
+    const bool strided = !ggml_is_contiguous(ids);
+    const size_t tails_before = ggml_backend_cuda_get_copy_tail_count();
+    std::vector<float> vx(n_cols * n_rows), got(k * n_rows);
+    int64_t bad = 0;
+    bool computed = true;
+    for (int step = 0; step < kSteps && computed; ++step) {
+        for (int64_t i = 0; i < n_cols * n_rows; ++i) vx[i] = (float) ((i * 7 + step * 13) % 1000);
+        ggml_backend_tensor_set(x, vx.data(), 0, ggml_nbytes(x));
+        computed = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+        for (int64_t r = 0; r < n_rows; ++r) {
+            for (int64_t c = 0; c < k; ++c) {
+                bad += got[r * k + c] != 2.0f * vx[r * n_cols + c] + 1.0f;
+            }
+        }
+    }
+    const size_t tails = ggml_backend_cuda_get_copy_tail_count() - tails_before;
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpus[0]);
+    ggml_backend_free(gpus[1]);
+    ggml_backend_cuda_set_qwen4exp_profile(profile_before);
+    std::printf("[cuda-copy-batch] strided hop through the scheduler: %lld mismatched values, %zu tail launches\n",
+                (long long) bad, tails);
+    REQUIRE(strided);
+    REQUIRE(computed);
+    REQUIRE(bad == 0);
+    REQUIRE(tails > 0);
+}
