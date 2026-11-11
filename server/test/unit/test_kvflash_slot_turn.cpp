@@ -887,3 +887,44 @@ TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_no_victim_validates_nothin
     CHECK(p.loads == 0);
 }
 
+
+// ── the victim among parked sessions: restore cost per byte freed, aged (GreedyDual-Size) ─────────
+
+TEST_CASE(KvflashSlotTurnFixture, the_victim_is_the_session_cheapest_to_restore_per_byte_not_the_oldest) {
+    // slot 0: 100K tokens, parked first. slot 1: 2K tokens, parked last. A slot slice is 22K token-bytes, a host token 1.
+    const std::vector<int32_t> big(100000, 7), small(2000, 7);
+    const std::vector<KvFlashParkedSession> parked = {{0, &big, 1, 22000 + 100000, 0.0}, {1, &small, 2, 22000 + 2000, 0.0}};
+    CHECK(kvflash_cheapest_session(parked) == 1);          // LRU would re-prefill 100K tokens to save 2K
+    CHECK(kvflash_session_priority(parked[0]) > kvflash_session_priority(parked[1]));
+}
+
+TEST_CASE(KvflashSlotTurnFixture, equal_cost_density_falls_back_to_the_oldest_and_unknown_bytes_never_divide_by_zero) {
+    const std::vector<int32_t> a(5000, 1), b(5000, 2);
+    CHECK(kvflash_cheapest_session({{0, &a, 9, 30000, 0.0}, {1, &b, 3, 30000, 0.0}}) == 1);
+    CHECK(kvflash_cheapest_session({{0, &a, 1}, {1, &b, 2}}) == 0);    // bytes unknown: every session one unit, the oldest of equals
+    CHECK(kvflash_cheapest_session({}) == -1);
+}
+
+TEST_CASE(KvflashSlotTurnFixture, the_eviction_clock_ages_an_idle_long_session_out_and_evict_reports_the_victims_priority) {
+    // One 100K session never comes back; 2K sessions keep arriving in the other slot. Each eviction raises the clock to the
+    // victim's priority and a new park is stamped with it, so the idle session is the victim after a bounded number of rounds.
+    const std::vector<int32_t> big(100000, 7), small(2000, 7);
+    double clock = 0;
+    uint64_t tick = 1;
+    std::vector<KvFlashParkedSession> parked = {{0, &big, tick++, 122000, clock}, {1, &small, tick++, 24000, clock}};
+    int rounds = 0, dropped = -1;
+    for (; rounds < 64; ++rounds) {
+        const KvFlashEvicted r = kvflash_evict_cheapest(parked, [&](int) { return false; }, [&](int slot) { dropped = slot; });
+        CHECK(r.slot == dropped);
+        CHECK(r.dropped);
+        CHECK(r.priority >= clock);                         // the clock never runs back
+        clock = r.priority;
+        if (r.slot == 0) break;
+        parked[1] = {1, &small, tick++, 24000, clock};     // the next short session parks at the new clock
+    }
+    CHECK(rounds >= 1);                                     // not on the first eviction (that is LRU's mistake)
+    CHECK(rounds < 64);                                     // and not never
+    // keep is never the victim
+    parked = {{0, &big, 1, 122000, 0.0}, {1, &small, 2, 24000, 0.0}};
+    CHECK(kvflash_evict_cheapest(parked, [](int) { return true; }, [](int) {}, 1).slot == 0);
+}

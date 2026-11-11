@@ -162,6 +162,8 @@ struct KvFlashParkedSession {
     int slot = -1;
     const std::vector<int32_t> * history = nullptr;
     uint64_t tick = 0;          // park order; newest wins a tie
+    int64_t bytes = 0;          // what its eviction frees: the slot's slice plus its host reservation (0: unknown, one unit)
+    double stamp = 0;           // the eviction clock when it parked
 };
 struct KvFlashSessionPick {
     int slot = -1;
@@ -343,6 +345,26 @@ inline int kvflash_oldest_session(const std::vector<KvFlashParkedSession> & park
     for (const KvFlashParkedSession & s : parked)
         if (s.slot >= 0 && (slot < 0 || s.tick < tick)) { slot = s.slot; tick = s.tick; }
     return slot;
+}
+
+// The victim's rank among parked sessions, lowest goes first.
+inline double kvflash_session_priority(const KvFlashParkedSession & s) { return (double)s.tick; }
+inline int kvflash_cheapest_session(const std::vector<KvFlashParkedSession> & parked) { return kvflash_oldest_session(parked); }
+
+// Frees the victim among the parked sessions other than `keep`: `to_disk(slot)` is the session's move to disk (false: its
+// park was refused, it stays), `drop(slot)` then releases it (its next turn prefills cold or from its last bundle). A refused
+// park is dropped, not skipped: the parked set is a cache and never blocks a request. -1 only when nothing is parked.
+struct KvFlashEvicted { int slot = -1; bool dropped = false; double priority = 0; };
+template <class ToDisk, class Drop>
+inline KvFlashEvicted kvflash_evict_cheapest(const std::vector<KvFlashParkedSession> & parked, ToDisk to_disk, Drop drop, int keep = -1) {
+    std::vector<KvFlashParkedSession> list;
+    for (const KvFlashParkedSession & s : parked) if (s.slot != keep) list.push_back(s);
+    KvFlashEvicted r;
+    r.slot = kvflash_cheapest_session(list);
+    if (r.slot < 0) return r;
+    for (const KvFlashParkedSession & s : list) if (s.slot == r.slot) r.priority = kvflash_session_priority(s);
+    if (!to_disk(r.slot)) { drop(r.slot); r.dropped = true; }
+    return r;
 }
 
 // LUCE_KVFLASH_SLOT_STICKY=0 turns sticky sessions off. Read here only: the host ledger's per-slot charge and the engine must agree.
