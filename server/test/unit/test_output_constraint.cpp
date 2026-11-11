@@ -334,40 +334,59 @@ TEST_CASE(OutputConstraintFixture, forced_tool_call_grammar_admits_only_openers)
 
 TEST_CASE(OutputConstraintFixture, parse_grammar_from_body_top_level_and_extra_body) {
     std::string grammar;
+    bool has_grammar = false;
     std::string error;
 
     // Absent or empty body
-    CHECK(parse_grammar_from_body(json::object(), grammar, error));
+    CHECK(parse_grammar_from_body(json::object(), grammar, has_grammar, error));
+    CHECK(!has_grammar);
     CHECK(grammar.empty());
 
     // Top-level grammar string
-    CHECK(parse_grammar_from_body(json{{"grammar", "root ::= [0-9]+"}}, grammar, error));
+    CHECK(parse_grammar_from_body(json{{"grammar", "root ::= [0-9]+"}}, grammar, has_grammar, error));
+    CHECK(has_grammar);
     CHECK(grammar == "root ::= [0-9]+");
 
+    // Top-level empty grammar preserves presence
+    CHECK(parse_grammar_from_body(json{{"grammar", ""}}, grammar, has_grammar, error));
+    CHECK(has_grammar);
+    CHECK(grammar.empty());
+
     // Top-level null grammar
-    CHECK(parse_grammar_from_body(json{{"grammar", nullptr}}, grammar, error));
+    CHECK(parse_grammar_from_body(json{{"grammar", nullptr}}, grammar, has_grammar, error));
+    CHECK(!has_grammar);
     CHECK(grammar.empty());
 
     // Top-level non-string grammar
-    CHECK(!parse_grammar_from_body(json{{"grammar", 123}}, grammar, error));
+    CHECK(!parse_grammar_from_body(json{{"grammar", 123}}, grammar, has_grammar, error));
     CHECK(error == "grammar must be a string");
 
     // extra_body grammar string
-    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", "root ::= [a-z]+"}}}}, grammar, error));
+    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", "root ::= [a-z]+"}}}}, grammar, has_grammar, error));
+    CHECK(has_grammar);
     CHECK(grammar == "root ::= [a-z]+");
 
-    // extra_body null grammar falls back if top-level is absent
-    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", nullptr}}}}, grammar, error));
+    // extra_body null grammar falls back to top-level grammar
+    CHECK(parse_grammar_from_body(
+        json{{"grammar", "root ::= \"top\""}, {"extra_body", {{"grammar", nullptr}}}},
+        grammar, has_grammar, error));
+    CHECK(has_grammar);
+    CHECK(grammar == "root ::= \"top\"");
+
+    // extra_body null grammar leaves empty if top-level is absent
+    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", nullptr}}}}, grammar, has_grammar, error));
+    CHECK(!has_grammar);
     CHECK(grammar.empty());
 
     // extra_body takes precedence over top-level
     CHECK(parse_grammar_from_body(
         json{{"grammar", "root ::= \"top\""}, {"extra_body", {{"grammar", "root ::= \"extra\""}}}},
-        grammar, error));
+        grammar, has_grammar, error));
+    CHECK(has_grammar);
     CHECK(grammar == "root ::= \"extra\"");
 
     // extra_body non-string grammar reports error
-    CHECK(!parse_grammar_from_body(json{{"extra_body", {{"grammar", false}}}}, grammar, error));
+    CHECK(!parse_grammar_from_body(json{{"extra_body", {{"grammar", false}}}}, grammar, has_grammar, error));
     CHECK(error == "grammar must be a string");
 }
 
@@ -378,8 +397,19 @@ TEST_CASE(OutputConstraintFixture, output_format_schema_supports_grammar_type) {
 
     // Valid response_format type grammar
     CHECK(output_format_schema(nlohmann::ordered_json::parse(
-        R"({"type":"grammar","grammar":"root ::= \"ok\""})"), schema, error));
+        R"json({"type":"grammar","grammar":"root ::= [0-9]+"})json"), schema, error));
     CHECK(schema.is_null());
+
+    // Reject combining type grammar with schema or json_schema
+    error.clear();
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(
+        R"json({"type":"grammar","grammar":"root ::= [0-9]+","schema":{"type":"object"}})json") , schema, error));
+    CHECK(error.find("cannot specify schema") != std::string::npos);
+
+    error.clear();
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(
+        R"json({"type":"grammar","grammar":"root ::= [0-9]+","json_schema":{"type":"object"}})json") , schema, error));
+    CHECK(error.find("cannot specify schema") != std::string::npos);
 
     // Missing grammar key in type grammar
     error.clear();

@@ -611,6 +611,7 @@ struct ParsedRequest {
     nlohmann::ordered_json    output_format;
     // Custom GBNF grammar string (from "grammar" field, extra_body, or response_format)
     std::string               custom_grammar;
+    bool                      has_custom_grammar = false;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -1281,26 +1282,36 @@ inline std::vector<std::string> parse_pflash_required_from_body(const json & bod
 // Returns true when valid (grammar populated or absent/null).
 // Returns false with error message if grammar is present but not a string.
 // Checks extra_body.grammar first, then top-level grammar.
-inline bool parse_grammar_from_body(const json & body, std::string & grammar, std::string & error) {
+inline bool parse_grammar_from_body(const json & body, std::string & grammar, bool & has_grammar, std::string & error) {
     grammar.clear();
+    has_grammar = false;
     error.clear();
     const json * field = nullptr;
     if (body.contains("extra_body")) {
         const auto & eb = body["extra_body"];
         if (eb.is_object() && eb.contains("grammar")) {
-            field = &eb["grammar"];
+            const auto & g = eb["grammar"];
+            if (!g.is_null()) field = &g;
         }
     }
     if (!field && body.contains("grammar")) {
-        field = &body["grammar"];
+        const auto & g = body["grammar"];
+        if (!g.is_null()) field = &g;
     }
-    if (!field || field->is_null()) return true;
+    if (!field) return true;
     if (!field->is_string()) {
         error = "grammar must be a string";
         return false;
     }
     grammar = field->get<std::string>();
+    has_grammar = true;
     return true;
+}
+
+// Overload without has_grammar for convenience
+inline bool parse_grammar_from_body(const json & body, std::string & grammar, std::string & error) {
+    bool has_grammar = false;
+    return parse_grammar_from_body(body, grammar, has_grammar, error);
 }
 
 inline std::string parse_session_id_from_body(const json & body) {
