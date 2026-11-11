@@ -17,6 +17,11 @@ constexpr int kQueryCaptureTokens = 64;
 
 // Only a KVFlash process (LUCE_KVFLASH names a pool) keeps the per-token queries: a pooled prefill
 // scores with them (selector v2, the user-question queries). Without a pool nothing is allocated.
+// The gate reads the env only, not the resolved recall plan: every process that builds a cache
+// (create_target_cache_partial, including layer-split shards) reserves the rows. Under tp_degree > 1
+// kvflash_recall_features turns recall off, so that reservation is unused: a deliberate per-process
+// cost of 64 x head_dim x n_head x n_full_attn x 4 B (about 25 MB at 256 x 24 x 16) in exchange for
+// not threading the plan through every cache builder and the VRAM estimate.
 inline bool kvflash_pool_process() {
     return kvflash_pool_requested(std::getenv("LUCE_KVFLASH"));
 }
