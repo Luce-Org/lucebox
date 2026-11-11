@@ -681,9 +681,9 @@ TEST_CASE(KvflashSlotBundleFixture, state_digest_survives_a_commit_and_a_load_an
 
 TEST_CASE(KvflashSlotBundleFixture, state_digest_line_has_the_fixed_format) {
     KvFlashStateDigest d;
-    d.all = 0x0123456789abcdefULL; d.hist = 1; d.slab = 2; d.kv = 3; d.ledger = 4; d.pager = 0xffULL; d.rung = 5; d.bytes = 4096;
+    d.all = 0x0123456789abcdefULL; d.hist = 1; d.slab = 2; d.kv = 3; d.ledger = 4; d.pager = 0xffULL; d.rung = 5; d.uq = 6; d.bytes = 4096;
     CHECK(kvflash_state_digest_line("save", "9f8e7d6c5b4a3921", 7, d, 12.34) ==
-          "[kvflash-digest] save sid=9f8e7d6c5b4a3921 gen=7 all=0123456789abcdef hist=0000000000000001 slab=0000000000000002 kv=0000000000000003 ledger=0000000000000004 pager=00000000000000ff rung=0000000000000005 bytes=4096 ms=12.3");
+          "[kvflash-digest] save sid=9f8e7d6c5b4a3921 gen=7 all=0123456789abcdef hist=0000000000000001 slab=0000000000000002 kv=0000000000000003 ledger=0000000000000004 pager=00000000000000ff rung=0000000000000005 uq=0000000000000006 bytes=4096 ms=12.3");
 }
 
 TEST_CASE(KvflashSlotBundleFixture, a_pinned_third_at_the_ckpt_position_is_hashed_raw_and_an_unpinned_one_is_not) {
@@ -719,4 +719,118 @@ TEST_CASE(KvflashSlotBundleFixture, a_pinned_third_at_the_ckpt_position_is_hashe
 TEST_CASE(KvflashSlotBundleFixture, regen_and_fault_lines_have_the_fixed_format) {
     CHECK(kvflash_regen_line("9f8e7d6c5b4a3921", 12, 9) == "[kvflash-digest] regen sid=9f8e7d6c5b4a3921 gen=12 from=9");
     CHECK(kvflash_fault_line("kv", "9f8e7d6c5b4a3921", 7) == "[kvflash-digest] fault kv sid=9f8e7d6c5b4a3921 gen=7");
+}
+
+// ---- the slot's user-question query rows (UQ rows) travel with the bundle ------------------------------------------
+// Evidence: prs/evidence/G6/RESULTS.md sections 2 and 3: after kill -9 + restart the restored slot logged "uq miss
+// reason=window-not-in-prefill" (n_q=64) where live and cold logged "uq hit lo=20935 hi=20999 n=64" (n_q=128), and the digest
+// was equal because it did not cover the rows.
+
+namespace {
+KvFlashUqStore sample_uq() {
+    KvFlashUqStore u;
+    u.lo = 3; u.hi = 5; u.n = 2; u.hash = 0xfeedfacecafebeefULL;
+    u.rows = {1.5f, -2.25f, 3.0f, 4.5f, 0.125f, -0.5f};   // n = 2 rows of 3 floats, oldest first
+    return u;
+}
+// The head's UQ fields as the engine fills them (the file id is the caller's).
+void put_uq(KvFlashSlotHead & h, const KvFlashUqStore & u, uint32_t gen) { h.uq_gen = gen; h.uq_lo = (uint32_t)u.lo; h.uq_hi = (uint32_t)u.hi; h.uq_n = (uint32_t)u.n; h.uq_hash = u.hash; }
+bool same_uq(const KvFlashUqStore & a, const KvFlashUqStore & b) { return a.lo == b.lo && a.hi == b.hi && a.n == b.n && a.hash == b.hash && a.rows == b.rows; }
+}  // namespace
+
+TEST_CASE(KvflashSlotBundleFixture, a_head_carries_the_uq_window_and_an_older_head_has_none) {
+    KvFlashSlotHead h = sample_head();
+    const std::vector<uint8_t> plain = kvflash_head_pack(h);                               // no UQ rows: the bytes of the head before this section
+    KvFlashSlotHead out;
+    REQUIRE(kvflash_head_unpack(plain.data(), plain.size(), h.identity, out));
+    CHECK(out.uq_gen == 0u); CHECK(out.uq_n == 0u);
+    put_uq(h, sample_uq(), 6);
+    const std::vector<uint8_t> bytes = kvflash_head_pack(h);
+    CHECK(bytes.size() == plain.size() + 24);
+    REQUIRE(kvflash_head_unpack(bytes.data(), bytes.size(), h.identity, out));
+    CHECK(out.uq_gen == 6u); CHECK(out.uq_lo == 3u); CHECK(out.uq_hi == 5u); CHECK(out.uq_n == 2u); CHECK(out.uq_hash == sample_uq().hash);
+    CHECK(kvflash_head_pack(out) == bytes);
+    for (size_t cut = 1; cut < 24; ++cut) CHECK(!kvflash_head_unpack(bytes.data(), bytes.size() - cut, h.identity, out));   // a torn section is no head
+    KvFlashSlotHead t = h;
+    t.uq_gen = h.end_gen;   { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // one file, two jobs
+    t = h; t.uq_n = 0;      { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // a file with no rows
+    t = h; t.uq_hi = 99;    { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // past the history
+    t = h; t.uq_lo = 9;     { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // lo past hi
+    t = h; t.uq_n = 4;      { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // more rows than the window holds
+}
+
+TEST_CASE(KvflashSlotBundleFixture, the_uq_rows_file_round_trips_and_refuses_a_ragged_one) {
+    const KvFlashUqStore u = sample_uq();
+    KvFlashSlotHead h = sample_head(); put_uq(h, u, 6);
+    const std::vector<uint8_t> file = kvflash_uq_file_pack(u);
+    CHECK(!file.empty());
+    KvFlashUqStore back;
+    REQUIRE(kvflash_uq_file_unpack(h, file, back));
+    CHECK(same_uq(back, u));
+    KvFlashSlotHead h2 = h; h2.uq_n = 4;                                                    // rows not divisible by the head's n
+    CHECK(!kvflash_uq_file_unpack(h2, file, back));
+    KvFlashSlotHead h3 = h; h3.uq_gen = 0;
+    CHECK(!kvflash_uq_file_unpack(h3, file, back));
+    CHECK(!kvflash_uq_file_unpack(h, std::vector<uint8_t>{1, 2, 3}, back));
+}
+
+TEST_CASE(KvflashSlotBundleFixture, the_uq_rows_survive_a_commit_a_load_a_restart_cleanup_and_a_lost_file_degrades_to_no_rows) {
+    const std::string dir = "kvflash_f3_unit_uq";
+    fs::remove_all(dir);
+    const uint64_t id = 79;
+    const KvFlashUqStore u = sample_uq();
+    auto c = park(dir, 1, 3, 0x20, id);
+    KvFlashSlotHead h;
+    REQUIRE(kvflash_head_unpack(c.head.data(), c.head.size(), id, h));
+    h.history.assign(8, 7);                                                                 // the window [3, 5) lies in it
+    put_uq(h, u, 9);
+    c.files.push_back({kvflash_bundle_slab_name(9), kvflash_uq_file_pack(u)});
+    c.head = kvflash_head_pack(h);
+    REQUIRE(kvflash_bundle_commit(c));
+    KvFlashBundleLoaded l; std::string why;
+    REQUIRE(kvflash_bundle_load(dir, id, CB, LIM, l, why));
+    CHECK(same_uq(l.uq, u)); CHECK(l.uq_why.empty());
+    REQUIRE(kvflash_bundle_validate(dir, h, CB, 1 << 20, why));
+    kvflash_bundle_write(dir + "/stray", {1});
+    kvflash_bundle_clean(dir, &h);
+    CHECK(fs::exists(dir + "/" + kvflash_bundle_slab_name(9))); CHECK(!fs::exists(dir + "/stray"));
+    // a park that failed to commit leaves its new rows file behind: the next park unlinks it
+    KvFlashSlotHead failed = h; failed.uq_gen = 11;
+    const auto left = kvflash_bundle_leftovers(h, failed);
+    CHECK(std::find(left.begin(), left.end(), kvflash_bundle_slab_name(11)) != left.end());
+    CHECK(kvflash_head_owned_gens(h)[4] == 9u);
+    // the session's cache-budget figure counts the rows file with the slabs
+    CHECK(kvflash_head_slab_bytes(h, [](uint32_t g) { return (uint64_t)g; }) == (uint64_t)h.end_gen + h.ckpt_gen + h.trunk_gen + h.extra_gen + 9u);
+    // the rows are derived data: a lost file costs the rows (recaptured on a new question), not the session
+    fs::remove(dir + "/" + kvflash_bundle_slab_name(9));
+    REQUIRE(kvflash_bundle_load(dir, id, CB, LIM, l, why));
+    CHECK(l.uq.empty()); CHECK(!l.uq_why.empty());
+    CHECK(kvflash_bundle_validate(dir, h, CB, 1 << 20, why));
+    // a head from before this section has no rows and no note
+    KvFlashSlotHead old = h; old.uq_gen = 0; old.uq_lo = old.uq_hi = old.uq_n = 0; old.uq_hash = 0;
+    const auto ob = kvflash_head_pack(old);
+    REQUIRE(kvflash_bundle_write(dir + "/head", ob));
+    REQUIRE(kvflash_bundle_load(dir, id, CB, LIM, l, why));
+    CHECK(l.uq.empty()); CHECK(l.uq_why.empty());
+    kvflash_bundle_remove(dir);
+}
+
+TEST_CASE(KvflashSlotBundleFixture, state_digest_covers_the_uq_rows) {
+    const DigestState s;
+    auto dg = [&](const KvFlashUqStore * u) {
+        KvFlashDigestRungs rg = kvflash_digest_rungs(s.ckpt_pos, &s.ckpt, s.trunk_pos, &s.trunk, 0, false, &s.extra);
+        return kvflash_state_digest(s.hist, s.slab, s.hdr, s.ledger, rg, CB, [&](int ci, uint8_t * dst) { std::memcpy(dst, s.chunks[(size_t)ci].data(), CB); }, u);
+    };
+    const KvFlashStateDigest none = dg(nullptr);
+    const KvFlashUqStore u = sample_uq();
+    const KvFlashStateDigest with = dg(&u);
+    CHECK(with.all != none.all); CHECK(with.uq != none.uq);                                  // a slot that holds rows is not the slot that does not
+    CHECK(with.hist == none.hist); CHECK(with.kv == none.kv); CHECK(with.rung == none.rung);   // only the rows component moves
+    CHECK(with.bytes == none.bytes + u.rows.size() * 4);
+    CHECK(dg(&u).all == with.all);                                                           // deterministic
+    KvFlashUqStore v = u; v.rows[4] += 1.0f;           CHECK(dg(&v).uq != with.uq); CHECK(dg(&v).all != with.all);   // one row value
+    v = u; v.lo = 2;                                   CHECK(dg(&v).all != with.all);        // the window
+    v = u; v.hi = 6;                                   CHECK(dg(&v).all != with.all);
+    v = u; v.hash ^= 1;                                CHECK(dg(&v).all != with.all);        // which question
+    KvFlashUqStore e;                                  CHECK(dg(&e).all == none.all);        // an empty store is no store
 }

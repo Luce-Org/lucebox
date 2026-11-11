@@ -14,6 +14,8 @@
 // testable on a directory with no engine; kvflash_bundle_commit takes a crash point for that.
 #pragma once
 
+#include "kvflash_uq.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -199,6 +201,11 @@ struct KvFlashSlotHead {
     uint32_t end_gen = 0, ckpt_gen = 0, trunk_gen = 0;   // slab file ids (slab.<id>), 0: no file
     uint32_t pin_pos = 0;                                 // the pinned branch point (v5): 0 none, else the position of the ckpt, trunk or third
     uint32_t extra_pos = 0, extra_gen = 0;                // the third rung (any position but the ckpt's and the trunk's), 0: none
+    // The slot's user-question query rows (LUCE_KVFLASH_UQ_QUERIES, KvFlashUqStore), an optional section after the pin: the n rows
+    // of positions [uq_hi - uq_n, uq_hi) of the question window [uq_lo, uq_hi) live in file slab.<uq_gen>, keyed by the hash of the
+    // prompt ids [0, uq_hi) as the live store is. uq_gen 0: none (a head from before this section, or a slot that held none).
+    uint32_t uq_gen = 0, uq_lo = 0, uq_hi = 0, uq_n = 0;
+    uint64_t uq_hash = 0;
     std::vector<int32_t> history;
     std::vector<uint8_t> pager_hdr;        // kKvFlashPagerHdr bytes
     std::vector<uint64_t> map;             // per chunk: the record's offset in the log, 0: no record (zeros)
@@ -208,9 +215,21 @@ struct KvFlashSlotHead {
 // Every slab file id a head names (0: none): the one place that lists them, so a new rung cannot be missed by a save, a
 // leftover sweep, a validate, a storage listing or a next-gen pick.
 inline std::array<uint32_t, 4> kvflash_head_gens(const KvFlashSlotHead & h) { return {h.end_gen, h.ckpt_gen, h.trunk_gen, h.extra_gen}; }
+// Those plus the UQ rows' file: every file id a head owns. The slabs above are required (a validate refuses a head whose one is
+// missing); the rows are derived data, optional at load, so a save, a leftover sweep, a cleanup and the next-gen pick use this list
+// and a validate does not.
+inline std::array<uint32_t, 5> kvflash_head_owned_gens(const KvFlashSlotHead & h) { return {h.end_gen, h.ckpt_gen, h.trunk_gen, h.extra_gen, h.uq_gen}; }
+// The bytes of every file a head owns, the ones a park kept from the last park as well as the ones it wrote: one definition for
+// the session's cache-budget figure at a park and at a start-up scan. size_of(id) is a file's size.
+template <class F> inline uint64_t kvflash_head_slab_bytes(const KvFlashSlotHead & h, F size_of) {
+    uint64_t b = 0;
+    for (uint32_t id : kvflash_head_owned_gens(h)) if (id) b += size_of(id);
+    return b;
+}
+inline uint32_t kvflash_head_max_gen(const KvFlashSlotHead & h) { const auto g = kvflash_head_owned_gens(h); return std::max(h.gen, *std::max_element(g.begin(), g.end())); }
 
 inline size_t kvflash_head_bytes(size_t nh, size_t nc) { return 8 + 8 + 4 + 4 + 8 + 5 * 4 + 4 + nh * 4 + 4 + kKvFlashPagerHdr + 4 + nc * 8 + 4 + nc * 8 + 12; }
-inline size_t kvflash_head_max_bytes(size_t history_max, size_t nc_max) { return kvflash_head_bytes(history_max, nc_max); }
+inline size_t kvflash_head_max_bytes(size_t history_max, size_t nc_max) { return kvflash_head_bytes(history_max, nc_max) + 24; }   // + the UQ section (kUqTail)
 
 inline std::vector<uint8_t> kvflash_head_pack(const KvFlashSlotHead & h) {
     std::vector<uint8_t> out(detail::kHeadMagic, detail::kHeadMagic + 8);   // constructed, not inserted: gcc 11 -Wstringop-overflow
@@ -218,7 +237,11 @@ inline std::vector<uint8_t> kvflash_head_pack(const KvFlashSlotHead & h) {
     detail::put(out, h.identity); detail::put(out, h.gen); detail::put(out, h.log_gen); detail::put(out, h.log_bytes);
     for (uint32_t v : {h.ckpt_pos, h.trunk_pos, h.end_gen, h.ckpt_gen, h.trunk_gen}) detail::put(out, v);
     detail::put_array(out, h.history); detail::put_array(out, h.pager_hdr); detail::put_array(out, h.map); detail::put_array(out, h.ledger);
-    detail::put(out, h.extra_pos); detail::put(out, h.extra_gen); detail::put(out, h.pin_pos);   // last: an older head ends before them
+    detail::put(out, h.extra_pos); detail::put(out, h.extra_gen); detail::put(out, h.pin_pos);   // an older head ends before them
+    if (h.uq_gen != 0) {   // the UQ section, last and only when there are rows: a head with none is the bytes it was before it (24 B more with)
+        for (uint32_t v : {h.uq_gen, h.uq_lo, h.uq_hi, h.uq_n}) detail::put(out, v);
+        detail::put(out, h.uq_hash);
+    }
     return out;
 }
 
@@ -234,10 +257,13 @@ inline bool kvflash_head_unpack(const uint8_t * data, size_t n, uint64_t identit
         !c.get_array(h.history) || !c.get_array(h.pager_hdr) || !c.get_array(h.map) || !c.get_array(h.ledger)) return false;
     // the tail: nothing (the base head), 4 bytes (the first B4 try's branch_pos, ignored), the third rung, or the third and its pin.
     // A new head cut by exactly 4 or 8 bytes reads as an older one (the pin or the third is lost): accepted, a head is written by an atomic rename.
+    // 36 bytes: the third, its pin and the UQ rows' section (kUqTail); an older head has none, and a head cut inside it is refused.
+    constexpr size_t kUqTail = 24;
     const size_t tail = n - c.at;
-    if (tail == 8 || tail == 12) { if (!c.get(h.extra_pos) || !c.get(h.extra_gen)) return false; }
-    if (tail == 12 && !c.get(h.pin_pos)) return false;
-    if (tail != 0 && tail != 4 && tail != 8 && tail != 12) return false;
+    if (tail == 8 || tail == 12 || tail == 12 + kUqTail) { if (!c.get(h.extra_pos) || !c.get(h.extra_gen)) return false; }
+    if ((tail == 12 || tail == 12 + kUqTail) && !c.get(h.pin_pos)) return false;
+    if (tail == 12 + kUqTail && (!c.get(h.uq_gen) || !c.get(h.uq_lo) || !c.get(h.uq_hi) || !c.get(h.uq_n) || !c.get(h.uq_hash))) return false;
+    if (tail != 0 && tail != 4 && tail != 8 && tail != 12 && tail != 12 + kUqTail) return false;
     const size_t nh = h.history.size();
     if (nh == 0 || h.ckpt_pos > nh || h.trunk_pos > nh || h.end_gen == 0 || (h.ckpt_pos == 0) != (h.ckpt_gen == 0) ||
         (h.trunk_pos == 0) != (h.trunk_gen == 0) || h.pager_hdr.size() != kKvFlashPagerHdr || h.ledger.size() != h.map.size() * kKvFlashLedgerEntry) return false;
@@ -251,7 +277,37 @@ inline bool kvflash_head_unpack(const uint8_t * data, size_t n, uint64_t identit
         (h.extra_pos != 0 && (h.extra_pos == h.ckpt_pos || h.extra_pos == h.trunk_pos))) return false;
     // the pin: none, or the position of the third (when there is one) or else of the checkpoint or the trunk
     if (h.pin_pos != 0 && h.pin_pos != (h.extra_pos != 0 ? h.extra_pos : h.ckpt_pos) && !(h.extra_pos == 0 && h.pin_pos == h.trunk_pos)) return false;
+    // the UQ rows: a window inside the history holding n rows, in a file of their own
+    if (h.uq_gen != 0 && (h.uq_n == 0 || h.uq_lo >= h.uq_hi || h.uq_hi > nh || h.uq_n > h.uq_hi - h.uq_lo ||
+                          h.uq_gen == h.end_gen || h.uq_gen == h.ckpt_gen || h.uq_gen == h.trunk_gen || h.uq_gen == h.extra_gen)) return false;
     out = std::move(h);
+    return true;
+}
+
+
+// The UQ rows' file is a slab file (one "ssm" tensor holding the rows' float bytes, no conv), so its length checks, size cap and
+// cleanup are the slab's. The window, the key and n are the head's; the rows come back as the live store held them.
+inline std::vector<uint8_t> kvflash_uq_file_pack(const KvFlashUqStore & u) {
+    std::vector<uint8_t> rows(u.rows.size() * sizeof(float));
+    if (!rows.empty()) std::memcpy(rows.data(), u.rows.data(), rows.size());
+    std::vector<uint8_t> out;
+    out.reserve(8 + 4 + rows.size());
+    detail::put_list(out, std::vector<std::vector<uint8_t>>{std::move(rows)}); detail::put_list(out, std::vector<std::vector<uint8_t>>{});
+    return out;
+}
+// False when the head names no rows, or the file is not one tensor of n equal rows of floats (the caller then has no rows).
+inline bool kvflash_uq_file_unpack(const KvFlashSlotHead & h, const std::vector<uint8_t> & file, KvFlashUqStore & out) {
+    if (h.uq_gen == 0 || h.uq_n == 0) return false;
+    detail::Cursor c{file.data(), file.size()};
+    std::vector<std::vector<uint8_t>> rows, none;
+    if (!c.get_list(rows) || !c.get_list(none) || c.at != file.size() || rows.size() != 1 || !none.empty()) return false;
+    const size_t bytes = rows[0].size();
+    if (bytes == 0 || bytes % (sizeof(float) * h.uq_n) != 0) return false;
+    KvFlashUqStore u;
+    u.lo = (int)h.uq_lo; u.hi = (int)h.uq_hi; u.n = (int)h.uq_n; u.hash = h.uq_hash;
+    u.rows.resize(bytes / sizeof(float));
+    std::memcpy(u.rows.data(), rows[0].data(), bytes);
+    out = std::move(u);
     return true;
 }
 
@@ -469,14 +525,16 @@ inline bool kvflash_bundle_compacts(uint64_t log_bytes, size_t kept, size_t writ
 inline std::vector<std::string> kvflash_bundle_leftovers(const KvFlashSlotHead & durable, const KvFlashSlotHead & failed) {
     std::vector<std::string> out;
     if (failed.log_gen != durable.log_gen) out.push_back(kvflash_bundle_log_name(failed.log_gen));
-    const auto named = kvflash_head_gens(durable);
-    for (uint32_t id : kvflash_head_gens(failed))
+    const auto named = kvflash_head_owned_gens(durable);
+    for (uint32_t id : kvflash_head_owned_gens(failed))
         if (id && std::find(named.begin(), named.end(), id) == named.end()) out.push_back(kvflash_bundle_slab_name(id));
     return out;
 }
 
 struct KvFlashBundleLoaded {
     KvFlashSlotHead head;
+    KvFlashUqStore uq;
+    std::string uq_why;
     std::vector<uint8_t> pager;            // a KvFlashPager::serialize() blob
     std::vector<std::vector<uint8_t>> end_ssm, end_conv, ckpt_ssm, ckpt_conv, trunk_ssm, trunk_conv, extra_ssm, extra_conv;
 };
@@ -519,6 +577,14 @@ inline bool kvflash_bundle_load(const std::string & dir, uint64_t identity, size
     };
     if (!slab("end", l.head.end_gen, l.end_ssm, l.end_conv) || !slab("ckpt", l.head.ckpt_gen, l.ckpt_ssm, l.ckpt_conv) ||
         !slab("trunk", l.head.trunk_gen, l.trunk_ssm, l.trunk_conv) || !slab("third", l.head.extra_gen, l.extra_ssm, l.extra_conv)) return false;
+    if (l.head.uq_gen != 0) {   // derived data: a lost or damaged file costs the rows (a new question recaptures them), not the session
+        const std::string name = kvflash_bundle_slab_name(l.head.uq_gen);
+        std::vector<uint8_t> b;
+        if (!kvflash_bundle_read(dir + "/" + name, b, lim.slab_max) || !kvflash_uq_file_unpack(l.head, b, l.uq)) {
+            l.uq = KvFlashUqStore{};
+            l.uq_why = "uq rows " + name + ": missing, over " + std::to_string(lim.slab_max) + " bytes or a bad format; the slot runs without them";
+        }
+    }
     out = std::move(l);
     return true;
 }
@@ -570,6 +636,7 @@ inline void kvflash_bundle_clean(const std::string & dir, const KvFlashSlotHead 
         if (head->ckpt_gen) keep.push_back(kvflash_bundle_slab_name(head->ckpt_gen));
         if (head->trunk_gen) keep.push_back(kvflash_bundle_slab_name(head->trunk_gen));
         if (head->extra_gen) keep.push_back(kvflash_bundle_slab_name(head->extra_gen));
+        if (head->uq_gen) keep.push_back(kvflash_bundle_slab_name(head->uq_gen));
     }
     std::error_code ec;
     for (const auto & e : std::filesystem::directory_iterator(dir, ec))
