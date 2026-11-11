@@ -168,12 +168,13 @@ TEST_CASE(KvflashPrefillReselectFixture, recall_plan_derives_tail_window_and_pic
 TEST_CASE(KvflashPrefillReselectFixture, recall_plan_with_the_preamble_pinned) {
     const auto s = ramp(400);
     KvFlashRecallIn in;
-    in.n_pool_blocks = 256 + 96; in.cur_chunk = 400; in.recall_chunks = 60; in.unit = 10; in.reserve = 3;
+    in.n_pool_blocks = 256; in.cur_chunk = 400; in.recall_chunks = 60; in.unit = 10; in.reserve = 3;   // production: the reserve is inside the pool
     in.pin_reserve_chunks = 96; in.pinned_chunks = 96;
     const KvFlashRecallPlan p = kvflash_recall_plan(s, in);
     KvFlashRecallIn off = in;
     off.n_pool_blocks = 256; off.pin_reserve_chunks = 0; off.pinned_chunks = 0;
-    CHECK(p.tail == kvflash_recall_plan(s, off).tail);        // the history budget is the feature-off one
+    CHECK(p.tail == 256 - 96 - 1 - 60 - 3 - 1);               // the pool minus the reserve, not the feature-off budget
+    CHECK(p.tail == kvflash_recall_plan(s, off).tail - 96);
     CHECK(p.first_chunk == 96);
     for (int b : p.picked) CHECK(b * 10 >= 96);              // no pinned chunk is a recall candidate
 }
