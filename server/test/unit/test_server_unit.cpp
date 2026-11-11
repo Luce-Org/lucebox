@@ -21,6 +21,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/launch_profiles.h"
 #include "server/api_adapters.h"
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
@@ -17474,6 +17475,50 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     // keys are NOT in the wholesale shape — they moved to budget_envelope.
     TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
     TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+TEST_CASE(ServerUnitFixture, test_kvflash_recall_help_line_names_the_protocol) {
+    TEST_ASSERT(luce::server::kvflash_recall_help_line() == "kvflash-recall: protocol=1");
+}
+
+TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_installed_reselect_mode) {
+    using luce::server::kvflash_recall_mode;
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4") == "prefill-reselect=4");   // the default profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5") == "prefill-reselect=5");   // the drafter profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "0").empty());                   // the user turned recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "").empty());
+    TEST_ASSERT(kvflash_recall_mode("gemma4", "4").empty());                   // no profile on other architectures
+}
+
+TEST_CASE(ServerUnitFixture, test_props_kvflash_disabled_without_the_flag) {
+    ServerConfig cfg;
+    cfg.arch = "qwen35";
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body.contains("kvflash"));
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>() == false);
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 0);
+    TEST_ASSERT(body["kvflash"]["recall"]["protocol"].get<int>() == 1);
+    TEST_ASSERT(body["kvflash"]["recall"]["active"].get<bool>() == false);
+    TEST_ASSERT(body["kvflash"]["recall"]["mode"].is_string());
+}
+
+TEST_CASE(ServerUnitFixture, test_props_kvflash_reports_pool_and_recall) {
+    ServerConfig cfg;
+    cfg.arch                = "qwen35";
+    cfg.kvflash_enabled     = true;
+    cfg.kvflash_pool_tokens = 16384;
+    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4");
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>());
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 16384);
+    TEST_ASSERT(body["kvflash"]["recall"]["active"].get<bool>());
+    TEST_ASSERT(body["kvflash"]["recall"]["mode"].get<std::string>() == "prefill-reselect=4");
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_exposes_sampling_no_thinking) {
