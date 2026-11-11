@@ -4508,6 +4508,9 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // the replaced token's key.
     auto pool_settled = [&]() {
         if (!kvflash_active()) return;
+        // A chunk a verify opened ahead of AR and the step did not reach
+        // (rejected tail, terminal or budget-close repair) goes back first.
+        kvflash_settle_chunks(kvflash_pager_, committed);
         if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
     };
     // Decode-time reselection: AR reselects right after it emits generated
@@ -4596,14 +4599,17 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         // emit, then forward, which allocates the chunk exactly as AR does (a
         // request that ends on the emission never allocates it; restore_kv()
         // could not undo a verify's allocation). The next spec step starts
-        // after it. (LUCE_MIN_TOKENS with KVFlash is refused at startup, so no
-        // floor case reaches here.)
+        // after it. While the pool still has a free block the chunk counts as
+        // usable (kvflash_span_chunk_ok): the verify opens it and pool_settled()
+        // takes it back if the step did not reach it, so no hop and no span
+        // clamp there. (LUCE_MIN_TOKENS with KVFlash is refused at startup, so
+        // no floor case reaches here.)
         KvflashSpecStep kvf_step{false, q_len};
         if (kvflash_active())
             kvf_step = kvflash_spec_step_plan(
                 history_guard.base, history_guard.entry, out_tokens.size(), committed, q_len,
                 kvflash_tau_, kvflash_pager_.chunk_tokens(),
-                [&](int c) { return kvflash_pager_.is_resident(c); });
+                [&](int c) { return kvflash_span_chunk_ok(kvflash_pager_, c); });
         if (kvf_step.ar_hop && last_tok >= 0) {
             // AR's state when the request ends or closes here: the last emitted
             // token is pending, not forwarded.
@@ -5451,9 +5457,8 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                                    /*capture_ssm_intermediates=*/true)) {
             // No pool-exhaustion branch: the span plan (kvflash_spec_step_plan)
             // keeps every verify row inside a chunk that is already resident
-            // (the seed's own chunk, which the AR hop allocates, plus resident
-            // chunks it may reach), and slot_for on a resident chunk allocates
-            // nothing, so a spec verify cannot run out of pool slots. Only the
+            // or that a free block can take (kvflash_span_chunk_ok), so a spec
+            // verify never evicts and cannot run out of pool slots. Only the
             // AR hop's one-token forward can, and it handles it itself.
             std::fprintf(stderr, "spec-decode: verify failed\n");
             // Only restore when this step actually took the snapshot;

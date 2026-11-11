@@ -443,6 +443,35 @@ inline KvflashSpecStep kvflash_spec_step_plan(size_t hist_base, size_t guard_ent
                                   is_resident)};
 }
 
+// A verify span may also enter the next chunk the pool has not allocated when
+// opening it is an append the settle can take back: the pager is in identity
+// layout (nothing evicted in this request) and a free block is left, so the
+// allocation pops a block and evicts nothing. Passed to kvflash_spec_step_plan
+// as its chunk predicate; with it the seed that opens such a chunk takes a spec
+// step too. Once the pool is full the predicate is is_resident and the plan is
+// the clamp + AR hop.
+template <class Pager>
+inline bool kvflash_span_chunk_ok(const Pager & pager, int c) {
+    return pager.is_resident(c) ||
+           (c == pager.n_chunks() && pager.is_identity() &&
+            pager.resident_blocks() + pager.pending_free_blocks() < pager.n_pool_blocks());
+}
+
+// The other half: at every settled position the pager holds the chunks AR
+// holds there, ceil(committed / chunk_tokens). A chunk a verify opened and the
+// step did not reach (rejected tail, terminal or budget-close repair) is
+// dropped with truncate(), which in identity layout frees the block, zeroes the
+// rejected rows, rebuilds the free stack and renumbers the use clock in logical
+// order: the state of a pager that only ever saw `committed` rows. Returns
+// whether it dropped anything.
+template <class Pager>
+inline bool kvflash_settle_chunks(Pager & pager, int committed) {
+    const int ct = pager.chunk_tokens();
+    if (pager.n_chunks() <= (committed + ct - 1) / ct || !pager.is_identity()) return false;
+    pager.truncate(committed);
+    return true;
+}
+
 // The verify pass stages the query of each of its rows (positions
 // stage_base .. stage_base + stage_n - 1). After acceptance q_cap must hold
 // what AR holds: the query of the last consumed row, position new_committed -
