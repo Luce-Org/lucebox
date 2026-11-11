@@ -102,7 +102,7 @@ inline int kvflash_same_sid_slot(const std::vector<KvFlashOwnedSession> & parked
     return best;
 }
 
-// The oldest parked session other than `keep`, for a cold admit. A summary-cold request keeps its sid's parked slot, but when that is
+// The parked session cheapest to restore other than `keep`, for a cold admit. A summary-cold request keeps its sid's parked slot, but when that is
 // the only evictable one and nothing is live, no retry can change the answer: the keep is given up rather than answered busy forever.
 // evict(keep) returns the freed slot or -1.
 template <class Evict>
