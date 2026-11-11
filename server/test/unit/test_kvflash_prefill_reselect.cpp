@@ -18,26 +18,13 @@ std::vector<float> ramp(int n) { std::vector<float> s((size_t)n); for (int i = 0
 // ---- the mode gate: only 0, 4 and 5 exist -----------------------------------------------------------------
 
 TEST_CASE(KvflashPrefillReselectFixture, modes_one_to_three_are_off) {
-    std::string why;
-    for (int m : {1, 2, 3, 6, -1, 100}) {
-        CHECK(kvflash_reselect_mode(m, true, "exact", &why) == 0);
-        CHECK(kvflash_reselect_mode(m, true, "pflash2", &why) == 0);
-    }
-    CHECK(kvflash_reselect_mode(0, true, "exact", &why) == 0);
+    for (int m : {0, 1, 2, 3, 6, -1, 100}) CHECK(kvflash_reselect_mode(m, true) == 0);
 }
-TEST_CASE(KvflashPrefillReselectFixture, modes_four_and_five_need_the_qk_policy_and_their_scorer) {
-    std::string why;
-    CHECK(kvflash_reselect_mode(4, true, "exact", &why) == 4);
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(5, true, "pflash2", &why) == 5);
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, false, "exact", &why) == 0);   // LRU policy: no recall, and nothing to complain about
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, true, "pflash2", &why) == 0);  // the scorer must match the mode
-    CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact");
-    CHECK(kvflash_reselect_mode(5, true, nullptr, &why) == 0);
-    CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=5 needs LUCE_KVFLASH_RESELECT_SCORER=pflash2");
-    CHECK(kvflash_reselect_mode(4, true, "cosine", nullptr) == 0);   // the cosine scorer is gone
+TEST_CASE(KvflashPrefillReselectFixture, modes_four_and_five_need_the_qk_policy_and_name_their_scorer) {
+    CHECK(kvflash_reselect_mode(4, true) == 4);    // exact attention mass
+    CHECK(kvflash_reselect_mode(5, true) == 5);    // the PFlash drafter's scores
+    CHECK(kvflash_reselect_mode(4, false) == 0);   // LRU policy: no recall
+    CHECK(kvflash_reselect_mode(5, false) == 0);
 }
 
 // ---- a recall mode holds the turn's plan while the answer decodes ------------------------------------------

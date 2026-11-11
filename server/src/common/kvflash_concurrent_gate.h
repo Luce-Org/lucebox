@@ -13,8 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include "kvflash_query_capture.h"
-
 namespace luce::common {
 
 // ── When is the seq engine built? ──────────────────────────────────────
@@ -93,10 +91,7 @@ struct KvFlashProfileRequest {
     bool explicit_lru_policy = false;   // LUCE_KVFLASH_POLICY=lru or --kvflash-policy lru: the opt-out
     bool explicit_qk_policy = false, explicit_recall = false, explicit_uq = false;
     bool explicit_tau = false;       // the decode-time reselect: refused, the slot engine has none
-    int  reselect_mode = 0;          // LUCE_KVFLASH_PREFILL_RESELECT as parsed
-    bool exact_scorer = false;       // LUCE_KVFLASH_RESELECT_SCORER=exact
-    bool pflash2_scorer = false;     // LUCE_KVFLASH_RESELECT_SCORER=pflash2 (mode 5)
-    int  select_queries = 0;         // queries kept per prefill, as the backend derives them (kQueryCaptureTokens in mode 4, else 0)
+    int  reselect_mode = 0;          // LUCE_KVFLASH_PREFILL_RESELECT as parsed: 4 scores by exact attention mass, 5 by the drafter
     bool multi_model = false;        // env defaults are process-wide: one model's defaults would leak into the next
 };
 struct KvFlashProfile {
@@ -114,16 +109,12 @@ inline KvFlashProfile kvflash_resolve_concurrent_profile(const KvFlashProfileReq
         p.error = "concurrent KVFlash is LRU or per-slot recall; tau (the decode-time reselect) is not supported there";
         return p;
     }
-    const bool any = r.explicit_qk_policy || r.explicit_recall || r.reselect_mode != 0 || r.exact_scorer || r.pflash2_scorer;
+    const bool any = r.explicit_qk_policy || r.explicit_recall || r.reselect_mode != 0;
     if (any) {
-        const bool mode4 = r.reselect_mode == 4 && r.exact_scorer && r.select_queries > 0;
-        const bool mode5 = r.reselect_mode == 5 && r.pflash2_scorer;   // the drafter is a scorer here: no queries, no first pass
-        if (!(r.explicit_qk_policy && r.explicit_recall && (mode4 || mode5))) {
+        if (!(r.explicit_qk_policy && r.explicit_recall && (r.reselect_mode == 4 || r.reselect_mode == 5))) {
             p.ok = false;
-            p.error = "concurrent KVFlash recall needs LUCE_KVFLASH_POLICY=qk, LUCE_KVFLASH_PREFILL_RESELECT=4, "
-                      "LUCE_KVFLASH_RESELECT_SCORER=exact and LUCE_KVFLASH_RECALL_BLOCKS "
-                      "together, or PREFILL_RESELECT=5 with RESELECT_SCORER=pflash2 and RECALL_BLOCKS "
-                      "(C1.4: no defaults are installed)";
+            p.error = "concurrent KVFlash recall needs LUCE_KVFLASH_POLICY=qk, LUCE_KVFLASH_PREFILL_RESELECT=4 (or 5) "
+                      "and LUCE_KVFLASH_RECALL_BLOCKS together (C1.4: no defaults are installed)";
             return p;
         }
         p.policy = "recall";
@@ -164,9 +155,6 @@ inline KvFlashProfileRequest kvflash_concurrent_request(const std::string & arch
     r.explicit_uq = on("LUCE_KVFLASH_UQ_QUERIES");
     const char * rs = lookup("LUCE_KVFLASH_PREFILL_RESELECT");
     r.reselect_mode = rs ? std::atoi(rs) : 0;
-    r.exact_scorer = is("LUCE_KVFLASH_RESELECT_SCORER", "exact");
-    r.pflash2_scorer = is("LUCE_KVFLASH_RESELECT_SCORER", "pflash2");
-    r.select_queries = r.reselect_mode == 4 ? kQueryCaptureTokens : 0;
     r.explicit_tau = on("LUCE_KVFLASH_TAU") || cli_tau;
     r.multi_model = multi_model;
     return r;
@@ -179,7 +167,7 @@ inline std::string kvflash_merged_profile_error(const std::string & arch, const 
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request(arch, cli_policy, cli_tau, multi_model, lookup));
     if (p.ok && p.policy == "recall" && !p.install_recall_defaults) return std::string();
     return "a LUCE_KVFLASH_* value or --kvflash-policy keeps the C1.4 recall defaults from forming a recall profile "
-           "(they need POLICY=qk, PREFILL_RESELECT=4, RESELECT_SCORER=exact, RECALL_BLOCKS>0); "
+           "(they need POLICY=qk, PREFILL_RESELECT=4, RECALL_BLOCKS>0); "
            "unset it, set the full recall env, or set LUCE_KVFLASH_POLICY=lru";
 }
 

@@ -760,7 +760,6 @@ struct LaunchPolicyFixture : CommonFixture {
         check_env(kvflash_recall_env("qwen35", true), {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
             {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},
@@ -781,7 +780,6 @@ struct LaunchPolicyFixture : CommonFixture {
         check_env(kvflash_recall_env("qwen35", false), {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
             {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},

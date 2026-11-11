@@ -410,14 +410,12 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch, b
     if (!mode5) {
         env.insert(env.end(), {
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
             {"LUCE_KVFLASH_UQ_QUERIES", std::to_string(P::exact_uq_queries)},
         });
         return env;
     }
     env.insert(env.end(), {
         {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
-        {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
         {"LUCE_KVFLASH_UQ_QUERIES", "0"},
         {"PFLASH_SELECT_MODE", "budget_only"},
         {"PFLASH_SELECT_SCORE", "density"},

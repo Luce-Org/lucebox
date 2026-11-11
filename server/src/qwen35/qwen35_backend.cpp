@@ -437,11 +437,7 @@ bool Qwen35Backend::init() {
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
     {
-        const char * sc = std::getenv("LUCE_KVFLASH_RESELECT_SCORER");
-        std::string why;
-        kvflash_prefill_reselect_ = luce::common::kvflash_reselect_mode(
-            env_int_or_default("LUCE_KVFLASH_PREFILL_RESELECT", 0), kvflash_qk_policy_, sc, &why);
-        if (!why.empty()) std::fprintf(stderr, "[kvflash] %s; reselect off\n", why.c_str());
+        kvflash_prefill_reselect_ = luce::common::kvflash_reselect_mode(env_int_or_default("LUCE_KVFLASH_PREFILL_RESELECT", 0), kvflash_qk_policy_);
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_m4_single_ = env_int_or_default("LUCE_KVFLASH_M4_SINGLE", 1) != 0;
         kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));

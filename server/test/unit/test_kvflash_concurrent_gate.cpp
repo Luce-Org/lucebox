@@ -108,7 +108,7 @@ TEST_CASE(KvflashConcurrentGateFixture, the_concurrent_profile_is_lru_only_by_de
     CHECK(ok.log_line.find("lru-only") != std::string::npos);
     for (int with_recall = 0; with_recall < 2; with_recall++) {   // tau, alone or on top of a full recall request
         KvFlashProfileRequest q;
-        if (with_recall) { q.explicit_qk_policy = q.explicit_recall = q.exact_scorer = true; q.reselect_mode = 4; q.select_queries = 64; }
+        if (with_recall) { q.explicit_qk_policy = q.explicit_recall = true; q.reselect_mode = 4; }
         q.explicit_tau = true;
         const KvFlashProfile bad = kvflash_resolve_concurrent_profile(q);
         CHECK(!bad.ok);
@@ -117,23 +117,20 @@ TEST_CASE(KvflashConcurrentGateFixture, the_concurrent_profile_is_lru_only_by_de
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, the_recall_profile_needs_every_explicit_piece_and_installs_no_default) {
-    KvFlashProfileRequest full;                           // C1.4: qk + mode 4 + exact scorer + recall blocks
-    full.explicit_qk_policy = full.explicit_recall = full.exact_scorer = true;
-    full.reselect_mode = 4; full.select_queries = 64;
+    KvFlashProfileRequest full;                           // qk + mode 4 + recall blocks: the mode names its scorer
+    full.explicit_qk_policy = full.explicit_recall = true;
+    full.reselect_mode = 4;
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(full);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
     CHECK(ok.log_line.find("recall") != std::string::npos);
-    for (int i = 0; i < 7; i++) {                         // a partial request is refused, not completed with defaults
+    for (int i = 0; i < 4; i++) {                         // a partial request is refused, not completed with defaults
         KvFlashProfileRequest q = full;
         switch (i) {
             case 0: q = {}; q.explicit_qk_policy = true; break;
             case 1: q = {}; q.explicit_recall = true; break;
-            case 2: q = {}; q.exact_scorer = true; break;
-            case 3: q = {}; q.reselect_mode = 4; break;
-            case 4: q.reselect_mode = 3; break;                // mode 3 is not per-slot recall
-            case 5: q.exact_scorer = false; break;
-            case 6: q.select_queries = 0; break;
+            case 2: q = {}; q.reselect_mode = 4; break;
+            case 3: q.reselect_mode = 3; break;                // mode 3 is not per-slot recall
         }
         const KvFlashProfile bad = kvflash_resolve_concurrent_profile(q);
         CHECK(!bad.ok);
@@ -141,21 +138,16 @@ TEST_CASE(KvflashConcurrentGateFixture, the_recall_profile_needs_every_explicit_
     }
 }
 
-TEST_CASE(KvflashConcurrentGateFixture, mode5_takes_the_pflash2_scorer_in_place_of_the_exact_scorer_and_its_queries) {
-    KvFlashProfileRequest m5;                             // qk + mode 5 + pflash2 + recall blocks; no select queries
-    m5.explicit_qk_policy = m5.explicit_recall = m5.pflash2_scorer = true;
+TEST_CASE(KvflashConcurrentGateFixture, mode5_is_a_recall_profile_with_the_qk_policy_and_recall_blocks) {
+    KvFlashProfileRequest m5;                             // qk + mode 5 + recall blocks: the drafter is the scorer
+    m5.explicit_qk_policy = m5.explicit_recall = true;
     m5.reselect_mode = 5;
     const KvFlashProfile ok = kvflash_resolve_concurrent_profile(m5);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2; i++) {
         KvFlashProfileRequest q = m5;
-        switch (i) {
-            case 0: q.pflash2_scorer = false; break;       // mode 5 without its scorer
-            case 1: q.explicit_recall = false; break;
-            case 2: q.explicit_qk_policy = false; break;
-            case 3: q.reselect_mode = 4; break;            // pflash2 under mode 4 is not a profile
-        }
+        if (i == 0) q.explicit_recall = false; else q.explicit_qk_policy = false;
         const KvFlashProfile bad = kvflash_resolve_concurrent_profile(q);
         CHECK(!bad.ok);
         CHECK(bad.error.find("together") != std::string::npos);
@@ -200,7 +192,7 @@ TEST_CASE(KvflashConcurrentGateFixture, merged_defaults_resolve_to_recall_throug
     CHECK(merged_after_defaults({{"LUCE_KVFLASH_UQ_QUERIES", "0"}}).at("LUCE_KVFLASH_UQ_QUERIES") == "0");   // a set variable keeps its value
     CHECK(merged_error({{"LUCE_KVFLASH_LOG_RESIDENT", "1"}}).empty());     // an unrelated variable changes nothing
     CHECK(merged_error({{"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-                        {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "3"}}).empty());   // a coherent explicit user value is kept
+                        {"LUCE_KVFLASH_RECALL_BLOCKS", "3"}}).empty());   // a coherent explicit user value is kept: the mode names its scorer
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, a_user_value_that_breaks_the_merged_profile_is_refused) {
@@ -208,9 +200,7 @@ TEST_CASE(KvflashConcurrentGateFixture, a_user_value_that_breaks_the_merged_prof
     CHECK(!merged_error({}, "drafter").empty());                           // --kvflash-policy applied later
     CHECK(!merged_error({{"LUCE_KVFLASH_PREFILL_RESELECT", "3"}}).empty());
     // Every recall variable kept at an off value: the merged request falls into the defaults branch again.
-    const EnvMap all_off = {{"LUCE_KVFLASH_POLICY", "drafter"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "0"},
-                            {"LUCE_KVFLASH_RESELECT_SCORER", "cosine"},
-                            {"LUCE_KVFLASH_RECALL_BLOCKS", "0"}};
+    const EnvMap all_off = {{"LUCE_KVFLASH_POLICY", "drafter"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "0"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "0"}};
     CHECK(!merged_error(all_off).empty());
     CHECK(!merged_error({{"LUCE_KVFLASH_PREFILL_RESELECT", "0"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "0"}}, "drafter").empty());
     // The refusal follows installed defaults, so it must not say none were installed.
@@ -222,7 +212,7 @@ TEST_CASE(KvflashConcurrentGateFixture, the_preamble_pin_runs_in_every_concurren
     const EnvMap lru = {{"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"}, {"LUCE_KVFLASH_POLICY", "lru"}};
     const EnvMap def = {{"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"}};
     const EnvMap full = {{"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"}, {"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-                         {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "6"}};
+                         {"LUCE_KVFLASH_RECALL_BLOCKS", "6"}};
     for (const EnvMap * env : {&lru, &def, &full}) {
         const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request("qwen35", "", false, false, lookup_of(*env)));
         CHECK(p.ok);
@@ -241,8 +231,7 @@ TEST_CASE(KvflashConcurrentGateFixture, multi_model_qwen35_with_no_env_is_lru_on
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, multi_model_with_the_full_explicit_mode4_env_still_runs_recall) {
-    const EnvMap env = {{"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-                        {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "6"}};
+    const EnvMap env = {{"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_PREFILL_RESELECT", "4"}, {"LUCE_KVFLASH_RECALL_BLOCKS", "6"}};
     const KvFlashProfile p = kvflash_resolve_concurrent_profile(kvflash_concurrent_request("qwen35", "", false, true, lookup_of(env)));
     CHECK(p.ok);
     CHECK(p.policy == "recall");
@@ -251,7 +240,7 @@ TEST_CASE(KvflashConcurrentGateFixture, multi_model_with_the_full_explicit_mode4
 
 TEST_CASE(KvflashConcurrentGateFixture, the_request_builder_reads_cli_over_env_and_mirrors_env_set_on) {
     EnvMap env = {{"LUCE_KVFLASH_POLICY", "qk"}, {"LUCE_KVFLASH_RECALL_BLOCKS", ""}, {"LUCE_KVFLASH_UQ_QUERIES", "0"},
-                  {"LUCE_KVFLASH_PREFILL_RESELECT", "4"}, {"LUCE_KVFLASH_RESELECT_SCORER", "exact"}};
+                  {"LUCE_KVFLASH_PREFILL_RESELECT", "4"}};
     KvFlashProfileRequest r = kvflash_concurrent_request("qwen35", "", false, false, lookup_of(env));
     CHECK(r.arch == "qwen35");
     CHECK(r.explicit_qk_policy);
@@ -259,9 +248,6 @@ TEST_CASE(KvflashConcurrentGateFixture, the_request_builder_reads_cli_over_env_a
     CHECK(!r.explicit_recall);                 // empty counts as unset
     CHECK(!r.explicit_uq);                     // "0" counts as unset
     CHECK(r.reselect_mode == 4);
-    CHECK(r.exact_scorer);
-    CHECK(!r.pflash2_scorer);
-    CHECK(r.select_queries == kQueryCaptureTokens);   // mode 4 keeps the capture window, as the backend derives it
     CHECK(!r.multi_model);
     r = kvflash_concurrent_request("qwen35", "lru", true, true, lookup_of(env));
     CHECK(r.explicit_lru_policy);              // the CLI policy wins over the env policy
@@ -273,7 +259,7 @@ TEST_CASE(KvflashConcurrentGateFixture, the_request_builder_reads_cli_over_env_a
     env["LUCE_KVFLASH_PREAMBLE_ROWS"] = "6144";
     r = kvflash_concurrent_request("qwen35", "", false, false, lookup_of(env));
     CHECK(r.explicit_recall);
-    CHECK(r.select_queries == 0);              // no mode 4, no queries
+    CHECK(r.reselect_mode == 0);
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, explicit_lru_policy_keeps_lru_only_and_installs_no_defaults) {
@@ -290,8 +276,8 @@ TEST_CASE(KvflashConcurrentGateFixture, explicit_lru_policy_keeps_lru_only_and_i
 TEST_CASE(KvflashConcurrentGateFixture, explicit_full_mode4_and_mode5_install_no_defaults) {
     KvFlashProfileRequest m4;
     m4.arch = "qwen35";
-    m4.explicit_qk_policy = m4.explicit_recall = m4.exact_scorer = true;
-    m4.reselect_mode = 4; m4.select_queries = 64;
+    m4.explicit_qk_policy = m4.explicit_recall = true;
+    m4.reselect_mode = 4;
     KvFlashProfile ok = kvflash_resolve_concurrent_profile(m4);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
@@ -299,7 +285,7 @@ TEST_CASE(KvflashConcurrentGateFixture, explicit_full_mode4_and_mode5_install_no
     CHECK(ok.log_line.find("explicit env") != std::string::npos);
     KvFlashProfileRequest m5;
     m5.arch = "qwen35";
-    m5.explicit_qk_policy = m5.explicit_recall = m5.pflash2_scorer = true;
+    m5.explicit_qk_policy = m5.explicit_recall = true;
     m5.reselect_mode = 5;
     ok = kvflash_resolve_concurrent_profile(m5);
     CHECK(ok.ok);
@@ -325,8 +311,8 @@ TEST_CASE(KvflashConcurrentGateFixture, the_question_queries_run_with_per_slot_r
     KvFlashProfile ok = kvflash_resolve_concurrent_profile(uq);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
-    uq.explicit_qk_policy = uq.explicit_recall = uq.exact_scorer = true;   // the explicit recall env
-    uq.reselect_mode = 4; uq.select_queries = 64;
+    uq.explicit_qk_policy = uq.explicit_recall = true;   // the explicit recall env
+    uq.reselect_mode = 4;
     ok = kvflash_resolve_concurrent_profile(uq);
     CHECK(ok.ok);
     CHECK(ok.policy == "recall");
