@@ -50,8 +50,6 @@ inline bool kvflash_chain_spec_switch() {
 // ── What may run the concurrent KVFlash arena? ─────────────────────────
 struct KvFlashConcurrentRequest {
     std::string arch;
-    bool wmma_env = false;                             // the WMMA kernel is active (kvflash_paged_wmma_active)
-    bool wmma_null_exclusion_ready = false;            // true once the kernel excludes null blocks (-04, gate lift)
     bool draft = false, tree = false;
     // Stage C: a draft model is admitted only as a DFlash2 chain, behind the switch.
     bool chain_spec_switch = false;          // LUCE_KVFLASH_CHAIN_SPEC=1
@@ -59,13 +57,6 @@ struct KvFlashConcurrentRequest {
     int  draft_block = 0;                    // the drafter's block size; a chain needs 2..16
     int  fa_window = 0;                      // the chain path needs full attention
 };
-
-// Whether the paged WMMA launcher runs its kernel: on unless LUCE_PAGED_WMMA parses to 0
-// (paged-attn.cu try_launch_paged_attn_wmma), and only on an RDNA4 device (gfx1200/gfx1201).
-// `env` is the raw getenv value, nullptr when unset.
-inline bool kvflash_paged_wmma_active(const char * env, bool device_rdna4) {
-    return device_rdna4 && !(env && std::atoi(env) == 0);
-}
 
 // LUCE_KVFLASH_HOST_MIB: the host budget for paged-out state, 16384 MiB when unset or empty.
 // nullopt when the value is not a positive integer.
@@ -84,8 +75,6 @@ inline std::optional<int64_t> kvflash_parse_host_mib(const char * env) {
 inline std::optional<std::string> kvflash_concurrent_refusal(const KvFlashConcurrentRequest & r) {
     if (r.arch != "qwen35")
         return "concurrent KVFlash supports only dense arch qwen35 (got '" + r.arch + "')";
-    if (r.wmma_env && !r.wmma_null_exclusion_ready)
-        return "the paged WMMA kernel is active (the default on RDNA4) and cannot run with KVFlash until it excludes null blocks; set LUCE_PAGED_WMMA=0";
     if (r.draft) {
         if (!r.chain_spec_switch)
             return "concurrent KVFlash does not support a draft model unless LUCE_KVFLASH_CHAIN_SPEC=1 "
