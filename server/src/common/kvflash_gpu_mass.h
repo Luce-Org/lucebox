@@ -27,6 +27,8 @@
 #pragma once
 
 #include "kvflash_exact_mass.h"
+#include "kvflash_fused_mass.h"
+#include "kvflash_fused_mass_cuda.h"
 #include "parallel_for.h"
 
 #include "ggml.h"
@@ -50,6 +52,7 @@ namespace luce::common {
 struct KvFlashGpuMassTiming {   // ms
     double gather = 0, build = 0, h2d = 0, graph = 0, d2h = 0, agg = 0, total = 0;
     int batches = 0;
+    bool fused = false;               // the fused kernel scored this call: graph = its upload + kernel + reduce, d2h = its copy back
     int uploaded = 0, archived = 0;   // evicted chunks uploaded by this call; archive slots held after it
     size_t peak_bytes = 0;   // device bytes held at the call's peak: call buffer + the largest gallocr buffer
 };
@@ -145,8 +148,25 @@ public:
     KvFlashGpuMass & operator=(const KvFlashGpuMass &) = delete;
     ~KvFlashGpuMass() {
         arch_free();
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+        if (fws_) luce::common::kvflash_fused_ws_free(fws_);
+#endif
         if (stage_) ggml_backend_buffer_free(stage_);
         if (out_) ggml_backend_buffer_free(out_);
+    }
+
+    // The fused chunk-mass kernel (kvflash_fused_mass_cuda.h) instead of the logits graph, when the K is q8_0 and the build has it.
+    // Its scores follow the same MMQ numerics but are not bit-equal to the graph's.
+    void set_fused(bool on) { fused_ = on; }
+    // Can the fused kernel score this K? The logits graph spans every archive slot, held for this call's chunks or not, so callers
+    // keep the archive (pass versions) only when this holds.
+    static bool fused_available(ggml_type kt, int D, int L) {
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+        return kt == GGML_TYPE_Q8_0 && D % 32 == 0 && D <= 256 && L <= luce::common::kFusedMaxLayers;
+#else
+        (void)kt; (void)D; (void)L;
+        return false;
+#endif
     }
 
     // Would a call with `nq` queries pass the free-memory guard right now (same test as score())? The archive counts
@@ -294,12 +314,56 @@ public:
             else for (int h = 0; h < HK; h++)
                 ggml_backend_tensor_set_async(be_, a, stage + ((size_t)l * HK + h) * U * SEG, (size_t)h * a->nb[2] + (size_t)n_kept * SEG, (size_t)U * SEG);
         }
+        ggml_backend_synchronize(be_);
+        for (int c : plan.upload) aslots_.push_back({c, keep ? (*versions)[(size_t)c] : 0});
+        tm.uploaded = U; tm.archived = keep ? (int)aslots_.size() : 0;
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+        // The fused kernel: one pass over the pool K and the archive where they are, no logits. Any failure: the graph below.
+        if (fused_ && fused_available(kt, D, L)) {
+            tm.h2d = ms(t1, clk::now());
+            const auto t2 = clk::now();
+            luce::common::KvFlashFusedGeom g;
+            g.L = L; g.HK = HK; g.Hq = HQ; g.D = D; g.ct = ct; g.C = sealed; g.nq = N;
+            luce::common::KvFlashFusedK k;
+            for (int l = 0; l < L; l++) {
+                k.pool.push_back((const uint8_t *)pool_k[(size_t)l]->data);
+                if (E) k.copy.push_back((const uint8_t *)ak_[(size_t)l]->data);
+            }
+            k.pool_nb2 = pool_k[0]->nb[2];
+            if (E) k.copy_nb2 = ak_[0]->nb[2];
+            k.src.assign((size_t)sealed, 0);
+            for (int c = 0; c < sealed; c++) k.src[(size_t)c] = block_of[(size_t)c];
+            for (int s = 0; s < (int)plan.chunk_of.size(); s++) {
+                const int c = plan.chunk_of[(size_t)s];
+                if (c >= 0 && c < sealed && block_of[(size_t)c] < 0) k.src[(size_t)c] = -1 - s;
+            }
+            const size_t QB = QS / 32;
+            std::vector<int8_t> q8((size_t)N * QS);
+            std::vector<float> qd((size_t)N * QB), om((size_t)N * sealed), ot((size_t)N * sealed), ox((size_t)N * sealed);
+            parallel_for(N, [&](int n) { luce::common::kvflash_quantize_q8_1(qs[(size_t)n], (int)QS, &q8[(size_t)n * QS], &qd[(size_t)n * QB]); });
+            if (!fws_) fws_ = luce::common::kvflash_fused_ws_new();
+            luce::common::KvFlashFusedTiming ft;
+            std::string e;
+            if (luce::common::kvflash_fused_run(fws_, g, k, q8.data(), qd.data(), fused_part_bytes_, om.data(), ot.data(), ox.data(), &ft, &e)) {
+                for (int n = 0; n < N; n++) {
+                    outs[(size_t)n].assign(om.begin() + (size_t)n * sealed, om.begin() + (size_t)(n + 1) * sealed);
+                    if (!planes) continue;
+                    (*planes)[(size_t)n].top.assign(ot.begin() + (size_t)n * sealed, ot.begin() + (size_t)(n + 1) * sealed);
+                    (*planes)[(size_t)n].max.assign(ox.begin() + (size_t)n * sealed, ox.begin() + (size_t)(n + 1) * sealed);
+                }
+                tm.fused = true; tm.gather = ms(t0, t1); tm.graph = ft.up_ms + ft.kernel_ms + ft.reduce_ms; tm.d2h = ft.down_ms;
+                tm.total = ms(t0, clk::now()); tm.agg = ms(t2, clk::now()) - tm.graph - tm.d2h;   // agg: query quantization and the copies out
+                tm.batches = ft.tiles; tm.peak_bytes = ft.partial_bytes + arch_bytes();
+                if (timing) *timing = tm;
+                return true;
+            }
+            if (!fused_warned_) { fused_warned_ = true; std::fprintf(stderr, "[kvflash] fused scorer unavailable: %s; using the logits graph\n", e.c_str()); }
+        }
+#endif
         ggml_backend_tensor_set_async(be_, q_all, qbuf, 0, ggml_nbytes(q_all));
         ggml_backend_tensor_set_async(be_, b_t, bias.data(), 0, ggml_nbytes(b_t));
         ggml_backend_synchronize(be_);
         tm.h2d = ms(t1, clk::now());
-        for (int c : plan.upload) aslots_.push_back({c, keep ? (*versions)[(size_t)c] : 0});
-        tm.uploaded = U; tm.archived = keep ? (int)aslots_.size() : 0;
 
         const int nb = kvflash_gpu_mass_batch(d, ct, NBT, N, batch_bytes_);
         sc.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be_));
@@ -424,6 +488,9 @@ private:
     ggml_backend_t            be_;
     ggml_backend_buffer_type_t host_buft_ = nullptr;
     size_t                    batch_bytes_;
+    bool                      fused_ = false, fused_warned_ = false;
+    size_t                    fused_part_bytes_ = (size_t)256 << 20;   // device bytes of one partials tile
+    luce::common::KvFlashFusedWs * fws_ = nullptr;
     ggml_backend_buffer_t     stage_ = nullptr;   // pinned: evicted K staging, then the queries
     ggml_backend_buffer_t     out_ = nullptr;     // pinned: [planes, blocks, N] masses
     // Device archive of evicted K: ak_[l] = [D, acap_ * ct, Hkv]; aslots_[i] = what slot i holds (slots fill in order).
