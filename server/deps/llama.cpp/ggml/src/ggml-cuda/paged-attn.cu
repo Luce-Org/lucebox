@@ -1403,6 +1403,35 @@ extern "C" size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void) {
 // fits two blocks per CU (64 KiB budget on gfx1201).
 static constexpr int PAGED_ATTN_WMMA_SMEM_HALF2 = 128*36;
 
+// Is `token` of sequence `seq_s` backed by a named physical block? A -1 (or
+// out-of-pool) entry is a KVFlash hole: its rows are not in this slot's cache
+// and must not enter the softmax (the stage tile zero-fills them, and a zero K
+// row scores 0, not -inf). Same criterion as the stage tile's null path.
+static __device__ __forceinline__ bool paged_attn_wmma_token_named(
+        const char * __restrict__ block_table,
+        int64_t bt_nb0, int64_t bt_nb1,
+        int32_t seq_s, int32_t block_size, int32_t pool_tokens, int32_t token) {
+    const int32_t physical_block = *(const int32_t *) (
+        block_table + (int64_t) (token / block_size) * bt_nb0 + (int64_t) seq_s * bt_nb1);
+    return physical_block >= 0 && physical_block < pool_tokens / block_size;
+}
+
+// True when no token of [chunk_tok0, chunk_tok0 + k_VKQ_sup) has a named block:
+// the whole chunk contributes nothing, so the caller skips it before staging.
+// Uniform across the thread block (it depends only on the table).
+static __device__ __forceinline__ bool paged_attn_wmma_chunk_all_null(
+        const char * __restrict__ block_table,
+        int64_t bt_nb0, int64_t bt_nb1,
+        int32_t seq_s, int32_t block_size, int32_t pool_tokens,
+        int32_t chunk_tok0, int32_t k_VKQ_sup) {
+    for (int32_t t = chunk_tok0; t < chunk_tok0 + k_VKQ_sup; t += block_size) {
+        if (paged_attn_wmma_token_named(block_table, bt_nb0, bt_nb1, seq_s, block_size, pool_tokens, t)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Vectorized paged K/V gather for one sequence and one KV head. Each thread
 // owns 16 contiguous half2s (64 B) of one token row, so the block-table entry
 // is resolved once per thread instead of once per (row, half2) element: F16
@@ -1624,9 +1653,18 @@ static __device__ __forceinline__ void paged_attn_wmma_iter(
 
                 const int32_t e = (row_seq[j] == seq_s) ? row_extent[j] : -1;
                 const int32_t t0 = chunk_tok0 + 2*i;
+                // A token is visible iff causal/extent/partition bounds cover it AND
+                // its block is named (KVFlash holes are excluded, not scored as 0).
+                // The table is read only for tokens inside the bounds, so it is
+                // never indexed past max_blocks. t0 is even and block_size is a
+                // multiple of 2, so t0 and t0 + 1 share a block.
+                const bool in0 = t0     < e && t0     < chunk_tok0 + k_VKQ_sup;
+                const bool in1 = t0 + 1 < e && t0 + 1 < chunk_tok0 + k_VKQ_sup;
+                const bool named = (in0 || in1) &&
+                    paged_attn_wmma_token_named(block_table, bt_nb0, bt_nb1, seq_s, block_size, pool_tokens, t0);
                 const float2 tmp = make_float2(
-                    (t0     < e && t0     < chunk_tok0 + k_VKQ_sup) ? 0.0f : -FLT_MAX,
-                    (t0 + 1 < e && t0 + 1 < chunk_tok0 + k_VKQ_sup) ? 0.0f : -FLT_MAX);
+                    (in0 && named) ? 0.0f : -FLT_MAX,
+                    (in1 && named) ? 0.0f : -FLT_MAX);
                 KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += tmp.x;
                 KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += tmp.y;
             }
@@ -2052,6 +2090,11 @@ static __global__ void paged_attn_wmma(
         const int32_t chunk_start = token_begin + kb0*nbatch_fa;
         const int32_t k_VKQ_sup =
             min(nbatch_fa, max(0, token_end - chunk_start));
+        // A chunk with no named block adds nothing: skip staging, MMA and softmax.
+        if (paged_attn_wmma_chunk_all_null(block_table, bt_nb0, bt_nb1, seq_s, block_size,
+                                           pool_tokens, chunk_start, k_VKQ_sup)) {
+            continue;
+        }
         paged_attn_wmma_iter<type_K, type_V>(
             k, v, block_table, bt_nb0, bt_nb1, k_nb1, k_nb2, v_nb1, v_nb2, kv_head, seq_s,
             block_size, pool_tokens, token_begin,
