@@ -6,6 +6,8 @@
 // keeps CUDA-graph capture enabled ([TAG_MUL_MAT_ID_CUDA_GRAPHS]); measured
 // on sm_86 the fallback costs ~9ms/step for 9-16 token spec-verify batches.
 #define MMVQ_MAX_MOE_BATCH_SIZE 16
+// Max. columns of a batch-invariant dense product (ggml_backend_cuda_set_mmvq_invariant_max_ncols).
+#define MMVQ_INVARIANT_MAX_BATCH_SIZE 16
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
@@ -18,6 +20,9 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 
 // Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
 bool ggml_cuda_mmvq_batch_invariant();
+// Columns up to which batch-invariant dense products stay on the matrix-vector kernels (calling thread):
+// MMVQ_MAX_BATCH_SIZE unless ggml_backend_cuda_set_mmvq_invariant_max_ncols raised it.
+int ggml_cuda_mmvq_invariant_max_ncols();
 
 bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu);
 // Two Q8_0 MUL_MATs of the same activations that one RDNA4 launch computes bit for bit (fusion.twin_x).

@@ -1004,8 +1004,120 @@ static void ggml_cuda_op_ds4_moe_owner_split(
         down_scale);
 }
 
+// GGML_MOE_FUSED_HOT_ROUTES: one thread per token walks its picks in route order and gives each of the first n_lanes
+// picks with a hot slot a lane (ggml_moe_hot_routes). Both outputs come from the same walk, so the expert device's
+// lane numbers and the target's lane slots agree.
+static __global__ void moe_hot_routes_kernel(
+        const int32_t * __restrict__ sel, const int64_t sel_ld, const int32_t * __restrict__ lut, const int n_expert,
+        int32_t * __restrict__ hist, int32_t * __restrict__ dst, const int n_used, const int n_lanes, const int n_tokens,
+        const bool hot_slots) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens) {
+        return;
+    }
+    const int32_t * s = sel + (int64_t) t * sel_ld;
+    int lane = 0;
+    if (hot_slots) {
+        int32_t * d = dst + (int64_t) t * n_lanes;
+        for (int k = 0; k < n_used && lane < n_lanes; ++k) {
+            const int32_t e = s[k];
+            const int32_t slot = e >= 0 && e < n_expert ? lut[e] : -1;
+            if (slot >= 0) {
+                d[lane++] = slot;
+            }
+        }
+        for (; lane < n_lanes; ++lane) {
+            d[lane] = -1;
+        }
+    } else {
+        int32_t * d = dst + (int64_t) t * n_used;
+        for (int k = 0; k < n_used; ++k) {
+            const int32_t e = s[k];
+            const bool valid = e >= 0 && e < n_expert;
+            const int32_t slot = lane < n_lanes && valid ? lut[e] : -1;
+            d[k] = slot >= 0 ? -2 - lane++ : e;
+            if (hist && valid) {
+                atomicAdd(hist + e, 1);
+            }
+        }
+    }
+}
+
+// GGML_MOE_FUSED_COMBINE_LANES: moe_fused_combine_shared_kernel_f32 without a shared expert (route order from +0,
+// products and sums rounded one by one, zero weights skipped), reading a pick's output from its lane when the target
+// computed it.
+static __global__ void moe_combine_lanes_kernel(
+        const float4 * __restrict__ down, const float4 * __restrict__ lanes, const float * __restrict__ weights,
+        const int32_t * __restrict__ routes, float4 * __restrict__ out, const int n_embd_vec4, const int n_used,
+        const int n_tokens, const int64_t down_nb1, const int64_t down_nb2, const int64_t lanes_nb1,
+        const int64_t lanes_nb2, const int64_t weights_nb1, const int64_t routes_nb1, const int64_t out_nb1) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_embd_vec4 * n_tokens) {
+        return;
+    }
+    const int h4 = idx % n_embd_vec4;
+    const int t  = idx / n_embd_vec4;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    for (int e = 0; e < n_used; ++e) {
+        const float w = weights[e + t * weights_nb1];
+        if (w == 0.0f) {
+            continue;
+        }
+        const int32_t r = routes[e + t * routes_nb1];
+        const float4 v = r <= -2 ? lanes[h4 + (int64_t) (-2 - r) * lanes_nb1 + t * lanes_nb2]
+                                 : down[h4 + (int64_t) e * down_nb1 + t * down_nb2];
+        sum0 = __fadd_rn(sum0, __fmul_rn(v.x, w));
+        sum1 = __fadd_rn(sum1, __fmul_rn(v.y, w));
+        sum2 = __fadd_rn(sum2, __fmul_rn(v.z, w));
+        sum3 = __fadd_rn(sum3, __fmul_rn(v.w, w));
+    }
+    out[h4 + t * out_nb1] = make_float4(sum0, sum1, sum2, sum3);
+}
+
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_MOE_FUSED_HOT_ROUTES) {
+        const ggml_tensor * sel = dst->src[0];
+        const ggml_tensor * lut = dst->src[1];
+        const int n_lanes = ggml_get_op_params_i32(dst, 1);
+        const bool hot_slots = ggml_get_op_params_i32(dst, 2) != 0;
+        GGML_ASSERT(ggml_is_contiguous(dst) && dst->type == GGML_TYPE_I32);
+        const int n_used = (int) sel->ne[0];
+        const int n_tokens = (int) sel->ne[1];
+        moe_hot_routes_kernel<<<(n_tokens + 63) / 64, 64, 0, ctx.stream()>>>(
+            (const int32_t *) sel->data, (int64_t) (sel->nb[1] / sizeof(int32_t)), (const int32_t *) lut->data,
+            (int) ggml_nelements(lut), dst->src[2] ? (int32_t *) dst->src[2]->data : nullptr, (int32_t *) dst->data,
+            n_used, n_lanes, n_tokens, hot_slots);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_COMBINE_LANES) {
+        const ggml_tensor * down = dst->src[0];
+        const ggml_tensor * lanes = dst->src[1];
+        const ggml_tensor * weights = dst->src[2];
+        const ggml_tensor * routes = dst->src[3];
+        for (const ggml_tensor * t : {down, lanes}) {
+            GGML_ASSERT((uintptr_t) t->data % sizeof(float4) == 0 && t->nb[1] % sizeof(float4) == 0 &&
+                        t->nb[2] % sizeof(float4) == 0);
+        }
+        GGML_ASSERT((uintptr_t) dst->data % sizeof(float4) == 0 && dst->nb[1] % sizeof(float4) == 0);
+        const int n_embd_vec4 = (int) (down->ne[0] / 4);
+        const int n_used = (int) down->ne[1];
+        const int n_tokens = (int) down->ne[2];
+        const int total = n_embd_vec4 * n_tokens;
+        moe_combine_lanes_kernel<<<(total + 255) / 256, 256, 0, ctx.stream()>>>(
+            (const float4 *) down->data, (const float4 *) lanes->data, (const float *) weights->data,
+            (const int32_t *) routes->data, (float4 *) dst->data, n_embd_vec4, n_used, n_tokens,
+            (int64_t) (down->nb[1] / sizeof(float4)), (int64_t) (down->nb[2] / sizeof(float4)),
+            (int64_t) (lanes->nb[1] / sizeof(float4)), (int64_t) (lanes->nb[2] / sizeof(float4)),
+            (int64_t) (weights->nb[1] / sizeof(float)), (int64_t) (routes->nb[1] / sizeof(int32_t)),
+            (int64_t) (dst->nb[1] / sizeof(float4)));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
         const ggml_tensor * global_ids = dst->src[0];
         const ggml_tensor * weights = dst->src[1];
