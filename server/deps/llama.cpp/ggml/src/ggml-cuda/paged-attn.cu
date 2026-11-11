@@ -3,6 +3,7 @@
 #include "fattn-common.cuh"
 #include "mma.cuh"
 #include "paged-attn-common.cuh"
+#include "mmvq.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -57,6 +58,24 @@ static void paged_attn_poison_scratch(cudaStream_t stream, void * p, size_t byte
 static int32_t paged_attn_blocks_per_partition(int64_t table_blocks) {
     return std::max<int32_t>(PAGED_ATTN_BLOCKS_PER_PARTITION,
                              paged_attn_ceil_div(table_blocks, PAGED_ATTN_MAX_PARTITIONS));
+}
+
+// Default mode only (no batch-invariant scope): the occupancy floor of the old
+// split. A small batch on a short context is one partition at the fixed S and
+// leaves most of the device idle, so S shrinks until the launch has about
+// target_blocks blocks. The cuts then follow the batch, which is why the
+// invariant mode keeps the fixed S.
+static int32_t paged_attn_occupancy_blocks_per_partition(
+        int32_t blocks_per_partition, int32_t live_blocks, int64_t target_blocks,
+        int64_t work_groups, int64_t n_rows) {
+    if (ggml_cuda_mmvq_batch_invariant() || work_groups < 1 || n_rows < 1) {
+        return blocks_per_partition;
+    }
+    const int64_t floor = std::min<int64_t>(
+        (target_blocks + work_groups - 1) / work_groups,
+        std::max<int64_t>(32, PAGED_ATTN_MAX_PARTITIONS / n_rows));
+    return std::min<int32_t>(blocks_per_partition,
+                             std::max<int32_t>(1, paged_attn_ceil_div(live_blocks, (int32_t) std::max<int64_t>(1, floor))));
 }
 
 // parent_ids is a sequence-major [tree_width, n_tree_seq] table. Parents
@@ -1210,6 +1229,10 @@ static bool try_launch_paged_attn(
     if (paged_attn_ceil_div(table_blocks, blocks_per_partition) == 1) {
         blocks_per_partition = std::max<int64_t>(blocks_per_partition, extent_blocks);
     }
+    blocks_per_partition = paged_attn_occupancy_blocks_per_partition(
+        blocks_per_partition, live_blocks,
+        (int64_t) ggml_cuda_info().devices[ctx.device].nsm * max_blocks_per_sm,
+        q->ne[1] * head_groups, q->ne[1]);
     // Only a chain launched at the very end of a full table needs more
     // partitions than the cap allows at AR's S; its cuts move, no AR row
     // exists there to match.
@@ -2524,9 +2547,13 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     // launch covers (the batch's longest context, as rounded by the caller).
     // The grid may shrink with the batch; the cut positions do not, and the
     // combine reads the dead partitions as exact zeros in fixed slots.
-    const int32_t max_partitions = paged_attn_ceil_div(table_blocks, blocks_per_partition);
     const int32_t n_logical_blocks =
         std::min<int32_t>(paged_attn_ceil_div(max_kv_seq_len + tree_width, block_size), table_blocks);
+    blocks_per_partition = paged_attn_occupancy_blocks_per_partition(
+        blocks_per_partition, n_logical_blocks,
+        (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 4,
+        (int64_t) n_rows * n_head_kv, n_rows);
+    const int32_t max_partitions = paged_attn_ceil_div(table_blocks, blocks_per_partition);
     const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
         max_partitions, paged_attn_ceil_div(n_logical_blocks, blocks_per_partition)));
     // The direct path (f32 output) and the partials path (half partials, then
