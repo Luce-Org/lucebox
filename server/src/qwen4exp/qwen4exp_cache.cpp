@@ -1,6 +1,7 @@
 #include "qwen4exp_cache.h"
 #include "common/layer_split_kvflash.h"
 #include "ggml-cuda.h"
+#include "ggml-cuda-gdn-chain.h"
 
 #include <algorithm>
 #include <cmath>
@@ -173,8 +174,8 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
     out.slot_states = slot_states;
     out.state_slot = slot_states ? state_slot : -1;
-    out.spec_ssm.clear(); out.spec_conv.clear();
-    out.spec_ssm_rows.clear(); out.spec_conv_rows.clear();
+    out.spec_conv.clear(); out.spec_conv_rows.clear();
+    out.spec_slot0 = nullptr; out.spec_log.clear();
     out.spec_ple_rows = {};
     out.mtp_draft = mtp_draft;
     out.spec_ple = nullptr;
@@ -185,17 +186,19 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         out.mtp_chain_hidden = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hc_dim, 1);
         out.mtp_chain_ids = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, out.mtp_draft);
         const int count = out.mtp_draft + 1;
+        // Rollback replays the verify's log with the grouped-cols GDN kernel's update; on a device whose verify takes
+        // another kernel the replay would not be bitwise, so the cache does not verify (qwen4exp_verify_supported).
+        if (ggml_backend_is_cuda(backend) &&
+            ggml_backend_cuda_gdn_chain_uses_grouped_cols(ggml_backend_cuda_get_device_id(backend), S_v)) {
+            out.spec_slot0 = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, 1);
+        }
         for (size_t i = 0; i < n_linear; ++i) {
-            ggml_tensor * states = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F32, S_v, S_v, H_v, count);
             ggml_tensor * conv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, kernel - 1, conv_channels, count);
-            out.spec_ssm.push_back(states);
             out.spec_conv.push_back(conv);
-            Qwen4ExpCache::SpecRows sr{}, cr{};
+            Qwen4ExpCache::SpecRows cr{};
             for (int t = 0; t < count; ++t) {
-                sr[t] = ggml_view_3d(out.ctx, states, S_v, S_v, H_v, states->nb[1], states->nb[2], t * states->nb[3]);
                 cr[t] = ggml_view_2d(out.ctx, conv, kernel - 1, conv_channels, conv->nb[1], t * conv->nb[2]);
             }
-            out.spec_ssm_rows.push_back(sr);
             out.spec_conv_rows.push_back(cr);
         }
         if (!out.ple_conv_state.empty()) {
@@ -206,7 +209,6 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
             }
         }
         size_t rollback_bytes = out.spec_ple ? ggml_nbytes(out.spec_ple) : 0;
-        for (auto * t : out.spec_ssm) rollback_bytes += ggml_nbytes(t);
         for (auto * t : out.spec_conv) rollback_bytes += ggml_nbytes(t);
         std::fprintf(stderr, "[qwen4exp-mtp] k=%d rollback_bytes=%zu (%.3f MiB), draft_kv_bytes=%zu; allocated once\n",
             out.mtp_draft, rollback_bytes, rollback_bytes / (1024.0 * 1024.0),
@@ -218,6 +220,10 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     if (!out.buf || (out.remote_ctx && !out.remote_buf)) {
         free_qwen4exp_cache(out);
         return false;
+    }
+    if (out.spec_slot0) {
+        const int32_t slab = 0;
+        ggml_backend_tensor_set(out.spec_slot0, &slab, 0, sizeof slab);
     }
     if (kvflash_pool > 0) {
         // Attached right after the target's allocation, so the pager's page stream is the target's. Slots read before
@@ -335,8 +341,8 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.mtp_chain_hidden = c.mtp_chain_ids = nullptr;
     if (c.mtp_ids_host) { ggml_backend_buffer_free(c.mtp_ids_host); c.mtp_ids_host = nullptr; }
     c.mtp_prev_pos = -1;
-    c.spec_ssm.clear();
-    c.spec_ssm_rows.clear();
+    c.spec_slot0 = nullptr;
+    c.spec_log.clear();
     c.spec_conv_rows.clear();
     c.spec_conv.clear();
     c.spec_ple = nullptr;

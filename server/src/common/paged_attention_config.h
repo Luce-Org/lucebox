@@ -27,7 +27,9 @@ inline constexpr int DEEPSEEK4_MAX_MOE_ROWS_PER_PART = 8;
 // --paged-attention a launch profile's default for one of them is left out;
 // one the operator sets is refused by the backend. LUCE_DS4_TP_NATIVE_ROUTE_WIDTH
 // is not listed: every paged step runs what it selects (see the routed FFN in
-// deepseek4_fused_verify.inc), so it changes nothing there.
+// deepseek4_fused_verify.inc), so it changes nothing there. LUCE_MOE_Q8_HANDOFF
+// is listed because paged steps were never qualified with it (it hands the
+// secondary owner Q8_1 rows of the input).
 inline constexpr const char * DEEPSEEK41_PAGED_UNQUALIFIED_ENV[] = {
     "LUCE_DS4_TP_GROUPED_MMVQ", "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_MMID_GROUPED",
     "LUCE_DS4_TP_MASKED_ROUTES",
@@ -35,7 +37,7 @@ inline constexpr const char * DEEPSEEK41_PAGED_UNQUALIFIED_ENV[] = {
     "LUCE_DS4_TP_DEVICE_JOIN", "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN_SPLIT",
     "LUCE_DS4_TP_FUSED_HC_JOIN", "LUCE_DS4_TP_ROUTE_PREFORK", "LUCE_MOE_TP_ROUTE_PREFORK",
     "LUCE_DS4_TP_COARSE_OWNER", "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS",
-    "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK",
+    "LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK", "LUCE_MOE_Q8_HANDOFF",
 };
 
 inline bool deepseek41_paged_unqualified_env(std::string_view name) {

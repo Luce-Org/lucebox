@@ -1475,6 +1475,192 @@ TEST_CASE(QnSplitFusionsFixture, expert_parity) {
     }
 }
 
+// Hot lanes (qwen4exp_graph.cpp, build_moe_route): the target runs a token's first hot picks in lanes from its copies
+// of those experts, the expert device runs the other picks, and ggml_moe_combine_lanes sums every pick in route order.
+// The routed sum must be the expert device's own sum over every pick (MUL_MAT_ID on all of them, then
+// DS4_MOE_COMBINE) bit for bit, for any hot set and lane count, at every width that takes lanes: a single token, and
+// 1 to QWEN4EXP_MTP_MAX_VERIFY rows under the batch-invariant scope (verify, batched verify groups, multi-slot
+// decode), for each expert quant mix of the shipped UD-Q4_K_XL GGUF (read from its header: gate/up Q4_K with down
+// Q5_1 in 43 layers, Q4_K with Q8_0 in 4, Q5_K with Q8_0 in 1). Then the text does not depend on which experts are
+// hot. Each GPU takes each role. Rows outside that scope (a prompt chunk) take no lanes (build_moe_route): they run
+// too and are counted apart, since there 5 and 8 rows differ.
+TEST_CASE(QnSplitFusionsFixture, hot_lanes) {
+    if (ggml_backend_cuda_get_device_count() < 2) SKIP("one GPU");
+    const GraphsOff graphs;
+    const Profile profile(true);
+    const int n_embd = 2560, n_ff = 640, n_exp = 16, n_used = 10, max_rows = 8;
+    struct Mix { ggml_type gate_up, down; };
+    const Mix mixes[] = {{GGML_TYPE_Q4_K, GGML_TYPE_Q5_1}, {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0},
+                         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}};
+    std::mt19937 rng(7);
+    auto quant = [&](ggml_type type, int64_t n0, int64_t n1, int64_t n2) {
+        std::normal_distribution<float> nd(0.0f, 0.05f);
+        std::vector<float> v((size_t) (n0 * n1 * n2));
+        for (float & x : v) x = nd(rng);
+        std::vector<uint8_t> q(ggml_row_size(type, n0) * (size_t) (n1 * n2));
+        ggml_quantize_chunk(type, v.data(), q.data(), 0, n1 * n2, n0, nullptr);
+        return q;
+    };
+    auto experts = [](Pattern & p, ggml_tensor * g, ggml_tensor * u, ggml_tensor * d, ggml_tensor * x,
+                      ggml_tensor * ids) {
+        ggml_tensor * gu = ggml_swiglu_split(p.ctx, ggml_mul_mat_id(p.ctx, g, x, ids), ggml_mul_mat_id(p.ctx, u, x, ids));
+        return ggml_mul_mat_id(p.ctx, d, gu, ids);
+    };
+    const std::vector<std::vector<int>> hot_sets = {
+        {}, {3}, {0, 5, 9}, {1, 2, 4, 6, 8, 11, 13, 15}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+    ggml_backend_ptr gpus[2] = {ggml_backend_ptr(ggml_backend_cuda_init(0)), ggml_backend_ptr(ggml_backend_cuda_init(1))};
+    REQUIRE(gpus[0] != nullptr && gpus[1] != nullptr);
+    size_t checked = 0, failed = 0, chunk_cases = 0, chunk_differ = 0;
+    for (const Mix & mix : mixes) {
+        const std::vector<uint8_t> gate = quant(mix.gate_up, n_embd, n_ff, n_exp);
+        const std::vector<uint8_t> up = quant(mix.gate_up, n_embd, n_ff, n_exp);
+        const std::vector<uint8_t> down = quant(mix.down, n_ff, n_embd, n_exp);
+        const size_t gu_slice = ggml_row_size(mix.gate_up, n_embd) * n_ff;
+        const size_t down_slice = ggml_row_size(mix.down, n_ff) * n_embd;
+        for (int target = 0; target < 2; ++target) {
+            ggml_backend_t on_target = gpus[target].get(), on_expert = gpus[1 - target].get();
+            for (const bool inv : {true, false}) {
+                const Invariant invariant(inv);
+                for (int T = 1; T <= max_rows; ++T) {
+                    std::vector<int32_t> ids((size_t) (n_used * T));
+                    std::vector<float> wv((size_t) (n_used * T));
+                    std::uniform_real_distribution<float> ud(0.01f, 0.3f);
+                    for (int t = 0; t < T; ++t) {
+                        for (int k = 0; k < n_used; ++k) {
+                            ids[(size_t) (t * n_used + k)] = (t * 7 + k * 3) % n_exp;
+                            wv[(size_t) (t * n_used + k)] = k == 4 && t == 1 ? 0.0f : ud(rng);   // a zero weight is skipped
+                        }
+                    }
+                    std::normal_distribution<float> nd(0.0f, 1.0f);
+                    std::vector<float> xv((size_t) (n_embd * T));
+                    for (float & v : xv) v = nd(rng);
+                    // The expert device's sum over every pick.
+                    std::vector<uint8_t> ref;
+                    {
+                        Pattern p;
+                        ggml_tensor * g = p.input(mix.gate_up, n_embd, n_ff, n_exp);
+                        ggml_tensor * u = p.input(mix.gate_up, n_embd, n_ff, n_exp);
+                        ggml_tensor * d = p.input(mix.down, n_ff, n_embd, n_exp);
+                        ggml_tensor * x = p.input(GGML_TYPE_F32, n_embd, 1, T);
+                        ggml_tensor * sel = p.input(GGML_TYPE_I32, n_used, T);
+                        ggml_tensor * wsel = p.input(GGML_TYPE_F32, n_used, T);
+                        ggml_tensor * routed =
+                            ggml_ds4_moe_fused_combine_shared(p.ctx, experts(p, g, u, d, x, sel), wsel, nullptr);
+                        p.output(routed);
+                        REQUIRE(p.alloc(on_expert));
+                        p.set(g, gate.data()); p.set(u, up.data()); p.set(d, down.data());
+                        p.set(x, xv.data()); p.set(sel, ids.data()); p.set(wsel, wv.data());
+                        REQUIRE(ggml_backend_graph_compute(on_expert, p.gf) == GGML_STATUS_SUCCESS);
+                        ref = read(routed);
+                    }
+                    for (const std::vector<int> & hot : hot_sets) {
+                        const int n_hot = std::max<int>(1, (int) hot.size());
+                        std::vector<int32_t> lut((size_t) n_exp, -1);
+                        std::vector<uint8_t> hg(gu_slice * n_hot), hu(gu_slice * n_hot), hd(down_slice * n_hot);
+                        for (int s = 0; s < (int) hot.size(); ++s) {
+                            lut[(size_t) hot[(size_t) s]] = s;
+                            std::memcpy(&hg[gu_slice * s], &gate[gu_slice * hot[(size_t) s]], gu_slice);
+                            std::memcpy(&hu[gu_slice * s], &up[gu_slice * hot[(size_t) s]], gu_slice);
+                            std::memcpy(&hd[down_slice * s], &down[down_slice * hot[(size_t) s]], down_slice);
+                        }
+                        for (int lanes : {1, 3, n_used}) {
+                            // The target: the routes and its lanes.
+                            std::vector<uint8_t> routes_v, lanes_v;
+                            {
+                                Pattern p;
+                                ggml_tensor * g = p.input(mix.gate_up, n_embd, n_ff, n_hot);
+                                ggml_tensor * u = p.input(mix.gate_up, n_embd, n_ff, n_hot);
+                                ggml_tensor * d = p.input(mix.down, n_ff, n_embd, n_hot);
+                                ggml_tensor * x = p.input(GGML_TYPE_F32, n_embd, 1, T);
+                                ggml_tensor * sel = p.input(GGML_TYPE_I32, n_used, T);
+                                ggml_tensor * lt = p.input(GGML_TYPE_I32, 1, n_exp);
+                                ggml_tensor * hist = p.input(GGML_TYPE_I32, n_exp);
+                                ggml_tensor * slots = ggml_moe_hot_routes(p.ctx, sel, lt, nullptr, lanes, true);
+                                ggml_tensor * routes = ggml_moe_hot_routes(p.ctx, sel, lt, hist, lanes, false);
+                                ggml_tensor * out = experts(p, g, u, d, x, slots);
+                                p.output(routes);
+                                p.output(out);
+                                REQUIRE(p.alloc(on_target));
+                                p.set(g, hg.data()); p.set(u, hu.data()); p.set(d, hd.data());
+                                p.set(x, xv.data()); p.set(sel, ids.data()); p.set(lt, lut.data());
+                                const std::vector<int32_t> zeros((size_t) n_exp, 0);
+                                p.set(hist, zeros.data());
+                                REQUIRE(ggml_backend_graph_compute(on_target, p.gf) == GGML_STATUS_SUCCESS);
+                                routes_v = read(routes);
+                                lanes_v = read(out);
+                                // Every pick counted once in its expert's bin.
+                                std::vector<int32_t> counted((size_t) n_exp), want((size_t) n_exp, 0);
+                                ggml_backend_tensor_get(hist, counted.data(), 0, counted.size() * sizeof(int32_t));
+                                for (int32_t e : ids) ++want[(size_t) e];
+                                if (counted != want) fail("hot routes: pick counts differ");
+                            }
+                            // The routes as a host walk gives them: a token's first `lanes` hot picks get lanes 0, 1, ...
+                            int n_lane_picks = 0;
+                            for (int t = 0; t < T; ++t) {
+                                int lane = 0;
+                                for (int k = 0; k < n_used; ++k) {
+                                    const int e = ids[(size_t) (t * n_used + k)];
+                                    const int32_t want = lut[(size_t) e] >= 0 && lane < lanes ? -2 - lane++ : e;
+                                    int32_t got;
+                                    std::memcpy(&got, &routes_v[sizeof(int32_t) * (size_t) (t * n_used + k)], sizeof(got));
+                                    if (got != want) fail("hot routes: token " + std::to_string(t) + " pick " + std::to_string(k));
+                                }
+                                n_lane_picks += lane;
+                            }
+                            // The expert device: the other picks and the sum.
+                            std::vector<uint8_t> got;
+                            {
+                                Pattern p;
+                                ggml_tensor * g = p.input(mix.gate_up, n_embd, n_ff, n_exp);
+                                ggml_tensor * u = p.input(mix.gate_up, n_embd, n_ff, n_exp);
+                                ggml_tensor * d = p.input(mix.down, n_ff, n_embd, n_exp);
+                                ggml_tensor * x = p.input(GGML_TYPE_F32, n_embd, 1, T);
+                                ggml_tensor * routes = p.input(GGML_TYPE_I32, n_used, T);
+                                ggml_tensor * ln = p.input(GGML_TYPE_F32, n_embd, lanes, T);
+                                ggml_tensor * wsel = p.input(GGML_TYPE_F32, n_used, T);
+                                ggml_tensor * routed =
+                                    ggml_moe_combine_lanes(p.ctx, experts(p, g, u, d, x, routes), ln, wsel, routes);
+                                p.output(routed);
+                                REQUIRE(p.alloc(on_expert));
+                                p.set(g, gate.data()); p.set(u, up.data()); p.set(d, down.data());
+                                p.set(x, xv.data()); p.set(routes, routes_v.data()); p.set(ln, lanes_v.data());
+                                p.set(wsel, wv.data());
+                                REQUIRE(ggml_backend_graph_compute(on_expert, p.gf) == GGML_STATUS_SUCCESS);
+                                got = read(routed);
+                            }
+                            size_t n = 0;
+                            for (size_t i = 0; i < got.size(); i += sizeof(float)) {
+                                n += std::memcmp(&got[i], &ref[i], sizeof(float)) != 0;
+                            }
+                            const std::string name = std::string(ggml_type_name(mix.gate_up)) + "/" +
+                                ggml_type_name(mix.down) + " target=" + std::to_string(target) + " invariant=" +
+                                std::to_string((int) inv) + " T=" + std::to_string(T) + " hot=" +
+                                std::to_string(hot.size()) + " lanes=" + std::to_string(lanes);
+                            // A prompt chunk's rows (no batch-invariant scope, more than one): no lanes are taken.
+                            const bool lane_case = inv || T == 1;
+                            std::printf("[hot-lanes] %s: %d of %d picks in lanes, %zu of %zu outputs differ%s\n",
+                                        name.c_str(), n_lane_picks, n_used * T, n, got.size() / sizeof(float),
+                                        lane_case ? "" : " (prompt-chunk scope, no lanes taken)");
+                            if (!lane_case) {
+                                ++chunk_cases;
+                                chunk_differ += n != 0;
+                                continue;
+                            }
+                            if (n) {
+                                ++failed;
+                                fail("hot lanes: " + name + " differs");
+                            }
+                            ++checked;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::printf("[hot-lanes] %zu cases, %zu differ; prompt-chunk scope (no lanes): %zu cases, %zu differ\n", checked,
+                failed, chunk_cases, chunk_differ);
+}
+
 // The LM head row split (qwen4exp_graph.cpp, build_lm_head). On every GPU that runs the RDNA4 Q8_0 matvec for a
 // flagged product (ggml_backend_cuda_rdna4_rows_device), the flagged product of a Q8_0 matrix, and its first rows and
 // its last rows (a matrix of their own, as on the expert device) joined by a concat, must give the first such GPU's

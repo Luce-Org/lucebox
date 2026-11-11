@@ -1,9 +1,13 @@
-// GPU adapter contract and lifecycle soak for the full-cache engine.
-// Usage: test_qwen4exp_seq_engine <iq4nl-shard1.gguf> [ctx=32768]
+// GPU adapter contract and lifecycle soak for the full-cache engine, and with every slot's cache carrying the MTP draft
+// layer (as the server makes them): prefix checkpoints across slots, and every request of a concurrent run producing
+// its alone stream token for token, with the batched verify forced on and off.
+// Usage: test_qwen4exp_seq_engine <shard1.gguf> [ctx=32768] (the MTP sidecar is found beside the model, as the server
+// finds it)
 #include "qwen4exp_seq_engine.h"
 #include "qwen4exp_graph.h"
 #include "qwen4exp_internal.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/prompt_lookup.h"
 #include "seq_engine_contract.h"
 #include "common/sampler.h"
 #include "common/snapshot_backend.h"
@@ -358,8 +362,9 @@ static std::vector<int32_t> drive_slot(Qwen4ExpSeqEngine & engine, int slot, int
 }
 
 // A checkpoint captured by one slot restores into another and continues
-// token for token like the cold run that captured it, both ways between the
-// MTP slot (0, with the draft layer) and a slot without it.
+// token for token like the cold run that captured it, both ways between
+// slot 0 (the widest verify, drafting alone) and another slot (a batched
+// verify's rollback rows).
 static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & w) {
     constexpr int L = 3000, C = 2000, STEPS = 24;
     if (!engine.supports_prefix_store() || engine.estimate_prefix_store_bytes(C) == 0) return false;
@@ -408,7 +413,7 @@ static bool run_prefix_store(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights &
     engine.retire(stale.slot);
     engine.discard_prefix_store({1, C});
 
-    // And back: a slot without the draft layer captures, slot 0 restores and decodes without drafts.
+    // And back: another slot captures, slot 0 restores and decodes.
     const auto holder = engine.admit(904, filler, SamplerCfg{});
     PrefixStorePlan plain_capture;
     plain_capture.capture = {2, {2, C}};
@@ -467,6 +472,194 @@ static bool run_prefix_cuts(Qwen4ExpSeqEngine & engine, const Qwen4ExpWeights & 
     const bool ok = cold.size() == STEPS + 1 && cold == captured && restored && cold == resumed;
     std::fprintf(stderr, "[prefix-cuts] cold==captured=%d restored=%d cold==restored=%d\n",
                  (int) (cold == captured), (int) restored, (int) (cold == resumed));
+    return ok;
+}
+
+// One request of a run: its prompt, sampler and token limit (the prompt's sampled token included).
+struct Request {
+    std::vector<int32_t> prompt;
+    SamplerCfg sampler;
+    int limit = 0;
+};
+
+// A run of requests admitted together and driven as the scheduler drives the engine: every request's tokens (its
+// prompt's, then each output's committed tokens and final token, in order) up to EOS or its limit, where it retires
+// at once while the others go on.
+struct RunResult {
+    bool ok = true;
+    std::vector<std::vector<int32_t>> streams;
+    std::vector<int> slots;
+    int verify_rows = 0;   // decode outputs of a step that verified drafts beside other decoders (or on a slot past 0)
+    int plain_rows = 0;    // decode outputs of a step that decoded one token beside other decoders
+    int cut_limit = 0;     // stops at the limit before an output's last token: inside a verified block
+    int cut_eos = 0;       // stops at EOS after an output's accepted drafts
+    int early_stops = 0;   // stops while another request still runs
+};
+
+static RunResult run_requests(Qwen4ExpSeqEngine & engine, const std::vector<Request> & reqs) {
+    RunResult r;
+    const int n = (int) reqs.size();
+    r.streams.assign((size_t) n, {});
+    r.slots.assign((size_t) n, -1);
+    std::vector<int32_t> next((size_t) n, -1);
+    std::vector<int> state((size_t) n, 0);   // 0 prefilling, 1 decoding, 2 stopped
+    for (int i = 0; i < n; ++i) {
+        const auto admitted = engine.admit(7000 + (uint64_t) i, reqs[(size_t) i].prompt, reqs[(size_t) i].sampler);
+        if (admitted.status != SeqEngine::AdmitResult::Status::admitted) {
+            r.ok = false;
+            return r;
+        }
+        r.slots[(size_t) i] = admitted.slot;
+    }
+    auto request_at = [&](int slot) {
+        for (int i = 0; i < n; ++i) if (r.slots[(size_t) i] == slot && state[(size_t) i] != 2) return i;
+        return -1;
+    };
+    auto take = [&](int i, const std::vector<int32_t> & tokens) {
+        if (i < 0) {
+            r.ok = false;
+            return;
+        }
+        std::vector<int32_t> & stream = r.streams[(size_t) i];
+        for (size_t k = 0; k < tokens.size(); ++k) {
+            stream.push_back(tokens[k]);
+            const bool eos = engine.token_is_eos(tokens[k]);
+            if (!eos && (int) stream.size() < reqs[(size_t) i].limit) continue;
+            r.cut_limit += !eos && k + 1 < tokens.size();
+            r.cut_eos += eos && k > 0;
+            engine.retire(r.slots[(size_t) i]);
+            state[(size_t) i] = 2;
+            for (int j = 0; j < n; ++j) {
+                if (state[(size_t) j] != 2) {
+                    ++r.early_stops;
+                    break;
+                }
+            }
+            return;
+        }
+        next[(size_t) i] = tokens.back();
+        state[(size_t) i] = 1;
+    };
+    for (int guard = 0; guard < 4096; ++guard) {
+        SeqEngine::StepPlan plan;
+        for (int i = 0; i < n; ++i)
+            if (state[(size_t) i] == 1) plan.decode.push_back({r.slots[(size_t) i], next[(size_t) i]});
+        const StepPlanLimits limits = engine.step_plan_limits((int) plan.decode.size());
+        for (int i = 0; i < n && (int) plan.prefills.size() < limits.max_prefill_sequences; ++i)
+            if (state[(size_t) i] == 0) plan.prefills.push_back({r.slots[(size_t) i], limits.max_prefill_tokens_per_sequence});
+        if (plan.decode.empty() && plan.prefills.empty()) return r;
+        if (!engine.reserve_decode(plan)) break;
+        const auto result = engine.step(plan);
+        if (!result.ok() || result.decode.size() != plan.decode.size() ||
+            result.prefills.size() != plan.prefills.size()) {
+            std::fprintf(stderr, "[alone-vs-together] step failed: '%s'\n", result.error.c_str());
+            break;
+        }
+        const bool beside = plan.decode.size() > 1 || (plan.decode.size() == 1 && plan.decode[0].slot != 0);
+        for (const auto & output : result.decode) {
+            if (beside) ++(output.spec_offered > 0 ? r.verify_rows : r.plain_rows);
+            std::vector<int32_t> tokens = output.committed_tokens;
+            tokens.push_back(output.token);
+            take(request_at(output.slot), tokens);
+        }
+        for (const auto & output : result.prefills) {
+            if (output.status == SeqEngine::PrefillOutput::Status::completed) take(request_at(output.slot), {output.token});
+        }
+        if (!r.ok) break;
+    }
+    r.ok = false;
+    for (int i = 0; i < n; ++i) if (state[(size_t) i] != 2) engine.retire(r.slots[(size_t) i]);
+    return r;
+}
+
+// Each request of a concurrent run (three greedy, one seeded sampled) must produce its alone stream token for token,
+// with the batched verify forced on and off. A request alone lands in slot 0 and drafts there like the single-slot
+// loop (prompt lookup included). Together, slot 0's request stops first (its limit), so the others go on three, then
+// two at once, and the longest ends alone on a slot past 0 (a one-slot batched verify). One request stops at EOS:
+// eos_chat_id is set to a token its alone stream reaches mid-reply (the engine reads EOS from the weights, on the host
+// only; `eos` keeps the pick across draft caps). The limits and that EOS must cut a verified block somewhere.
+static bool run_alone_vs_together(ggml_backend_t backend, Qwen4ExpWeights & w, const std::vector<Qwen4ExpCache *> & caches,
+                                  int ctx, int verify_width, const char * model_path, int32_t & eos) {
+    Tokenizer tokenizer;
+    if (!tokenizer.load_from_gguf(model_path)) return false;
+    const char * texts[] = {
+        "Write a short paragraph about the lighthouse of Alexandria.\n",
+        "List five facts about the planet Mars, one per line.\n",
+        "Explain in plain words how a refrigerator keeps food cold.\n",
+        "Describe a quiet morning in a mountain village.\n",
+    };
+    const int limits[] = {14, 33, 40, 47};
+    std::vector<Request> reqs(4);
+    for (int i = 0; i < 4; ++i) {
+        reqs[(size_t) i].prompt = tokenizer.encode(texts[i]);
+        reqs[(size_t) i].limit = limits[i];
+        if (reqs[(size_t) i].prompt.empty()) return false;
+    }
+    SamplerCfg & sampled = reqs[1].sampler;
+    sampled.temp = 0.8f;
+    sampled.top_k = 40;
+    sampled.top_p = 0.95f;
+    sampled.seed = 20261110;
+    sampled.has_seed = true;
+
+    PromptLookupPolicy lookup(QWEN4EXP_MTP_MAX_VERIFY);
+    Qwen4ExpSeqEngine engine(backend, w, caches, ctx, 512, 0, verify_width, nullptr, nullptr, nullptr,
+                             verify_width == 0 ? &lookup : nullptr);
+    for (int s = 0; s < engine.slot_count(); ++s) engine.retire(s);
+    const int32_t chat_eos = w.eos_chat_id;
+    if (eos < 0) {
+        // Request 2's greedy reply, long enough: its first token past the eighth that it has not produced before.
+        Request probe = reqs[2];
+        probe.limit = 64;
+        const RunResult alone = run_requests(engine, {probe});
+        const std::vector<int32_t> t = alone.ok ? alone.streams[0] : std::vector<int32_t>{};
+        for (size_t k = 8; eos < 0 && k + 4 < t.size(); ++k) {
+            if (!engine.token_is_eos(t[k]) && std::find(t.begin(), t.begin() + (std::ptrdiff_t) k, t[k]) == t.begin() + (std::ptrdiff_t) k)
+                eos = t[k];
+        }
+        if (eos < 0) {
+            std::fprintf(stderr, "[alone-vs-together] no EOS stand-in in request 2's reply\n");
+            return false;
+        }
+    }
+    w.eos_chat_id = eos;
+    const int caps = caches[0]->mtp_draft;
+    bool ok = true;
+    std::vector<std::vector<int32_t>> alone(reqs.size());
+    for (size_t i = 0; i < reqs.size() && ok; ++i) {
+        const RunResult r = run_requests(engine, {reqs[i]});
+        ok = r.ok && r.slots[0] == 0;
+        if (!ok) std::fprintf(stderr, "[alone-vs-together] request %zu alone failed (slot %d)\n", i, r.slots[0]);
+        alone[i] = r.ok ? r.streams[0] : std::vector<int32_t>{};
+    }
+    for (const auto mode : {Qwen4ExpSeqEngine::DecodeMode::verify, Qwen4ExpSeqEngine::DecodeMode::plain}) {
+        if (!ok) break;
+        const bool verify = mode == Qwen4ExpSeqEngine::DecodeMode::verify;
+        engine.set_decode_mode(mode);
+        const RunResult r = run_requests(engine, reqs);
+        ok = r.ok;
+        for (size_t i = 0; ok && i < reqs.size(); ++i) {
+            const bool same = r.streams[i] == alone[i];
+            size_t first = 0;
+            while (first < r.streams[i].size() && first < alone[i].size() && r.streams[i][first] == alone[i][first]) ++first;
+            std::printf("[alone-vs-together] draft=%d/%d mode=%s request=%zu slot=%d %s tokens=%zu alone=%zu %s",
+                        caps, caches[1]->mtp_draft, verify ? "verify" : "plain", i, r.slots[i],
+                        reqs[i].sampler.temp > 0.0f ? "sampled" : "greedy", r.streams[i].size(), alone[i].size(),
+                        same ? "identical\n" : "DIFFER");
+            if (!same) std::printf(" at token %zu\n", first);
+            ok = ok && same;
+        }
+        // The run covers what it claims: verified blocks beside other decoders in the verify mode (none in the plain
+        // one), a request stopping while others go on, and a stop inside a verified block.
+        const bool covered = r.early_stops > 0 && (verify ? r.verify_rows > 0 && r.cut_limit + r.cut_eos > 0
+                                                          : r.verify_rows == 0 && r.plain_rows > 0);
+        std::printf("[alone-vs-together] draft=%d/%d mode=%s verify_rows=%d plain_rows=%d cut_limit=%d cut_eos=%d "
+                    "early_stops=%d covered=%d\n", caps, caches[1]->mtp_draft, verify ? "verify" : "plain",
+                    r.verify_rows, r.plain_rows, r.cut_limit, r.cut_eos, r.early_stops, (int) covered);
+        ok = ok && covered;
+    }
+    engine.set_decode_mode(Qwen4ExpSeqEngine::DecodeMode::measured);
+    w.eos_chat_id = chat_eos;
     return ok;
 }
 
@@ -550,33 +743,6 @@ int main(int argc, char ** argv) {
                     violations.empty() ? "PASS" : "FAIL", soak_ok ? "PASS" : "FAIL");
     }
     {
-        // Slot 0 as the server makes it: the MTP draft layer and its verify state, drafting when alone.
-        Qwen4ExpCache mtp_cache;
-        const bool mtp_ok = create_qwen4exp_cache(backend, weights, ctx, mtp_cache, /*mtp=*/true, QWEN4EXP_MTP_MAX_DRAFT);
-        if (mtp_ok) {
-            std::vector<Qwen4ExpCache *> served = ptrs;
-            served[0] = &mtp_cache;
-            // Checkpoints in the device's memory, and in system memory as beside a discrete GPU.
-            const ggml_backend_t system = create_snapshot_backend(backend);
-            for (ggml_backend_t store : {backend, system}) {
-                Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, /*verify_width=*/0,
-                                         nullptr, nullptr, store);
-                const char * memory = store == backend ? "device" : "system";
-                const bool prefix_ok = run_prefix_store(engine, weights);
-                std::printf("[qwen4exp-seq] prefix-store(%s)=%s\n", memory, prefix_ok ? "PASS" : "FAIL");
-                const bool cuts_ok = run_prefix_cuts(engine, weights);
-                std::printf("[qwen4exp-seq] prefix-cuts(%s)=%s\n", memory, cuts_ok ? "PASS" : "FAIL");
-                ok = ok && prefix_ok && cuts_ok;
-                if (system == backend) break;
-            }
-            free_snapshot_backend(system, backend);
-        } else {
-            std::fprintf(stderr, "[qwen4exp-seq] MTP cache creation failed\n");
-            ok = false;
-        }
-        free_qwen4exp_cache(mtp_cache);
-    }
-    {
         Qwen4ExpSeqEngine engine(backend, weights, ptrs, ctx);
         const bool boundary_ok = run_qsa_boundary(engine, backend, weights, ptrs);
         std::printf("[qwen4exp-seq] qsa-boundary=%s\n", boundary_ok ? "PASS" : "FAIL");
@@ -588,7 +754,49 @@ int main(int argc, char ** argv) {
         ok = ok && ok_distinct;
     }
     for (auto & cache : caches) free_qwen4exp_cache(cache);
+    // Every slot as the server makes it with MTP (start_seq_engine): slot 0 with the draft cap of the verify width
+    // (adaptive: QWEN4EXP_MTP_MAX_DRAFT), the others with a batched verify's rollback rows; for the adaptive width and
+    // the fixed widths 3 and 2, whose caps bound the batched verify's rows.
+    int32_t eos = -1;
+    for (const int verify_width : {0, 3, 2}) {
+        const int cap = verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : verify_width - 1;
+        std::vector<Qwen4ExpCache> served_caches(4);
+        std::vector<Qwen4ExpCache *> served;
+        bool made = true;
+        for (size_t s = 0; s < served_caches.size(); ++s) {
+            made = made && create_qwen4exp_cache(backend, weights, ctx, served_caches[s], /*mtp=*/true,
+                                                 s == 0 ? cap : std::min(kQwen4ExpBatchedVerifyRows, cap + 1) - 1);
+            served.push_back(&served_caches[s]);
+        }
+        if (!made) {
+            std::fprintf(stderr, "[qwen4exp-seq] MTP cache creation failed\n");
+            ok = false;
+        } else if (verify_width == 0) {
+            // Checkpoints in the device's memory, and in system memory as beside a discrete GPU.
+            const ggml_backend_t system = create_snapshot_backend(backend);
+            for (ggml_backend_t store : {backend, system}) {
+                Qwen4ExpSeqEngine engine(backend, weights, served, ctx, 512, size_t(8) << 30, verify_width,
+                                         nullptr, nullptr, store);
+                const char * memory = store == backend ? "device" : "system";
+                const bool prefix_ok = run_prefix_store(engine, weights);
+                std::printf("[qwen4exp-seq] prefix-store(%s)=%s\n", memory, prefix_ok ? "PASS" : "FAIL");
+                const bool cuts_ok = run_prefix_cuts(engine, weights);
+                std::printf("[qwen4exp-seq] prefix-cuts(%s)=%s\n", memory, cuts_ok ? "PASS" : "FAIL");
+                ok = ok && prefix_ok && cuts_ok;
+                if (system == backend) break;
+            }
+            free_snapshot_backend(system, backend);
+        }
+        if (made) {
+            const bool together_ok = run_alone_vs_together(backend, weights, served, ctx, verify_width, argv[1], eos);
+            std::printf("[qwen4exp-seq] alone-vs-together(verify-width %d)=%s\n", verify_width,
+                        together_ok ? "PASS" : "FAIL");
+            ok = ok && together_ok;
+        }
+        for (auto & cache : served_caches) free_qwen4exp_cache(cache);
+    }
     free_qwen4exp_weights(weights);
     ggml_backend_free(backend);
+    std::printf("[qwen4exp-seq] all=%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

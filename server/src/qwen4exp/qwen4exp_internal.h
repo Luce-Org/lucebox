@@ -11,7 +11,7 @@
 #include "ggml-cuda.h"
 #include "common/gguf_mmap.h"
 #include "common/moe_hybrid_routing_stats.h"
-#include "common/moe_hybrid_storage.h"
+#include "qwen4exp_hot.h"
 
 #include <cstdint>
 #include <memory>
@@ -158,12 +158,8 @@ struct Qwen4ExpWeights {
     ggml_backend_t        expert_backend = nullptr;
     ggml_backend_buffer_t expert_buf     = nullptr;
     bool                  expert_gfx1151 = false;
-    // Split mode: the most-routed experts copied to the target (`hot`, from
-    // --expert-placement). Verify steps run them there while the expert device
-    // runs the rest of the picks.
-    std::unique_ptr<MoeHybridStorage> hot;
-    std::vector<ggml_tensor *> hot_lut;    // per layer [1, n_expert] i32: hot slot, -1 if cold (null: no hot experts)
-    std::vector<ggml_tensor *> cold_lut;   // per layer [1, n_expert] i32: the expert, -1 if hot
+    // Split mode: experts the target computes beside the expert device in decode and verify steps (null: none).
+    std::unique_ptr<Qwen4ExpHotSet> hot;
     ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
     // Split mode, per layer, on the expert device: the cold experts' router rows as Q8_0 [n_embd, n_cold] and their
     // expert ids [n_cold], for the expert device's read-ahead of the layer's picks (qwen4exp_graph.cpp; null: none).

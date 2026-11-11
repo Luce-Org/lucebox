@@ -72,6 +72,9 @@ struct Qwen4ExpDecodeWorkspace {
     // Verify: each row's dense span (0 = QSA) and its mask or M-RoPE positions input.
     std::vector<int64_t> row_spans;
     std::vector<ggml_tensor *> row_inputs;
+    // Verify: each linear layer's GDN replay log, F32 [2*S_v + 1, H_v, rows], read in place from this graph's buffer
+    // by the rollback that follows it (slot-major in a batched verify).
+    std::vector<ggml_tensor *> spec_log;
     uint64_t builds = 0;      // smoke-test evidence: metadata addresses can be recycled
     uint64_t replays = 0;
     int qsa_budget = 0;
@@ -99,17 +102,23 @@ struct Qwen4ExpCache;
 struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     struct GroupInput {
         ggml_tensor * positions = nullptr;   // I32 [4 * n], the group's M-RoPE sections
-        int s0 = 0, n = 0;
+        int s0 = 0, n = 0;                   // its first row and rows (a decode step: one row per slot)
+        // Batched verify: the group's logits rows, their argmax, and with top_n > 0 each row's top_n candidates.
+        ggml_tensor * logits = nullptr, * greedy = nullptr, * top_ids = nullptr, * top_vals = nullptr;
     };
     std::vector<GroupInput> groups;
+    int rows = 1;   // per slot: 1 for a decode step, the verify width for a batched verify (qwen4exp_verify_batched)
     ggml_tensor * slot_ids = nullptr;            // I32 [n]: each slot's slab of Qwen4ExpSlotStates
-    std::vector<ggml_tensor *> masks, kv_rows;   // per slot: attention mask (dense slots), I32 [1] K/V row
-    // QSA slots: each one's runtime inputs and [4] M-RoPE positions as its stable T=1 graph has them, views of
-    // qsa_params (I32 [10 * n]), qsa_visibility (each QSA slot's blocks in turn) and qsa_positions (I32 [4 * n]).
+    // Per slot: attention mask (dense slots) and I32 [1] K/V row. A batched verify: per group, F16 [max span, rows]
+    // with a column per row (null when every row is QSA), and per slot its I32 [rows] K/V rows.
+    std::vector<ggml_tensor *> masks, kv_rows;
+    // QSA slots (qsa_blocks >= 0): each one's runtime inputs and M-RoPE positions as a stable graph of its `rows` rows
+    // has them, views of qsa_params (I32 [10 * rows] per slot), qsa_visibility (each QSA slot's blocks per row in
+    // turn) and qsa_positions (I32 [4 * rows] per slot).
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa;
     ggml_tensor * qsa_positions = nullptr;
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
-    std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket)
+    std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket); verify: per row
 };
 
 // Recurrent state of every concurrency slot, stacked per linear layer, so one
@@ -188,13 +197,17 @@ struct Qwen4ExpCache {
     // for the host-side PLE n-gram hash across decode steps.
     std::vector<int32_t> ple_prev;
 
-    // Allocated once per cache: token-major snapshots after all k+1 verify
-    // inputs. Fixed views let rollback enqueue device copies without allocation.
+    // Allocated once per cache: the conv and PLE histories after each of the k+1 verify inputs, token-major. Fixed
+    // views let rollback enqueue device copies without allocation. The recurrent state keeps no snapshots: a verify
+    // reads it in place (spec_slot0 maps the verify onto its own slab) and records each row's GDN replay log
+    // (spec_log), from which rollback replays the kept rows onto it.
     int mtp_draft = 1;
     int spec_pos = -1, spec_tokens = 0;
-    std::vector<ggml_tensor *> spec_ssm, spec_conv;
+    std::vector<ggml_tensor *> spec_conv;
     using SpecRows = std::array<ggml_tensor *, QWEN4EXP_MTP_MAX_VERIFY>;
-    std::vector<SpecRows> spec_ssm_rows, spec_conv_rows;
+    std::vector<SpecRows> spec_conv_rows;
+    ggml_tensor * spec_slot0 = nullptr;    // I32 [1] = 0
+    std::vector<ggml_tensor *> spec_log;   // the last verify's log per linear layer: its workspace's graph tensors
     ggml_tensor * spec_ple = nullptr;
     SpecRows spec_ple_rows{};
     std::array<std::vector<int32_t>, QWEN4EXP_MTP_MAX_VERIFY> spec_ple_prev;

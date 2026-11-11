@@ -382,8 +382,6 @@ void Qwen4ExpDerived::free() {
 void free_qwen4exp_derived(Qwen4ExpWeights & w) {
     for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = L.ssm_alpha_beta = nullptr;
     w.qsa_ones = nullptr;
-    w.hot_lut.clear();
-    w.cold_lut.clear();
     w.ahead_router.clear();
     w.ahead_ids.clear();
     w.output_tail = nullptr;
@@ -1079,6 +1077,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
 }
 
 void free_qwen4exp_weights(Qwen4ExpWeights & w) {
+    w.hot.reset();   // first: its copier reads the expert stacks
     w.ple_reader.close();
     if (w.buf) {
         ggml_backend_buffer_free(w.buf);
@@ -1088,7 +1087,6 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         ggml_backend_buffer_free(w.expert_buf);
         w.expert_buf = nullptr;
     }
-    w.hot.reset();
     free_qwen4exp_derived(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);

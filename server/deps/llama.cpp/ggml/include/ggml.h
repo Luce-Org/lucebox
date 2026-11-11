@@ -2715,6 +2715,8 @@ extern "C" {
         GGML_MOE_FUSED_PREFETCH           = -12,
         GGML_MOE_FUSED_PREFETCH_ROWS      = -13,
         GGML_MOE_FUSED_WAKE_HOLD          = -14,
+        GGML_MOE_FUSED_HOT_ROUTES         = -15,
+        GGML_MOE_FUSED_COMBINE_LANES      = -16,
     };
 
     // Word offsets in ggml_tensor::op_params for the host mailbox pair. All
@@ -2936,6 +2938,34 @@ extern "C" {
             struct ggml_tensor  * after,
             int                   slot,
             int                   max_us);
+
+    // Split MoE with hot experts and one arithmetic wherever a pick runs. sel: I32 [n_used, T], each token's picks in
+    // route order; hot_lut: I32 [1, n_expert], the target's hot slot of each expert (-1: none). A token's first n_lanes
+    // picks with a hot slot, in route order, each get a lane that the target computes. hot_slots = false: the expert
+    // device's ids, I32 [n_used, T]: the expert for a pick it computes, -2 - lane for a pick a lane computes (MUL_MAT_ID
+    // masks negative ids). hot_slots = true: the target's ids, I32 [n_lanes, T]: each lane's hot slot, -1 past the
+    // token's last lane. hist (may be NULL; hot_slots = false only): I32 [n_expert], each pick of an expert adds one
+    // (the node writes it in place; nothing in the graph may read it). n_lanes = 0 (hot_slots = false, with hist): sel
+    // unchanged, only the counts.
+    GGML_API struct ggml_tensor * ggml_moe_hot_routes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            struct ggml_tensor  * hot_lut,
+            struct ggml_tensor  * hist,
+            int                   n_lanes,
+            bool                  hot_slots);
+
+    // The routed sum of ggml_ds4_moe_fused_combine_shared (no shared expert), F32 [n_embd, T], with each pick's
+    // output from the lane that computed it: down F32 [n_embd, n_used, T] (the expert device's MUL_MAT_ID on the
+    // routes), lanes F32 [n_embd, n_lanes, T] (the target's on the hot slots), weights F32 [n_used, T], routes from
+    // ggml_moe_hot_routes(hot_slots = false). Same products, same route order: when a lane gives the expert device's
+    // bits for its pick, the sum does not depend on which picks were hot.
+    GGML_API struct ggml_tensor * ggml_moe_combine_lanes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * lanes,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * routes);
 
     // Fused DeepSeek4 hyper-connection helpers. The first dimension is the
     // per-token payload; an optional second dimension batches independent
