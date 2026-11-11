@@ -1042,7 +1042,15 @@ int invariance_mismatches(ggml_backend_t backend, ggml_type kv_type, int a_len, 
 
 }  // namespace
 
+// The fixed context cuts are the batch-invariant mode's; default mode moves
+// them with the batch for occupancy.
+struct InvariantScope {
+    bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
+    ~InvariantScope() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
+};
+
 TEST_CASE(PagedAttention, RowOutputBitsIndependentOfBatch) {
+    const InvariantScope invariant;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
     for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
@@ -1241,6 +1249,7 @@ int chain_vs_ar_mismatches(ggml_backend_t backend, ggml_type kv_type, int commit
 }  // namespace
 
 TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
+    const InvariantScope invariant;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
     for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
@@ -1263,6 +1272,7 @@ TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
 // chain whose launch sees a wider table than the AR call changes the bits of every row. The V_DOT2 route
 // runs on gfx1151 and, with LUCE_PAGED_WMMA=0, on gfx1201.
 TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBitsAcrossTableWidths) {
+    const InvariantScope invariant;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
     int total = 0, bad = 0;
