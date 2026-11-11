@@ -1479,8 +1479,11 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
         for (uint64_t o : h.map) live += o != 0;
         KvFlashParkStats st;
         st.tokens = ps.history.size();
-        st.bytes_live = live * rb + c.head.size();
-        for (const auto & f : c.files) st.bytes_live += f.second.size();
+        st.bytes_live = live * rb + c.head.size() + kvflash_head_slab_bytes(h, [&](uint32_t id) {   // a file this park wrote is staged, one kept from the last park is on disk
+            const std::string name = kvflash_bundle_slab_name(id);
+            for (const auto & f : c.files) if (f.first == name) return (uint64_t)f.second.size();
+            return detail::file_size_or0(c.dir + "/" + name);
+        });
         st.bytes_dead = h.log_bytes - kKvFlashLogHeader - live * rb;
         if (const KvFlashHeadBinding hb = head_binder_.binding(slot); hb.k > 0) { st.preamble = kvflash_hex16(hb.hash); st.preamble_chunks = hb.k; }   // the head it pins
         if (!book_.publish_park(slot, st, (int64_t)std::time(nullptr))) {   // no room in the cache budget, or the session's identity is not durable
