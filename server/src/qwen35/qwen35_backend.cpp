@@ -1271,8 +1271,11 @@ bool Qwen35Backend::state_only_snapshots() const {
     // Concurrent serving keeps its checkpoints through the SeqEngine
     // (drop_prefix_kv). A KVFlash pool keeps state-only rungs of its own
     // beside the live cache (state_ladder_), and its pooled snapshots carry
-    // the pool layout of their own position.
-    return !cfg_.paged_attention && !kvflash_active() && snap_backend_ != nullptr;
+    // the pool layout of their own position. Tensor-parallel and split-GPU
+    // snapshots hold shards on several devices; their row split is not
+    // implemented, so they stay whole.
+    return !cfg_.paged_attention && !kvflash_active() && !tensor_parallel_ &&
+           !split_gpus_ && snap_backend_ != nullptr;
 }
 
 const PrefixSnapshot * Qwen35Backend::snapshot_kv_source(int slot, int kv_slot) const {
