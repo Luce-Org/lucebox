@@ -945,29 +945,51 @@ public:
     //   nc x 8 bytes       ledger: u8 was_resident, u8 materialized, 2 pad, f32 score
     //                      (a hole left by a failed allocation is not materialized)
     //   pool layout:       u32 n_blocks, u32 n_free, u64 use clock,
-    //                      nc x (i32 block or -1, u32 0, u64 LRU rank, 0 if not resident),
+    //                      nc x (i32 block or -1, u32 hard-pin flag, u64 LRU rank, 0 if not resident),
     //                      n_free x i32 free blocks in free-list order (back = next)
     // The pool layout lets deserialize() put every chunk back in its own block
     // with its LRU stamp, so a restored pager is the pager that was saved:
     // attention then reads the same slots in the same order as a cold prefill,
     // and later evictions pick the same victims. Chunks past max_chunks give
-    // their blocks to the free list. Not serialized: pins.
+    // their blocks to the free list. The hard pins (pin_range) come back with it:
+    // a resume reselects before its turn re-pins, and a pinned chunk is no victim.
+    // Not serialized: step pins, which end with the step.
     //
     // KVFLASH2 is the same blob without the pool layout: blob_header() +
     // read_chunk(0..nc) + ledger_blob(), streamed by serialize_to(). A writer
     // that keeps chunks apart (a slot bundle rewrites only the chunks a turn
-    // changed) assembles it; deserialize() takes both and restores a KVFLASH2
-    // blob in identity block order.
+    // changed) assembles it and, to keep the layout, appends pool_layout_blob()
+    // under the KVFLASH3 magic; deserialize() takes both and restores a KVFLASH2
+    // blob in identity block order, so a KVFLASH2 blob is not the pager that was
+    // saved: its LRU order and block table are the chunk order.
     std::vector<uint8_t> serialize(int max_chunks = -1) const {
         synchronize_page_stream_();   // queued D2H must land in host_data first
         const int nc = serialized_chunks_(max_chunks);
         const size_t kv_bytes = (size_t)nc * chunk_bytes_;
+        const std::vector<uint8_t> pool = pool_layout_blob(max_chunks);
+        std::vector<uint8_t> out(kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry + pool.size(), 0);
+        const std::vector<uint8_t> head = blob_header(max_chunks);
+        std::memcpy(out.data(), head.data(), kBlobHdr);
+        std::memcpy(out.data(), &kBlobMagic3, 8);   // the pool layout below makes it KVFLASH3
+        for (int c = 0; c < nc; ++c) read_chunk(c, out.data() + kBlobHdr + (size_t)c * chunk_bytes_);
+        const std::vector<uint8_t> ledger = ledger_blob(max_chunks);
+        std::memcpy(out.data() + kBlobHdr + kv_bytes, ledger.data(), ledger.size());
+        std::memcpy(out.data() + kBlobHdr + kv_bytes + ledger.size(), pool.data(), pool.size());
+        return out;
+    }
+
+    // The pool layout of chunks [0, max_chunks) as KVFLASH3 writes it after the ledger (see serialize()): the
+    // chunk -> block table, the LRU ranks, the use clock and the free list in order. A pager that was saved in
+    // parts (blob_header() + read_chunk() + ledger_blob(), a slot bundle) keeps this with them and appends it
+    // under the KVFLASH3 magic, so deserialize() puts it all back.
+    std::vector<uint8_t> pool_layout_blob(int max_chunks = -1) const {
+        const int nc = serialized_chunks_(max_chunks);
+        // A block awaiting its page-out record holds no resident chunk: free in the layout, handed out
+        // where the live pager hands it out once complete() settles it (the back of the free list, in order).
         std::vector<int32_t> free_list(free_blocks_.begin(), free_blocks_.end());
-        // A block awaiting its page-out record holds no resident chunk: free in the layout.
-        for (const auto & pf : pending_free_) free_list.insert(free_list.begin(), pf.first);
+        for (const auto & pf : pending_free_) free_list.push_back(pf.first);
         for (int c = (int)chunks_.size() - 1; c >= nc; --c)   // dropped tail: handed out last
             if (chunks_[(size_t)c].block >= 0) free_list.insert(free_list.begin(), chunks_[(size_t)c].block);
-        const size_t ledger_end = kBlobHdr + kv_bytes + (size_t)nc * kLedgerEntry;
         // LRU stamps as dense ranks among the resident chunks (0 elsewhere):
         // eviction only compares stamps and new ones always exceed the clock,
         // so ranks behave exactly like the raw clock values, and two pagers
@@ -980,30 +1002,23 @@ public:
         auto rank_of = [&](uint64_t u) {
             return (uint64_t)(std::lower_bound(stamps.begin(), stamps.end(), u) - stamps.begin()) + 1;
         };
-        std::vector<uint8_t> out(ledger_end + kPoolHdr + (size_t)nc * kPoolEntry +
-                                 free_list.size() * sizeof(int32_t), 0);
-        const std::vector<uint8_t> head = blob_header(max_chunks);
-        std::memcpy(out.data(), head.data(), kBlobHdr);
-        std::memcpy(out.data(), &kBlobMagic3, 8);   // the pool layout below makes it KVFLASH3
-        for (int c = 0; c < nc; ++c) read_chunk(c, out.data() + kBlobHdr + (size_t)c * chunk_bytes_);
-        const std::vector<uint8_t> ledger = ledger_blob(max_chunks);
-        std::memcpy(out.data() + kBlobHdr + kv_bytes, ledger.data(), ledger.size());
-        for (int c = 0; c < nc; ++c) {
-            const ChunkState & st = chunks_[(size_t)c];
-            uint8_t * pe = out.data() + ledger_end + kPoolHdr + (size_t)c * kPoolEntry;
-            const int32_t blk = st.block;
-            const uint64_t rank = st.block >= 0 ? rank_of(st.last_use) : 0;
-            std::memcpy(pe, &blk, 4);
-            std::memcpy(pe + 8, &rank, 8);
-        }
-        uint8_t * ph = out.data() + ledger_end;
+        std::vector<uint8_t> out(kPoolHdr + (size_t)nc * kPoolEntry + free_list.size() * sizeof(int32_t), 0);
         const uint32_t pool_hdr[2] = {(uint32_t)n_blocks_, (uint32_t)free_list.size()};
         const uint64_t clock = stamps.size();
-        std::memcpy(ph, pool_hdr, 8);
-        std::memcpy(ph + 8, &clock, 8);
+        std::memcpy(out.data(), pool_hdr, 8);
+        std::memcpy(out.data() + 8, &clock, 8);
+        for (int c = 0; c < nc; ++c) {
+            const ChunkState & st = chunks_[(size_t)c];
+            uint8_t * pe = out.data() + kPoolHdr + (size_t)c * kPoolEntry;
+            const int32_t blk = st.block;
+            const uint32_t pin = (size_t)c < pinned_.size() && pinned_[(size_t)c] == kPinHard ? 1u : 0u;   // step pins end with the step
+            const uint64_t rank = st.block >= 0 ? rank_of(st.last_use) : 0;
+            std::memcpy(pe, &blk, 4);
+            std::memcpy(pe + 4, &pin, 4);
+            std::memcpy(pe + 8, &rank, 8);
+        }
         if (!free_list.empty())
-            std::memcpy(ph + kPoolHdr + (size_t)nc * kPoolEntry, free_list.data(),
-                        free_list.size() * sizeof(int32_t));
+            std::memcpy(out.data() + kPoolHdr + (size_t)nc * kPoolEntry, free_list.data(), free_list.size() * sizeof(int32_t));
         return out;
     }
 
@@ -1100,7 +1115,7 @@ public:
     // (KVFLASH2) blob. The blob is fully validated (magic, geometry, K and V
     // dtype, length, resident count <= pool, pool layout) BEFORE any state is
     // touched: a rejected blob returns false and leaves the pager as it was.
-    // On success: reset() semantics (pins cleared), chunks that were resident
+    // On success: reset() semantics (pins cleared, then the saved hard pins back with an exact layout), chunks that were resident
     // get a pool block (bytes restored), the rest stay host-backed and
     // recallable via page_in(), and scores are restored. When a KVFLASH3 blob
     // was saved from a pool with this block count, every resident chunk gets
@@ -1163,11 +1178,17 @@ public:
                 used[(size_t)b] = 1;
                 return true;
             };
+            size_t n_pinned = 0;
             for (size_t c = 0; c < nc; ++c) {
                 int32_t b;
+                uint32_t pin;
                 std::memcpy(&b, pe + c * kPoolEntry, 4);
+                std::memcpy(&pin, pe + c * kPoolEntry + 4, 4);
                 if (lp[c * kLedgerEntry] != 0 ? !take(b) : b != -1) return false;
+                if (pin > 1) return false;
+                n_pinned += pin;
             }
+            if ((size_t)cfg_.sink_chunks + (size_t)cfg_.tail_window_chunks + n_pinned + 2 > (size_t)n_blocks_) return false;   // pin_range's guard
             for (size_t i = 0; i < n_free; ++i) {
                 int32_t b;
                 std::memcpy(&b, fl + i * sizeof(int32_t), 4);
@@ -1202,6 +1223,12 @@ public:
             if (lp[c * kLedgerEntry] != 0) slot_for_((int64_t)c * cfg_.chunk_tokens, /*write=*/false);
         }
         if (exact) {
+            pinned_.assign(nc, 0);
+            for (size_t c = 0; c < nc; ++c) {
+                uint32_t pin;
+                std::memcpy(&pin, pe + c * kPoolEntry + 4, 4);
+                pinned_[c] = pin ? kPinHard : 0;
+            }
             free_blocks_.resize(n_free);
             if (n_free > 0) std::memcpy(free_blocks_.data(), fl, n_free * sizeof(int32_t));
             for (size_t c = 0; c < nc; ++c) {

@@ -92,6 +92,12 @@ bool bound(World & w, int slot, int k) {
     for (int c = 0; c < k; c++) ok = ok && w.s[(size_t)slot]->is_pinned(c) && w.s[(size_t)slot]->is_resident(c);
     return ok;
 }
+// A restored pager holds the pins it parked with (they ride in the pool layout); the binder knows nothing of the slot until the rebind.
+bool restored_unbound(World & w, int slot, int k) {
+    bool ok = w.binder.binding(slot).k == 0 && w.binder.pins(slot) == 0;
+    for (int c = 0; c < k; c++) ok = ok && w.s[(size_t)slot]->is_pinned(c);
+    return ok;
+}
 bool unbound(World & w, int slot, int k_was) {
     bool ok = w.binder.binding(slot).k == 0 && w.binder.pins(slot) == 0;
     for (int c = 0; c < k_was; c++) ok = ok && !w.s[(size_t)slot]->is_pinned(c);
@@ -175,7 +181,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, restart_adopts_a_full_session_and_the_r
     // "restart": the pagers are fresh, the binding comes from meta.json
     World w2;
     REQUIRE(w2.kv->adopt_parked(a.slot, 0x99, 1200, blob.data(), blob.size()) == PagedKvStatus::Ok);
-    CHECK(unbound(w2, a.slot, kK));                              // deserialize cleared the pins, nothing bound yet
+    CHECK(restored_unbound(w2, a.slot, kK));                      // deserialize put the pins back, nothing bound yet
     CHECK(kvflash_head_rebind(*w2.kv, w2.binder, a.slot, hist, a.hash, kK));
     CHECK(bound(w2, a.slot, kK));
     // a binding that names another prefix than the history's is not honoured

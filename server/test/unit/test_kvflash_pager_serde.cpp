@@ -1285,6 +1285,23 @@ TEST_CASE(KvflashPagerSerdeFixture, kvflash3_blob_with_deferred_free_pending_loa
     CHECK(q.serialize() == blob);
 }
 
+// A pending block joins the free list at its back when its record completes, so the layout lists it there:
+// the blob written while it waits is the blob of the same pager once it has settled.
+TEST_CASE(KvflashPagerSerdeFixture, kvflash3_free_list_puts_pending_blocks_where_the_live_pager_frees_them) {
+    TestPager p;
+    REQUIRE(p.attach(make_cfg(), {}, {}));
+    REQUIRE(p.alloc_span(0, 8 * kChunk));
+    REQUIRE(p.page_out(5));                       // an older free block already waits in the list
+    p.set_deferred_free(true);
+    REQUIRE(p.page_out(1));
+    REQUIRE(p.page_out(2));
+    REQUIRE(p.pending_free_blocks() == 2);
+    const std::vector<uint8_t> waiting = p.serialize();
+    p.synchronize_paging();
+    CHECK(p.pending_free_blocks() == 0);
+    CHECK(p.serialize() == waiting);
+}
+
 // A page-out planned against an earlier generation is stale after reset(),
 // attach() or abort_step(): it must not evict the new request's chunk.
 TEST_CASE(KvflashPagerSerdeFixture, page_out_checked_refuses_a_stale_generation_and_protected_chunks) {
@@ -1477,4 +1494,126 @@ TEST_CASE(KvflashPagerSerdeFixture, reselect_score_ties_keep_resident_chunks_whe
     CHECK(reselect_with(p, kTies, 12) == 0);
     CHECK(blocks(p, 12) == vec(kMainAfterAlloc));
     CHECK(vec(kMainAfterTieReselect) != vec(kMainAfterAlloc));   // main did move chunks here
+}
+
+// ── restore == continue ──────────────────────────────────────────────────
+// A session parked to disk and restored must continue like the live slot: the chunk -> block table, the free list
+// and its order and the LRU order the later evictions read are the live pager's, not the identity layout a
+// KVFLASH2 blob falls back to (prs/evidence/G6/RESULTS.md section 6).
+namespace {
+// 10 chunks through an 8 block pool, then two recalls: chunks 1 and 2 return to the pool newer than 5..9, chunks 3 and 4
+// stay on the host. Blocks are not the identity, the LRU order is not the chunk order, the free list is shuffled.
+void build_lived_in(Harness & h, KvFlashPager & p) {
+    must(p.attach(make_cfg(), h.k, h.v));
+    for (int c = 0; c < 10; c++) {
+        must(p.alloc_span(c * kChunk, kChunk));
+        stamp_chunk(h, p, c, 3);
+    }
+    must(p.page_in(2));
+    must(p.page_in(1));
+    p.synchronize_paging();
+    for (int c = 0; c < 10; c++) p.set_chunk_score(c, 10.0f * (float)c);
+}
+
+// What a park writes and a restore feeds the pager: the parts a bundle keeps apart, the pool layout among them.
+std::vector<uint8_t> bundle_blob(const KvFlashPager & p) {
+    std::vector<uint8_t> blob;
+    must(p.serialize_to([&](const uint8_t * d, size_t n) { blob.insert(blob.end(), d, d + n); return true; }));
+    const std::vector<uint8_t> pool = p.pool_layout_blob();
+    blob.insert(blob.end(), pool.begin(), pool.end());
+    blob[0] = '3';   // KVFLASH3
+    return blob;
+}
+
+std::vector<int> block_table(const KvFlashPager & p, int n) {
+    std::vector<int> t;
+    for (int c = 0; c < n; c++) t.push_back(p.block_of(c));
+    return t;
+}
+}  // namespace
+
+TEST_CASE(KvflashPagerSerdeFixture, a_restored_pager_is_the_live_pager_and_evicts_alike) {
+    Harness A;
+    TestPager live;
+    build_lived_in(A, live);
+    REQUIRE(live.n_chunks() == 10);
+    REQUIRE(!live.is_resident(3));
+    REQUIRE(!live.is_resident(4));
+    REQUIRE(live.block_of(2) != 2);
+    REQUIRE((live.lru_victims(8) == std::vector<int>{2, 1}));   // chunk 2 is older than 1; the identity order would say {1, 2}
+
+    const std::vector<uint8_t> blob = bundle_blob(live);
+    Harness B;
+    TestPager back;
+    REQUIRE(back.attach(make_cfg(), B.k, B.v));
+    REQUIRE(back.deserialize(blob.data(), blob.size(), 10));
+
+    // field by field
+    REQUIRE(back.n_chunks() == live.n_chunks());
+    CHECK(back.cur_chunk() == live.cur_chunk());
+    CHECK(back.resident_blocks() == live.resident_blocks());
+    CHECK(block_table(back, 10) == block_table(live, 10));
+    for (int c = 0; c < 10; c++) CHECK(back.chunk_score(c) == live.chunk_score(c));
+    CHECK(back.lru_victims(8) == live.lru_victims(8));
+    CHECK(back.serialize() == live.serialize());                // pool layout: blocks, LRU ranks, use clock, free list order
+
+    // the same later life: pins (the binder re-applies them), appends that evict, then a reselect
+    live.pin_range(2 * kChunk, 3 * kChunk);
+    back.pin_range(2 * kChunk, 3 * kChunk);
+    for (int c = 10; c < 14; c++) {
+        REQUIRE(live.alloc_span(c * kChunk, kChunk));
+        REQUIRE(back.alloc_span(c * kChunk, kChunk));
+        CHECK(block_table(back, c + 1) == block_table(live, c + 1));
+        CHECK(back.lru_victims(8) == live.lru_victims(8));
+    }
+    const auto score = [](int c) { return (float)((c * 7) % 5); };
+    live.score_hook = score;
+    back.score_hook = score;
+    CHECK(back.reselect() == live.reselect());
+    CHECK(block_table(back, 14) == block_table(live, 14));
+    live.score_hook = nullptr;
+    back.score_hook = nullptr;
+    CHECK(back.serialize() == live.serialize());
+}
+
+// Hard pins are state: a pinned chunk is no eviction victim and reselect() keeps it, and a resume reselects before the turn
+// re-pins its preamble (the G6 evidence: live kept preamble chunks 1-9 resident, the restored slot only chunk 0). The pin set
+// rides in the pool layout, so the restored pager protects what the live one does and the digest sees a lost pin.
+TEST_CASE(KvflashPagerSerdeFixture, a_restored_pager_keeps_the_hard_pins_and_reselects_like_the_live_one) {
+    Harness A;
+    TestPager live;
+    build_lived_in(A, live);
+    live.pin_range(2 * kChunk, 3 * kChunk);                      // chunk 2: resident, older than 5..9, the first LRU victim
+    REQUIRE(live.is_pinned(2));
+
+    Harness C;                                                   // a pin lost in the round trip is another layout: another digest
+    TestPager unpinned;
+    build_lived_in(C, unpinned);
+    CHECK(unpinned.pool_layout_blob() != live.pool_layout_blob());
+
+    const std::vector<uint8_t> blob = bundle_blob(live);
+    Harness B;
+    TestPager back;
+    REQUIRE(back.attach(make_cfg(), B.k, B.v));
+    REQUIRE(back.deserialize(blob.data(), blob.size(), 10));
+
+    for (int c = 0; c < 10; c++) CHECK(back.is_pinned(c) == live.is_pinned(c));
+    CHECK(back.lru_victims(8) == live.lru_victims(8));
+    CHECK(back.pool_layout_blob() == live.pool_layout_blob());
+
+    // the resume: a reselect before anything re-pins, then appends that evict
+    const auto score = [](int c) { return (float)((c * 7) % 5); };
+    live.score_hook = score;
+    back.score_hook = score;
+    CHECK(back.reselect_recent() == live.reselect_recent());
+    CHECK(block_table(back, 10) == block_table(live, 10));
+    CHECK(back.is_resident(2) == live.is_resident(2));
+    for (int c = 10; c < 14; c++) {
+        REQUIRE(live.alloc_span(c * kChunk, kChunk));
+        REQUIRE(back.alloc_span(c * kChunk, kChunk));
+        CHECK(block_table(back, c + 1) == block_table(live, c + 1));
+    }
+    live.score_hook = nullptr;
+    back.score_hook = nullptr;
+    CHECK(back.serialize() == live.serialize());
 }

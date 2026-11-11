@@ -76,7 +76,7 @@ inline KvFlashPreambleDecision kvflash_head_decide(const std::vector<int32_t> & 
 
 // ---- re-pin ---------------------------------------------------------------------------------------------------
 //
-// A slot's binding {k chunks pinned from chunk 0} is lost by reset() and deserialize() (they clear every pin) and
+// A slot's binding {k chunks pinned from chunk 0} is lost by reset() and by deserialize() of a blob without the layout (they clear every pin) and
 // cut by truncate() below k. The slot holds the head while it has k chunks. This re-applies the pins, reads back how
 // many the pager accepted (pin_range refuses a span that would deadlock eviction), and releases the binding when the
 // slot's length fell below the head or fewer than k pins were accepted: the request then runs as if cold.
@@ -214,9 +214,9 @@ inline bool kvflash_head_attach(Kv & kv, KvFlashHeadBinder & bd, int slot, uint6
 template <class Kv>
 inline bool kvflash_head_rebind(Kv & kv, KvFlashHeadBinder & bd, int slot, const std::vector<int32_t> & history,
                                 uint64_t hash, int k) {
-    if (k < 2) return false;
-    const std::vector<uint64_t> path = kvflash_head_hashes(history, k, (int)kv.block_size());
-    if ((int)path.size() < k || path.back() != hash || !bd.bind(slot, hash, k)) return false;
+    // The pager comes back with the hard pins it parked with (KVFLASH3 layout): a head that does not hold runs unpinned.
+    const std::vector<uint64_t> path = k < 2 ? std::vector<uint64_t>() : kvflash_head_hashes(history, k, (int)kv.block_size());
+    if ((int)path.size() < k || path.empty() || path.back() != hash || !bd.bind(slot, hash, k)) { kv.pager(slot).unpin_all(); return false; }
     bd.ensure(slot, kv.pager(slot));
     return bd.binding(slot).k == k;
 }
