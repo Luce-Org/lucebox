@@ -5,9 +5,11 @@
 #include "common/concurrency/seq_slot_manager.h"
 #include "common/prompt_lookup.h"
 #include "qwen4exp_cache.h"
+#include "qwen4exp_graph.h"
 #include "qwen4exp_mtp.h"
 
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -107,7 +109,11 @@ private:
     };
     bool mtp_capable(int slot) const;
     bool mtp_prefill(int slot, const int32_t * tokens, int n, int pos0,
-                     std::vector<float> & logits);
+                     std::vector<float> & logits, const Qwen4ExpInputs * inputs = nullptr);
+    // A prompt chunk's host inputs (embeddings, PLE rows): those gathered while the previous chunk computed when they
+    // were gathered for these tokens and this history, else gathered now. Then starts the gather for the slot's next
+    // chunk, which the single-slot loop also runs ahead. A lookahead that fails or cannot start is gathered inline.
+    Qwen4ExpInputs prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment);
     bool mtp_eligible(const StepPlan & plan) const;
     StepResult mtp_step(const StepInput & input);
     // Sample a verified row as one-token decode samples it after `fed` (pushed to the slot's history): the device's
@@ -160,6 +166,12 @@ private:
     // With an adaptive width, a round verifies prompt-lookup drafts instead of the MTP's when this policy expects
     // them to commit more tokens per ms (as the single-slot loop does); null: MTP drafts only.
     PromptLookupPolicy * lookup_policy_ = nullptr;
+    struct InputGather {   // a slot's next prompt chunk: its position, tokens and PLE history, and its inputs
+        int pos0 = -1;
+        std::vector<int32_t> tokens, ple_prev;
+        std::future<Qwen4ExpInputs> inputs;
+    };
+    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); joined first by the destructor
 };
 
 } // namespace luce::common

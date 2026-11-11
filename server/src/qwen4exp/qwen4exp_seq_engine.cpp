@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -49,9 +50,11 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       mode_rates_((size_t)kQwen4ExpMaxBatchedSlots + 1),
       mtp_width_(mtp_width ? mtp_width : &own_mtp_width_),
       mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_),
-      lookup_policy_(verify_width == 0 ? lookup_policy : nullptr) {}
+      lookup_policy_(verify_width == 0 ? lookup_policy : nullptr),
+      next_inputs_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
+    next_inputs_.clear();   // waits for any lookahead gather still running
     ggml_backend_synchronize(backend_);
     for (Qwen4ExpSnapshot & checkpoint : checkpoints_) free_qwen4exp_snapshot(checkpoint);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
@@ -201,7 +204,7 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
 // mtp_prev_pos), so a cache restored from a prefix snapshot keeps drafting; a
 // cache without that row prefills plainly and its request decodes undrafted.
 bool Qwen4ExpSeqEngine::mtp_prefill(int slot, const int32_t * tokens, int n, int pos0,
-                                    std::vector<float> & logits) {
+                                    std::vector<float> & logits, const Qwen4ExpInputs * inputs) {
     const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
     Qwen4ExpCache & cache = *caches_[(size_t)slot];
     MtpState & m = mtp_[(size_t)slot];
@@ -210,20 +213,21 @@ bool Qwen4ExpSeqEngine::mtp_prefill(int slot, const int32_t * tokens, int n, int
     if (pos0 > 0 && cache.mtp_prev_pos != pos0 - 1) {
         m.live = false;
         pending.h.clear();
-        return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits).ok;
+        return qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, nullptr, false, false, inputs).ok;
     }
     pending.h.resize(pos0 > 0 ? hd : 0);
     if (pos0 > 0) ggml_backend_tensor_get(cache.mtp_prev_hidden, pending.h.data(), 0, hd * sizeof(float));
     pending.pos = std::max(0, pos0 - 1);
     std::vector<float> hidden;
     if (n > 1) {
-        if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true).ok)
+        if (!qwen4exp_forward(backend_, weights_, cache, tokens, n, pos0, logits, &hidden, false, true, inputs).ok)
             return false;
         pending.h.swap(hidden);
         pending.pos = pos0 + n - 1;
         return true;
     }
-    if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden).ok) return false;
+    if (!qwen4exp_forward(backend_, weights_, cache, tokens, 1, pos0, logits, &hidden, false, false, inputs).ok)
+        return false;
     if (pos0 > 0) pending.tok.assign(tokens, tokens + 1);
     pending.h.insert(pending.h.end(), hidden.begin(), hidden.end());
     if (!qwen4exp_mtp_catch_up(backend_, weights_, cache, pending, 0) || pending.h.size() != hd) return false;
@@ -615,6 +619,42 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
     return event;
 }
 
+Qwen4ExpInputs Qwen4ExpSeqEngine::prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment) {
+    const std::vector<int32_t> & ple_prev = segment.cache->ple_prev;
+    InputGather & next = next_inputs_[(size_t)slot];
+    Qwen4ExpInputs inputs;
+    // The lookahead serves this chunk only when it was gathered for exactly it (the inputs depend on nothing else).
+    if (next.inputs.valid() && next.pos0 == segment.pos0 && next.ple_prev == ple_prev &&
+        std::equal(next.tokens.begin(), next.tokens.end(), segment.tokens, segment.tokens + segment.n_tokens)) {
+        try {
+            inputs = next.inputs.get();
+        } catch (...) {   // the gather failed (memory, a reader thread): gather inline, as without the lookahead
+            inputs = Qwen4ExpInputs{};
+        }
+    }
+    if (!inputs.ok) inputs = qwen4exp_prepare_inputs(weights_, segment.tokens, segment.n_tokens, ple_prev);
+    next = InputGather{};   // a missed lookahead goes only now, so the inline gather above did not wait for it
+    // The slot's next chunk as the next step plans it when nothing else changes (this chunk is appended already): a
+    // whole granule, cut at the slot's restore points and capture boundary (prefill_segment). The step limits grant
+    // every prefilling sequence a whole granule (step_plan_limits), so it is the next slice unless the scheduler
+    // grants less; then the next chunk misses and is gathered inline.
+    const SeqSlot & s = slots_.slot(slot);
+    const int n = inputs.ok && s.cur_pos < s.prompt_len ? prefill_segment(slot, prefill_granule_) : 0;
+    if (n > 0) {
+        next.pos0 = s.cur_pos;
+        next.tokens.assign(s.sample_history.begin() + s.cur_pos, s.sample_history.begin() + s.cur_pos + n);
+        next.ple_prev = inputs.ple_prev;
+        try {
+            next.inputs = std::async(std::launch::async, [&w = weights_, tokens = next.tokens, prev = next.ple_prev] {
+                return qwen4exp_prepare_inputs(w, tokens.data(), (int) tokens.size(), prev);
+            });
+        } catch (const std::exception &) {   // no thread for it (std::system_error): the next chunk is gathered inline
+            next = InputGather{};
+        }
+    }
+    return inputs;
+}
+
 int Qwen4ExpSeqEngine::prefill_segment(int slot, int max_tokens) const {
     const SeqSlot & s = slots_.slot(slot);
     int end = std::min({s.prompt_len, s.cur_pos + max_tokens, s.cur_pos + prefill_granule_});
@@ -826,9 +866,11 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (size_t i = plan.decode.size(); i < forward_segments.size(); ++i) {
         const auto & segment = forward_segments[i];
         const int id = plan.prefills[i - plan.decode.size()].slot;
-        if (mtp_[(size_t)id].live ? !mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[i])
+        const Qwen4ExpInputs inputs = prompt_inputs(id, segment);
+        if (mtp_[(size_t)id].live
+                ? !mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[i], &inputs)
                 : !qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
-                                    segment.n_tokens, segment.pos0, logits[i]).ok)
+                                    segment.n_tokens, segment.pos0, logits[i], nullptr, false, false, &inputs).ok)
             return fail("qwen4exp solo prefill forward failed");
     }
     for (size_t i = 0; i < logits.size(); ++i) {
@@ -909,6 +951,7 @@ void Qwen4ExpSeqEngine::retire(int slot) {
         if (slot == mtp_slot_ && verify_width_ == 0) mtp_costs_->store(*mtp_width_, m.context);
         m = MtpState{};
     }
+    next_inputs_[(size_t)slot] = InputGather{};   // its next chunk is not coming: waits out its gather (one at most)
     // The batched steps' summary once no other request is left: one line per busy stretch.
     bool last = true;
     for (int s = 0; s < slot_count(); ++s) last = last && (s == slot || !slots_.is_active(s));

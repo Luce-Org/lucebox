@@ -327,7 +327,9 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             graph = std::max(graph, m.graph + m.metadata);
             inputs = std::max(inputs, m.inputs);
             mask = std::max(mask, m.mask);
-            host = std::max(host, m.host);
+            // m.host: two chunks' host inputs, the running chunk's and its lookahead's. With concurrent slots the
+            // seq engine can also hold every other slot's finished lookahead (Qwen4ExpSeqEngine::prompt_inputs).
+            host = std::max(host, slots > 1 ? m.host / 2 * (size_t) (slots + 1) : m.host);
             scratch = std::max(scratch, m.scratch);
             return true;
         };
