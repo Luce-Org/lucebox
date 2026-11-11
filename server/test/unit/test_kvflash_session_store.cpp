@@ -571,9 +571,9 @@ TEST_CASE(KvflashSessionStoreFixture, a_full_house_evicts_the_oldest_to_disk_kee
         store.upsert(e);
         REQUIRE(store.write_meta(e.key));
     }
-    // the two slots are full and a third session arrives: the oldest parked one goes to disk
+    // the two slots are full and a third session arrives: the parked one cheapest to restore goes to disk
     const std::vector<KvFlashParkedSession> parked = {{0, &ha, 1}, {1, &hb, 2}};   // slot, history, park tick: the engine's own pick
-    CHECK(kvflash_oldest_session(parked) == 0);
+    CHECK(kvflash_cheapest_session(parked) == 0);
     const std::string key_a = kvflash_sid_key("header", "sid-a");
     REQUIRE(store.evict(key_a, ha));
     CHECK(store.find_key(key_a)->state == "disk");

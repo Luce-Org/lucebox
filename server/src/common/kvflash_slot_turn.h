@@ -338,18 +338,24 @@ inline KvFlashLadderMove kvflash_ladder_restored(int ckpt, int trunk, int extra,
     return m;
 }
 
-// The oldest parked session (the one to drop when a slot is needed); -1 when none.
-inline int kvflash_oldest_session(const std::vector<KvFlashParkedSession> & parked) {
-    int slot = -1;
-    uint64_t tick = 0;
-    for (const KvFlashParkedSession & s : parked)
-        if (s.slot >= 0 && (slot < 0 || s.tick < tick)) { slot = s.slot; tick = s.tick; }
-    return slot;
+// The victim among parked sessions (GreedyDual-Size, as FlashStates eq. 7): priority = the eviction clock when it parked +
+// its restore cost per byte freed. The lowest goes and the caller raises its clock to the victim's priority, so a session
+// nobody resumes ages out. The restore cost is the re-prefill of its history, linear in tokens under a fixed pool, so tokens
+// stand for seconds and no weight is tuned; a slot's slice is the same for every session, so a long history outranks a short one.
+// ponytail: the cost is re-prefill tokens only; with the disk tier it is min(re-prefill, bundle bytes / link rate).
+inline double kvflash_session_priority(const KvFlashParkedSession & s) {
+    return s.stamp + (double)(s.history ? s.history->size() : 0) / (double)std::max<int64_t>(s.bytes, 1);
 }
-
-// The victim's rank among parked sessions, lowest goes first.
-inline double kvflash_session_priority(const KvFlashParkedSession & s) { return (double)s.tick; }
-inline int kvflash_cheapest_session(const std::vector<KvFlashParkedSession> & parked) { return kvflash_oldest_session(parked); }
+// The parked session to drop when room is needed (ties to the oldest); -1 when none.
+inline int kvflash_cheapest_session(const std::vector<KvFlashParkedSession> & parked) {
+    const KvFlashParkedSession * v = nullptr;
+    for (const KvFlashParkedSession & s : parked) {
+        if (s.slot < 0) continue;
+        const double h = kvflash_session_priority(s);
+        if (!v || h < kvflash_session_priority(*v) || (h == kvflash_session_priority(*v) && s.tick < v->tick)) v = &s;
+    }
+    return v ? v->slot : -1;
+}
 
 // Frees the victim among the parked sessions other than `keep`: `to_disk(slot)` is the session's move to disk (false: its
 // park was refused, it stays), `drop(slot)` then releases it (its next turn prefills cold or from its last bundle). A refused
@@ -396,7 +402,7 @@ inline KvFlashResumeRefused kvflash_resume_refused(bool busy, bool other_parked,
     return other_parked ? KvFlashResumeRefused::evict_other_retry : KvFlashResumeRefused::wait_parked;
 }
 
-// Restoring a session from disk reserves host bytes like any admit. Busy (the ledger lacks room) evicts the oldest
+// Restoring a session from disk reserves host bytes like any admit. Busy (the ledger lacks room) evicts the cheapest
 // parked session and tries again; Refused (the bundle or the pager cannot take it) is final. Returns Busy only
 // when `evict()` has nothing left to free.
 enum class KvFlashAdopt { Ok, Busy, Refused };
@@ -419,7 +425,7 @@ inline KvFlashAdopt kvflash_adopt_with_evict(TryAdopt try_adopt, Evict evict) {
 // A returning session's restore from disk: `probe()` answers from the ledger alone whether the host reservation fits
 // (Busy = it does not; anything else = cannot decide or fits), `has_victim()` whether a parked session could leave,
 // `validate()` streams the bundle once without holding it (false: unreadable), `load()` reads the bundle (false: unreadable), `try_adopt`
-// reserves and installs it, `release` frees the loaded bundle before a victim is staged, `evict_one` frees the oldest
+// reserves and installs it, `release` frees the loaded bundle before a victim is staged, `evict_one` frees the cheapest
 // parked session (false: nothing left). `load_failed` says the bundle could not be read (first load or the reload).
 struct KvFlashRestoreResult { KvFlashAdopt adopt = KvFlashAdopt::Refused; bool load_failed = false; };
 template <class Probe, class HasVictim, class Validate, class Load, class TryAdopt, class Release, class EvictOne>

@@ -345,6 +345,7 @@ private:
         SlotCkpt trunk;
         SlotCkpt extra;
         KvFlashResumeWait wait;          // a resume rewound it to L and was refused busy: the retry resumes it there
+        double stamp = 0;                // evict_clock_ when it parked (kvflash_session_priority)
     };
     std::vector<ParkedSession> parked_;
     std::vector<SlotCkpt> ckpt_;                      // the live slot's prompt-end checkpoint, taken at commit
@@ -409,7 +410,8 @@ private:
     void release_host_(int slot, const char * why);   // a refused park: host memory goes, the last committed bundle stays (else dropped)
     bool evict_session_(int slot, const char * why);  // the session leaves the slot, its bundle stays on disk; false: its latest park is not on disk, it stays
     bool any_slot_live_() const;
-    int evict_oldest_(const char * why, int keep = -1);   // the oldest parked session (but `keep`) that can be evicted: its slot, -1 when none
+    int evict_cheapest_(const char * why, int keep = -1);   // evicts the parked session cheapest to restore (but `keep`): its slot, -1 when none
+    double evict_clock_ = 0;                          // the priority of the last victim: what a park is stamped with
     std::vector<bool> active_slots_() const;          // which slots decode a request now
     std::vector<KvFlashOwnedSession> parked_list_() const;   // every parked session with its owner
     void begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
