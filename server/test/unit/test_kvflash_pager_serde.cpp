@@ -4,6 +4,7 @@
 // that moves bytes between pool and host backing is exercised for real.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_pager_test_host.h"
+#include "../../src/common/kvflash_bundle_digest.h"
 #include "../../src/common/kvflash_slot_bundle.h"
 
 #include "ggml-alloc.h"
@@ -1668,4 +1669,73 @@ TEST_CASE(KvflashPagerSerdeFixture, a_session_bundle_restores_the_parked_pager_a
         REQUIRE(back.alloc_span(c2 * kChunk, kChunk));
         CHECK(block_table(back, c2 + 1) == block_table(live, c2 + 1));
     }
+}
+
+// The restart-determinism check: the digest of the parked slot (taken at save) and of the restored one (taken after the
+// restore) are equal only when the restore kept the layout and the LRU order; the KVFLASH2 restore the bundle used to give
+// has every chunk, byte and ledger entry of the live pager and still differs in the digest's pool component.
+TEST_CASE(KvflashPagerSerdeFixture, a_restore_that_loses_the_pool_layout_shows_in_the_state_digest) {
+    const auto digest = [](const KvFlashPager & p) {
+        const std::vector<uint8_t> slab = {1, 2, 3}, pool = p.pool_layout_blob();
+        const std::vector<int32_t> hist((size_t)p.n_chunks() * kChunk, 1);
+        return kvflash_state_digest(hist, slab, p.blob_header(), p.ledger_blob(), KvFlashDigestRungs{}, p.chunk_bytes(),
+                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, nullptr, &pool);
+    };
+    Harness A;
+    TestPager live;
+    build_lived_in(A, live);
+    const KvFlashStateDigest saved = digest(live);
+    Harness B, C;
+    TestPager kept, lost;
+    REQUIRE(kept.attach(make_cfg(), B.k, B.v));
+    REQUIRE(lost.attach(make_cfg(), C.k, C.v));
+    const std::vector<uint8_t> with_layout = bundle_blob(live);
+    std::vector<uint8_t> without_layout;                        // the blob before the layout was kept
+    REQUIRE(live.serialize_to([&](const uint8_t * d, size_t n) { without_layout.insert(without_layout.end(), d, d + n); return true; }));
+    REQUIRE(kept.deserialize(with_layout.data(), with_layout.size(), 10));
+    REQUIRE(lost.deserialize(without_layout.data(), without_layout.size(), 10));
+    const KvFlashStateDigest back = digest(kept), gone = digest(lost);
+    CHECK(back.all == saved.all);
+    CHECK(gone.all != saved.all);
+    CHECK(gone.pool != saved.pool);
+    CHECK(gone.hist == saved.hist); CHECK(gone.kv == saved.kv); CHECK(gone.ledger == saved.ledger);   // everything the digest had before is equal
+}
+
+// The digest covers the pins: the restore that kept them equals the save, a restore that lost them (the pin flags of the layout
+// cleared) differs in the pool component, and a blob with a pin flag no pager writes, or more pins than the pool can hold
+// beside its sink and tail, is refused before any state moves.
+TEST_CASE(KvflashPagerSerdeFixture, a_restore_that_loses_the_hard_pins_shows_in_the_state_digest_and_a_bad_pin_flag_is_refused) {
+    const auto digest = [](const KvFlashPager & p) {
+        const std::vector<uint8_t> slab = {1, 2, 3}, pool = p.pool_layout_blob();
+        const std::vector<int32_t> hist((size_t)p.n_chunks() * kChunk, 1);
+        return kvflash_state_digest(hist, slab, p.blob_header(), p.ledger_blob(), KvFlashDigestRungs{}, p.chunk_bytes(),
+                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, nullptr, &pool);
+    };
+    Harness A;
+    TestPager live;
+    build_lived_in(A, live);
+    live.pin_range(2 * kChunk, 3 * kChunk);
+    const KvFlashStateDigest saved = digest(live);
+    const std::vector<uint8_t> blob = bundle_blob(live);
+    const size_t entries = blob.size() - live.pool_layout_blob().size() + 16;   // the pool layout's first per-chunk entry
+    const auto flag_at = [&](std::vector<uint8_t> b, int c, uint32_t v) {
+        std::memcpy(b.data() + entries + (size_t)c * 16 + 4, &v, 4);
+        return b;
+    };
+    Harness B, C, D, E;
+    TestPager kept, lost, odd, crowded;
+    REQUIRE(kept.attach(make_cfg(), B.k, B.v));
+    REQUIRE(lost.attach(make_cfg(), C.k, C.v));
+    REQUIRE(odd.attach(make_cfg(), D.k, D.v));
+    REQUIRE(crowded.attach(make_cfg(), E.k, E.v));
+    const std::vector<uint8_t> no_pins = flag_at(blob, 2, 0), bad = flag_at(blob, 2, 7), many = flag_at(flag_at(blob, 3, 1), 4, 1);
+    REQUIRE(kept.deserialize(blob.data(), blob.size(), 10));
+    REQUIRE(lost.deserialize(no_pins.data(), no_pins.size(), 10));
+    CHECK(digest(kept).all == saved.all);
+    CHECK(digest(lost).all != saved.all);
+    CHECK(digest(lost).pool != saved.pool);
+    CHECK(!odd.deserialize(bad.data(), bad.size(), 10));
+    CHECK(odd.n_chunks() == 0);
+    CHECK(!crowded.deserialize(many.data(), many.size(), 10));   // sink 1 + tail 4 + 3 pins + 2 > 8 blocks
+    CHECK(crowded.n_chunks() == 0);
 }

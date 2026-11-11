@@ -681,9 +681,9 @@ TEST_CASE(KvflashSlotBundleFixture, state_digest_survives_a_commit_and_a_load_an
 
 TEST_CASE(KvflashSlotBundleFixture, state_digest_line_has_the_fixed_format) {
     KvFlashStateDigest d;
-    d.all = 0x0123456789abcdefULL; d.hist = 1; d.slab = 2; d.kv = 3; d.ledger = 4; d.pager = 0xffULL; d.rung = 5; d.uq = 6; d.bytes = 4096;
+    d.all = 0x0123456789abcdefULL; d.hist = 1; d.slab = 2; d.kv = 3; d.ledger = 4; d.pager = 0xffULL; d.rung = 5; d.uq = 6; d.pool = 7; d.bytes = 4096;
     CHECK(kvflash_state_digest_line("save", "9f8e7d6c5b4a3921", 7, d, 12.34) ==
-          "[kvflash-digest] save sid=9f8e7d6c5b4a3921 gen=7 all=0123456789abcdef hist=0000000000000001 slab=0000000000000002 kv=0000000000000003 ledger=0000000000000004 pager=00000000000000ff rung=0000000000000005 uq=0000000000000006 bytes=4096 ms=12.3");
+          "[kvflash-digest] save sid=9f8e7d6c5b4a3921 gen=7 all=0123456789abcdef hist=0000000000000001 slab=0000000000000002 kv=0000000000000003 ledger=0000000000000004 pager=00000000000000ff rung=0000000000000005 uq=0000000000000006 pool=0000000000000007 bytes=4096 ms=12.3");
 }
 
 TEST_CASE(KvflashSlotBundleFixture, a_pinned_third_at_the_ckpt_position_is_hashed_raw_and_an_unpinned_one_is_not) {
@@ -892,4 +892,29 @@ TEST_CASE(KvflashSlotBundleFixture, assembly_puts_the_pool_layout_after_the_ledg
     k3.insert(k3.end(), h.pool.begin(), h.pool.end());
     CHECK(blob == k3);
     CHECK(h.pager_hdr == hdr44());                                                         // the head's own header is not touched
+}
+
+// The digest follows the layout: two states that differ only in the pool layout digest differently, and the component is
+// folded only when a layout exists (a state with none digests as it did before).
+TEST_CASE(KvflashSlotBundleFixture, state_digest_covers_the_pool_layout) {
+    const DigestState s;
+    const KvFlashStateDigest none = s.digest();
+    std::vector<uint8_t> pool = sample_pool(4, 3);
+    auto with = [&](const std::vector<uint8_t> & p) {
+        KvFlashDigestRungs rg = kvflash_digest_rungs(s.ckpt_pos, &s.ckpt, s.trunk_pos, &s.trunk, s.extra_pos, false, &s.extra);
+        return kvflash_state_digest(s.hist, s.slab, s.hdr, s.ledger, rg, CB, [&](int ci, uint8_t * dst) { std::memcpy(dst, s.chunks[(size_t)ci].data(), CB); }, nullptr, &p);
+    };
+    const KvFlashStateDigest a = with(pool);
+    CHECK(a.pool != 0); CHECK(a.pool != none.pool); CHECK(a.all != none.all);
+    CHECK(a.hist == none.hist); CHECK(a.kv == none.kv); CHECK(a.ledger == none.ledger); CHECK(a.pager == none.pager); CHECK(a.rung == none.rung);
+    CHECK(a.bytes == none.bytes + pool.size());
+    CHECK(with(pool).all == a.all);
+    auto swapped = pool;                                                                   // chunk 0 and chunk 1 swap blocks: the same chunks, another table
+    std::swap_ranges(swapped.begin() + kKvFlashPoolHdr, swapped.begin() + kKvFlashPoolHdr + 4, swapped.begin() + kKvFlashPoolHdr + kKvFlashPoolEntry);
+    CHECK(with(swapped).pool != a.pool); CHECK(with(swapped).all != a.all);
+    auto reranked = pool; reranked[kKvFlashPoolHdr + 8] ^= 1;                              // another LRU rank
+    CHECK(with(reranked).pool != a.pool);
+    auto freed = pool; freed[kKvFlashPoolHdr + 4 * kKvFlashPoolEntry] ^= 1;                // another free list order
+    CHECK(with(freed).pool != a.pool);
+    CHECK(with(std::vector<uint8_t>()).all == none.all);                                   // none: nothing folded
 }

@@ -1120,8 +1120,9 @@ void Qwen35SeqEngine::log_bundle_digest_(const char * tag, int slot, const std::
                                pt = tr.pos > 0 ? kvflash_slab_pack(tr.slab.ssm, tr.slab.conv) : std::vector<uint8_t>(),
                                pe = ex.pos > 0 ? kvflash_slab_pack(ex.slab.ssm, ex.slab.conv) : std::vector<uint8_t>();
     const KvFlashDigestRungs rungs = kvflash_digest_rungs(ck.pos, &pk, tr.pos, &pt, ex.pos, ex.pinned, &pe);   // raw, as the session holds them
+    const std::vector<uint8_t> pool = p.pool_layout_blob();   // the live pager's, at save and again after a restore: a restore that lost it shows
     const KvFlashStateDigest d = kvflash_state_digest(history, kvflash_slab_pack(slab.ssm, slab.conv), p.blob_header(), p.ledger_blob(), rungs, p.chunk_bytes(),
-                                                      [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, uq);
+                                                      [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, uq, &pool);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "%s\n", kvflash_state_digest_line(tag, key, gen, d, ms).c_str());
     std::fflush(stderr);
@@ -1220,8 +1221,8 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     uq_store_[(size_t)slot] = std::move(l.uq);
     if (!uq_store_[(size_t)slot].empty())
         std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, uq_store_[(size_t)slot].lo, uq_store_[(size_t)slot].hi, uq_store_[(size_t)slot].n);
-    const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind (pins are not state)
-    if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the pins, the rebind and any reselect
+    const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind: the hard pins came back with the pager's layout, the rebind only adds the head's again
+    if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the rebind and any reselect
         ParkedSession & q = parked_[(size_t)slot];
         if (const std::string & fault = kvflash_digest_fault(); !fault.empty()) {   // R3 negative control (test hook): corrupt one byte of the live restored slot
             KvFlashSlotPager & fp = kvf_kv_->pager(slot);
