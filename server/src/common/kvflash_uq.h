@@ -109,6 +109,13 @@ inline bool kvflash_uq_belongs(const KvFlashUqStore & s, const std::vector<int32
     return !s.empty() && s.lo >= 0 && s.lo < s.hi && s.hi <= (int)ids.size() && s.n <= s.hi - s.lo && !s.rows.empty() &&
            s.rows.size() % (size_t)s.n == 0 && s.hash == kvflash_uq_hash(ids, s.hi);
 }
+// A slot holds the stores of several questions: the one a bundle save keeps is this history's latest question's (null: none).
+inline const KvFlashUqStore * kvflash_uq_of_history(const std::vector<KvFlashUqStore> & v, const std::vector<int32_t> & ids) {
+    const KvFlashUqStore * best = nullptr;
+    for (const KvFlashUqStore & s : v)
+        if (kvflash_uq_belongs(s, ids) && (!best || s.hi > best->hi)) best = &s;
+    return best;
+}
 
 // LRU of stores, most recent first, keyed by {hi, hash of ids[0, hi)}: the key is the content of the
 // prompt prefix, so a store stays valid whatever the pager or history did since.

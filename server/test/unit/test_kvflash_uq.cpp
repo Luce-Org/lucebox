@@ -367,6 +367,25 @@ TEST_CASE(KvflashUqFixture, a_store_belongs_to_the_history_it_was_captured_from)
     t = s; t.rows.pop_back();                         CHECK(!kvflash_uq_belongs(t, ids));   // ragged rows
     CHECK(!kvflash_uq_belongs(KvFlashUqStore{}, ids));
 }
+// A slot keeps the stores of several questions: the save takes the one of this history's latest question, not the most recent put.
+TEST_CASE(KvflashUqFixture, a_save_takes_the_store_of_the_historys_latest_question) {
+    const std::vector<int32_t> ids{5, 6, 7, 8, 9, 10, 11, 12};
+    auto side = ids; side[5] = 99;                                      // a side request: other ids from position 5
+    auto st = [](const std::vector<int32_t> & of, int hi) {
+        KvFlashUqStore s; s.lo = hi - 2; s.hi = hi; s.n = 2; s.hash = kvflash_uq_hash(of, hi); s.rows = {1.f, 2.f, 3.f, 4.f};
+        return s;
+    };
+    std::vector<KvFlashUqStore> v;
+    CHECK(kvflash_uq_of_history(v, ids) == nullptr);
+    kvflash_uq_put(v, st(ids, 4), 4);                                   // the session's first question
+    kvflash_uq_put(v, st(ids, 7), 4);                                   // its latest
+    kvflash_uq_put(v, st(side, 8), 4);                                  // the side question: the most recent put
+    const KvFlashUqStore * s = kvflash_uq_of_history(v, ids);
+    REQUIRE(s != nullptr);
+    CHECK(s->hi == 7);
+    CHECK(kvflash_uq_of_history(v, side)->hi == 8);
+    CHECK(kvflash_uq_of_history(v, std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}) == nullptr);
+}
 
 // The live question stores are host memory no request reserved (24 MiB a store on qwen35-27B, 4 a slot): the list's bytes
 // are held on the host ledger, put by put, and given back when a store leaves.
