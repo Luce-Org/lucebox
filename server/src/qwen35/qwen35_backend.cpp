@@ -105,17 +105,6 @@ static bool tokens_have_recent_any(const std::vector<int32_t> & tokens,
     return false;
 }
 
-// RDNA4 (gfx1200/gfx1201): the only device the paged WMMA kernel launches on. HIP builds only; false elsewhere.
-static bool device_is_rdna4(int gpu) {
-#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
-    cudaDeviceProp prop{};
-    return cudaGetDeviceProperties(&prop, gpu) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
-#else
-    (void) gpu;
-    return false;
-#endif
-}
-
 static int env_int_or_default(const char * name, int fallback) {
     if (const char * raw = std::getenv(name)) {
         if (*raw) return std::atoi(raw);
@@ -532,7 +521,6 @@ bool Qwen35Backend::init() {
     if (cfg_.paged_attention && kvflash_active()) {
         luce::common::KvFlashConcurrentRequest rq;
         rq.arch = kvflash_arch();
-        rq.wmma_env = luce::common::kvflash_paged_wmma_active(std::getenv("LUCE_PAGED_WMMA"), device_is_rdna4(cfg_.device.gpu));
         rq.draft = cfg_.draft_path.has_value();
         rq.tree = cfg_.ddtree_mode;
         rq.chain_spec_switch = luce::common::kvflash_chain_spec_switch();

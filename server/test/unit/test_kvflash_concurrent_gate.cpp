@@ -47,16 +47,8 @@ TEST_CASE(KvflashConcurrentGateFixture, only_dense_qwen35_may_run_the_concurrent
     }
 }
 
-TEST_CASE(KvflashConcurrentGateFixture, wmma_a_draft_and_tree_verification_are_refused_with_a_message_each) {
+TEST_CASE(KvflashConcurrentGateFixture, a_draft_and_tree_verification_are_refused_with_a_message_each) {
     auto base = [] { KvFlashConcurrentRequest r; r.arch = "qwen35"; return r; };
-    {
-        auto r = base(); r.wmma_env = true;               // until the kernel excludes null blocks
-        const auto m = kvflash_concurrent_refusal(r);
-        REQUIRE(m.has_value());
-        CHECK(m->find("PAGED_WMMA") != std::string::npos);
-        r.wmma_null_exclusion_ready = true;               // what qwen35_backend.cpp sets: the WMMA kernel skips all-null chunks
-        CHECK(!kvflash_concurrent_refusal(r).has_value());
-    }
     { auto r = base(); r.draft = true;  const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("draft") != std::string::npos); }
     { auto r = base(); r.tree = true;   const auto m = kvflash_concurrent_refusal(r); REQUIRE(m.has_value()); CHECK(m->find("tree") != std::string::npos); }
 }
@@ -91,7 +83,6 @@ TEST_CASE(KvflashConcurrentGateFixture, a_dflash2_chain_is_allowed_only_with_the
     { auto r = chain_request(); r.draft_block = 0;                 refused(r, "draft"); }
     { auto r = chain_request(); r.fa_window = 4096;                refused(r, "draft"); }
     { auto r = chain_request(); r.arch = "qwen35moe";              refused(r, "qwen35"); }
-    { auto r = chain_request(); r.wmma_env = true;                 refused(r, "PAGED_WMMA"); }
     // the switch without a draft changes nothing
     { KvFlashConcurrentRequest r; r.arch = "qwen35"; r.chain_spec_switch = true; CHECK(!kvflash_concurrent_refusal(r).has_value()); }
 }
@@ -376,22 +367,6 @@ TEST_CASE(KvflashConcurrentGateFixture, test_switch_opens_only_on_exactly_1) {
     setenv("LUCE_KVFLASH_CONCURRENT_TEST", "1", 1);
     CHECK(luce::common::kvflash_concurrent_test_switch());
     if (old) setenv("LUCE_KVFLASH_CONCURRENT_TEST", old, 1); else unsetenv("LUCE_KVFLASH_CONCURRENT_TEST");
-}
-
-TEST_CASE(KvflashConcurrentGateFixture, wmma_is_active_when_the_launcher_would_run_it_not_only_for_a_literal_1) {
-    // The launcher: on unless LUCE_PAGED_WMMA parses to 0, and only on an RDNA4 device.
-    CHECK(kvflash_paged_wmma_active(nullptr, true));     // unset: the kernel is on by default
-    CHECK(kvflash_paged_wmma_active("1", true));
-    CHECK(kvflash_paged_wmma_active("2", true));
-    CHECK(!kvflash_paged_wmma_active("", true));         // atoi("") == 0: the launcher reads it as off
-    CHECK(!kvflash_paged_wmma_active("0", true));        // the opt-out
-    CHECK(!kvflash_paged_wmma_active(nullptr, false));   // gfx1151 and NVIDIA never take the kernel
-    CHECK(!kvflash_paged_wmma_active("1", false));
-    KvFlashConcurrentRequest r; r.arch = "qwen35";
-    r.wmma_env = kvflash_paged_wmma_active(nullptr, true);
-    const auto m = kvflash_concurrent_refusal(r);
-    REQUIRE(m.has_value());
-    CHECK(m->find("LUCE_PAGED_WMMA=0") != std::string::npos);   // the message names the way out
 }
 
 TEST_CASE(KvflashConcurrentGateFixture, the_page_stream_must_exist_on_an_async_dma_build) {
