@@ -97,7 +97,7 @@ private:
                      std::vector<float> & logits, const Qwen4ExpInputs * inputs = nullptr);
     // A prompt chunk's host inputs (embeddings, PLE rows): those gathered while the previous chunk computed when they
     // were gathered for these tokens and this history, else gathered now. Then starts the gather for the slot's next
-    // chunk, which the single-slot loop also runs ahead.
+    // chunk, which the single-slot loop also runs ahead. A lookahead that fails or cannot start is gathered inline.
     Qwen4ExpInputs prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment);
     bool mtp_eligible(const StepPlan & plan) const;
     StepResult mtp_step(const StepInput & input);
@@ -124,10 +124,10 @@ private:
     SpecWidthCostMemory * mtp_costs_;
     struct InputGather {   // a slot's next prompt chunk: its position, tokens and PLE history, and its inputs
         int pos0 = -1;
-        std::vector<int32_t> tokens, prev;
+        std::vector<int32_t> tokens, ple_prev;
         std::future<Qwen4ExpInputs> inputs;
     };
-    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); last, so joined before the rest goes
+    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); joined first by the destructor
 };
 
 } // namespace luce::common

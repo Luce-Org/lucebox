@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -50,6 +51,7 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       next_inputs_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
+    next_inputs_.clear();   // waits for any lookahead gather still running
     ggml_backend_synchronize(backend_);
     for (Qwen4ExpSnapshot & checkpoint : checkpoints_) free_qwen4exp_snapshot(checkpoint);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
@@ -358,27 +360,37 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
 }
 
 Qwen4ExpInputs Qwen4ExpSeqEngine::prompt_inputs(int slot, const Qwen4ExpForwardSegment & segment) {
-    const std::vector<int32_t> & prev = segment.cache->ple_prev;
+    const std::vector<int32_t> & ple_prev = segment.cache->ple_prev;
     InputGather & next = next_inputs_[(size_t)slot];
     Qwen4ExpInputs inputs;
-    if (next.inputs.valid()) {
-        Qwen4ExpInputs ahead = next.inputs.get();
-        if (next.pos0 == segment.pos0 && next.prev == prev &&
-            next.tokens == std::vector<int32_t>(segment.tokens, segment.tokens + segment.n_tokens)) {
-            inputs = std::move(ahead);
+    // The lookahead serves this chunk only when it was gathered for exactly it (the inputs depend on nothing else).
+    if (next.inputs.valid() && next.pos0 == segment.pos0 && next.ple_prev == ple_prev &&
+        std::equal(next.tokens.begin(), next.tokens.end(), segment.tokens, segment.tokens + segment.n_tokens)) {
+        try {
+            inputs = next.inputs.get();
+        } catch (...) {   // the gather failed (memory, a reader thread): gather inline, as without the lookahead
+            inputs = Qwen4ExpInputs{};
         }
     }
-    if (!inputs.ok) inputs = qwen4exp_prepare_inputs(weights_, segment.tokens, segment.n_tokens, prev);
-    // The slot's next chunk as the next step plans it when nothing else changes (this chunk is appended already).
+    if (!inputs.ok) inputs = qwen4exp_prepare_inputs(weights_, segment.tokens, segment.n_tokens, ple_prev);
+    next = InputGather{};   // a missed lookahead goes only now, so the inline gather above did not wait for it
+    // The slot's next chunk as the next step plans it when nothing else changes (this chunk is appended already): a
+    // whole granule, cut at the slot's restore points and capture boundary (prefill_segment). The step limits grant
+    // every prefilling sequence a whole granule (step_plan_limits), so it is the next slice unless the scheduler
+    // grants less; then the next chunk misses and is gathered inline.
     const SeqSlot & s = slots_.slot(slot);
     const int n = inputs.ok && s.cur_pos < s.prompt_len ? prefill_segment(slot, prefill_granule_) : 0;
     if (n > 0) {
         next.pos0 = s.cur_pos;
         next.tokens.assign(s.sample_history.begin() + s.cur_pos, s.sample_history.begin() + s.cur_pos + n);
-        next.prev = inputs.ple_prev;
-        next.inputs = std::async(std::launch::async, [this, tokens = next.tokens, prev = next.prev] {
-            return qwen4exp_prepare_inputs(weights_, tokens.data(), (int) tokens.size(), prev);
-        });
+        next.ple_prev = inputs.ple_prev;
+        try {
+            next.inputs = std::async(std::launch::async, [&w = weights_, tokens = next.tokens, prev = next.ple_prev] {
+                return qwen4exp_prepare_inputs(w, tokens.data(), (int) tokens.size(), prev);
+            });
+        } catch (const std::exception &) {   // no thread for it (std::system_error): the next chunk is gathered inline
+            next = InputGather{};
+        }
     }
     return inputs;
 }
@@ -651,7 +663,7 @@ void Qwen4ExpSeqEngine::retire(int slot) {
         if (verify_width_ == 0) mtp_costs_->store(*mtp_width_, mtp_.context);
         mtp_ = MtpState{};
     }
-    next_inputs_[(size_t)slot] = InputGather{};   // its next chunk is not coming: wait out its gather, drop it
+    next_inputs_[(size_t)slot] = InputGather{};   // its next chunk is not coming: waits out its gather (one at most)
     ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();
