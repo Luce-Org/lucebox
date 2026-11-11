@@ -21,6 +21,7 @@
 #include "../../src/common/concurrency/seq_slot_manager.h"
 #include "../../src/common/kvflash_arena.h"
 #include "../../src/common/kvflash_pinned_head.h"
+#include "../../src/common/kvflash_slot_bundle.h"
 
 #include <map>
 #include <memory>
@@ -191,6 +192,41 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, restart_adopts_a_full_session_and_the_r
     other[5] ^= 1;
     CHECK(!kvflash_head_rebind(*w3.kv, w3.binder, a.slot, other, a.hash, kK));
     CHECK(unbound(w3, a.slot, kK));
+}
+
+// A parked session that went through evictions (its pool layout is not the identity and its LRU order is not the chunk
+// order) comes back from a bundle (header, chunks and ledger, and the pool layout the head carries) as the pager that
+// parked, with the pins the rebind puts back: the restored slot evicts the victims the live slot would.
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_restart_restores_the_parked_layout_lru_order_and_pins) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const Captured a = capture_on_miss(w, mgr, 1, 1200);
+    REQUIRE(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
+    mgr.commit_prefill(a.slot);
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park(a.slot, hist));
+    KvFlashSlotPager & live = *w.s[(size_t)a.slot];
+    REQUIRE(live.resident_blocks() < live.n_chunks());           // it evicted: not every chunk is in the pool
+    std::vector<int> identity;
+    for (int c = 0; c < live.n_chunks(); c++) if (live.is_resident(c)) identity.push_back(c);
+    REQUIRE(live.lru_victims(kQ) != std::vector<int>(identity.begin() + kK, identity.end()));   // the LRU order is not the chunk order
+
+    KvFlashSlotHead h;
+    kvflash_head_take_pager(h, live);
+    std::vector<uint8_t> blob;                                    // what the bundle assembles from the head and the log
+    live.serialize_to([&](const uint8_t * d, size_t n) { blob.insert(blob.end(), d, d + n); return true; });
+    std::memcpy(blob.data(), kKvFlashPagerMagic3, 8);
+    blob.insert(blob.end(), h.pool.begin(), h.pool.end());
+
+    World w2;                                                     // the restarted server
+    REQUIRE(w2.kv->adopt_parked(a.slot, 0x99, 1200, blob.data(), blob.size()) == PagedKvStatus::Ok);
+    KvFlashSlotPager & back = *w2.s[(size_t)a.slot];
+    CHECK(back.serialize() == live.serialize());                  // block table, LRU ranks, use clock, free list order
+    CHECK(restored_unbound(w2, a.slot, kK));                      // the pins are in the layout: the binding comes from meta.json
+    REQUIRE(kvflash_head_rebind(*w2.kv, w2.binder, a.slot, hist, a.hash, kK));
+    CHECK(bound(w2, a.slot, kK));
+    for (int c = 0; c < live.n_chunks(); c++) CHECK(back.is_pinned(c) == live.is_pinned(c));
+    CHECK(back.lru_victims(kQ) == live.lru_victims(kQ));
 }
 
 TEST_CASE(KvflashPinnedHeadPathsFixture, a_rung_rewind_of_a_parked_session_keeps_the_binding_down_to_the_prefix_and_releases_below) {

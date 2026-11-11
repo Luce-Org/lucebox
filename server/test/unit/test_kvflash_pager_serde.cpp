@@ -4,6 +4,7 @@
 // that moves bytes between pool and host backing is exercised for real.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_pager_test_host.h"
+#include "../../src/common/kvflash_slot_bundle.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -1616,4 +1618,54 @@ TEST_CASE(KvflashPagerSerdeFixture, a_restored_pager_keeps_the_hard_pins_and_res
     live.score_hook = nullptr;
     back.score_hook = nullptr;
     CHECK(back.serialize() == live.serialize());
+}
+
+// The same through a session bundle on disk: the park a slot writes (head, one record per chunk) and the restore that reads
+// it back and feeds the pager. The restored pager is the parked one: it evicts and reselects as the live slot does.
+TEST_CASE(KvflashPagerSerdeFixture, a_session_bundle_restores_the_parked_pager_as_it_was) {
+    Harness A;
+    TestPager live;
+    build_lived_in(A, live);
+    const std::string dir = "kvflash_pager_unit_bundle";
+    std::filesystem::remove_all(dir);
+    const uint64_t id = 91;
+    const size_t cb = live.chunk_bytes(), rb = kvflash_record_bytes(cb);
+    KvFlashSlotHead h;
+    h.identity = id; h.gen = 1; h.log_gen = 1; h.end_gen = 2;
+    h.history.assign((size_t)live.n_chunks() * kChunk, 1);
+    kvflash_head_take_pager(h, live);
+    h.map.assign((size_t)live.n_chunks(), 0);
+    KvFlashBundleCommit c;
+    c.dir = dir; c.gen = 1; c.log_gen = 1; c.new_log = true; c.new_dir = true; c.record_bytes = rb;
+    uint64_t off = kKvFlashLogHeader;
+    for (int ci = 0; ci < live.n_chunks(); ++ci) {
+        if (h.ledger[(size_t)ci * kKvFlashLedgerEntry + 1] == 0) continue;
+        std::vector<uint8_t> bytes(cb);
+        live.read_chunk(ci, bytes.data());
+        c.records.push_back({(uint32_t)ci, std::move(bytes)});
+        h.map[(size_t)ci] = off; off += rb;
+    }
+    h.log_bytes = off;
+    c.files = {{kvflash_bundle_slab_name(h.end_gen), kvflash_slab_pack({{1}}, {{2}})}};
+    c.head = kvflash_head_pack(h);
+    REQUIRE(kvflash_bundle_commit(c));
+
+    KvFlashBundleLoaded l;
+    std::string why;
+    REQUIRE(kvflash_bundle_load(dir, id, cb, KvFlashBundleLimits{1 << 20, 1 << 20, 1 << 20, 8}, l, why));
+    Harness B;
+    TestPager back;
+    REQUIRE(back.attach(make_cfg(), B.k, B.v));
+    REQUIRE(back.deserialize(l.pager.data(), l.pager.size(), 10));
+    kvflash_bundle_remove(dir);
+
+    CHECK(block_table(back, 10) == block_table(live, 10));
+    CHECK(back.lru_victims(8) == live.lru_victims(8));
+    CHECK(back.serialize() == live.serialize());
+    for (int c2 = 0; c2 < 10; c2++) if (live.is_resident(c2)) CHECK(chunk_matches(B, back, c2, 3));
+    for (int c2 = 10; c2 < 14; c2++) {
+        REQUIRE(live.alloc_span(c2 * kChunk, kChunk));
+        REQUIRE(back.alloc_span(c2 * kChunk, kChunk));
+        CHECK(block_table(back, c2 + 1) == block_table(live, c2 + 1));
+    }
 }

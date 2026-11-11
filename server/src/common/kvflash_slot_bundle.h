@@ -48,6 +48,9 @@ constexpr size_t kKvFlashLogHeader = 16;   // "KVFSLOG3", u32 log generation, u3
 constexpr size_t kKvFlashRecordTag = 16;   // u32 chunk, u32 park generation, u64 crc64 of the payload
 constexpr size_t kKvFlashPagerHdr = 44;    // KvFlashPager's blob header, kept whole in the head
 constexpr size_t kKvFlashLedgerEntry = 8;  // its per-chunk ledger entry: u8 was_resident, u8 materialized, 2 pad, f32 score
+constexpr size_t kKvFlashPoolHdr = 16;     // its pool layout (KvFlashPager::pool_layout_blob): u32 n_blocks, u32 n_free, u64 use clock,
+constexpr size_t kKvFlashPoolEntry = 16;   // then per chunk: i32 block, u32 hard-pin flag, u64 LRU rank; then n_free x i32 free blocks in order
+constexpr char kKvFlashPagerMagic3[9] = "3HSALFVK";   // "KVFLASH3" as the pager writes its u64: the blob with the pool layout after the ledger
 
 inline uint64_t kvflash_fnv1a(std::string_view s) {
     uint64_t h = 1469598103934665603ULL;
@@ -206,6 +209,10 @@ struct KvFlashSlotHead {
     // prompt ids [0, uq_hi) as the live store is. uq_gen 0: none (a head from before this section, or a slot that held none).
     uint32_t uq_gen = 0, uq_lo = 0, uq_hi = 0, uq_n = 0;
     uint64_t uq_hash = 0;
+    // The pager's pool layout (KvFlashPager::pool_layout_blob), an optional section after the UQ one: the chunk -> block table, the
+    // LRU ranks, the use clock and the free list in order. Without it a restored pager gets the identity layout and a chunk-order LRU
+    // and so evicts other chunks than the live slot would. Empty: none (a head from before this section).
+    std::vector<uint8_t> pool;
     std::vector<int32_t> history;
     std::vector<uint8_t> pager_hdr;        // kKvFlashPagerHdr bytes
     std::vector<uint64_t> map;             // per chunk: the record's offset in the log, 0: no record (zeros)
@@ -229,7 +236,10 @@ template <class F> inline uint64_t kvflash_head_slab_bytes(const KvFlashSlotHead
 inline uint32_t kvflash_head_max_gen(const KvFlashSlotHead & h) { const auto g = kvflash_head_owned_gens(h); return std::max(h.gen, *std::max_element(g.begin(), g.end())); }
 
 inline size_t kvflash_head_bytes(size_t nh, size_t nc) { return 8 + 8 + 4 + 4 + 8 + 5 * 4 + 4 + nh * 4 + 4 + kKvFlashPagerHdr + 4 + nc * 8 + 4 + nc * 8 + 12; }
-inline size_t kvflash_head_max_bytes(size_t history_max, size_t nc_max) { return kvflash_head_bytes(history_max, nc_max) + 24; }   // + the UQ section (kUqTail)
+// + the UQ section (kUqTail) and the pool section: its length, the layout of nc_max chunks and a free list of up to blocks_max blocks
+inline size_t kvflash_head_max_bytes(size_t history_max, size_t nc_max, size_t blocks_max = 0) {
+    return kvflash_head_bytes(history_max, nc_max) + 24 + 4 + kKvFlashPoolHdr + nc_max * kKvFlashPoolEntry + blocks_max * 4;
+}
 
 inline std::vector<uint8_t> kvflash_head_pack(const KvFlashSlotHead & h) {
     std::vector<uint8_t> out(detail::kHeadMagic, detail::kHeadMagic + 8);   // constructed, not inserted: gcc 11 -Wstringop-overflow
@@ -238,11 +248,20 @@ inline std::vector<uint8_t> kvflash_head_pack(const KvFlashSlotHead & h) {
     for (uint32_t v : {h.ckpt_pos, h.trunk_pos, h.end_gen, h.ckpt_gen, h.trunk_gen}) detail::put(out, v);
     detail::put_array(out, h.history); detail::put_array(out, h.pager_hdr); detail::put_array(out, h.map); detail::put_array(out, h.ledger);
     detail::put(out, h.extra_pos); detail::put(out, h.extra_gen); detail::put(out, h.pin_pos);   // an older head ends before them
-    if (h.uq_gen != 0) {   // the UQ section, last and only when there are rows: a head with none is the bytes it was before it (24 B more with)
+    if (h.uq_gen != 0 || !h.pool.empty()) {   // the UQ section, only when there are rows or a pool section follows it (24 B, all zero for none)
         for (uint32_t v : {h.uq_gen, h.uq_lo, h.uq_hi, h.uq_n}) detail::put(out, v);
         detail::put(out, h.uq_hash);
     }
+    if (!h.pool.empty()) detail::put_array(out, h.pool);   // last, and only when the pager gave one: a head with none is the bytes it was before it
     return out;
+}
+
+// What a park takes from the slot's pager for its head: the header, the ledger and the pool layout (the layout and the LRU order a
+// restore puts back, so the restored slot continues like the live one). The map and the records are the caller's.
+template <class Pager> inline void kvflash_head_take_pager(KvFlashSlotHead & h, const Pager & p) {
+    h.pager_hdr = p.blob_header();
+    h.ledger = p.ledger_blob();
+    h.pool = p.pool_layout_blob();
 }
 
 // False (out untouched) on a bad magic, another identity, a truncated or oversized section, an
@@ -258,12 +277,14 @@ inline bool kvflash_head_unpack(const uint8_t * data, size_t n, uint64_t identit
     // the tail: nothing (the base head), 4 bytes (the first B4 try's branch_pos, ignored), the third rung, or the third and its pin.
     // A new head cut by exactly 4 or 8 bytes reads as an older one (the pin or the third is lost): accepted, a head is written by an atomic rename.
     // 36 bytes: the third, its pin and the UQ rows' section (kUqTail); an older head has none, and a head cut inside it is refused.
+    // More than 36: the pager's pool layout after them (a length and its bytes), which must end the head.
     constexpr size_t kUqTail = 24;
     const size_t tail = n - c.at;
-    if (tail == 8 || tail == 12 || tail == 12 + kUqTail) { if (!c.get(h.extra_pos) || !c.get(h.extra_gen)) return false; }
-    if ((tail == 12 || tail == 12 + kUqTail) && !c.get(h.pin_pos)) return false;
-    if (tail == 12 + kUqTail && (!c.get(h.uq_gen) || !c.get(h.uq_lo) || !c.get(h.uq_hi) || !c.get(h.uq_n) || !c.get(h.uq_hash))) return false;
-    if (tail != 0 && tail != 4 && tail != 8 && tail != 12 && tail != 12 + kUqTail) return false;
+    if (tail == 8 || tail == 12 || tail >= 12 + kUqTail) { if (!c.get(h.extra_pos) || !c.get(h.extra_gen)) return false; }
+    if ((tail == 12 || tail >= 12 + kUqTail) && !c.get(h.pin_pos)) return false;
+    if (tail >= 12 + kUqTail && (!c.get(h.uq_gen) || !c.get(h.uq_lo) || !c.get(h.uq_hi) || !c.get(h.uq_n) || !c.get(h.uq_hash))) return false;
+    if (tail > 12 + kUqTail && (!c.get_array(h.pool) || h.pool.empty() || c.at != n)) return false;
+    if (tail != 0 && tail != 4 && tail != 8 && tail != 12 && tail < 12 + kUqTail) return false;
     const size_t nh = h.history.size();
     if (nh == 0 || h.ckpt_pos > nh || h.trunk_pos > nh || h.end_gen == 0 || (h.ckpt_pos == 0) != (h.ckpt_gen == 0) ||
         (h.trunk_pos == 0) != (h.trunk_gen == 0) || h.pager_hdr.size() != kKvFlashPagerHdr || h.ledger.size() != h.map.size() * kKvFlashLedgerEntry) return false;
@@ -277,6 +298,13 @@ inline bool kvflash_head_unpack(const uint8_t * data, size_t n, uint64_t identit
         (h.extra_pos != 0 && (h.extra_pos == h.ckpt_pos || h.extra_pos == h.trunk_pos))) return false;
     // the pin: none, or the position of the third (when there is one) or else of the checkpoint or the trunk
     if (h.pin_pos != 0 && h.pin_pos != (h.extra_pos != 0 ? h.extra_pos : h.ckpt_pos) && !(h.extra_pos == 0 && h.pin_pos == h.trunk_pos)) return false;
+    // the pool layout: a header and an entry per chunk, then the free list its header counts
+    if (!h.pool.empty()) {
+        uint32_t n_free = 0;
+        if (h.pool.size() < kKvFlashPoolHdr + h.map.size() * kKvFlashPoolEntry) return false;
+        std::memcpy(&n_free, h.pool.data() + 4, 4);
+        if (h.pool.size() != kKvFlashPoolHdr + h.map.size() * kKvFlashPoolEntry + (size_t)n_free * 4) return false;
+    }
     // the UQ rows: a window inside the history holding n rows, in a file of their own
     if (h.uq_gen != 0 && (h.uq_n == 0 || h.uq_lo >= h.uq_hi || h.uq_hi > nh || h.uq_n > h.uq_hi - h.uq_lo ||
                           h.uq_gen == h.end_gen || h.uq_gen == h.ckpt_gen || h.uq_gen == h.trunk_gen || h.uq_gen == h.extra_gen)) return false;
@@ -373,7 +401,7 @@ template <class ReadAt>
 inline bool kvflash_bundle_assemble(const KvFlashSlotHead & h, size_t chunk_bytes, ReadAt && read_at, std::vector<uint8_t> & out, std::string & why) {
     const size_t nc = h.map.size();
     std::vector<uint8_t> blob;
-    const size_t total = h.pager_hdr.size() + nc * chunk_bytes + h.ledger.size();
+    const size_t total = h.pager_hdr.size() + nc * chunk_bytes + h.ledger.size() + h.pool.size();
     try { blob.reserve(total); } catch (const std::bad_alloc &) { why = "cannot hold " + std::to_string(total) + " bytes"; return false; }
     blob.insert(blob.end(), h.pager_hdr.begin(), h.pager_hdr.end());
     const bool ok = kvflash_bundle_walk(h, chunk_bytes, read_at, [&](size_t, const uint8_t * payload) {
@@ -381,6 +409,10 @@ inline bool kvflash_bundle_assemble(const KvFlashSlotHead & h, size_t chunk_byte
     }, why);
     if (!ok) return false;
     blob.insert(blob.end(), h.ledger.begin(), h.ledger.end());
+    if (!h.pool.empty()) {   // the pool layout makes it the pager's KVFLASH3 blob: it restores the park's layout, not an identity one
+        std::memcpy(blob.data(), kKvFlashPagerMagic3, 8);
+        blob.insert(blob.end(), h.pool.begin(), h.pool.end());
+    }
     out = std::move(blob);
     return true;
 }
@@ -545,7 +577,9 @@ struct KvFlashBundleLimits {
     size_t history_max = 0;                // tokens (the context)
     size_t nc_max = 0;                     // chunks (the context in chunks)
     size_t slab_max = 0;                   // bytes of one slab file (kvflash_slab_max_bytes)
+    size_t blocks_max = 0;                 // blocks of a slot's pool: the longest free list of the pool layout in a head
 };
+inline size_t kvflash_bundle_head_max(const KvFlashBundleLimits & lim) { return kvflash_head_max_bytes(lim.history_max, lim.nc_max, lim.blocks_max); }
 
 // The park a slot directory holds: its head (within the limits, of this identity), the pager
 // blob assembled from its log, its slab files. False with the reason.
@@ -553,7 +587,7 @@ inline bool kvflash_bundle_load(const std::string & dir, uint64_t identity, size
                                 KvFlashBundleLoaded & out, std::string & why) {
     std::vector<uint8_t> bytes;
     KvFlashBundleLoaded l;
-    const size_t head_max = kvflash_head_max_bytes(lim.history_max, lim.nc_max);
+    const size_t head_max = kvflash_bundle_head_max(lim);
     if (!kvflash_bundle_read(dir + "/head", bytes, head_max)) { why = "no head under " + std::to_string(head_max) + " bytes"; return false; }
     if (!kvflash_head_unpack(bytes.data(), bytes.size(), identity, l.head)) { why = "head refused: another server or a bad format"; return false; }
     if (l.head.history.size() > lim.history_max || l.head.map.size() > lim.nc_max) {

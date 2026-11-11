@@ -1080,7 +1080,7 @@ void Qwen35SeqEngine::init_bundles_() {
     std::fprintf(stderr, "[kvflash] sessions on disk: %s/sessions (identity %016llx)\n", dir, (unsigned long long)bundle_identity_);
     const size_t slab = slab_bytes_();   // the read cap: a file past what this server can write is skipped before it is loaded
     const size_t max_ctx = (size_t)slots_.max_context(), ct = (size_t)p0.chunk_tokens();
-    bundle_lim_ = KvFlashBundleLimits{max_ctx, (max_ctx + ct - 1) / ct, kvflash_slab_max_bytes(slab)};
+    bundle_lim_ = KvFlashBundleLimits{max_ctx, (max_ctx + ct - 1) / ct, kvflash_slab_max_bytes(slab), (size_t)p0.n_pool_blocks()};
     // The session store is a tenant of the cache directory's DiskStore (one budget, one LRU, one TTL); every session
     // directory is listed, the newest ones fill the slots and the rest stay on disk.
     book_.enable_store(KvFlashSessionStore(dir), bundle_identity_);
@@ -1088,7 +1088,7 @@ void Qwen35SeqEngine::init_bundles_() {
     book_.resume_claim = [this](const std::string & key) { return book_.store().claim(key); };   // the budget cannot evict a session a restore is about to read
     std::error_code mk;
     std::filesystem::create_directories(book_.store().dir(""), mk);
-    const size_t head_max = kvflash_head_max_bytes(bundle_lim_.history_max, bundle_lim_.nc_max);
+    const size_t head_max = kvflash_bundle_head_max(bundle_lim_);
     KvFlashScanReport rep;
     book_.store().load(kvflash_session_scan(dir, bundle_identity_, kvflash_record_bytes(p0.chunk_bytes()), head_max, rep, bundle_lim_.slab_max));
     std::fprintf(stderr, "[kvflash] sessions: %zu on disk, %zu empty removed, %zu skipped (another server's)\n",
@@ -1149,7 +1149,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     // server's limits, an occupied slot) falls through to the load, which refuses with its own reason.
     auto read_head = [&](KvFlashSlotHead & head) {
         std::vector<uint8_t> bytes;
-        return kvflash_bundle_read(sdir + "/head", bytes, kvflash_head_max_bytes(bundle_lim_.history_max, bundle_lim_.nc_max)) &&
+        return kvflash_bundle_read(sdir + "/head", bytes, kvflash_bundle_head_max(bundle_lim_)) &&
                kvflash_head_unpack(bytes.data(), bytes.size(), bundle_identity_, head) &&
                head.history.size() <= bundle_lim_.history_max && head.map.size() <= bundle_lim_.nc_max;
     };
@@ -1395,8 +1395,7 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
     KvFlashSlotHead h;
     h.identity = bundle_identity_; h.gen = c.gen;
     h.history = ps.history;
-    h.pager_hdr = p.blob_header();
-    h.ledger = p.ledger_blob();
+    kvflash_head_take_pager(h, p);
     h.map.assign((size_t)nc, 0);
     // the records: a chunk from the resume point on, or one the previous park had no record for
     const int d0 = fresh ? 0 : kvflash_bundle_dirty_chunks(sb.resume_L, nc, p.chunk_tokens()).first;
