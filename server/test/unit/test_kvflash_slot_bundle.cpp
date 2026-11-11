@@ -41,7 +41,7 @@ KvFlashSlotHead sample_head() {
 bool same(const KvFlashSlotHead & a, const KvFlashSlotHead & b) {
     return a.identity == b.identity && a.gen == b.gen && a.log_gen == b.log_gen && a.log_bytes == b.log_bytes &&
            a.ckpt_pos == b.ckpt_pos && a.trunk_pos == b.trunk_pos && a.end_gen == b.end_gen && a.ckpt_gen == b.ckpt_gen &&
-           a.trunk_gen == b.trunk_gen && a.extra_pos == b.extra_pos && a.extra_gen == b.extra_gen && a.pin_pos == b.pin_pos && a.history == b.history && a.pager_hdr == b.pager_hdr && a.map == b.map && a.ledger == b.ledger;
+           a.trunk_gen == b.trunk_gen && a.extra_pos == b.extra_pos && a.extra_gen == b.extra_gen && a.pin_pos == b.pin_pos && a.history == b.history && a.pager_hdr == b.pager_hdr && a.pool == b.pool && a.map == b.map && a.ledger == b.ledger;
 }
 
 inline std::vector<uint8_t> kvflash_record(uint32_t chunk, uint32_t gen, const uint8_t * payload, size_t n) {
@@ -833,4 +833,63 @@ TEST_CASE(KvflashSlotBundleFixture, state_digest_covers_the_uq_rows) {
     v = u; v.hi = 6;                                   CHECK(dg(&v).all != with.all);
     v = u; v.hash ^= 1;                                CHECK(dg(&v).all != with.all);        // which question
     KvFlashUqStore e;                                  CHECK(dg(&e).all == none.all);        // an empty store is no store
+}
+
+// Evidence: prs/evidence/G6/RESULTS.md section 6: a session restored from disk did not continue like the live slot (other block
+// table, other LRU order, other resident chunks at the first scorer call) because the bundle kept the chunks and the ledger but not
+// the pager's pool layout. The head carries the layout (KvFlashPager::pool_layout_blob) and assembly appends it under the KVFLASH3 magic.
+namespace {
+// A pool layout of nc chunks and n_free free blocks as the pager writes it: u32 n_blocks, u32 n_free, u64 clock, nc x 16, n_free x i32.
+std::vector<uint8_t> sample_pool(size_t nc, uint32_t n_free) {
+    std::vector<uint8_t> p(kKvFlashPoolHdr + nc * kKvFlashPoolEntry + n_free * 4);
+    for (size_t i = 0; i < p.size(); ++i) p[i] = (uint8_t)(0x30 + i);
+    const uint32_t n_blocks = (uint32_t)nc + n_free;
+    std::memcpy(p.data(), &n_blocks, 4); std::memcpy(p.data() + 4, &n_free, 4);
+    return p;
+}
+}  // namespace
+
+TEST_CASE(KvflashSlotBundleFixture, a_head_carries_the_pool_layout_and_an_older_head_has_none) {
+    KvFlashSlotHead h = sample_head();
+    const std::vector<uint8_t> plain = kvflash_head_pack(h);                               // no layout: the bytes of the head before this section
+    CHECK(plain.size() == kvflash_head_bytes(h.history.size(), h.map.size()));
+    KvFlashSlotHead out;
+    REQUIRE(kvflash_head_unpack(plain.data(), plain.size(), h.identity, out));
+    CHECK(out.pool.empty());
+    h.pool = sample_pool(4, 3);
+    const std::vector<uint8_t> bytes = kvflash_head_pack(h);
+    CHECK(bytes.size() == plain.size() + 24 + 4 + h.pool.size());                          // the (empty) UQ section, the length, the layout
+    REQUIRE(kvflash_head_unpack(bytes.data(), bytes.size(), h.identity, out));
+    CHECK(out.pool == h.pool); CHECK(out.uq_gen == 0u); CHECK(same(out, h));
+    CHECK(kvflash_head_pack(out) == bytes);
+    put_uq(h, sample_uq(), 6);                                                             // with UQ rows as well
+    const std::vector<uint8_t> both = kvflash_head_pack(h);
+    CHECK(both.size() == bytes.size());
+    REQUIRE(kvflash_head_unpack(both.data(), both.size(), h.identity, out));
+    CHECK(out.pool == h.pool); CHECK(out.uq_gen == 6u); CHECK(out.uq_n == 2u);
+    CHECK(kvflash_head_max_bytes(h.history.size(), h.map.size(), 3) >= both.size());
+    for (size_t cut = 1; cut < 4 + h.pool.size(); ++cut) CHECK(!kvflash_head_unpack(both.data(), both.size() - cut, h.identity, out));   // a torn layout is no head
+    auto longer = both; longer.push_back(0);
+    CHECK(!kvflash_head_unpack(longer.data(), longer.size(), h.identity, out));
+    KvFlashSlotHead t = h;
+    t.pool = sample_pool(3, 3);   { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // a layout of another chunk count
+    t = h; t.pool.pop_back();     { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // a free list its header does not count
+    t = h; t.pool.resize(8);      { auto b = kvflash_head_pack(t); CHECK(!kvflash_head_unpack(b.data(), b.size(), h.identity, out)); }   // no room for its header
+}
+
+TEST_CASE(KvflashSlotBundleFixture, assembly_puts_the_pool_layout_after_the_ledger_under_the_kvflash3_magic) {
+    KvFlashSlotHead h = sample_head();
+    const std::vector<uint8_t> log = sample_log();
+    std::vector<uint8_t> blob;
+    std::string why;
+    REQUIRE(kvflash_bundle_assemble(h, CB, mem_reader(log), blob, why));
+    const std::vector<uint8_t> k2 = expected_blob(h);
+    CHECK(blob == k2);                                                                     // no layout: the KVFLASH2 blob, as before
+    h.pool = sample_pool(4, 3);
+    REQUIRE(kvflash_bundle_assemble(h, CB, mem_reader(log), blob, why));
+    std::vector<uint8_t> k3 = k2;
+    std::memcpy(k3.data(), kKvFlashPagerMagic3, 8);
+    k3.insert(k3.end(), h.pool.begin(), h.pool.end());
+    CHECK(blob == k3);
+    CHECK(h.pager_hdr == hdr44());                                                         // the head's own header is not touched
 }
