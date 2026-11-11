@@ -36,6 +36,7 @@
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 #include "kvflash_prefill_reselect.h"
 #include "kvflash_m5_rescore.h"
+#include "kvflash_m4_reuse.h"
 #include "kvflash_query_capture.h" // per-token query capture counts
 #include "kvflash_uq.h"            // LUCE_KVFLASH_UQ_QUERIES store
 
@@ -357,14 +358,22 @@ protected:
     // do_prefill's recall decisions before its batch loop (see the definition).
     struct KvflashRecallSetup {
         luce::common::KvFlashMode4Plan rw;   // rw.run: mode 4 rewinds the pass over [rw.r, end)
-        int    m5_r = -1;                     // mode 5: apply the drafter's pick when the prefill reaches this position
+        int    m5_r = -1;                     // single pass (mode 5, or mode 4 on a continuing turn): apply the pick when the prefill reaches this position
         double m5_ms = 0.0;
+        const char * apply_note = "; pflash2";
+        bool   m4_track = false;              // mode 4: keep this prefill's tail queries and prompt for the next request (kvflash_m4_last_)
         luce::common::KvFlashUqPlan uqp;
         bool   uq_capturing = false;
         int    uq_cut = -1;
     };
     KvflashRecallSetup kvflash_recall_setup(const std::vector<int32_t> & tokens, const std::vector<int32_t> & kvf_ids,
-                                            int kv_offset, int prompt_len, bool kvf_reselect, bool images);
+                                            int kv_offset, int prompt_len, bool kvf_reselect, bool images, bool kvf_paged);
+    // The recall budget of a pick made at `committed` for a prompt ending at `end`.
+    luce::common::KvFlashRecallIn kvflash_recall_in(int committed, int end) const;
+    // What the last mode-4 request left for a turn that continues its question (kvflash_m4_reuse.h); valid only
+    // after a prefill that ran to its end.
+    luce::common::KvFlashM4Last kvflash_m4_last_;
+    bool                    kvflash_m4_single_ = true;   // LUCE_KVFLASH_M4_SINGLE=0: every mode-4 turn takes the two-pass path
     // Select (recall / tail logic) from kvflash_scores_ and reselect the pool.
     // The pool room kept for the rest of the prefill is derived from `end`.
     void kvflash_prefill_apply(int committed, int end, int q_tok,
