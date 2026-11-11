@@ -13,14 +13,10 @@
 
 namespace luce::common {
 
-// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass. Mode 4 needs the qk policy and the exact
-// scorer; any other value (the retired modes 1-3 and 5 included) is off. A mismatch is reported in *why (cleared first).
-inline int kvflash_reselect_mode(int env_mode, bool qk_policy, const char * scorer, std::string * why) {
-    if (why) why->clear();
-    if (!qk_policy || env_mode != 4) return 0;
-    if (scorer && std::string(scorer) == "exact") return env_mode;
-    if (why) *why = "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact";
-    return 0;
+// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass. Mode 4 needs the qk policy; any other
+// value (the retired modes 1-3 and 5 included) is off.
+inline int kvflash_reselect_mode(int env_mode, bool qk_policy) {
+    return qk_policy && env_mode == 4 ? env_mode : 0;
 }
 
 // Tokens between two decode-time reselects (LUCE_KVFLASH_TAU, at least 1); 0 = none. A recall mode plans the pool for

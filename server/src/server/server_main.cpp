@@ -1645,7 +1645,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         model.sconfig.kvflash_pool_tokens = std::max(0, std::atoi(pool));  // 0: "auto", sized at load
         model.sconfig.kvflash_recall_mode = luce::server::kvflash_recall_mode(
             inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, env("LUCE_KVFLASH_PREFILL_RESELECT"),
-            env("LUCE_KVFLASH_POLICY"), env("LUCE_KVFLASH_RESELECT_SCORER"));
+            env("LUCE_KVFLASH_POLICY"));
     }
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())

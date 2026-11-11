@@ -912,7 +912,6 @@ struct LaunchPolicyFixture : CommonFixture {
         const std::vector<std::pair<std::string, std::string>> expected = {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
             {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},

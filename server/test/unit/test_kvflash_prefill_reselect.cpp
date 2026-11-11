@@ -18,22 +18,11 @@ std::vector<float> ramp(int n) { std::vector<float> s((size_t)n); for (int i = 0
 // ---- the mode gate: only 0 and 4 exist -----------------------------------------------------------------
 
 TEST_CASE(KvflashPrefillReselectFixture, modes_one_to_three_are_off) {
-    std::string why;
-    for (int m : {1, 2, 3, 5, 6, -1, 100}) {
-        CHECK(kvflash_reselect_mode(m, true, "exact", &why) == 0);
-        CHECK(kvflash_reselect_mode(m, true, "pflash2", &why) == 0);
-    }
-    CHECK(kvflash_reselect_mode(0, true, "exact", &why) == 0);
+    for (int m : {0, 1, 2, 3, 5, 6, -1, 100}) CHECK(kvflash_reselect_mode(m, true) == 0);
 }
-TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy_and_the_exact_scorer) {
-    std::string why;
-    CHECK(kvflash_reselect_mode(4, true, "exact", &why) == 4);
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, false, "exact", &why) == 0);   // LRU policy: no recall, and nothing to complain about
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, true, "pflash2", &why) == 0);  // the scorer must match the mode
-    CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact");
-    CHECK(kvflash_reselect_mode(4, true, "cosine", nullptr) == 0);   // the cosine scorer is gone
+TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy) {
+    CHECK(kvflash_reselect_mode(4, true) == 4);    // exact attention mass
+    CHECK(kvflash_reselect_mode(4, false) == 0);   // LRU policy: no recall
 }
 
 // ---- a recall mode holds the turn's plan while the answer decodes ------------------------------------------
