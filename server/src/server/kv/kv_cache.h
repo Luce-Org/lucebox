@@ -310,6 +310,15 @@ public:
     // After a commit in `slot`: free what it supersedes, then evict to the
     // resident budget (enforce_budget).
     void trim_after_commit(int slot);
+    // The turns the checkpoint committed in `slot` supersedes: the ones
+    // worth keeping stay as state-only backups, where the store can drop
+    // their attention rows; the rest are freed. Both serving paths.
+    void trim_superseded(int slot);
+    // A checkpoint's payload on the path being served: the backend's
+    // snapshot slots, or the concurrent engine's store.
+    void free_payload(int slot, int tokens);
+    bool drop_payload_kv(int slot, int tokens);
+    size_t state_payload_bytes(int tokens) const;
     // Evict, writing out what is worth keeping, until the resident bytes
     // fit the budget again; never `keep_slot`.
     void enforce_budget(int keep_slot);

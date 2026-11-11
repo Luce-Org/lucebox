@@ -184,6 +184,11 @@ int PrefixCache::kv_source_slot(int slot) const {
     return source < 0 ? -1 : entries_[(size_t)source].slot;
 }
 
+int PrefixCache::tokens(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx < 0 ? 0 : (int)entries_[(size_t)idx].ids.size();
+}
+
 bool PrefixCache::state_only(int slot) const {
     const int idx = find_slot_entry(slot);
     return idx >= 0 && entries_[(size_t)idx].state_only;
@@ -205,7 +210,7 @@ void PrefixCache::mark_state_only(int slot, size_t resident_bytes) {
     entry.aux.clear();
 }
 
-std::vector<int> PrefixCache::take_orphaned_state_backups() {
+std::vector<int> PrefixCache::take_orphaned_state_backups(std::vector<int> * tokens) {
     std::vector<int> slots;
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
         const auto & entry = entries_[(size_t)i];
@@ -219,6 +224,7 @@ std::vector<int> PrefixCache::take_orphaned_state_backups() {
         }
         if (extended) continue;
         slots.push_back(entry.slot);
+        if (tokens) tokens->push_back((int)entry.ids.size());
         erase_inline_entry(i);
     }
     if (!slots.empty()) {

@@ -5270,7 +5270,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
         release_prefill_arenas();
         cache_.pipeline_off = true;
-        const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
+        const bool restored = kv_offset == 0 ||
+            snapshot_restore(prefill_retry_slot_, prefill_retry_rows_slot_);
         std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
                      kv_offset, restored ? "" : " (snapshot restore failed)");
         if (restored) committed = run_prefill();
@@ -5597,6 +5598,25 @@ size_t DeepSeek4Backend::staged_checkpoint_bytes(int tokens) const {
 }
 
 size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
+    return snapshot_bytes(tokens, /*rows=*/true);
+}
+
+size_t DeepSeek4Backend::snapshot_state_bytes_estimate(int tokens) const {
+    // Cluster workers hold their own share of a snapshot; the head keeps
+    // those whole.
+    return cluster_ ? 0 : snapshot_bytes(tokens, /*rows=*/false);
+}
+
+bool DeepSeek4Backend::snapshot_drop_kv(int slot) {
+    if (cluster_ || cfg_.paged_attention || !snapshot_used(slot)) return false;
+    return deepseek4_snapshot_drop_rows(snapshots_[slot]);
+}
+
+bool DeepSeek4Backend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < PREFIX_SLOTS && snapshots_[slot].state_only;
+}
+
+size_t DeepSeek4Backend::snapshot_bytes(int tokens, bool rows) const {
     // Paged serving keeps no single-sequence snapshots.
     if (cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) {
         return 0;
@@ -5614,7 +5634,9 @@ size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     aux.n_logits = n_logits;
     aux.spec_feat = n_features ? &kDeclared : nullptr;
     aux.n_spec_feat = n_features;
-    const size_t bytes = ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, &aux);
+    // Without its rows a snapshot is the layout of an empty prompt.
+    const size_t bytes = ds4_declared_snapshot_bytes(
+        cache_, w_, snap_backend_, rows ? tokens : 0, &aux);
     return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
@@ -5696,6 +5718,8 @@ ModelBackend::SnapshotRef DeepSeek4Backend::snapshot_ref(int slot) const {
     // Paged concurrent serving has no monolithic cache to restore into.
     if (cfg_.paged_attention || !snapshot_used(slot)) return ref;
     const auto & snap = snapshots_[slot];
+    // A state-only snapshot is not a whole state to write or copy.
+    ref.pooled = snap.state_only;
     // Only snapshots that carry the serialization sidecar are exportable.
     if (!snap.meta_snap || !snap.last_logits_snap || !snap.spec_feat_snap) {
         return ref;
@@ -5765,8 +5789,11 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
     return true;
 }
 
-bool DeepSeek4Backend::snapshot_restore(int slot) {
+bool DeepSeek4Backend::snapshot_restore(int slot, int rows_slot) {
     if (!snapshot_used(slot)) return false;
+    const DeepSeek4Snapshot * rows_from =
+        snapshots_[slot].state_only && rows_slot != slot && snapshot_used(rows_slot)
+            ? &snapshots_[rows_slot] : nullptr;
 
     std::vector<float> restored_logits;
     std::vector<float> restored_features;
@@ -5777,7 +5804,7 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
         return false;
     }
 
-    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_)) {
+    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from)) {
         return false;
     }
     last_logits_ = std::move(restored_logits);
@@ -5807,13 +5834,15 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
                      snap_pos, req.prompt.size());
         return generate_impl(req, io);
     }
-    if (!snapshot_restore(slot)) {
+    if (!snapshot_restore(slot, req.restore_kv_slot)) {
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
     prefill_retry_slot_ = slot;
+    prefill_retry_rows_slot_ = req.restore_kv_slot;
     result = generate_from_state(req, io, snap_pos);
     prefill_retry_slot_ = -1;
+    prefill_retry_rows_slot_ = -1;
     if (result.ok()) result.restored_prefix_tokens = snap_pos;
     return result;
 }

@@ -3042,10 +3042,9 @@ size_t estimate_target_cache_state_bytes(const TargetWeights & w,
     return bytes;
 }
 
-bool drop_prefix_snapshot_kv(ggml_backend_t backend, PrefixSnapshot & snap) {
-    if (!backend || !snap.ctx || !snap.buf || snap.state_only || snap.is_pooled ||
-        snap.layout != PrefixSnapshot::Layout::dense) {
-        set_last_error("drop_prefix_snapshot_kv: not a plain dense snapshot");
+bool drop_prefix_snapshot_kv(PrefixSnapshot & snap) {
+    if (!snap.ctx || !snap.buf || snap.state_only || snap.is_pooled) {
+        set_last_error("drop_prefix_snapshot_kv: not a whole snapshot with its rows in tensors");
         return false;
     }
     // The same tensors minus K/V, in a buffer of their own: a ggml buffer
@@ -3071,7 +3070,10 @@ bool drop_prefix_snapshot_kv(ggml_backend_t backend, PrefixSnapshot & snap) {
     for (const ggml_tensor * t : snap.ssm_state_snap)  kept.ssm_state_snap.push_back(twin(t));
     for (const ggml_tensor * t : snap.conv_state_snap) kept.conv_state_snap.push_back(twin(t));
     kept.target_feat_snap = twin(snap.target_feat_snap);
-    kept.buf = ggml_backend_alloc_ctx_tensors(kept.ctx, backend);
+    // Where the snapshot already lives (the snapshot backend; host memory
+    // for a paged checkpoint).
+    kept.buf = ggml_backend_alloc_ctx_tensors_from_buft(
+        kept.ctx, ggml_backend_buffer_get_type(snap.buf));
     if (!kept.buf) {
         set_last_error("drop_prefix_snapshot_kv: allocation failed");
         free_prefix_snapshot(kept);
@@ -3087,7 +3089,7 @@ bool drop_prefix_snapshot_kv(ggml_backend_t backend, PrefixSnapshot & snap) {
     kept.kv_k_type       = snap.kv_k_type;
     kept.max_ctx         = snap.max_ctx;
     kept.target_feat_cap = snap.target_feat_cap;
-    kept.layout          = PrefixSnapshot::Layout::dense;
+    kept.layout          = snap.layout;
     kept.state_only      = true;
     free_prefix_snapshot(snap);
     snap = std::move(kept);
@@ -3367,9 +3369,10 @@ size_t contiguous_block_run(
 
 bool paged_tensor_layout_matches(
         const ggml_tensor * dense, const ggml_tensor * paged,
-        int tokens) {
+        int tokens, bool longer_ok = false) {
     return dense && paged && dense->type == paged->type &&
-        dense->ne[0] == paged->ne[0] && dense->ne[1] == tokens &&
+        dense->ne[0] == paged->ne[0] &&
+        (dense->ne[1] == tokens || (longer_ok && dense->ne[1] > tokens)) &&
         dense->ne[2] == paged->ne[2] && dense->ne[3] == paged->ne[3] &&
         ggml_is_contiguous(dense) && ggml_is_contiguous(paged);
 }
@@ -3468,7 +3471,8 @@ bool paged_cache_pairs_complete(const TargetCache & cache) {
 }
 
 bool create_paged_snapshot_layout(
-        const TargetCache & cache, int token_count, PrefixSnapshot & snap) {
+        const TargetCache & cache, int token_count, PrefixSnapshot & snap,
+        bool skip_kv = false) {
     const int total_tensors = 2 * (int)cache.attn_k.size() +
         2 * (int)cache.ssm_state.size();
     ggml_init_params params{};
@@ -3483,7 +3487,7 @@ bool create_paged_snapshot_layout(
     snap.ssm_state_snap.assign(cache.ssm_state.size(), nullptr);
     snap.conv_state_snap.assign(cache.conv_state.size(), nullptr);
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
-        if (!cache.attn_k[i]) continue;
+        if (!cache.attn_k[i] || skip_kv) continue;
         snap.attn_k_snap[i] = ggml_new_tensor_3d(
             snap.ctx, cache.attn_k[i]->type, cache.attn_k[i]->ne[0],
             token_count, cache.attn_k[i]->ne[2]);
@@ -3513,24 +3517,28 @@ bool create_paged_snapshot_layout(
     return true;
 }
 
+// `kv` holds the attention rows: `snap` itself, or for a state-only `snap`
+// the deeper checkpoint it restores with, which may hold more rows.
 bool paged_snapshot_matches(
         const TargetCache & cache, const PrefixSnapshot & snap,
-        const std::vector<uint32_t> & blocks, int block_size, int tokens) {
+        const std::vector<uint32_t> & blocks, int block_size, int tokens,
+        const PrefixSnapshot * kv_from = nullptr) {
+    const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
     if (!paged_cache_pairs_complete(cache) ||
-        snap.attn_k_snap.size() != cache.attn_k.size() ||
-        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        kv.attn_k_snap.size() != cache.attn_k.size() ||
+        kv.attn_v_snap.size() != cache.attn_v.size() ||
         snap.ssm_state_snap.size() != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size()) return false;
 
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
         const bool present = cache.attn_k[i] != nullptr;
-        if ((snap.attn_k_snap[i] != nullptr) != present ||
-            (snap.attn_v_snap[i] != nullptr) != present) return false;
+        if ((kv.attn_k_snap[i] != nullptr) != present ||
+            (kv.attn_v_snap[i] != nullptr) != present) return false;
         if (present &&
             (!paged_tensor_layout_matches(
-                 snap.attn_k_snap[i], cache.attn_k[i], tokens) ||
+                 kv.attn_k_snap[i], cache.attn_k[i], tokens, kv_from != nullptr) ||
              !paged_tensor_layout_matches(
-                 snap.attn_v_snap[i], cache.attn_v[i], tokens) ||
+                 kv.attn_v_snap[i], cache.attn_v[i], tokens, kv_from != nullptr) ||
              !paged_rows_fit(cache.attn_k[i], blocks, block_size, tokens) ||
              !paged_rows_fit(cache.attn_v[i], blocks, block_size, tokens))) {
             return false;
@@ -3566,6 +3574,16 @@ size_t estimate_paged_target_cache_snapshot_bytes(
     const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
         layout.ctx,
         paged_snapshot_buffer_type());
+    free_prefix_snapshot(layout);
+    return bytes;
+}
+
+size_t estimate_paged_target_cache_state_bytes(const TargetCache & cache) {
+    if (cache.n_seq_slots < 1 || !paged_cache_pairs_complete(cache)) return 0;
+    PrefixSnapshot layout;
+    if (!create_paged_snapshot_layout(cache, 1, layout, /*skip_kv=*/true)) return 0;
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        layout.ctx, paged_snapshot_buffer_type());
     free_prefix_snapshot(layout);
     return bytes;
 }
@@ -3684,7 +3702,22 @@ bool restore_paged_target_cache(
         TargetCache & cache,
         int seq_slot,
         const std::vector<uint32_t> & block_table,
-        int block_size) {
+        int block_size,
+        const PrefixSnapshot * kv_from) {
+    // A state-only checkpoint takes its attention rows [0, cur_pos) from a
+    // deeper whole checkpoint of the same cache geometry.
+    if (snap.state_only) {
+        if (!kv_from || kv_from == &snap || !kv_from->ctx || kv_from->state_only ||
+            kv_from->layout != PrefixSnapshot::Layout::paged ||
+            kv_from->cur_pos < snap.cur_pos ||
+            kv_from->max_ctx != snap.max_ctx || kv_from->kv_k_type != snap.kv_k_type) {
+            set_last_error("restore_paged_target_cache: state-only checkpoint without attention rows");
+            return false;
+        }
+    } else {
+        kv_from = nullptr;
+    }
+    const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
     if (!snap.ctx || snap.layout != PrefixSnapshot::Layout::paged ||
         !cache.backend ||
         cache.n_seq_slots < 1 ||
@@ -3693,18 +3726,18 @@ bool restore_paged_target_cache(
         snap.max_ctx != cache.max_ctx || snap.kv_k_type != cache.kv_k_type ||
         block_table.size() < blocks_for_prefix(snap.cur_pos, block_size) ||
         !paged_snapshot_matches(
-            cache, snap, block_table, block_size, snap.cur_pos)) {
+            cache, snap, block_table, block_size, snap.cur_pos, kv_from)) {
         set_last_error("restore_paged_target_cache: incompatible checkpoint");
         return false;
     }
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
         if (!cache.attn_k[i]) continue;
         copy_paged_tensor(
-            cache.backend, snap.attn_k_snap[i], cache.attn_k[i],
+            cache.backend, kv.attn_k_snap[i], cache.attn_k[i],
             block_table, block_size, snap.cur_pos,
             PagedCopyDirection::scatter);
         copy_paged_tensor(
-            cache.backend, snap.attn_v_snap[i], cache.attn_v[i],
+            cache.backend, kv.attn_v_snap[i], cache.attn_v[i],
             block_table, block_size, snap.cur_pos,
             PagedCopyDirection::scatter);
     }

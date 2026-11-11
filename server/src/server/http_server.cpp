@@ -1960,7 +1960,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     prefix_cache_.set_prunes_superseded(true);
     // Where the backend can drop a snapshot's attention rows, the turns a
     // commit supersedes stay as state-only backups (0: it cannot, and they
-    // are freed as before; concurrent serving keeps none).
+    // are freed as before). Concurrent serving asks its engine instead.
     prefix_cache_.set_state_backup_bytes(
         checkpoints_.estimate_state_bytes(config.max_ctx));
     // Fold model+config identity into the layout fingerprint BEFORE init()

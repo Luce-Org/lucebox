@@ -112,6 +112,12 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    // Host bytes of a snapshot of `tokens` positions, with or without its
+    // compressed and index rows.
+    size_t snapshot_bytes(int tokens, bool rows) const;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
     MemoryReport memory_report() const override;
     // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
     // tensors carry stable names plus a meta/logits/feature sidecar, so they
@@ -259,6 +265,7 @@ private:
     // Snapshot slot a restored request started from (-1: fresh prompt);
     // a failed prefill restores it before its one retry.
     int                            prefill_retry_slot_ = -1;
+    int                            prefill_retry_rows_slot_ = -1;
     // Whether a retried prefill already turned the pipeline back on.
     bool                           pipeline_retry_recovered_ = false;
     int                            hybrid_long_context_chunk_ = kDs4DefaultLongContextChunk;
@@ -399,7 +406,8 @@ private:
     GenerateResult generate_from_state(const GenerateRequest & req,
                                        const DaemonIO & io,
                                        int kv_offset);
-    bool snapshot_restore(int slot);
+    // `rows_slot`: the whole snapshot a state-only `slot` takes its rows from.
+    bool snapshot_restore(int slot, int rows_slot = -1);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,

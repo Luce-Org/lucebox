@@ -338,8 +338,8 @@ private:
     // Copies a deferred live snapshot into its slot before the live state
     // changes; a no-op otherwise.
     void materialize_live_snapshot();
-    // Plain dense single-sequence snapshots only: the dense K/V of one is a
-    // prefix of a deeper one's.
+    // Single-sequence snapshots whose rows are their own tensors: the K/V of
+    // one is a prefix of a deeper one's.
     bool state_only_snapshots() const;
     // The dense snapshot `kv_slot` whose rows a state-only `slot` restores
     // with; nullptr when `slot` needs none, or `kv_slot` cannot serve.

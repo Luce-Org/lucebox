@@ -699,11 +699,12 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
                           bool skip_kv = false,
                           const PrefixSnapshot * kv_from = nullptr);
 
-// Free the attention KV of a dense snapshot and keep the rest: the result is
-// state-only and restores with the rows of a deeper snapshot (see
-// PrefixSnapshot::state_only). False, with `snap` unchanged, when it is not a
-// plain dense snapshot or the allocation fails.
-bool drop_prefix_snapshot_kv(ggml_backend_t backend, PrefixSnapshot & snap);
+// Free the attention KV of a snapshot (dense, or a paged checkpoint) and keep
+// the rest: the result is state-only and restores with the rows of a deeper
+// snapshot (see PrefixSnapshot::state_only). False, with `snap` unchanged,
+// when its rows are not in its own tensors (a KVFlash pool blob) or the
+// allocation fails.
+bool drop_prefix_snapshot_kv(PrefixSnapshot & snap);
 // Bytes a state-only snapshot of `token_count` positions holds; 0 when the
 // cache cannot take one.
 size_t estimate_target_cache_state_bytes(const TargetWeights & w,
@@ -768,12 +769,18 @@ bool replace_paged_target_cache(
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and
 // must cover snap.cur_pos logical tokens.
+// A state-only `snap` takes its attention rows from `kv_from`, a deeper whole
+// checkpoint.
 bool restore_paged_target_cache(
     const PrefixSnapshot & snap,
     TargetCache & cache,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
-    int block_size);
+    int block_size,
+    const PrefixSnapshot * kv_from = nullptr);
+// Bytes a state-only paged checkpoint holds (any length); 0 when the cache
+// cannot take one.
+size_t estimate_paged_target_cache_state_bytes(const TargetCache & cache);
 
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries

@@ -49,6 +49,9 @@ inline bool operator!=(const PrefixCaptureTicket & a,
 
 struct PrefixStorePlan {
     PrefixStoreRef restore;
+    // Set when `restore` is a state-only checkpoint (SeqEngine::drop_prefix_kv):
+    // the deeper whole checkpoint whose attention rows it restores with.
+    PrefixStoreRef restore_kv;
     PrefixCaptureTicket capture;
     // Every prompt position a later request may restore this prefix from
     // (chat boundaries plus the capture and restore cuts), ascending. An engine

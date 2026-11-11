@@ -246,9 +246,12 @@ public:
     // `slot`, most recently used first: its rows restore it. -1 when `slot`
     // holds no state-only entry or none is resident.
     int kv_source_slot(int slot) const;
+    // Prompt tokens the entry in `slot` covers; 0 when it holds none.
+    int tokens(int slot) const;
     // Erase the state-only entries no resident dense entry extends any more
-    // and return their slots; the caller frees the payloads.
-    std::vector<int> take_orphaned_state_backups();
+    // and return their slots (and, with `tokens`, each one's prefix length);
+    // the caller frees the payloads.
+    std::vector<int> take_orphaned_state_backups(std::vector<int> * tokens = nullptr);
 
     // Evicts committed entries, pins last and never `keep_slot` or a pinned
     // ancestor of it, until the resident bytes fit the budget again. Returns

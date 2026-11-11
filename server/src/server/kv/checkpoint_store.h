@@ -122,6 +122,10 @@ public:
     // cache can write and read them (slots()).
     bool in_backend_slots() const;
     size_t estimate_bytes(int tokens) const;
+    // State-only checkpoints: SeqEngine::estimate_prefix_state_bytes and
+    // drop_prefix_kv.
+    size_t estimate_state_bytes(int tokens) const;
+    bool drop_kv(Checkpoint checkpoint, int tokens);
 
     static PrefixStoreRef ref(Checkpoint checkpoint, int tokens) {
         return {checkpoint.id, tokens};

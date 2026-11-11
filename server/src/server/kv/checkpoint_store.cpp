@@ -138,6 +138,14 @@ size_t EngineCheckpoints::estimate_bytes(int tokens) const {
     return engine_.estimate_prefix_store_bytes(tokens);
 }
 
+size_t EngineCheckpoints::estimate_state_bytes(int tokens) const {
+    return engine_.estimate_prefix_state_bytes(tokens);
+}
+
+bool EngineCheckpoints::drop_kv(Checkpoint checkpoint, int tokens) {
+    return engine_.drop_prefix_kv(ref(checkpoint, tokens));
+}
+
 void EngineCheckpoints::discard(PrefixStoreRef ref) {
     engine_.discard_prefix_store(ref);
 }
