@@ -692,16 +692,19 @@ prefixes with no VRAM cost.
 
 `scripts/bench_agentx_cache.py` replays the public coding-agent traces of the AgentX
 benchmark against a running server and reports the share of prompt tokens read from the
-cache, the median tokens a request computed, and where the computed tokens came from: the
-first turn of a session, the previous reply computed again, or new text.
+cache, next to the share a cache that never misses would read on the same requests. The
+client is the official AgentX harness running its `agentx` scenario unchanged, so the
+harness itself checks the benchmark's rules and marks the run `submission_valid`; the
+report prints that verdict.
 
 ```bash
 python3 server/scripts/bench_agentx_cache.py run --url http://127.0.0.1:8080 \
     --model qwen3.8-27b --tokenizer Qwen/Qwen3.8-27B --sessions 1 --out results/agentx-1
 ```
 
-The traces hold the shape of real Claude Code sessions and no text, so the client sends
-filler text of the recorded lengths and asks for each reply at its recorded length with
-`ignore_eos`. They carry no tool calls: the [Agent Turn Cache](API.md#agent-turn-cache),
+The default corpus is the official 256K one (every request at most 256,000 tokens): serve
+it with `--max-ctx 262144`. The traces hold the shape of real Claude Code sessions and no
+text, so the client sends filler text of the recorded lengths, replays the recorded
+replies, and asks for each reply at its recorded length with `ignore_eos`. They carry no tool calls: the [Agent Turn Cache](API.md#agent-turn-cache),
 which keeps the state a tool-call turn leaves behind, does not take part, and every turn
 resumes from the end of the previous prompt.
