@@ -155,7 +155,7 @@ profile and the requirements checked at startup.
 - `LUCE_DS4_FUSE_COLLAPSE` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact HC collapse op; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
 - `LUCE_DS4_DEVICE_TOPK` - deepseek4/deepseek4_graph.cpp (=1: hybrid prefill takes each token's top route candidates from the device; the host orders them exactly as before; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_PREFILL_ARENA_CHUNK_MB` - deepseek4/deepseek4_graph.cpp (chunk size of the shared prefill arena; 0 = one chunk that only grows; set to 0 by `--profile ds41-r9700-gorgon`)
-- `LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill keeps the residual on the primary GPU; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL` - deepseek4/deepseek4_graph.cpp, deepseek4_backend.cpp (=1: layer-major prefill keeps the residual on the primary GPU, and a pass whose rows do not fit beside 1.5 GiB of free memory runs its leading bands that do, leaving the rest to the next pass; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_PREFILL_PIPELINE` - deepseek4/deepseek4_graph.cpp (N > 0: layer-major prefill runs each chunk as max(N, 2) parts and overlaps one part's cold-owner FFN with the next part's attention; set to 2 by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_SPLIT_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp (=1: both owners' prefill partials join on the device; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_GROUPED_HYBRID_PREFILL` - moe_hybrid_ffn_eval.cpp (1 = cold owner's ROCmFP2-down stacks, 2 = both owners', through the grouped MUL_MAT_ID prefill; set to 1 by `--profile ds41-r9700-gorgon`)
