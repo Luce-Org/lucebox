@@ -9,12 +9,20 @@
 //      routes are known, ahead of the target's own routed experts and shared expert (moe_overlap_queue_expert), and
 //   2. the target's split ends right before the join, the first node that reads the expert GPU's sum, so the
 //      target's experts before it do not wait for that copy (moe_overlap_join, moe_overlap_mark_join).
-// All of it is scheduling: every node computes the same bytes as in one serial graph.
+// Both are scheduling: every node computes the same bytes as in one serial graph.
+//
+// A step of several rows (sequences side by side) whose products are batch-invariant
+// (ggml_backend_cuda_set_mmvq_batch_invariant: each column of a product gets the arithmetic it gets alone) also
+// shares the expert weights between its rows:
+//   3. each GPU builds the one-row expert branch once for all rows, one product per projection over every row's
+//      routes, and the rows routed to one expert share its weight reads (moe_overlap_expert_product). A row's bytes
+//      are those it gets alone, at every width and row order.
 
 #pragma once
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 namespace luce::common {
 
@@ -34,6 +42,15 @@ inline ggml_tensor * moe_overlap_join(ggml_context * ctx, ggml_tensor * expert_s
 // it allocates the graph.
 inline void moe_overlap_mark_join(ggml_backend_sched_t sched, ggml_tensor * join) {
     ggml_backend_sched_add_late_cross_input_split_node(sched, join);
+}
+
+// 3: one routed-expert projection of an overlap step for all of its rows, ggml_mul_mat_id(ctx, experts, rows, ids),
+// whose rows share each routed expert's weight reads (ggml_backend_cuda_mul_mat_id_grouped).
+inline ggml_tensor * moe_overlap_expert_product(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * rows,
+                                                ggml_tensor * ids) {
+    ggml_tensor * product = ggml_mul_mat_id(ctx, experts, rows, ids);
+    ggml_backend_cuda_mul_mat_id_grouped(product);
+    return product;
 }
 
 }  // namespace luce::common

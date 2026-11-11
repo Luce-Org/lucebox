@@ -180,6 +180,11 @@ struct MoeHybridGraphInputs {
     // join; every node of the main owner's shared expert is listed in hot_nodes. The caller marks each join_nodes entry
     // with moe_overlap_mark_join.
     bool overlap_owners = false;
+    // Input, set by the caller before building: the caller computes the graph with batch-invariant products
+    // (ggml_backend_cuda_set_mmvq_batch_invariant). Overlapping owners then serve a step of several rows with one
+    // product per projection, whose rows share each routed expert's weight reads (moe_overlap.h, 3), instead of one
+    // product per row.
+    bool batch_invariant_rows = false;
     // Input, set by the caller before building (split steps with a device join): weights the main owner reads next,
     // in the order it reads them. Right after its own experts the main owner reads up to prefetch_bytes of them, in its
     // wait for the secondary owner's sum, so its last-level cache holds them when they are used

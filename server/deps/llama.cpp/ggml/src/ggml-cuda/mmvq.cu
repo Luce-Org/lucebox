@@ -11,6 +11,7 @@
 
 static thread_local size_t g_mmvq_launch_count = 0;
 static thread_local size_t g_mmvq_mmid_grouped_launch_count = 0;
+static thread_local size_t g_mmvq_mmid_grouped_launch_count_on[GGML_CUDA_MAX_DEVICES] = {};
 
 extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
     return g_mmvq_launch_count;
@@ -18,6 +19,10 @@ extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
 
 extern "C" size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void) {
     return g_mmvq_mmid_grouped_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count_on(int device) {
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES ? g_mmvq_mmid_grouped_launch_count_on[device] : 0;
 }
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -3794,6 +3799,44 @@ static bool mmvq_moe_matches_single_column(const int cc, const int ncols_x, cons
     }
 }
 
+// A MUL_MAT_ID that ggml_backend_cuda_mul_mat_id_grouped marked takes the grouped kernel, which computes every
+// (token, route) pair as the MoE kernel does, only under batch-invariant products and only where the MoE kernel
+// reproduces the single-token launch (mmvq_moe_matches_single_column), so each token keeps the arithmetic it gets
+// alone. Tokens routed to the same expert then share its weight reads through the cache. Declined, the product
+// runs as it would unmarked, with the same bytes:
+//   - ROCmFP2 only, the routed-expert format test_ds41_mmid_width_invariance pins in grouped mode on RDNA3/RDNA4;
+//   - up to the batch-invariant MoE width (get_mmvq_mmid_max_batch: 8 rows on RDNA3/RDNA4); 9 to 16 rows fall
+//     back to per-row reads;
+//   - expert rows in whole four-row tiles (the grouped kernel reads four rows per tile with no row bound);
+//   - not where the single-column launch is another kernel, such as RDNA4's eight-wave tables, including the
+//     short-row case that runs on the MoE kernel (mmvq_rdna4_moe_short_rows) and would match;
+//   - not with LUCE_MMID_GROUPED=0. LUCE_MMID_GROUPED_TYPES and LUCE_MMID_GROUPED_DEVICE do not apply here.
+static bool mmid_grouped_requested(const ggml_tensor * dst, int cc) {
+    if (dst->op != GGML_OP_MUL_MAT_ID || ggml_get_op_params_i32(dst, 1) != GGML_CUDA_MMID_GROUPED) {
+        return false;
+    }
+    static const bool switched_off = []() {
+        const char * e = std::getenv("LUCE_MMID_GROUPED");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    static const bool use_moe_kernel = mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
+    const ggml_tensor * src0 = dst->src[0];
+    const int64_t ncols_dst = dst->ne[2];
+    if (switched_off || !use_moe_kernel || !ggml_cuda_mmvq_batch_invariant() ||
+        src0->type != GGML_TYPE_Q2_0_ROCMFP2 || src0->ne[1] % 4 != 0 ||
+        ncols_dst < 2 || dst->ne[1]*ncols_dst > MMID_GROUPED_MAX_PAIRS || !mmid_grouped_arch_ok(cc)) {
+        return false;
+    }
+    return mmvq_moe_matches_single_column<GGML_TYPE_Q2_0_ROCMFP2>(
+        cc, (int) src0->ne[0], (int) ncols_dst, get_device_table_id(cc));
+}
+
+bool ggml_cuda_mmvq_mmid_grouped_for(const ggml_tensor * mul_mat_id, int cc) {
+    return ggml_cuda_mmvq_mmid_grouped_enabled(mul_mat_id->src[0]->type, cc, mul_mat_id->ne[2],
+                                               mul_mat_id->ne[1]*mul_mat_id->ne[2]) ||
+           mmid_grouped_requested(mul_mat_id, cc);
+}
+
 // RDNA4 MUL_MAT_ID with short expert rows runs on the one-wave MoE kernel at every width, decode included.
 // RDNA4's single-column launch gives each output row eight waves; when a row holds fewer quant blocks than
 // eight waves read in one K step, most of those waves have nothing to read (qwen4exp's experts on gfx1201:
@@ -4806,7 +4849,7 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
         mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_device_ok();
     if (ids && (q5_grouped || ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst))) {
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst) || mmid_grouped_requested(dst, cc))) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
@@ -4883,6 +4926,7 @@ void ggml_cuda_mul_mat_vec_q(
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
                 np, stream)) {
             ++g_mmvq_mmid_grouped_launch_count;
+            ++g_mmvq_mmid_grouped_launch_count_on[ggml_cuda_get_device()];
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=grouped\n",

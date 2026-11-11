@@ -23,11 +23,16 @@ inline constexpr int DEEPSEEK4_MAX_GATHERED_ROWS = 16;
 inline constexpr int DEEPSEEK4_MAX_MOE_ROWS_PER_PART = 8;
 
 // Expert-owner switches paged DeepSeek V4.1 serving is not qualified with:
-// with them it has faulted the GPU (server/docs/DS41.md). Under
+// they were on when paged serving faulted the GPU in September
+// (server/docs/DS41.md, Reliability). Under
 // --paged-attention a launch profile's default for one of them is left out;
 // one the operator sets is refused by the backend. LUCE_DS4_TP_NATIVE_ROUTE_WIDTH
 // is not listed: every paged step runs what it selects (see the routed FFN in
-// deepseek4_fused_verify.inc), so it changes nothing there. LUCE_MOE_Q8_HANDOFF
+// deepseek4_fused_verify.inc), so it changes nothing there. LUCE_MMID_GROUPED
+// and LUCE_DS4_TP_GROUPED_MMVQ / LUCE_MOE_TP_GROUPED_MMVQ stay listed for their
+// history, though a paged split step already does what they select wherever it
+// keeps each row exact: each owner runs its rows together and asks for the
+// grouped kernel per product (moe_overlap.h, 3). LUCE_MOE_Q8_HANDOFF
 // is listed because paged steps were never qualified with it (it hands the
 // secondary owner Q8_1 rows of the input).
 inline constexpr const char * DEEPSEEK41_PAGED_UNQUALIFIED_ENV[] = {

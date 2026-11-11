@@ -18,6 +18,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 bool ggml_cuda_mmvq_mmid_grouped_enabled(
     ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs);
 
+// Whether this MUL_MAT_ID node takes the grouped kernel on a device of compute capability cc: the
+// environment's selection (ggml_cuda_mmvq_mmid_grouped_enabled) or the node's own request
+// (ggml_backend_cuda_mul_mat_id_grouped). Grouped nodes are not fused with their GLU.
+bool ggml_cuda_mmvq_mmid_grouped_for(const ggml_tensor * mul_mat_id, int cc);
+
 // Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
 bool ggml_cuda_mmvq_batch_invariant();
 // Columns up to which batch-invariant dense products stay on the matrix-vector kernels (calling thread):

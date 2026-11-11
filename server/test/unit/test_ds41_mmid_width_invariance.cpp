@@ -8,6 +8,13 @@
 // per expert format and DS4.1 surface, with the invariance switch off and on. Weights are random blocks with sane
 // scales (every IQ2_XXS / IQ3_XXS bit pattern is a valid encoding).
 //
+// The grouped modes are the shared expert product of overlapping owners (moe_overlap_expert_product): the batch is
+// marked with ggml_backend_cuda_mul_mat_id_grouped and run batch-invariant, with some routes masked (-1) as an owner
+// that does not hold them sees them, once with distinct experts per token and once with tokens that share most of
+// their experts (the case where the grouped kernel's sorted pairs differ from the MoE kernel's). Each token must still
+// be bit-identical to its product alone. Every format runs them (a declined request computes as unmarked); ROCmFP2,
+// the format the request serves, must take the grouped kernel on RDNA3 and RDNA4 (grouped_launches > 0).
+//
 //   test_ds41_mmid_width_invariance [tokens=3] [experts=64]
 //
 // Prints one JSON line per (device, type, surface, invariant mode); exits 1 when any batch differs.
@@ -16,6 +23,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
 
 #include <cinttypes>
 #include <cstdio>
@@ -56,10 +67,35 @@ static void fill_blocks(std::vector<uint8_t> & w, ggml_type type, size_t n_block
     }
 }
 
+// The grouped request: none, distinct experts per token, or tokens that share five of their six experts.
+enum class Grouped { no, distinct, shared };
+
+static const char * grouped_name(Grouped grouped) {
+    switch (grouped) {
+        case Grouped::no:       return "no";
+        case Grouped::distinct: return "distinct";
+        case Grouped::shared:   return "shared";
+    }
+    return "?";
+}
+
+// RDNA3 / RDNA4, where the grouped request serves ROCmFP2 experts (mmvq.cu, mmid_grouped_requested).
+static bool rdna3_or_rdna4(int device) {
+#if defined(GGML_USE_HIP)
+    hipDeviceProp_t props{};
+    return hipGetDeviceProperties(&props, device) == hipSuccess &&
+           (std::strncmp(props.gcnArchName, "gfx11", 5) == 0 || std::strncmp(props.gcnArchName, "gfx12", 5) == 0);
+#else
+    (void) device;
+    return false;
+#endif
+}
+
 // masked: every other route is -1, as in a split step where the other device owns those picks (only live routes are
-// compared). glu: gate and up products with SwiGLU, the pair the backend fuses into one expert kernel.
+// compared). glu: gate and up products with SwiGLU, the pair the backend fuses into one expert kernel. grouped: the
+// batch's products are marked with ggml_backend_cuda_mul_mat_id_grouped, with every third route masked.
 static bool check(ggml_backend_t backend, int device, const Case & c, int tokens, int experts, bool invariant,
-                  bool masked = false, bool glu = false) {
+                  bool masked = false, bool glu = false, Grouped grouped = Grouped::no) {
     const int used = c.used;
     const size_t row = ggml_row_size(c.type, c.k);
     std::mt19937 rng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
@@ -72,6 +108,13 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     std::vector<int32_t> ids(size_t(used) * tokens);
     for (int t = 0; t < tokens; ++t)                               // distinct and partly shared experts across tokens
         for (int j = 0; j < used; ++j) ids[size_t(t) * used + j] = masked && (j + t) % 2 ? -1 : (t * 3 + j * 5) % experts;
+    if (grouped == Grouped::shared)                                // tokens of one parity share all experts but their last
+        for (int t = 0; t < tokens; ++t)
+            for (int j = 0; j < used; ++j) ids[size_t(t) * used + j] = (j < used - 1 ? j * 5 + (t & 1) * 3 : 25 + 2 * t) % experts;
+    if (grouped != Grouped::no)                                    // the routes another owner holds
+        for (int t = 0; t < tokens; ++t)
+            for (int j = 0; j < used; ++j)
+                if ((t + j) % 3 == 2) ids[size_t(t) * used + j] = -1;
 
     ggml_init_params params{};
     params.mem_size = size_t(8 * tokens + 16) * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(8 * tokens + 16, false);
@@ -79,9 +122,13 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     auto ctx = ggml_init(params);
     auto a = ggml_new_tensor_3d(ctx, c.type, c.k, c.n, experts);
     auto a2 = glu ? ggml_new_tensor_3d(ctx, c.type, c.k, c.n, experts) : nullptr;
-    auto product = [&](ggml_tensor * b, ggml_tensor * id) {
-        return glu ? ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, a2, b, id), ggml_mul_mat_id(ctx, a, b, id))
-                   : ggml_mul_mat_id(ctx, a, b, id);
+    auto product = [&](ggml_tensor * b, ggml_tensor * id, bool mark = false) {
+        auto mm = [&](ggml_tensor * w) {
+            ggml_tensor * y = ggml_mul_mat_id(ctx, w, b, id);
+            if (mark) ggml_backend_cuda_mul_mat_id_grouped(y);
+            return y;
+        };
+        return glu ? ggml_swiglu_split(ctx, mm(a2), mm(a)) : mm(a);
     };
     // decode: one MUL_MAT_ID per token
     std::vector<ggml_tensor *> xs, is, ys;
@@ -96,7 +143,7 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     // verify: one MUL_MAT_ID over all tokens
     auto bb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, 1, tokens);
     auto ib = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
-    auto yb = product(bb, ib);
+    auto yb = product(bb, ib, grouped != Grouped::no);
     auto g2 = ggml_new_graph_custom(ctx, 8 * tokens + 16, false);
     ggml_build_forward_expand(g2, yb);
     if (!ggml_backend_supports_op(backend, yb) || !ggml_backend_supports_op(backend, ys[0])) {
@@ -116,9 +163,11 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     ggml_backend_tensor_set(ib, ids.data(), 0, ids.size() * sizeof(int32_t));
 
     const bool previous = ggml_backend_cuda_set_mmvq_batch_invariant(invariant);
-    bool ok = ggml_backend_graph_compute(backend, g1) == GGML_STATUS_SUCCESS &&
-              ggml_backend_graph_compute(backend, g2) == GGML_STATUS_SUCCESS;
+    bool ok = ggml_backend_graph_compute(backend, g1) == GGML_STATUS_SUCCESS;
+    const size_t grouped_before = ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count();
+    ok = ok && ggml_backend_graph_compute(backend, g2) == GGML_STATUS_SUCCESS;
     ggml_backend_synchronize(backend);
+    const size_t grouped_launches = ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count() - grouped_before;
     ggml_backend_cuda_set_mmvq_batch_invariant(previous);
 
     const size_t per_token = size_t(c.n) * used;
@@ -130,7 +179,7 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
     for (int t = 0; t < tokens && ok; ++t) {
         ggml_backend_tensor_get(ys[t], single.data(), 0, per_token * sizeof(float));
         const float * bt = batch.data() + size_t(t) * per_token;
-        if (masked)   // a masked route's row is not part of the result
+        if (masked || grouped != Grouped::no)   // a masked route's row is not part of the result
             for (int j = 0; j < used; ++j)
                 if (ids[size_t(t) * used + j] < 0) {
                     std::memset(single.data() + size_t(j) * c.n, 0, size_t(c.n) * sizeof(float));
@@ -147,13 +196,18 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
         }
     }
     std::printf("{\"device\":%d,\"name\":\"%s\",\"type\":\"%s\",\"surface\":\"%s\",\"k\":%d,\"n\":%d,\"tokens\":%d,"
-                "\"batch_invariant\":%s,\"masked\":%s,\"glu\":%s,\"identical\":%s,\"diff_tokens\":%d,\"diff_values\":%zu,\"max_abs\":%.3g,\"ok\":%s}\n",
+                "\"batch_invariant\":%s,\"masked\":%s,\"glu\":%s,\"grouped\":\"%s\",\"grouped_launches\":%zu,\"identical\":%s,\"diff_tokens\":%d,\"diff_values\":%zu,\"max_abs\":%.3g,\"ok\":%s}\n",
                 device, ggml_backend_name(backend), ggml_type_name(c.type), c.surface, c.k, c.n, tokens,
-                invariant ? "true" : "false", masked ? "true" : "false", glu ? "true" : "false", diff_tokens == 0 ? "true" : "false", diff_tokens, diff_values, max_abs,
-                ok ? "true" : "false");
+                invariant ? "true" : "false", masked ? "true" : "false", glu ? "true" : "false", grouped_name(grouped), grouped_launches,
+                diff_tokens == 0 ? "true" : "false", diff_tokens, diff_values, max_abs, ok ? "true" : "false");
     std::fflush(stdout);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    if (grouped != Grouped::no && c.type == GGML_TYPE_Q2_0_ROCMFP2 && tokens >= 2 && rdna3_or_rdna4(device) && grouped_launches == 0) {
+        std::printf("FAIL: device %d %s %s: the grouped request did not take the grouped kernel\n", device,
+                    ggml_type_name(c.type), c.surface);
+        return false;
+    }
     return ok && diff_tokens == 0;
 }
 
@@ -231,20 +285,28 @@ int main(int argc, char ** argv) {
         for (const T & t : types) {
             const Case cases[] = {{t.type, "down", 2304, 5120}, {t.type, "gate_up", 5120, 2304}};
             // inv=false is the diagnostic (the multi-token kernels may differ); only the
-            // batch-invariant mode of the contract formats decides the exit status.
-            for (const auto & c : cases)
+            // batch-invariant and grouped modes of the contract formats decide the exit status.
+            for (const auto & c : cases) {
                 for (bool inv : {false, true}) {
                     const bool ok = check(backend, dv, c, tokens, experts, inv);
                     if (inv && t.contract) all = ok && all;
                 }
+                for (Grouped g : {Grouped::distinct, Grouped::shared}) {
+                    const bool ok = check(backend, dv, c, tokens, experts, true, false, false, g);
+                    if (t.contract) all = ok && all;
+                }
+            }
         }
         // qwen4exp routed experts (n_embd 2560, expert FFN 640)
         const Case qwen4exp[] = {{GGML_TYPE_Q5_1, "qwen4exp_down", 640, 2560}, {GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640}};
-        for (const auto & c : qwen4exp)
+        for (const auto & c : qwen4exp) {
             for (bool inv : {false, true}) {
                 const bool ok = check(backend, dv, c, tokens, experts, inv);
                 if (inv) all = ok && all;
             }
+            for (Grouped g : {Grouped::distinct, Grouped::shared})
+                all = check(backend, dv, c, tokens, experts, true, false, false, g) && all;
+        }
         // The split step's expert products (Qwen3.8-Flash on the Strix Halo, 10 routes a token): every verify width,
         // half the routes masked to the other device, gate/up fused with SwiGLU and the Q5_1 / Q8_0 down products.
         const Case qwen4exp_split[] = {{GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640, 10},

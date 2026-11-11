@@ -198,6 +198,11 @@ extern "C" void ggml_backend_cuda_mul_mat_whole_row_lanes(ggml_tensor * mul_mat)
     ggml_set_op_params_i32(mul_mat, 1, GGML_CUDA_WHOLE_ROW_LANES);
 }
 
+extern "C" void ggml_backend_cuda_mul_mat_id_grouped(ggml_tensor * mul_mat_id) {
+    GGML_ASSERT(mul_mat_id != nullptr && mul_mat_id->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(mul_mat_id, 1, GGML_CUDA_MMID_GROUPED);
+}
+
 bool ggml_cuda_mmvq_batch_invariant() {
     return ggml_cuda_mmvq_batch_invariant_enabled;
 }
@@ -3251,8 +3256,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, dst->ne[2], dst->ne[1]*dst->ne[2])) {
+    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_for(tensor, cc)) {
         return false;
     }
     if (cc <= GGML_CUDA_CC_PASCAL) {
@@ -3348,8 +3352,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 #endif
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
+    if (ids && (ggml_cuda_mmvq_mmid_grouped_for(up, cc) || ggml_cuda_mmvq_mmid_grouped_for(gate, cc))) {
         return false;
     }
 
