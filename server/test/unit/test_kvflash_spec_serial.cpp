@@ -306,6 +306,108 @@ TEST_CASE(KvflashSpecSerialFixture, planned_steps_reach_ars_pool_state_and_resel
     }
 }
 
+// While the pool has a free block a verify span may enter the next unallocated
+// chunk (kvflash_span_chunk_ok) and the settle drops a chunk the step did not
+// reach (kvflash_settle_chunks). Driven over a request that starts with free
+// blocks and runs into the full pool, with rejected tails across chunk
+// boundaries: after every step the pager (chunks, resident set, block map,
+// eviction order) is the one AR has at the same position. Without the settle
+// the speculative chunk stays and the states differ.
+namespace {
+std::string f5_full_state(const F5Pager & f) {
+    std::string s = f.state() + " blocks=";
+    for (int c = 0; c < f.pager.n_chunks(); c++) s += std::to_string(f.pager.block_of(c)) + ",";
+    s += " lru=";
+    for (int c : f.pager.lru_victims(64)) s += std::to_string(c) + ",";
+    return s + " free=" + std::to_string(f.pager.n_pool_blocks() - f.pager.resident_blocks());
+}
+struct F5SpecRun { int crossed = 0, dropped = 0, hops = 0, mismatches = 0; std::string end; };
+// AR reference states are built once per position by the caller.
+F5SpecRun f5_spec_run(int accept_mod, bool settle, int p_start, int p_end,
+                      const std::vector<std::string> & ar_at) {
+    const size_t hist0 = 450;
+    const int tau = 64, block = 16;
+    F5Pager spec;
+    spec.pager.alloc_span(0, p_start);
+    F5SpecRun r;
+    int p = p_start, g0 = 0, step = 0;
+    while (p < p_end) {
+        const auto plan = kvflash_spec_step_plan(
+            hist0, 0, (size_t)g0, p, block, tau, kF5Chunk,
+            [&](int c) { return kvflash_span_chunk_ok(spec.pager, c); });
+        int consumed = 1;
+        if (plan.ar_hop) {
+            r.hops++;
+            if (!spec.alloc_row(p)) r.mismatches++;
+        } else {
+            const int n = std::min(block, plan.span), chunks0 = spec.pager.n_chunks();
+            for (int i = 0; i < n; i++)
+                if (!spec.alloc_row(p + i)) r.mismatches++;       // verify rows
+            if (spec.pager.n_chunks() > chunks0) r.crossed++;
+            // A seed on a chunk's first row rejects everything after it now and then (the terminal shape).
+            consumed = (p % kF5Chunk == 0 && step % 2) ? 0 : 1 + (step % accept_mod) % n;
+        }
+        consumed = std::min(consumed, p_end - p);
+        p += consumed;
+        g0 += consumed;
+        step++;
+        if (settle && kvflash_settle_chunks(spec.pager, p)) r.dropped++;
+        if (f5_full_state(spec) != ar_at[(size_t)(p - p_start)]) r.mismatches++;
+    }
+    r.end = f5_full_state(spec);
+    return r;
+}
+}
+
+TEST_CASE(KvflashSpecSerialFixture, span_into_a_free_chunk_settles_to_ars_pager_state) {
+    const int p_start = 130, p_end = 900;   // 3 of 8 blocks used at the start, pool full from 512
+    std::vector<std::string> ar_at;
+    {
+        F5Pager ar;
+        ar.pager.alloc_span(0, p_start);
+        ar_at.push_back(f5_full_state(ar));
+        for (int pos = p_start; pos < p_end; pos++) {
+            CHECK(ar.alloc_row(pos));
+            ar_at.push_back(f5_full_state(ar));
+        }
+    }
+    for (int accept_mod : {1, 3, 7, 16}) {
+        const F5SpecRun r = f5_spec_run(accept_mod, /*settle=*/true, p_start, p_end, ar_at);
+        CHECK(r.crossed > 0);                // spans did enter unallocated chunks
+        CHECK(r.hops > 0);                   // and the full pool still takes the AR hop
+        CHECK(r.mismatches == 0);            // AR's pager state after every step
+        CHECK(r.end == ar_at.back());
+        if (accept_mod != 16) CHECK(r.dropped > 0);   // rejected tails across a boundary were taken back
+    }
+    // The hazard the settle removes: the same steps without it leave the chunk behind.
+    const F5SpecRun bad = f5_spec_run(3, /*settle=*/false, p_start, p_end, ar_at);
+    CHECK(bad.crossed > 0);
+    CHECK(bad.mismatches > 0);
+}
+
+// A request that ends on a seed opening a chunk: the spec step verifies the
+// seed (allocating the chunk), the terminal repair settles at the seed's
+// position, and the chunk is gone, as in AR, which never forwarded the seed.
+TEST_CASE(KvflashSpecSerialFixture, terminal_seed_at_a_free_chunk_is_taken_back) {
+    const int p0 = 3 * kF5Chunk;
+    F5Pager ar, spec;
+    ar.pager.alloc_span(0, p0);
+    spec.pager.alloc_span(0, p0);
+    const auto plan = kvflash_spec_step_plan(
+        0, 0, 0, p0, 8, /*tau0=*/64, kF5Chunk,
+        [&](int c) { return kvflash_span_chunk_ok(spec.pager, c); });
+    CHECK(!plan.ar_hop);
+    CHECK(plan.span == 8);
+    for (int i = 0; i < plan.span; i++) CHECK(spec.alloc_row(p0 + i));
+    CHECK(f5_full_state(spec) != f5_full_state(ar));
+    CHECK(kvflash_settle_chunks(spec.pager, p0));          // emitted 1, terminal: new_committed = p0
+    CHECK(f5_full_state(spec) == f5_full_state(ar));
+    CHECK(!kvflash_settle_chunks(spec.pager, p0));         // nothing left to drop
+    // The next appends get the same blocks and victims in both.
+    for (int pos = p0; pos < 900; pos++) { CHECK(ar.alloc_row(pos)); CHECK(spec.alloc_row(pos)); }
+    CHECK(f5_full_state(spec) == f5_full_state(ar));
+}
+
 TEST_CASE(KvflashSpecSerialFixture, seed_takes_the_ar_step_only_where_it_opens_an_unallocated_chunk) {
     const std::function<bool(int)> upto7 = [](int c) { return c <= 7; };
     CHECK(kvflash_seed_takes_ar_step(512, 64, upto7));     // opens chunk 8
