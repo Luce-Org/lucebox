@@ -53,6 +53,14 @@ jobs:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
+      - name: Add a last-resort Ubuntu mirror outside Canonical's DNS
+        # The CUDA install below runs apt. The runner reads its Ubuntu mirrors from
+        # /etc/apt/apt-mirrors.txt and tries them in priority order, but all three are
+        # ubuntu.com names, so a Canonical DNS outage fails every apt install. kernel.org
+        # mirrors the same signed archive (apt still checks it against the Ubuntu keys) and
+        # is only reached when the three runner mirrors fail.
+        run: printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' | sudo tee -a /etc/apt/apt-mirrors.txt
+
       - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
           # Keep the existing upstream CUDA toolkit version; the uv workspace
