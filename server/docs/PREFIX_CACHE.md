@@ -510,8 +510,8 @@ serving `SeqEngine::estimate_prefix_state_bytes`, `drop_prefix_kv`,
 
 Single-sequence and concurrent serving both take part for these three. They
 rely on a prefix's rows not depending on how it was reached, which holds
-because these backends end a prompt forward at every restore point
-(`prefill_cuts_at_restore_points`). Not covered, and unchanged: a KVFlash pool
+because these backends start a prefill chunk at every restore point
+(`GenerateRequest::restore_points`). Not covered, and unchanged: a KVFlash pool
 (Qwen keeps state-only rungs of its own beside the live cache there), layer
 split and cluster serving, and the other backends, which keep the previous
 turn whole while the limit holds it. Chains that are abandoned,
