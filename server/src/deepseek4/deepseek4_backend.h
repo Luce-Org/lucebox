@@ -373,7 +373,9 @@ private:
                               std::string & error);
     // Resets the item's staging cache, then restores `from` into it when
     // given (a text prompt's prefix checkpoint): staging continues after it.
-    bool begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from = nullptr);
+    // `rows_from`: the whole checkpoint a state-only `from` takes its rows from.
+    bool begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from = nullptr,
+                              const DeepSeek4Snapshot * rows_from = nullptr);
     // Before a staged prompt's first chunk: what a fresh prompt's first bulk
     // chunk retires before it allocates (deepseek4_step_layer_range does that
     // only for a wide chunk at position 0; a restore or a cut rules it out).
@@ -381,6 +383,9 @@ private:
     // Host bytes of a prefix checkpoint of `tokens` positions (a staging
     // cache snapshot without the single-request aux sidecar).
     size_t staged_checkpoint_bytes(int tokens) const;
+    // The same checkpoint without its compressed and index rows
+    // (deepseek4_snapshot_drop_rows).
+    size_t staged_checkpoint_state_bytes() const;
     // A finished (or failed) staged prompt: retire the staging cache's
     // prefill arenas and the device pools' cached temporaries, as the
     // single-request path does after its prefill.

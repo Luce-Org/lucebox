@@ -390,28 +390,58 @@ namespace {
 // The same enumeration sizes, saves and restores the snapshot. The MTP draft
 // layer's strips come last (`mtp`: visit them), so a snapshot's trunk is the
 // same leading strips whether or not the cache it came from has the layer.
+// visit(t, offset, bytes, rows): `rows` marks a per-position strip, rows
+// [0, n) of one head, which is the leading part of the same strip of a deeper
+// snapshot; the others are point state.
 template<class F>
 void snapshot_strips(const Qwen4ExpCache & c, int pos, int blocks, bool mtp, F visit) {
     auto prefix = [&](ggml_tensor * t, int64_t rows) {
         rows = t ? std::min(rows, t->ne[1]) : 0;   // a KVFlash pool's rows
         if (rows <= 0) return;
-        for (int64_t h = 0; h < t->ne[2]; ++h) visit(t, h * t->nb[2], rows * t->nb[1]);
+        for (int64_t h = 0; h < t->ne[2]; ++h) visit(t, h * t->nb[2], rows * t->nb[1], true);
     };
     for (auto * t : c.attn_k) prefix(t, pos);
     for (auto * t : c.attn_v) prefix(t, pos);
     for (auto * t : c.indexer_raw) prefix(t, pos);
     for (auto * t : c.indexer_k) prefix(t, blocks);
     for (const auto * group : {&c.ssm_state, &c.conv_state, &c.ple_conv_state}) {
-        for (auto * t : *group) if (t) visit(t, 0, ggml_nbytes(t));
+        for (auto * t : *group) if (t) visit(t, 0, ggml_nbytes(t), false);
     }
     if (!mtp) return;
     prefix(c.mtp_k, pos - 1);
     prefix(c.mtp_v, pos - 1);
-    if (c.mtp_prev_hidden) visit(c.mtp_prev_hidden, 0, ggml_nbytes(c.mtp_prev_hidden));
+    if (c.mtp_prev_hidden) visit(c.mtp_prev_hidden, 0, ggml_nbytes(c.mtp_prev_hidden), false);
+}
+
+// A strip of the target cache and the snapshot copy it restores from (a donor's copy may be longer: its leading
+// `bytes` are the rows).
+struct RestoreStrip {
+    ggml_tensor * t;
+    size_t off, bytes;
+    bool rows;
+    ggml_tensor * src;
+};
+
+// The strips of `c` that `s` holds at its position, each with its copy: every strip of a whole snapshot, the point
+// state of a state-only one. `mtp`: the draft layer's strips come along. False when `s` does not fit c's layout.
+bool held_strips(const Qwen4ExpCache & c, const Qwen4ExpSnapshot & s, bool mtp, std::vector<RestoreStrip> & out) {
+    out.clear();
+    snapshot_strips(c, s.cur_pos, s.indexer_blocks, mtp, [&](ggml_tensor * t, size_t off, size_t bytes, bool rows) {
+        if (!rows || !s.state_only) out.push_back({t, off, bytes, rows, nullptr});
+    });
+    // A snapshot that has the draft layer, restored without it, leaves its trailing strips out.
+    if (out.size() > s.strips.size() || (out.size() < s.strips.size()) != (s.mtp && !mtp)) return false;
+    for (size_t i = 0; i < out.size(); ++i) {
+        ggml_tensor * copy = s.strips[i].second;
+        if (out[i].t->type != copy->type || out[i].bytes != ggml_nbytes(copy)) return false;
+        out[i].src = copy;
+    }
+    return true;
 }
 } // namespace
 
-size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens, size_t * host_bytes) {
+size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens, size_t * host_bytes,
+                               bool rows) {
     if (host_bytes) *host_bytes = 0;
     const int pos = std::clamp(tokens, 0, c.max_ctx);
     if (!pos) return 0;
@@ -419,7 +449,8 @@ size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, in
     size_t bytes = 0, count = 0;
     // The supported QSA layout pools four rows per block. Dense prefill can
     // have fewer valid blocks; this bound also covers its later completion.
-    snapshot_strips(c, pos, pos / 4, true, [&](ggml_tensor *, size_t, size_t n) {
+    snapshot_strips(c, pos, pos / 4, true, [&](ggml_tensor *, size_t, size_t n, bool per_position) {
+        if (per_position && !rows) return;
         bytes += (n + alignment - 1) / alignment * alignment;
         ++count;
     });
@@ -440,11 +471,11 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
     if (c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos)) return false;
     size_t count = 0;
-    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor *, size_t, size_t) { ++count; });
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor *, size_t, size_t, bool) { ++count; });
     s.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
     if (!s.ctx) return false;
     s.strips.reserve(count);
-    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor * t, size_t off, size_t bytes) {
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor * t, size_t off, size_t bytes, bool) {
         const int64_t n = bytes / ggml_type_size(t->type) * ggml_blck_size(t->type);
         auto * live = ggml_view_1d(s.ctx, t, n, off);
         auto * copy = ggml_new_tensor_1d(s.ctx, t->type, n);
@@ -464,37 +495,59 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     return true;
 }
 
-bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
+bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
+                               const Qwen4ExpSnapshot * rows_from) {
     if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
     if (c.kvflash && s.cur_pos > c.kvflash->pool_tokens()) return false;
-    // The target's strips at the snapshot's position, in the order they were saved. The draft layer's come only when
-    // both caches have the layer; a snapshot that has it and a target that does not leave its trailing strips out.
-    const bool mtp = s.mtp && c.mtp_k;
-    struct Strip { ggml_tensor * t; size_t off, bytes; };
-    std::vector<Strip> target;
-    target.reserve(s.strips.size());
-    snapshot_strips(c, s.cur_pos, s.indexer_blocks, mtp, [&](ggml_tensor * t, size_t off, size_t bytes) {
-        target.push_back({t, off, bytes});
-    });
-    if (target.size() > s.strips.size() || (target.size() < s.strips.size()) != (s.mtp && !mtp)) return false;
-    for (size_t i = 0; i < target.size(); ++i) {
-        const ggml_tensor * copy = s.strips[i].second;
-        if (target[i].t->type != copy->type || target[i].bytes != ggml_nbytes(copy)) return false;
+    // A state-only snapshot's rows come from a whole snapshot at least as deep, of a prompt that extends its own.
+    if (!s.state_only) {
+        rows_from = nullptr;
+    } else if (!rows_from || rows_from == &s || !rows_from->buf || rows_from->state_only ||
+               rows_from->cur_pos < s.cur_pos || rows_from->tokens.size() < s.tokens.size() ||
+               !std::equal(s.tokens.begin(), s.tokens.end(), rows_from->tokens.begin())) {
+        return false;
     }
-    ggml_context * views = ggml_init({target.size() * ggml_tensor_overhead(), nullptr, true});
+    // The target's strips at the snapshot's position, in the order they were saved. The draft layer's come only when
+    // both caches (and a state-only snapshot's donor) have the layer; a snapshot that has it and a target that does
+    // not leave its trailing strips out.
+    const bool mtp = s.mtp && c.mtp_k && (!rows_from || rows_from->mtp);
+    std::vector<RestoreStrip> target, donor;
+    if (!held_strips(c, s, mtp, target)) return false;
+    if (rows_from) {
+        if (!held_strips(c, *rows_from, rows_from->mtp && c.mtp_k, donor)) return false;
+        // Each row strip is the leading part of the donor's strip of the same tensor and head. snapshot_strips skips
+        // an empty one (no pooled blocks yet, the MTP rows at position 1), so strips match by place, not index.
+        bool covered = true;
+        snapshot_strips(c, s.cur_pos, s.indexer_blocks, mtp,
+                        [&](ggml_tensor * t, size_t off, size_t bytes, bool rows) {
+            if (!rows || !covered) return;
+            const auto d = std::find_if(donor.begin(), donor.end(),
+                                        [&](const RestoreStrip & x) { return x.t == t && x.off == off; });
+            covered = d != donor.end() && d->rows && d->bytes >= bytes;
+            if (covered) target.push_back({t, off, bytes, true, d->src});
+        });
+        if (!covered) return false;
+    }
+    ggml_context * views = ggml_init({2 * target.size() * ggml_tensor_overhead(), nullptr, true});
     if (!views) return false;
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
     if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);
     clear_position_bound_graphs(c);
     // Clear masked suffixes too: stable QSA scores the entire bucket. Stacked slot
     // states are not in c.buf; the snapshot rewrites this slot's slabs in full.
+    // Only a donor's leading rows are copied, so the rows past them are zero as after a whole restore.
     ggml_backend_buffer_clear(c.buf, 0);
     if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
-    for (size_t i = 0; i < target.size(); ++i) {
-        ggml_tensor * copy = s.strips[i].second;
-        ggml_tensor * live = ggml_view_1d(views, target[i].t, ggml_nelements(copy), target[i].off);
+    for (const RestoreStrip & strip : target) {
+        const int64_t n = (int64_t) (strip.bytes / ggml_type_size(strip.t->type)) * ggml_blck_size(strip.t->type);
+        ggml_tensor * live = ggml_view_1d(views, strip.t, n, strip.off);
         ggml_backend_view_init(live);
-        ggml_backend_tensor_copy_async(backend, backend, copy, live);
+        ggml_tensor * src = strip.src;
+        if (ggml_nelements(src) != n) {
+            src = ggml_view_1d(views, strip.src, n, 0);
+            ggml_backend_view_init(src);
+        }
+        ggml_backend_tensor_copy_async(backend, backend, src, live);
     }
     ggml_backend_synchronize(backend);
     ggml_free(views);
@@ -510,6 +563,46 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
         reset_qwen4exp_state(backend, c);
         return false;
     }
+    return true;
+}
+
+bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) {
+    if (!s.ctx || !s.buf || s.state_only) return false;
+    // Which saved strips are rows: the layout `s` was saved with, every strip of it.
+    std::vector<RestoreStrip> layout;
+    if (!held_strips(c, s, s.mtp, layout)) return false;
+    size_t count = 0;
+    for (const RestoreStrip & strip : layout) count += !strip.rows;
+    // The point strips under the same views, in a buffer of their own: a ggml buffer cannot give back part of itself.
+    Qwen4ExpSnapshot kept;
+    kept.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
+    if (!kept.ctx) return false;
+    kept.strips.reserve(count);
+    for (size_t i = 0; i < layout.size(); ++i) {
+        if (layout[i].rows) continue;
+        const auto [live, copy] = s.strips[i];
+        kept.strips.emplace_back(ggml_view_1d(kept.ctx, live->view_src, ggml_nelements(copy), live->view_offs),
+                                 ggml_new_tensor_1d(kept.ctx, copy->type, ggml_nelements(copy)));
+    }
+    kept.buf = ggml_backend_alloc_ctx_tensors_from_buft(kept.ctx, ggml_backend_buffer_get_type(s.buf));
+    if (!kept.buf) {
+        free_qwen4exp_snapshot(kept);
+        return false;
+    }
+    for (size_t i = 0, k = 0; i < layout.size(); ++i) {
+        if (!layout[i].rows) ggml_backend_tensor_copy(s.strips[i].second, kept.strips[k++].second);
+    }
+    kept.mtp = s.mtp;
+    kept.state_only = true;
+    kept.cur_pos = s.cur_pos;
+    kept.indexer_blocks = s.indexer_blocks;
+    kept.mtp_prev_pos = s.mtp_prev_pos;
+    kept.kv_bucket_base = s.kv_bucket_base;
+    kept.ple_prev = std::move(s.ple_prev);
+    kept.tokens = std::move(s.tokens);
+    kept.logits = std::move(s.logits);
+    free_qwen4exp_snapshot(s);
+    s = std::move(kept);
     return true;
 }
 

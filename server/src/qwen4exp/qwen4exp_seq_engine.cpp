@@ -138,18 +138,40 @@ void Qwen4ExpSeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
         free_qwen4exp_snapshot(checkpoints_[(size_t)index]);
 }
 
+size_t Qwen4ExpSeqEngine::estimate_prefix_state_bytes(int tokens) const {
+    // A KVFlash pool keeps its checkpoints whole (Qwen4ExpBackend::snapshot_state_bytes_estimate).
+    if (caches_.empty() || !caches_[0] || caches_[0]->kvflash || tokens <= 0) return 0;
+    size_t host = 0;
+    const size_t copies = qwen4exp_snapshot_bytes(store_, *caches_[0], tokens, &host, /*rows=*/false);
+    if (!copies) return 0;
+    return copies + host + (size_t(tokens) + std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+}
+
+// The first slot's cache has every layer a checkpoint can hold, the MTP draft layer's too. The allowance counts the
+// smaller buffer from here on (capture_prefix sums the resident buffers).
+bool Qwen4ExpSeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    if (index < 0 || !estimate_prefix_state_bytes(checkpoint.tokens)) return false;
+    Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
+    return s.buf && s.cur_pos == checkpoint.tokens && drop_qwen4exp_snapshot_rows(*caches_[0], s);
+}
+
 // A checkpoint restores only into a cold slot and only when its tokens are the
 // prompt's own prefix; any failure leaves the slot cold.
 bool Qwen4ExpSeqEngine::restore_prefix(int slot, const std::vector<int32_t> & prompt,
-                                       PrefixStoreRef checkpoint) {
+                                       PrefixStoreRef checkpoint, PrefixStoreRef rows) {
     const int index = checkpoint_index(checkpoint);
     if (index < 0 || checkpoint.tokens >= (int)prompt.size()) return false;
     const Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
     if (!s.buf || s.cur_pos != checkpoint.tokens ||
         s.tokens.size() != (size_t)checkpoint.tokens ||
         !std::equal(s.tokens.begin(), s.tokens.end(), prompt.begin())) return false;
+    // A state-only checkpoint takes its rows from the deeper one the plan names; a stale name fails the restore.
+    const int rows_index = checkpoint_index(rows);
+    const Qwen4ExpSnapshot * rows_from = rows_index >= 0 && rows_index != index &&
+        checkpoints_[(size_t)rows_index].cur_pos == rows.tokens ? &checkpoints_[(size_t)rows_index] : nullptr;
     Qwen4ExpCache & cache = *caches_[(size_t)slot];
-    if (!restore_qwen4exp_snapshot(backend_, s, cache)) return false;
+    if (!restore_qwen4exp_snapshot(backend_, s, cache, rows_from)) return false;
     if (!slots_.seed_restored_prefix(slot, checkpoint.tokens).ok) {
         reset_qwen4exp_state(backend_, cache);
         ggml_backend_synchronize(backend_);
@@ -169,7 +191,7 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
     std::sort(prefill_cuts_[(size_t)slot].begin(), prefill_cuts_[(size_t)slot].end());
     if (plan.restore.valid()) {
         const auto started = std::chrono::steady_clock::now();
-        const bool restored = restore_prefix(slot, prompt, plan.restore);
+        const bool restored = restore_prefix(slot, prompt, plan.restore, plan.restore_kv);
         const uint64_t elapsed_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - started).count();
         if (restored) {

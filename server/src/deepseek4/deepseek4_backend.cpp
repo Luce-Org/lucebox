@@ -1485,7 +1485,8 @@ void DeepSeek4Backend::release_paged_decode_graphs() {
     ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
-bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from) {
+bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from,
+                                            const DeepSeek4Snapshot * rows_from) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
         ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
@@ -1500,7 +1501,7 @@ bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek
     item.staging->prefill_mode = PrefillAttentionMode::Sparse;
     item.done = item.restored = 0;
     if (from) {
-        if (!deepseek4_snapshot_restore(*from, *item.staging)) {
+        if (!deepseek4_snapshot_restore(*from, *item.staging, rows_from)) {
             item.error = "prefix checkpoint could not be restored";
             return false;
         }
@@ -5595,6 +5596,11 @@ static size_t ds4_declared_snapshot_bytes(const DeepSeek4Cache & cache, const De
 size_t DeepSeek4Backend::staged_checkpoint_bytes(int tokens) const {
     if (!cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) return 0;
     return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, nullptr);
+}
+
+size_t DeepSeek4Backend::staged_checkpoint_state_bytes() const {
+    if (!cfg_.paged_attention || !cache_.ctx || !snap_backend_) return 0;
+    return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, 0, nullptr);
 }
 
 size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {

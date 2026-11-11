@@ -289,14 +289,19 @@ struct Qwen4ExpSnapshot {
     ggml_backend_buffer_t buf = nullptr;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> strips;
     bool mtp = false;   // the source cache has the MTP draft layer: its strips close `strips`
+    // State only (drop_qwen4exp_snapshot_rows): `strips` keeps what the position alone determines (recurrent, conv
+    // and PLE conv state, the MTP carry row), and a restore takes the K/V, QSA and MTP K/V rows from a deeper
+    // whole snapshot of a prompt that extends this one.
+    bool state_only = false;
     int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
     int64_t kv_bucket_base = 0;
     std::vector<int32_t> ple_prev, tokens;
     std::vector<float> logits;
 };
 
+// `rows` false: a state-only snapshot's bytes, the same at every length.
 size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens,
-                             size_t * host_bytes = nullptr);
+                             size_t * host_bytes = nullptr, bool rows = true);
 // Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. A KVFlash cache saves while its
 // positions still sit in their identity slots (the context fits the pool).
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
@@ -306,7 +311,18 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 // when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
 // no draft state (mtp_prev_pos -1), so its request decodes without drafts. False, with `c`
 // untouched, when the layouts differ otherwise or a KVFlash pool cannot hold the snapshot.
-bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
+// A state-only `s` takes its rows from `rows_from`, a whole snapshot whose tokens extend its own; the restored cache
+// is then byte for byte what the whole `s` restored. Without that donor, or when it holds fewer rows or pooled blocks
+// than `s`, false with `c` untouched. A donor without the MTP draft layer leaves no draft state, as above.
+// `rows_from` is ignored for a whole snapshot.
+bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
+                               const Qwen4ExpSnapshot * rows_from = nullptr);
+// Free the per-position rows of a whole snapshot and keep its point state and host fields (state_only). Rows below
+// the position (MTP K/V: below the carry row) and pooled blocks below indexer_blocks are final once written: no
+// forward, verify rollback or MTP catch-up writes below them, so a deeper snapshot that continued from this state
+// holds the same bytes. `c`: the cache `s` was saved from, or one with its layout. False, with `s` unchanged, when
+// `s` is not whole, does not match `c` or the allocation fails.
+bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
 }  // namespace luce::common
