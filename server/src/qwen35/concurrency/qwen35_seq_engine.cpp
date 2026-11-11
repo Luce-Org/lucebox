@@ -888,6 +888,7 @@ void Qwen35SeqEngine::release_host_(int slot, const char * why) {
     if (book_.release_to_last_commit(slot)) {
         std::fprintf(stderr, "[kvflash] slot %d session released from host memory, its last committed bundle %s stays on disk: its newer park cannot be written (%s)\n", slot, key.c_str(), why);
         parked_[(size_t)slot] = ParkedSession{};
+        uq_store_[(size_t)slot].clear();   // the rows go with the session: the next occupant must not save them
         kvf_kv_->drop_parked(slot);
         bundle_failed_[(size_t)slot] = false;
         return;
@@ -902,6 +903,7 @@ void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
         std::fprintf(stderr, "[kvflash] slot %d session dropped: history=%zu (%s)\n",
                      slot, parked_[(size_t)slot].history.size(), why);
     parked_[(size_t)slot] = ParkedSession{};
+    uq_store_[(size_t)slot].clear();
     kvf_kv_->drop_parked(slot);
     if (!bundle_dir_.empty()) {
         bundle_writer_->wait(slot);   // a queued park of this slot would recreate the directory after the removal
@@ -939,6 +941,7 @@ bool Qwen35SeqEngine::evict_session_(int slot, const char * why) {
     const std::string evicted_key = sb.key;
     if (!book_.evict(slot, bundle_failed_[(size_t)slot].load())) std::fprintf(stderr, "[kvflash] slot %d session %s: no committed head or meta and index not written\n", slot, evicted_key.c_str());
     parked_[(size_t)slot] = ParkedSession{};
+    uq_store_[(size_t)slot].clear();
     kvf_kv_->drop_parked(slot);
     bundle_failed_[(size_t)slot] = false;
     return true;
@@ -1110,7 +1113,7 @@ void Qwen35SeqEngine::init_bundles_() {
 // so a save (the slab being staged) and a restore (the slab read back from the slot) digest the same way. Flushed at once.
 // t0: when the caller's own staging began, so a restore's ms includes its slab readback.
 void Qwen35SeqEngine::log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
-                                           const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, std::chrono::steady_clock::time_point t0) {
+                                           const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const KvFlashUqStore * uq, std::chrono::steady_clock::time_point t0) {
     KvFlashSlotPager & p = kvf_kv_->pager(slot);
     p.synchronize_paging();
     const std::vector<uint8_t> pk = ck.pos > 0 ? kvflash_slab_pack(ck.slab.ssm, ck.slab.conv) : std::vector<uint8_t>(),
@@ -1118,7 +1121,7 @@ void Qwen35SeqEngine::log_bundle_digest_(const char * tag, int slot, const std::
                                pe = ex.pos > 0 ? kvflash_slab_pack(ex.slab.ssm, ex.slab.conv) : std::vector<uint8_t>();
     const KvFlashDigestRungs rungs = kvflash_digest_rungs(ck.pos, &pk, tr.pos, &pt, ex.pos, ex.pinned, &pe);   // raw, as the session holds them
     const KvFlashStateDigest d = kvflash_state_digest(history, kvflash_slab_pack(slab.ssm, slab.conv), p.blob_header(), p.ledger_blob(), rungs, p.chunk_bytes(),
-                                                      [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); });
+                                                      [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, uq);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "%s\n", kvflash_state_digest_line(tag, key, gen, d, ms).c_str());
     std::fflush(stderr);
@@ -1212,6 +1215,11 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     ps.history = book_.adopt(slot, key, std::move(l.head));
     parked_[(size_t)slot] = std::move(ps);
     bundle_failed_[(size_t)slot] = false;
+    // the slot's question rows come back with it (an older head or a lost file: none, the next question recaptures them)
+    if (!l.uq_why.empty()) std::fprintf(stderr, "[kvflash] slot %d bundle %s\n", slot, l.uq_why.c_str());
+    uq_store_[(size_t)slot] = std::move(l.uq);
+    if (!uq_store_[(size_t)slot].empty())
+        std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, uq_store_[(size_t)slot].lo, uq_store_[(size_t)slot].hi, uq_store_[(size_t)slot].n);
     const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind (pins are not state)
     if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the pins, the rebind and any reselect
         ParkedSession & q = parked_[(size_t)slot];
@@ -1225,7 +1233,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
         }
         const auto t0 = std::chrono::steady_clock::now();
         SlotStateSnapshot live;
-        if (snapshot_slot_state(b_.cache_, slot, live)) log_bundle_digest_("restore", slot, key, gen, q.history, live, q.ckpt, q.trunk, q.extra, t0);
+        if (snapshot_slot_state(b_.cache_, slot, live)) log_bundle_digest_("restore", slot, key, gen, q.history, live, q.ckpt, q.trunk, q.extra, &uq_store_[(size_t)slot], t0);
         else std::fprintf(stderr, "[kvflash-digest] restore sid=%s gen=%u unavailable: slab snapshot failed\n", key.c_str(), gen);
     }
     if (rebind) {   // the session pinned a head when it parked: pin it again (its history must still start with that head)
@@ -1442,8 +1450,17 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
     const KvFlashHeadRungs hr = kvflash_ladder_to_head(ladder_of_(ps.ckpt, ps.trunk, ps.extra));   // a third at a rung's position (parked mid-turn) has no slab of its own: the head keeps its pin
     if (hr.extra > 0) rung(ps.extra, h.extra_pos, h.extra_gen);
     h.pin_pos = (uint32_t)hr.pin;
-    const auto kept_gens = kvflash_head_gens(h);
-    for (uint32_t id : kvflash_head_gens(prev))
+    // the slot's question rows, when they are this session's (the key is the hash of its own prompt ids up to the window's end): a
+    // new file only when the directory does not already hold these
+    const KvFlashUqStore & uq = uq_store_[(size_t)slot];
+    const bool uq_rows = uq_queries_ > 0 && kvflash_uq_belongs(uq, ps.history);
+    if (uq_rows) {
+        h.uq_lo = (uint32_t)uq.lo; h.uq_hi = (uint32_t)uq.hi; h.uq_n = (uint32_t)uq.n; h.uq_hash = uq.hash;
+        if (prev.uq_gen != 0 && prev.uq_lo == h.uq_lo && prev.uq_hi == h.uq_hi && prev.uq_n == h.uq_n && prev.uq_hash == h.uq_hash && !fresh) h.uq_gen = prev.uq_gen;
+        else { h.uq_gen = sb.next_gen++; c.files.push_back({kvflash_bundle_slab_name(h.uq_gen), kvflash_uq_file_pack(uq)}); }
+    }
+    const auto kept_gens = kvflash_head_owned_gens(h);
+    for (uint32_t id : kvflash_head_owned_gens(prev))
         if (id != 0 && std::find(kept_gens.begin(), kept_gens.end(), id) == kept_gens.end()) c.unlink.push_back(kvflash_bundle_slab_name(id));
     c.head = kvflash_head_pack(h);
     size_t staged = c.head.size();
@@ -1473,7 +1490,7 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
     }
     sb.staged = std::move(h);
     sb.pending = true;
-    if (kvflash_bundle_digest_on()) log_bundle_digest_("save", slot, sb.key, c.gen, ps.history, end, ps.ckpt, ps.trunk, ps.extra, std::chrono::steady_clock::now());   // before the writer: a kill after the head commit cannot lose the line
+    if (kvflash_bundle_digest_on()) log_bundle_digest_("save", slot, sb.key, c.gen, ps.history, end, ps.ckpt, ps.trunk, ps.extra, uq_rows ? &uq_store_[(size_t)slot] : nullptr, std::chrono::steady_clock::now());   // before the writer: a kill after the head commit cannot lose the line
     bundle_writer_->submit({slot, std::move(c)});
 }
 

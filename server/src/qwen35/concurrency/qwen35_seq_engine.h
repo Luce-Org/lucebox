@@ -392,7 +392,7 @@ private:
     std::string identity_key_() const;                // model, KV types, pager geometry, context, attention route: the bundle identity's text
     size_t slab_bytes_() const;                       // one slot's recurrent slab
     void log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
-                            const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, std::chrono::steady_clock::time_point t0);
+                            const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const KvFlashUqStore * uq, std::chrono::steady_clock::time_point t0);
     uint64_t park_tick_ = 0;
     bool sticky_on_ = false;
     // G-D: park one token short (kvflash_park_point). The decode step stashes each live slot's recurrent
