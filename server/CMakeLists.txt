@@ -1867,6 +1867,10 @@ if(LUCE_TESTS)
     # copy; a one-key-wide last chunk used to take the dense transpose
     # kernel). CUDA and HIP; exits 77 without a device.
     luce_add_ggml_gpu_executable(test_cpy_strided_dst test/unit/test_cpy_strided_dst.cpp)
+    # Batch-invariant MUL_MAT: a column's bits must not depend on how many other columns share the product
+    # (a prefill cut packed with decode rows). Every backend.
+    luce_add_ggml_gpu_executable(test_mul_mat_invariant_wide_batch test/unit/test_mul_mat_invariant_wide_batch.cpp)
+    list(APPEND _raw_unit_test_targets test_mul_mat_invariant_wide_batch)
     target_link_libraries(test_cpy_strided_dst PRIVATE ggml-cpu)
     list(APPEND _raw_unit_test_targets test_cpy_strided_dst)
     if(LUCE_GPU_BACKEND STREQUAL "hip")
