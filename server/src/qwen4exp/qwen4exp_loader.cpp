@@ -308,7 +308,26 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
         }
     };
 
-    if (n_threads_ == 1 || n < 64) {
+    // A decode or verify step gathers one row per PLE head per token: up to 128 rows at Flash-Next's verify widths.
+    // Where the OS takes a read-ahead hint, hinting every row and then reading serially beat 31 spawned
+    // readers there (64 rows: 0.56 vs 0.87 ms with every row missing the page cache, 0.15 vs 0.89 ms with every row
+    // cached; 128 rows: 0.81 vs 1.0 ms). Prompt chunks keep the readers.
+#if defined(POSIX_FADV_WILLNEED)
+    constexpr int64_t kSerialRows = 128;
+#else
+    constexpr int64_t kSerialRows = 63;
+#endif
+    if (n_threads_ == 1 || n <= kSerialRows) {
+#if defined(POSIX_FADV_WILLNEED)
+        // A row the page cache misses costs one SSD read. Hinting every row first starts those reads together, so
+        // the serial reads below wait about one read instead of one per row (16 rows: 0.5 vs 2.2 to 3.3 ms); a
+        // cached row only pays the hint's system call.
+        for (const auto & p : pairs) {
+            const int64_t at = static_cast<int64_t>(base_) +
+                               static_cast<int64_t>(p.first) * static_cast<int64_t>(row_size_);
+            (void) posix_fadvise(fd_, static_cast<off_t>(at), static_cast<off_t>(row_size_), POSIX_FADV_WILLNEED);
+        }
+#endif
         // A serial fallback must cover every row. Dividing the range by the
         // configured pool size here used to process only the first 1/N chunk
         // when a T=1 decode gathered fewer rows than the pool had workers.
@@ -1041,7 +1060,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         }
         std::string reader_error;
         // A 2,048-token prefill gathers ~49k random rows of the n-gram table from disk; with 4 readers the cold
-        // preads alone took ~0.8 s of TTFT. 32 keep the NVMe queue full (decode stays serial below 64 rows).
+        // preads alone took ~0.8 s of TTFT. 32 keep the NVMe queue full (gather() reads a decode step serially).
         if (!out.ple_reader.open(ple_path, kPleTensor, 32, reader_error)) {
             return fail(reader_error);
         }

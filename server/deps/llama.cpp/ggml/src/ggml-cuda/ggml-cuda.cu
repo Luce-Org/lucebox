@@ -5054,7 +5054,7 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 // then copies the usual way.
 // A contiguous same-size copy between two CUDA backends on different devices,
 // each tensor in a CUDA buffer on its backend's device: the copies below
-// qualify only then, as ggml_backend_cuda_cpy_tensor_async's peer path does.
+// qualify only then.
 static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                           const ggml_tensor * src, const ggml_tensor * dst) {
 #ifdef GGML_CUDA_NO_PEER_COPY
@@ -5202,8 +5202,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                     ggml_cuda_flush_peer_copy_batch("peer-pair-change");
                 }
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                if (ggml_cuda_peer_copy_kernel_enabled() &&
-                    ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+                // The kernel copies exactly what cudaMemcpyPeerAsync below would, ggml_nbytes(dst) bytes from
+                // src->data, so a strided copy joins the batch too (a verify's top-k ids, a view of the router's
+                // sorted rows). A hop whose copies all join leaves as the producer graph's tail instead of a copy
+                // kernel, a runtime blit and a second copy kernel, each followed by a launch gap.
+                if (ggml_cuda_peer_copy_kernel_enabled()) {
                     if (batch.n_descs == ggml_cuda_copy_batch_max) {
                         ggml_cuda_backend_entry(cuda_ctx_src);
                         ggml_cuda_set_device(cuda_ctx_src->device);
