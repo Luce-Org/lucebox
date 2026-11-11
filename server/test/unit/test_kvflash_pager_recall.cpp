@@ -123,3 +123,33 @@ TEST_CASE(KvflashPagerRecallFixture, slot_mask_hides_rows_above_the_decode_posit
     CHECK(cut[(size_t)p.block_of(0) * kChunk + 5] == 0);   // older chunks stay visible
     CHECK(cut[(size_t)p.block_of(1) * kChunk + 63] == 0);
 }
+
+// The exact scorer keeps evicted keys on the device per chunk version (kvflash_gpu_mass.h): a version must change
+// whenever the chunk's rows may have, and never because the chunk moved between the pool and the host.
+TEST_CASE(KvflashPagerRecallFixture, chunk_version_changes_only_when_its_rows_are_written) {
+    Harness h;
+    KvFlashPager p;
+    REQUIRE(p.attach(cfg(), h.k, h.v));
+    must(p.alloc_span(0, 14 * kChunk));
+    const uint64_t v2 = p.chunk_version(2), v3 = p.chunk_version(3);
+    CHECK(v2 != 0u);
+    CHECK(v2 != v3);
+    CHECK(p.chunk_version(99) == 0u);
+    REQUIRE(!p.is_resident(2));
+    must(p.page_in(2));
+    CHECK(p.chunk_version(2) == v2);
+    must(p.page_out(2));
+    p.reselect_recent();
+    CHECK(p.chunk_version(2) == v2);
+    p.truncate(3 * kChunk + 5);                 // chunk 3 keeps 5 rows, the rest is zeroed
+    CHECK(p.chunk_version(2) == v2);
+    const uint64_t v3cut = p.chunk_version(3);
+    CHECK(v3cut != v3);
+    must(p.alloc_span(3 * kChunk + 5, kChunk)); // the turn is prefilled again
+    CHECK(p.chunk_version(3) != v3cut);
+    CHECK(p.chunk_version(2) == v2);
+    p.reset();
+    must(p.alloc_span(0, 3 * kChunk));
+    CHECK(p.chunk_version(2) != 0u);
+    CHECK(p.chunk_version(2) != v2);
+}
