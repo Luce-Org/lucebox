@@ -9,6 +9,9 @@
 #include "kvflash_mass_synth.h"
 
 #include "ggml-cpu.h"
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -320,7 +323,7 @@ struct World {
     ggml_backend_buffer_t pbuf = nullptr;
     std::vector<ggml_tensor *> pool_k;
 
-    explicit World(const SynthCfg & c) : cfg(c) {
+    explicit World(const SynthCfg & c, ggml_backend_t dev = nullptr) : cfg(c) {
         s.build(cfg);
         all.resize((size_t)cfg.sealed * s.CHUNK);
         for (int ch = 0; ch < cfg.sealed; ch++)
@@ -328,7 +331,7 @@ struct World {
                 for (int h = 0; h < cfg.HK; h++)
                     std::memcpy(seg_rw(ch, l, h), s.blk[(size_t)ch] >= 0 ? s.pool_seg(s.blk[(size_t)ch], l, h) : s.host_seg(ch, l, h), s.SEG);
         for (int ch = 0; ch < cfg.sealed; ch++) ver.push_back(100 + (uint64_t)ch);
-        be = ggml_backend_cpu_init();
+        be = dev ? dev : ggml_backend_cpu_init();
         ggml_init_params ip{ggml_tensor_overhead() * (size_t)(cfg.L + 4), nullptr, true};
         pctx = ggml_init(ip);
         for (int l = 0; l < cfg.L; l++) pool_k.push_back(ggml_new_tensor_3d(pctx, cfg.KT, cfg.D, (int64_t)cfg.NB * cfg.CT, cfg.HK));
@@ -478,4 +481,75 @@ TEST_CASE(KvflashGpuMassFixture, without_versions_every_call_uploads_every_evict
     CHECK(w.score(gm, false, o, pl, &tm) == 38);
     CHECK(w.score(gm, false, o, pl, &tm) == 38);
     CHECK(tm.archived == 0);
+}
+
+// The fused kernel reads the pool K and the archive where they are: the same residency steps, against the logits graph of a fresh scorer.
+TEST_CASE(KvflashGpuMassFixture, fused_kernel_over_the_archive_matches_the_logits_graph) {
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+    ggml_backend_t dev = ggml_backend_cuda_init(0);
+    if (!dev) SKIP("no CUDA/HIP device");
+    SynthCfg c = small_cfg(GGML_TYPE_Q8_0, 60, 8);
+    c.L = 8;
+    World w(c, dev);
+    KvFlashGpuMass gm(w.be);
+    gm.set_fused(true);
+    std::vector<std::vector<float>> o, ref;
+    std::vector<KvFlashMassPlanes> pl, pref;
+    KvFlashGpuMassTiming tm, tr;
+    std::vector<int> recalled = newest(60, 18);
+    recalled.push_back(5); recalled.push_back(6);
+    struct Step { int sealed; std::vector<int> resident; int uploads; };
+    const std::vector<Step> steps = {{40, newest(40, 20), 18}, {60, newest(60, 20), 20}, {60, recalled, 2}, {60, newest(60, 20), 0}, {48, newest(48, 20), 0}};
+    for (const Step & st : steps) {
+        w.place(st.sealed, st.resident);
+        CHECK(w.score(gm, true, o, pl, &tm) == st.uploads);
+        CHECK(tm.fused);
+        KvFlashGpuMass fresh(w.be);
+        REQUIRE(w.score(fresh, false, ref, pref, &tr) == w.evicted());
+        CHECK(!tr.fused);
+        double worst = 0;
+        for (size_t n = 0; n < ref.size(); n++)
+            for (size_t k = 0; k < ref[n].size(); k++) {
+                const double a = ref[n][k], b = o[n][k], ta = pref[n].top[k], tb = pl[n].top[k], xa = pref[n].max[k], xb = pl[n].max[k];
+                if (a > 1e-6) worst = std::max(worst, std::fabs(a - b) / std::max(a, b));
+                if (ta > 1e-6) worst = std::max(worst, std::fabs(ta - tb) / std::max(ta, tb));
+                if (xa > 1e-6) worst = std::max(worst, std::fabs(xa - xb) / std::max(xa, xb));
+            }
+        std::fprintf(stderr, "fused over archive vs graph: sealed=%d evicted=%d worst rel diff %.3g\n", st.sealed, w.evicted(), worst);
+        CHECK(worst <= 1e-3);
+    }
+#else
+    SKIP("needs a CUDA/HIP backend and the fused kernel");
+#endif
+}
+
+// Which K the fused kernel takes. Everything else is scored by the logits graph, and the backend passes no versions then (no archive).
+TEST_CASE(KvflashGpuMassFixture, fused_kernel_is_selected_only_for_the_k_it_can_score) {
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+    CHECK(KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 128, 16));
+    CHECK(KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 256, 64));
+#else
+    CHECK(!KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 128, 16));
+#endif
+    for (ggml_type kt : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_1})
+        CHECK(!KvFlashGpuMass::fused_available(kt, 128, 16));
+    CHECK(!KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 48, 16));    // not whole 32-blocks
+    CHECK(!KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 288, 16));   // over the kernel's head dim
+    CHECK(!KvFlashGpuMass::fused_available(GGML_TYPE_Q8_0, 128, 65));   // over the kernel's layer table
+}
+
+// A scorer asked for the fused kernel on a K it cannot score runs the logits graph and still matches the CPU scorer.
+TEST_CASE(KvflashGpuMassFixture, fused_request_on_other_k_types_scores_with_the_logits_graph) {
+    World w(small_cfg(GGML_TYPE_Q4_0, 60, 8));
+    w.place(60, newest(60, 20));
+    KvFlashGpuMass gm(w.be), plain(w.be);
+    gm.set_fused(true);
+    std::vector<std::vector<float>> o, ref;
+    std::vector<KvFlashMassPlanes> pl, pref;
+    KvFlashGpuMassTiming tm;
+    REQUIRE(w.score(gm, false, o, pl, &tm) == 38);
+    CHECK(!tm.fused);
+    CHECK(tm.archived == 0);
+    REQUIRE(w.score(plain, false, ref, pref) == 38);
+    CHECK(o == ref);
 }

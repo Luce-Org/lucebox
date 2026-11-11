@@ -3425,10 +3425,20 @@ bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const
         const int n_res = res.n_resident;
         luce::common::KvFlashGpuMassTiming tm;
         const std::vector<ggml_tensor *> pool_k(cache_.attn_k.begin(), cache_.attn_k.end());
+        // Default: the fused kernel, with the evicted K it reads kept on the device between calls (the chunk versions say which
+        // slots are still current). Where the kernel cannot score this K, or with LUCE_KVFLASH_GPU_SCORE_FUSED=0: the logits graph,
+        // call-scoped. The graph spans every slot held, so it never gets the archive.
+        const bool fused = env_int_or_default("LUCE_KVFLASH_GPU_SCORE_FUSED", 1) != 0 &&
+                           luce::common::KvFlashGpuMass::fused_available(pool_k[0]->type, d.head_dim, d.n_layers);
+        std::vector<uint64_t> ver;
+        for (int c = 0; fused && c < sealed; c++) ver.push_back(p.chunk_version(c));
+        kvflash_gpu_mass_->set_fused(fused);
         if (kvflash_gpu_mass_->score(pool_k, blk, [&](int c, int l, int h) { return p.host_k_seg(c, l, h); },
-                                     ct, d, qs, outs, &planes, &tm, &why)) {
-            std::fprintf(stderr, "[kvflash] gpu scorer: n_q=%d sealed=%d resident=%d gather %.1f h2d %.1f graph %.1f d2h %.1f agg %.1f total %.1f ms batches=%d peak=%.0f MiB\n",
-                         (int)qs.size(), sealed, n_res, tm.gather, tm.h2d, tm.graph, tm.d2h, tm.agg, tm.total, tm.batches, tm.peak_bytes / 1048576.0);
+                                     ct, d, qs, outs, &planes, &tm, &why, fused ? &ver : nullptr)) {
+            std::fprintf(stderr, "[kvflash] gpu scorer: n_q=%d sealed=%d resident=%d gather %.1f h2d %.1f graph %.1f d2h %.1f agg %.1f total %.1f ms batches=%d peak=%.0f MiB "
+                                 "uploaded=%d of %d evicted (%d held) fused=%d\n",
+                         (int)qs.size(), sealed, n_res, tm.gather, tm.h2d, tm.graph, tm.d2h, tm.agg, tm.total, tm.batches, tm.peak_bytes / 1048576.0,
+                         tm.uploaded, sealed - n_res, tm.archived, (int)tm.fused);
             return true;
         }
     }
