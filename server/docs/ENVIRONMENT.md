@@ -107,6 +107,7 @@ profile and the requirements checked at startup.
 | `LUCE_KVFLASH_RESTORE_CONSUME` | unset (off) | OPT-IN: `1` saves pooled KVFlash snapshots in the prefix cache and restores them, so a repeat request prefills only the suffix after the cached prefix. Unset or `0` keeps the old behavior: pooled snapshots are refused and the request re-prefills. Pooled snapshots are never written to the disk cache. |
 | `LUCE_KVFLASH_CONCURRENT_TEST` | unset (off) | TEST ONLY: `1` opens the concurrent KVFlash slot engine (`--paged-attention` with `--kvflash`, and an explicit `--max-concurrency` routing to the slot engine) for the GPU gates. Not a supported configuration. On RDNA4 it also requires `LUCE_PAGED_WMMA=0`, because the WMMA paged kernel (on by default there) does not yet skip evicted blocks. |
 | `LUCE_KVFLASH_HOST_MIB` | 16384 | Host memory budget in MiB for the paged-out state of the concurrent KVFlash slots; admissions beyond it are refused. Must be a positive integer, otherwise startup fails. Lower it on hosts with less free RAM. |
+| `LUCE_KVFLASH_HOST_BACKING` | `pinned` | Host memory of the concurrent KVFlash slots' paged-out chunks: `pinned` (page-locked, a refused allocation fails the page-out), `pageable` (never asks for pinned memory; slower copies) or `auto` (pinned, and a pager whose pinned allocation is refused switches to pageable and logs `[kvflash] host backing: pageable`). An unknown value is logged and read as `pinned`. |
 | `LUCE_KVFLASH_STEP_TRACE` | unset | DEBUG: logs per-step timings of the concurrent KVFlash slot engine. |
 | `LUCE_KVFLASH_DEBUG_RESIDENT` | unset | DEBUG: when set, logs a `[kvflash-dbg]` line after each prefill with the resident chunk ranges and a hash of the score ledger. Leave unset in production. |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
@@ -150,6 +151,7 @@ profile and the requirements checked at startup.
 - `LUCE_CHUNKED` - qwen35_target_graph.cpp
 - `LUCE_DRAFT_FP16` - draft_safetensors_loader.cpp
 - `LUCE_DRAFT_SWA` - server_main.cpp
+- `LUCE_KVFLASH_HOST_BACKING` - kvflash_host_backing.h
 - `LUCE_KVFLASH_PREAMBLE_ROWS` - kvflash_prefill_reselect.h
 - `LUCE_KVFLASH_PREFILL_RESELECT` - qwen35_backend.cpp
 - `LUCE_KVFLASH_M5_RESCORE_TOKENS` - qwen35_backend.cpp

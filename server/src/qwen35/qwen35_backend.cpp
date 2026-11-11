@@ -1809,6 +1809,13 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         }
         raw.push_back(kvf_pagers_.back().get());
     }
+    {   // the host backing policy reaches every slot pager before any restore or eviction allocates
+        const KvFlashHostBacking backing = kvflash_host_backing_from_env();
+        kvflash_apply_host_backing(raw, backing);
+        std::fprintf(stderr, "[kvflash] host backing policy: %s (%d slots)\n",
+                     backing == KvFlashHostBacking::Pinned ? "pinned" : backing == KvFlashHostBacking::Pageable ? "pageable" : "auto",
+                     (int)raw.size());
+    }
     KvFlashSlotKvConfig kc;
     kc.quota_chunks = quota_chunks;
     kc.headroom_blocks = kHeadroom;

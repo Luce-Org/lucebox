@@ -49,6 +49,7 @@
 
 #pragma once
 
+#include "kvflash_host_backing.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "fnv.h"
@@ -197,7 +198,17 @@ public:
     // unavailable (hosted CI with a stub driver, CPU-backend tests). Set it
     // before the first page_out/deserialize; each chunk remembers how its own
     // buffer was allocated. No effect on builds without async DMA.
-    void set_pinned_host_backing(bool pinned) { pinned_host_ = pinned; }
+    void set_pinned_host_backing(bool pinned) {
+        host_backing_ = KvFlashBackingState(pinned ? KvFlashHostBacking::Pinned : KvFlashHostBacking::Pageable);
+    }
+    // The production policy (LUCE_KVFLASH_HOST_BACKING, kvflash_host_backing.h): Auto falls back to pageable on
+    // the first refused pinned allocation and logs it. Same timing rule as set_pinned_host_backing.
+    void set_host_backing(KvFlashHostBacking mode) { host_backing_ = KvFlashBackingState(mode); }
+    const KvFlashBackingState & host_backing_state() const { return host_backing_; }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    // Test seam: replaces cudaMallocHost for the pinned path (return false = refused).
+    std::function<bool(void **, size_t)> pinned_alloc_hook;
+#endif
 
     // Optional: custom block hand-out order (e.g. shuffled placement in
     // relocation tests). `order[i]` = i-th block to hand out.
@@ -1260,18 +1271,28 @@ private:
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     bool alloc_host_buffer_(ChunkState & st) {
-        if (pinned_host_) {
-            const cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
-                             cudaGetErrorString(err));
-                st.host_data = nullptr;
-                return false;
+        if (host_backing_.pinned()) {
+            bool ok;
+            const char * why = "";
+            if (pinned_alloc_hook) {
+                ok = pinned_alloc_hook(&st.host_data, chunk_bytes_);
+                why = "refused";
+            } else {
+                const cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
+                ok = err == cudaSuccess;
+                if (!ok) why = cudaGetErrorString(err);
             }
-        } else if (!(st.host_data = std::malloc(chunk_bytes_))) {
+            if (ok) { st.host_pinned = true; return true; }
+            st.host_data = nullptr;
+            const KvFlashBackingDecision d = host_backing_.on_pinned_failure(why);
+            std::fprintf(stderr, "%s\n", d.log.c_str());
+            if (!d.retry_pageable) return false;
+        }
+        if (!(st.host_data = std::malloc(chunk_bytes_))) {
+            std::fprintf(stderr, "%s\n", host_backing_.on_pageable_failure().log.c_str());
             return false;
         }
-        st.host_pinned = pinned_host_;
+        st.host_pinned = false;
         return true;
     }
     void free_host_buffer_(ChunkState & st) {
@@ -1632,7 +1653,7 @@ private:
 #endif
 #endif
     bool has_pending_page_in_ = false;
-    bool pinned_host_ = true;
+    KvFlashBackingState host_backing_;   // default Pinned
 };
 
 // ── Shared backend helpers ─────────────────────────────────────────────
