@@ -225,6 +225,10 @@ struct ServerConfig {
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
+    // /props.kvflash: set by server_main from --kvflash; recall is active when the mode is not empty.
+    bool        kvflash_enabled     = false;
+    int         kvflash_pool_tokens = 0;       // 0 = off or "auto" (sized by the backend)
+    std::string kvflash_recall_mode;           // launch_profiles.h kvflash_recall_mode
     std::string arch;                  // detected model arch (qwen35/36, laguna, gemma4, ...)
     std::string model_path;            // bargs.model_path
     std::string draft_path;            // bargs.draft_path (empty if no draft)

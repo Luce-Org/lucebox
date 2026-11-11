@@ -433,6 +433,19 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch, b
     return env;
 }
 
+// KVFlash recall capability protocol. A launcher probes `luce_server --help` for "kvflash-recall: protocol=<N>" and
+// reads /props.kvflash.recall.protocol. Bump it only when the flags, the env contract or the /props shape change.
+inline constexpr int kKvflashRecallProtocol = 1;
+inline std::string kvflash_recall_help_line() {
+    return "kvflash-recall: protocol=" + std::to_string(kKvflashRecallProtocol);
+}
+// /props.kvflash.recall.mode: `reselect` is LUCE_KVFLASH_PREFILL_RESELECT once the profile is installed (4 by default,
+// 5 with the drafter; a value the user set stays). Empty = recall not active: another architecture, or 0.
+inline std::string kvflash_recall_mode(std::string_view arch, const std::string & reselect) {
+    if (kvflash_recall_env(arch, false).empty() || reselect.empty() || reselect == "0") return "";
+    return "prefill-reselect=" + reselect;
+}
+
 // PFlash with a trained scoring head (PFLASH_SCORING_HEAD_GGUF): the release
 // profile measured for the PFlash v2 post (Qwen3.8-27B target, Qwen3.5-0.8B
 // drafter, R9700). With prefill compression on, the server installs these
