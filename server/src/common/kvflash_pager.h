@@ -536,6 +536,7 @@ public:
                 if (!st.on_host) zero_block(st.block);
             }
             st.dirty = write || !st.on_host;
+            if (st.dirty) st.ver = ++ver_seq_;
             if (st.on_host) {              // recall: restore paged-out bytes, from the tier when it still holds them
                 if (st.victim >= 0) {
                     copy_block_(st.block, victim_ptr_(st.victim), /*to_host=*/false, /*peer_on_device=*/kVictimOnDevice);
@@ -553,7 +554,7 @@ public:
             // The caller uses this block on the compute stream next.
             fence_page_work_();
         }
-        else if (write) st.dirty = true;
+        else if (write) { st.dirty = true; st.ver = ++ver_seq_; }
         if (write && st.victim >= 0) victim_drop_(st);   // the rows change: the tier copy is stale
         st.last_use = ++clock_;
         return row_base_ + st.block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
@@ -797,6 +798,11 @@ public:
         return st.host_data.data() + off;
 #endif
     }
+
+    // Identity of chunk c's rows: a new value whenever they may have changed (a row write, a truncate through the
+    // chunk, a deserialize), the same value while the chunk only moves between the pool and its host copy. Never
+    // reused within this pager; 0 = no such chunk.
+    uint64_t chunk_version(int c) const { return c >= 0 && c < (int)chunks_.size() ? chunks_[(size_t)c].ver : 0; }
 
     // Bumped on every residency change (alloc / page_out / page_in).
     // Callers cache the slot mask and refill only when the epoch moves.
@@ -1182,6 +1188,7 @@ public:
                 stats_.host_bytes += (int64_t)chunk_bytes_;
             }
             st.on_host = materialized;   // a hole stays a hole, not recallable zero KV
+            st.ver = ++ver_seq_;
             std::memcpy(&st.score, lp + c * kLedgerEntry + 4, 4);
             if (exact) continue;
             // slot_for()'s recall branch copies host_data into the new block.
@@ -1248,6 +1255,7 @@ private:
         bool     on_host  = false;    // backing store holds valid bytes
         bool     dirty    = true;     // resident block may differ from its host copy (a row write, or no copy yet)
         uint64_t last_use = 0;
+        uint64_t ver      = 0;        // chunk_version()
         int      victim   = -1;       // victim-tier slot holding this chunk's bytes (kept while the chunk is clean)
         float    score    = -std::numeric_limits<float>::infinity();  // QK ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -1472,6 +1480,7 @@ private:
     void zero_chunk_rows_(int c, int row0) {
         if (!has_tensor_storage()) return;
         ChunkState & st = chunks_[(size_t)c];
+        st.ver = ++ver_seq_;
         size_t host_off = 0;
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
@@ -1624,6 +1633,7 @@ private:
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
     uint64_t clock_ = 0;
+    uint64_t ver_seq_ = 0;   // last chunk_version() handed out
     uint64_t epoch_ = 0;
     uint32_t last_serialized_kv_k_type_ = (uint32_t)GGML_TYPE_F16;
 
