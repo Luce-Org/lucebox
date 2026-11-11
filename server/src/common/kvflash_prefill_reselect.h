@@ -234,12 +234,16 @@ struct KvFlashRecallPlan {
     int first_window = 0;
     std::vector<int> picked;
 };
+// First chunk of the exact tail window: chunks left of it are the recall candidates.
+inline int kvflash_recall_first_window(const KvFlashRecallIn & in) {
+    return in.cur_chunk - kvflash_recall_tail_chunks(in.n_pool_blocks, in.recall_chunks, in.reserve, in.pin_reserve_chunks);
+}
 inline KvFlashRecallPlan kvflash_recall_plan(const std::vector<float> & scores, const KvFlashRecallIn & in) {
     KvFlashRecallPlan r;
     r.k_units = in.unit > 0 ? in.recall_chunks / in.unit : 0;
     r.first_chunk = kvflash_recall_first_chunk(in.pinned_chunks);
-    r.tail = kvflash_recall_tail_chunks(in.n_pool_blocks, in.recall_chunks, in.reserve, in.pin_reserve_chunks);
-    r.first_window = in.cur_chunk - r.tail;
+    r.first_window = kvflash_recall_first_window(in);
+    r.tail = in.cur_chunk - r.first_window;
     r.picked = kvflash_recall_pick(scores, r.first_window, r.k_units, in.unit, r.first_chunk);
     return r;
 }
