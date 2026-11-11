@@ -331,3 +331,93 @@ TEST_CASE(OutputConstraintFixture, forced_tool_call_grammar_admits_only_openers)
     CHECK(matches(grammar, "\n<｜DSML｜ calls>"));
     CHECK(!matches(grammar, "I will call the tool."));
 }
+
+TEST_CASE(OutputConstraintFixture, parse_grammar_from_body_top_level_and_extra_body) {
+    std::string grammar;
+    std::string error;
+
+    // Absent or empty body
+    CHECK(parse_grammar_from_body(json::object(), grammar, error));
+    CHECK(grammar.empty());
+
+    // Top-level grammar string
+    CHECK(parse_grammar_from_body(json{{"grammar", "root ::= [0-9]+"}}, grammar, error));
+    CHECK(grammar == "root ::= [0-9]+");
+
+    // Top-level null grammar
+    CHECK(parse_grammar_from_body(json{{"grammar", nullptr}}, grammar, error));
+    CHECK(grammar.empty());
+
+    // Top-level non-string grammar
+    CHECK(!parse_grammar_from_body(json{{"grammar", 123}}, grammar, error));
+    CHECK(error == "grammar must be a string");
+
+    // extra_body grammar string
+    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", "root ::= [a-z]+"}}}}, grammar, error));
+    CHECK(grammar == "root ::= [a-z]+");
+
+    // extra_body null grammar falls back if top-level is absent
+    CHECK(parse_grammar_from_body(json{{"extra_body", {{"grammar", nullptr}}}}, grammar, error));
+    CHECK(grammar.empty());
+
+    // extra_body takes precedence over top-level
+    CHECK(parse_grammar_from_body(
+        json{{"grammar", "root ::= \"top\""}, {"extra_body", {{"grammar", "root ::= \"extra\""}}}},
+        grammar, error));
+    CHECK(grammar == "root ::= \"extra\"");
+
+    // extra_body non-string grammar reports error
+    CHECK(!parse_grammar_from_body(json{{"extra_body", {{"grammar", false}}}}, grammar, error));
+    CHECK(error == "grammar must be a string");
+}
+
+TEST_CASE(OutputConstraintFixture, output_format_schema_supports_grammar_type) {
+    using http_detail::output_format_schema;
+    nlohmann::ordered_json schema;
+    std::string error;
+
+    // Valid response_format type grammar
+    CHECK(output_format_schema(nlohmann::ordered_json::parse(
+        R"({"type":"grammar","grammar":"root ::= \"ok\""})"), schema, error));
+    CHECK(schema.is_null());
+
+    // Missing grammar key in type grammar
+    error.clear();
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(R"({"type":"grammar"})"), schema, error));
+    CHECK(error == "response_format grammar must be a string");
+
+    // Non-string grammar key
+    error.clear();
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(R"({"type":"grammar","grammar":42})"), schema, error));
+    CHECK(error == "response_format grammar must be a string");
+
+    // Unknown type mentions grammar in error message
+    error.clear();
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(R"({"type":"unknown"})"), schema, error));
+    CHECK(error.find("grammar") != std::string::npos);
+}
+
+TEST_CASE(OutputConstraintFixture, custom_grammar_constrains_tokens) {
+    enum Tok : int32_t { YES, NO, MAYBE, END, N_TOK };
+    std::vector<std::string> pieces(N_TOK);
+    pieces[YES] = "yes";
+    pieces[NO] = "no";
+    pieces[MAYBE] = "maybe";
+    pieces[END] = "<|im_end|>";
+
+    std::string error;
+    auto matcher = gbnf::Matcher::compile("root ::= \"yes\" | \"no\"", "root", error);
+    CHECK(matcher != nullptr);
+
+    OutputConstraint constraint(ConstraintVocab::build(pieces, {END}), std::move(matcher), {});
+    CHECK(constraint.allows(YES));
+    CHECK(constraint.allows(NO));
+    CHECK(!constraint.allows(MAYBE));
+    CHECK(!constraint.allows(END));
+
+    constraint.accept(YES);
+    CHECK(constraint.complete());
+    CHECK(constraint.allows(END));
+    CHECK(!constraint.allows(YES));
+    CHECK(!constraint.allows(NO));
+}

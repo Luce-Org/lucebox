@@ -609,6 +609,8 @@ struct ParsedRequest {
     // Structured output format (http_detail::request_output_format), null
     // when the request asks for none.
     nlohmann::ordered_json    output_format;
+    // Custom GBNF grammar string (from "grammar" field, extra_body, or response_format)
+    std::string               custom_grammar;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -1273,6 +1275,32 @@ inline std::vector<std::string> parse_pflash_required_from_body(const json & bod
         if (entry.is_string()) result.push_back(entry.get<std::string>());
     }
     return result;
+}
+
+// ─── Parse custom grammar from a chat-completion JSON body ──────────────
+// Returns true when valid (grammar populated or absent/null).
+// Returns false with error message if grammar is present but not a string.
+// Checks extra_body.grammar first, then top-level grammar.
+inline bool parse_grammar_from_body(const json & body, std::string & grammar, std::string & error) {
+    grammar.clear();
+    error.clear();
+    const json * field = nullptr;
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("grammar")) {
+            field = &eb["grammar"];
+        }
+    }
+    if (!field && body.contains("grammar")) {
+        field = &body["grammar"];
+    }
+    if (!field || field->is_null()) return true;
+    if (!field->is_string()) {
+        error = "grammar must be a string";
+        return false;
+    }
+    grammar = field->get<std::string>();
+    return true;
 }
 
 inline std::string parse_session_id_from_body(const json & body) {
