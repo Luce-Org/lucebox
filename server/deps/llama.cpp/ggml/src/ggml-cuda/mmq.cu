@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmvq.cuh"
 #include "mmq_big.h"
 #include "mmq-tile-twin-gate.h"
 #include "mmq_tile_twins.h"
@@ -552,6 +553,11 @@ static void ggml_cuda_mul_mat_q_impl(
     if (use_stream_k && ne11 <= luce_mmq_dp_max_ne1) {
         use_stream_k = false;
     }
+    // Stream-k splits the k range by the number of column tiles, so a column's sum order would depend on the column
+    // count (RTX 3090, Q4_K: other bits at 256, 257, 512, 513 and 1024 columns).
+    if (ggml_cuda_mmvq_batch_invariant()) {
+        use_stream_k = false;
+    }
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
@@ -825,7 +831,7 @@ void ggml_cuda_op_mul_mat_q(
     // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
-                            && src1_ncols == ne11;
+                            && src1_ncols == ne11 && !ggml_cuda_mmvq_batch_invariant();
     mix_registry_dispatch_guard mix_guard(src0->type);
     const void * mix_codebooks_raw = nullptr;
     const uint8_t * mix_modes = nullptr;
@@ -988,6 +994,14 @@ bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int6
 #ifdef GGML_CUDA_FORCE_MMQ
     return true;
 #endif //GGML_CUDA_FORCE_MMQ
+
+    // Batch-invariant mode never leaves MMQ for dequantize + BLAS GEMM: BLAS picks its kernel by the column count
+    // (gfx1151, Q4_K: rocBLAS gives one set of bits at 257..320 columns and another from 384, hipBLASLt changes
+    // between 512 and 513), so a prefill token's bits would depend on what else was packed into the step. MMQ sums
+    // every column in one fixed order for any N (test_mul_mat_invariant_wide_batch).
+    if (ggml_cuda_mmvq_batch_invariant()) {
+        return true;
+    }
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
