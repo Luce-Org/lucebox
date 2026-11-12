@@ -3214,7 +3214,10 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
         }
     }
     if (kvf_reselect) {
-        const auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id);
+        auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id,
+            luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+                                                  luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_));
+        p4.r = luce::common::kvflash_uq_snap_rewind(s.uqp, p4.r);
         const auto gate = luce::common::kvflash_recall_gate(
             p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
             luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
