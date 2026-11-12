@@ -160,7 +160,7 @@ namespace {
 // Returns the worst relative difference against the CPU reference with the same numerics; -1 on a setup failure.
 double fused_gpu_worst(const FSynth & s, size_t max_partial_bytes, double floor_abs, int * tiles, int impl = 0) {
     ggml_backend_t be = ggml_backend_cuda_init(0);
-    if (!be) return -1;
+    if (!be) SKIP("no CUDA/HIP device");
     const int L = s.d.n_layers, HK = s.d.n_kv_heads, D = s.d.head_dim, ct = s.ct, C = s.C, nq = (int)s.q.size();
     const int LH = L * s.d.n_q_heads, nblk = D / 32;
     const int NB = C / 2 + 3, cap = C + 5;
