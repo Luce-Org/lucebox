@@ -28,6 +28,12 @@ inline bool kvflash_pool_process() {
 }
 inline int kvflash_q_cap_all_rows() { return kvflash_pool_process() ? kQueryCaptureTokens : 0; }
 
+// Whether a graph writes the per-token query capture q_cap_all. Only the prefill windows read it (recall mode 4
+// and the user-question queries); decode captures q_cap alone. q_cap_all has no tensor-parallel split, so TP never writes it.
+inline bool kvflash_capture_q_all(bool recall_on, bool uq_on, int tp_degree, bool capture_qk) {
+    return capture_qk && tp_degree <= 1 && (recall_on || uq_on);
+}
+
 // LUCE_KVFLASH_UQ_QUERIES=N: the latest human question's last N queries join the selector's.
 // 0 when unset or invalid, at most the capture window.
 inline int kvflash_uq_queries() {

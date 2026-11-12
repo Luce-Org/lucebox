@@ -489,7 +489,7 @@ bool Qwen35Backend::init() {
     }
     kvflash_uq_queries_ = luce::common::kvflash_uq_queries();
     {
-        const int tp_degree = cfg_.device.is_tensor_parallel() ? (int)cfg_.device.layer_split_gpus.size() : 1;
+        const int tp_degree = kvflash_tp_degree();
         const luce::common::KvflashFeaturePlan plan = luce::common::kvflash_recall_features(
             tp_degree, {kvflash_prefill_reselect_, kvflash_uq_queries_});
         if (!plan.why.empty()) std::fprintf(stderr, "[kvflash] recall disabled: %s\n", plan.why.c_str());
@@ -2738,6 +2738,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
+        // this batch reaches the turn's tail window (recall) or the UQ capture window
+        const bool q_window = (q_keep > 0 && kv_pos + n_tokens + q_keep > kv_offset + prompt_len) ||
+                              (uq_capturing && !uq_done && kv_pos < uqp.cut && kv_pos + n_tokens > uqp.win_lo);
         static const bool prefill_timing = std::getenv("LUCE_PREFILL_TIMING") != nullptr;
         const auto t_build0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
@@ -2750,9 +2753,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/kvf_paged,
-                               /*capture_qk=*/rw_capture ||
-                                   (q_keep > 0 && kv_pos + n_tokens + q_keep > kv_offset + prompt_len) ||
-                                   (uq_capturing && !uq_done && kv_pos < uqp.cut && kv_pos + n_tokens > uqp.win_lo))) {
+                               /*capture_qk=*/rw_capture || q_window,
+                               /*paged_attention=*/false, /*n_seqs=*/1, /*seq_slot=*/0, /*paged_max_kv_len=*/0,
+                               /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr, /*n_prefill_segments=*/0,
+                               /*n_logits_rows=*/0, /*compact_slots=*/false, /*top_n=*/0,
+                               /*keep_base_ssm_state=*/false, /*single_replay_slot_ids=*/nullptr,
+                               /*capture_q_all=*/luce::common::kvflash_capture_q_all(
+                                   kvflash_prefill_reselect_ != 0, kvflash_uq_queries_ > 0, kvflash_tp_degree(), q_window))) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
