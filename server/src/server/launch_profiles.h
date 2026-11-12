@@ -30,7 +30,9 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -364,6 +366,84 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         {"HSA_FORCE_FINE_GRAIN_PCIE", "1"},
     };
     return env;
+}
+
+// KVFlash recall profile. `--kvflash` on a qwen35 target installs it as defaults, so a launcher
+// passes one flag. By default it is mode 4: selector v2 with the exact attention-mass scorer on the
+// recency pool and the latest user question as `uq_queries` queries. With LUCE_KVFLASH_PREFILL_RESELECT=5,
+// a drafter (LUCE_KVFLASH_DRAFTER or --prefill-drafter) and its three PFlash GGUFs it is mode 5: the
+// PFlash drafter scores the prompt and the picks apply when the prefill reaches the cut, with the
+// PFlash release selection the K2/K3 LiveCode nights measured. Both keep the system+tools preamble pin
+// and k recalled blocks of `select_unit` chunks. Without `--kvflash`, or on any other
+// architecture, nothing is installed. A variable that is already set keeps its value, and
+// `--kvflash-policy` still wins over the policy default. The values live here and nowhere else.
+struct KvflashRecallProfile {
+    static constexpr const char * policy         = "qk";
+    static constexpr int          recall_blocks    = 6;
+    static constexpr int          select_unit      = 2;      // chunks per recall unit
+    static constexpr int          preamble_rows    = 1152;   // pool rows reserved for the pinned preamble: 18 chunks of 64, out of --kvflash N
+    static constexpr int          score_pool_recent = 1;     // reselect from the recency pool
+    static constexpr int          exact_uq_queries = 64;     // mode 4: latest-question queries for the exact scorer
+};
+
+// True when mode 5 is asked for and can run: LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and the three
+// PFlash GGUFs its scorer loads. Mode 4 is the default even with a drafter (2026-11-10: mode 4 kept the needle
+// resident in 10/10 replayed agent sessions, mode 5 in 0/10).
+inline bool kvflash_mode5_requested(const std::function<std::string(const char *)> & get) {
+    if (get("LUCE_KVFLASH_PREFILL_RESELECT") != "5") return false;
+    for (const char * k : {"LUCE_KVFLASH_DRAFTER", "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF",
+                           "PFLASH_REQUEST_PROBE_GGUF"})
+        if (get(k).empty()) return false;
+    return true;
+}
+
+inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch, bool mode5) {
+    if (arch != "qwen35") return {};
+    using P = KvflashRecallProfile;
+    std::vector<LaunchProfileEnv> env = {
+        {"LUCE_KVFLASH_POLICY", P::policy},
+        {"LUCE_KVFLASH_RECALL_BLOCKS", std::to_string(P::recall_blocks)},
+        {"LUCE_KVFLASH_SCORE_POOL_RECENT", std::to_string(P::score_pool_recent)},
+        {"LUCE_KVFLASH_SELECT_UNIT", std::to_string(P::select_unit)},
+        {"LUCE_KVFLASH_PREAMBLE_ROWS", std::to_string(P::preamble_rows)},
+    };
+    if (!mode5) {
+        env.insert(env.end(), {
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
+            {"LUCE_KVFLASH_UQ_QUERIES", std::to_string(P::exact_uq_queries)},
+        });
+        return env;
+    }
+    env.insert(env.end(), {
+        {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
+        {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
+        {"LUCE_KVFLASH_UQ_QUERIES", "0"},
+        {"PFLASH_SELECT_MODE", "budget_only"},
+        {"PFLASH_SELECT_SCORE", "density"},
+        {"PFLASH_SELECT_SEGMENTS", "probe"},
+        {"PFLASH_SELECT_CHUNK_SIZE", "256"},
+        {"PFLASH_SELECT_QUERY_TOKENS", "128"},
+        {"PFLASH_SELECT_QUERY_HEAD", "1"},
+        {"PFLASH_SELECT_QUERY_PROBE", "1"},
+        {"PFLASH_QUERY_CANDIDATES", "1"},
+        {"PFLASH_QUERY_PIN", "512"},
+        {"PFLASH_DRAFTER_SESSIONS", "2"},
+    });
+    return env;
+}
+
+// KVFlash recall capability protocol. A launcher probes `luce_server --help` for "kvflash-recall: protocol=<N>" and
+// reads /props.kvflash.recall.protocol. Bump it only when the flags, the env contract or the /props shape change.
+inline constexpr int kKvflashRecallProtocol = 1;
+inline std::string kvflash_recall_help_line() {
+    return "kvflash-recall: protocol=" + std::to_string(kKvflashRecallProtocol);
+}
+// /props.kvflash.recall.mode: `reselect` is LUCE_KVFLASH_PREFILL_RESELECT once the profile is installed (4 by default,
+// 5 with the drafter; a value the user set stays). Empty = recall not active: another architecture, or 0.
+inline std::string kvflash_recall_mode(std::string_view arch, const std::string & reselect) {
+    if (kvflash_recall_env(arch, false).empty() || reselect.empty() || reselect == "0") return "";
+    return "prefill-reselect=" + reselect;
 }
 
 // PFlash with a trained scoring head (PFLASH_SCORING_HEAD_GGUF): the release

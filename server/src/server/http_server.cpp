@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "launch_profiles.h"
 #include "api_adapters.h"
 #include "image_input.h"
 #include "engine/luce_engine.h"
@@ -1626,6 +1627,15 @@ json build_props_body(const ServerConfig & config,
         // The C++ daemon is linked in-process; if /props is responding,
         // the daemon is alive by construction.
         {"daemon", {{"alive", true}}},
+        {"kvflash", {
+            {"enabled",     config.kvflash_enabled},
+            {"pool_tokens", config.kvflash_pool_tokens},
+            {"recall", {
+                {"protocol", luce::server::kKvflashRecallProtocol},
+                {"active",   config.kvflash_enabled && !config.kvflash_recall_mode.empty()},
+                {"mode",     config.kvflash_recall_mode},
+            }},
+        }},
         {"api", {{"endpoints", kApiEndpoints}}},
         // Capability flags surfaced for clients that don't want to crack
         // open `reasoning` / `speculative` / etc. — matches the Python
