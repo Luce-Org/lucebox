@@ -1556,7 +1556,7 @@ bool DeepSeek4Backend::run_staged_chunk(StagedPrefill & item, int max_rows,
     const auto * images = item.images
         ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
     if ((item.images && (!images || !staged_images_use_chunks())) || !item.staging ||
-        item.finished() || !moe_hybrid_ || !(expert_runtime_.compute || expert_backend_)) {
+        item.finished() || !staged_chunks_available()) {
         error = "staged prefill is not available for this placement";
         return false;
     }

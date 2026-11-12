@@ -9659,6 +9659,10 @@ bool DeepSeek4PrefillPass::begin(ggml_backend_t backend, int device, const DeepS
     const auto fail_early = [&](const char * why) { error = why; return false; };
     if (!backend || seqs.empty() || w.moe_hybrid || !ds4_backend_is_gpu(backend))
         return fail_early("shared prefill needs a full model on one GPU");
+    // The pass applies V4's plain pre-mix and no Engram: a V4.1 model stages
+    // through the single-request sparse prefill instead.
+    if (w.hc_staggered_pre || w.engram_runtime)
+        return fail_early("shared prefill does not implement the staggered pre-mix or Engram");
     int total = 0;
     for (const auto & s : seqs) {
         if (!s.cache || !s.embed || !s.token_ids || s.n_tokens < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS || s.kv_start < 0 ||
@@ -9887,13 +9891,12 @@ bool DeepSeek4PrefillPass::run_layers(int count, std::string & error) {
         }
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return fail("compute failed", il); }
         ggml_free(ctx);
-        const int ratio = (int) w.compress_ratios[(size_t) il];
+        // The same counter rule as every other prefill path: only a layer
+        // that owns compressed rows counts them, and index rows advance
+        // wherever the layer has them (V4.1 indexes ratio-2 layers too).
         for (const auto & s : seqs_) {
-            if (ratio <= 0) continue;
-            DeepSeek4LayerCache & lc = s.cache->layers[(size_t) il];
-            const int next_pos = s.kv_start + s.n_tokens;
-            lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
-            if (ratio == 4) lc.n_index_comp = std::max(lc.n_index_comp, next_pos / ratio);
+            ds4_advance_comp_counters(w, il, s.cache->layers[(size_t) il],
+                                      s.kv_start + s.n_tokens);
         }
         std::swap(state_in_, state_out_);
     }

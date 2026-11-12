@@ -396,7 +396,8 @@ constexpr int kBulkPrefillRows = 512;
 
 void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
     if (b_.staged_text_uses_chunks() || b_.staged_images_use_chunks()) {
-        // Heterogeneous placement: stage one bounded chunk of the oldest
+        // Heterogeneous placement or a V4.1 model (see
+        // staged_pass_supported()): stage one bounded chunk of the oldest
         // pending prompt that can run per step, so live decoders wait for at
         // most one chunk rather than the whole prompt. An image prompt whose
         // next image is still encoding lets the next pending prompt go first.

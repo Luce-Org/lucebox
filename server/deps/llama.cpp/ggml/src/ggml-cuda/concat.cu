@@ -351,32 +351,8 @@ template <typename T>
 static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim) {
     cudaStream_t stream = ctx.stream();
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        const T * src0_d = (const T *)src0->data;
-        const T * src1_d = (const T *)src1->data;
-        T * dst_d = (T *)dst->data;
-
-        // Contiguous operands whose dims above `dim` are all 1 concatenate as
-        // two copies. Besides being cheaper, this keeps a long dim-1 concat
-        // (a DS4 layer's raw rows plus every compressed row at a 128K context)
-        // off the kernel below, whose grid.y is ne1 (at most 65535).
-        const bool outer_ones = dim == 2 || (dim == 1 && dst->ne[2] == 1);
-        if (dim != 3 && outer_ones) {
-            concat_as_copies(src0, src1, dst, dst->ne[3], stream);
-        } else if (dim != 3) {
-            GGML_ASSERT(dst->ne[1] <= 65535 && dst->ne[2] <= 65535);
-            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_cuda(
-                        src0_d + i3 * (src0->nb[3] / sizeof(T)),
-                        src1_d + i3 * (src1->nb[3] / sizeof(T)),
-                        dst_d + i3 * ( dst->nb[3] / sizeof(T)),
-                        src0->ne[0], src0->ne[1], src0->ne[2],
-                        dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
-            }
-        } else {
-            concat_as_copies(src0, src1, dst, 1, stream);
-        }
-    } else {
+    const auto launch_non_cont = [&]() {
+        GGML_ASSERT(dst->ne[2] <= 65535 && dst->ne[3] <= 65535);
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
@@ -405,6 +381,39 @@ static void concat_cuda_typed(ggml_backend_cuda_context & ctx, const ggml_tensor
                 GGML_ABORT("Invalid dim: %d", dim);
                 break;
         }
+    };
+
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        const T * src0_d = (const T *)src0->data;
+        const T * src1_d = (const T *)src1->data;
+        T * dst_d = (T *)dst->data;
+
+        // Contiguous operands whose dims above `dim` are all 1 concatenate as
+        // two copies. Besides being cheaper, this keeps a long dim-1 concat
+        // (a DS4 layer's raw rows plus every compressed row at a 128K context)
+        // off the kernel below, whose grid.y is ne1 (at most 65535).
+        const bool outer_ones = dim == 2 || (dim == 1 && dst->ne[2] == 1);
+        if (dim != 3 && outer_ones) {
+            concat_as_copies(src0, src1, dst, dst->ne[3], stream);
+        } else if (dim != 3 && dst->ne[1] <= 65535) {
+            GGML_ASSERT(dst->ne[2] <= 65535);
+            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+                concat_cuda(
+                        src0_d + i3 * (src0->nb[3] / sizeof(T)),
+                        src1_d + i3 * (src1->nb[3] / sizeof(T)),
+                        dst_d + i3 * ( dst->nb[3] / sizeof(T)),
+                        src0->ne[0], src0->ne[1], src0->ne[2],
+                        dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
+            }
+        } else if (dim != 3) {
+            // ne1 past concat_cuda's grid.y limit: concat_non_cont
+            // puts ne1 on grid.x and copies the same elements.
+            launch_non_cont();
+        } else {
+            concat_as_copies(src0, src1, dst, 1, stream);
+        }
+    } else {
+        launch_non_cont();
     }
 }
 
