@@ -23,7 +23,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # setup-uv reads uv's version list from raw.githubusercontent.com once, with a
+      # fixed 5-second timeout and no retry (an exact version still reads it, to find
+      # the download), so a slow fetch fails the job before any work. Try it twice.
+      - id: setup-uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        continue-on-error: true
+        with:
+          version: "0.11.x"
+      - if: steps.setup-uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
       - name: Verify uv lockfile and workspace sync
@@ -81,11 +90,18 @@ jobs:
             echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
           } >> "$GITHUB_ENV"
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # Twice, as in uv-workspace: one slow read of uv's version list fails setup-uv.
+      # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
+      # interpreter; no separate setup-python step needed.
+      - id: setup-uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        continue-on-error: true
         with:
           version: "0.11.x"
-          # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
-          # interpreter; no separate setup-python step needed.
+      - if: steps.setup-uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.11.x"
 
       - name: Build luce (smoke + server)
         run: |
@@ -177,12 +193,10 @@ jobs:
           #   runner: lucebox-rtx3090
           #   arch: "86"
           #   compute_cap: "8.6"
-          #   concurrency_group: lucebox-rtx3090-gpu-runner
           - job_name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
             runner: dgx-gb10
             arch: "121"
             compute_cap: "12.1"
-            concurrency_group: dgx-gb10-a197-gpu-runner
     runs-on: [self-hosted, "${{ matrix.runner }}"]
     timeout-minutes: 30
     env:
@@ -190,9 +204,9 @@ jobs:
       CUDACXX: /usr/local/cuda/bin/nvcc
       CUDA_ARCH: ${{ matrix.arch }}
       EXPECTED_COMPUTE_CAP: ${{ matrix.compute_cap }}
-    concurrency:
-      group: ${{ matrix.concurrency_group }}
-      cancel-in-progress: false
+    # No job concurrency group: each GPU box has one runner, which already runs its
+    # jobs one at a time, in order. A group keeps only one job waiting and cancels the
+    # older one when a third run arrives, so a busy box lost queued jobs.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -349,11 +363,9 @@ jobs:
           - device_name: Radeon AI PRO R9700
             arch: gfx1201
             device_index: "0"
-            concurrency_key: r9700
           - device_name: Strix Halo Radeon 8060S
             arch: gfx1151
             device_index: "1"
-            concurrency_key: strix-halo
     runs-on: [self-hosted, lucebox3]
     # Up to 120 minutes waiting for development work on the box, and room to
     # rerun steps stopped for it (.github/ci/box_step.sh).
@@ -374,9 +386,7 @@ jobs:
       # itself runs only across both GPUs; serve-smoke-amd below serves it).
       LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    concurrency:
-      group: lucebox3-${{ matrix.concurrency_key }}-runner
-      cancel-in-progress: false
+    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -543,9 +553,7 @@ jobs:
       LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
       LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    concurrency:
-      group: lucebox3-serve-runner
-      cancel-in-progress: false
+    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
