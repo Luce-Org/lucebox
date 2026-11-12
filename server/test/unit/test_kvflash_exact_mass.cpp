@@ -6,6 +6,7 @@
 #include "kvflash_exact_mass.h"
 #include "kvflash_exact_fast.h"
 #include "kvflash_mass_synth.h"
+#include "kvflash_prefill_reselect.h"
 #include "kvflash_query_capture.h"
 #include "scoped_env.h"
 
@@ -197,6 +198,19 @@ TEST_CASE(KvflashExactMassFixture, per_token_query_capture_exists_only_in_a_kvfl
     }
     luce_test::ScopedEnvVar zero("LUCE_KVFLASH", "0");
     CHECK(kvflash_q_cap_all_rows() == 0);
+}
+TEST_CASE(KvflashExactMassFixture, q_cap_all_is_written_only_for_recall_or_uq_prefill) {
+    // Decode under the qk policy captures q_cap but must not copy into q_cap_all.
+    CHECK(!kvflash_capture_q_all(false, false, 1, true));
+    CHECK(kvflash_capture_q_all(true, false, 1, true));            // recall (mode 4)
+    CHECK(kvflash_capture_q_all(false, true, 1, true));            // user-question queries
+    CHECK(!kvflash_capture_q_all(true, true, 1, false));           // this batch captures no queries
+    // Tensor parallel: q_cap_all has no split, so it is never written.
+    const auto plan = kvflash_recall_features(2, {4, 3});
+    CHECK(!kvflash_capture_q_all(plan.reselect_mode != 0, plan.uq_queries > 0, 2, true));
+    CHECK(!kvflash_capture_q_all(true, true, 2, true));
+    const auto one = kvflash_recall_features(1, {4, 3});
+    CHECK(kvflash_capture_q_all(one.reselect_mode != 0, one.uq_queries > 0, 1, true));
 }
 TEST_CASE(KvflashExactMassFixture, uq_queries_env_is_off_by_default_and_capped_at_the_capture_window) {
     {

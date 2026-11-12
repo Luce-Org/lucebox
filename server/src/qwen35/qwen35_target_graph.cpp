@@ -2609,7 +2609,7 @@ QwenGraphOutputs build_qwen35_graph(
                     cache.q_cap->nb[1], cache.q_cap->nb[1],
                     (size_t)fa_idx * cache.q_cap->nb[2]);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
-                if (cache.q_cap_all) {
+                if (in.q_capture_all && cache.q_cap_all) {
                     // The last T tokens' Q (T = min(n_tokens, capacity)),
                     // [head_dim, T, n_head] into plane fa_idx of q_cap_all.
                     const int T = std::min<int>(n_tokens, cache.q_cap_all_tokens);
