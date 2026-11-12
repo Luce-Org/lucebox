@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <set>
+#include <utility>
 #include <vector>
 
 using namespace CppUnitTestFramework;
@@ -28,6 +30,12 @@ struct TestCase {
     int max_blocks;
     std::vector<int32_t> kv_seq_lens;
     bool corrupt_blocks;
+    // Chain-over-holes cases (C-3). 0 none, 1 partial-null partitions, 2 whole-null partitions
+    // (128 tokens), 3 an all-null table, 4 modes 1, 2, 3 on slots 0, 1, 2 (then repeating).
+    // The last logical block of a slot stays mapped in modes 1 and 2: a KVFlash tail is resident.
+    int  gap_mode = 0;
+    bool poison_stale = false;    // pool rows no table entry names hold large K/V, as an evicted chunk's would
+    bool poison_tail = false;     // rows above the committed length inside the mapped tail block hold large K/V, as a rejected draft leaves them
 };
 
 struct TreeMetadata {
@@ -36,6 +44,7 @@ struct TreeMetadata {
     std::vector<int32_t> parent_ids;
     std::vector<int32_t> tree_sizes;
     int ar_rows = 0;
+    bool chain = false;   // every tree is a chain (parent n-1): build the chain op, which the WMMA route may take
 };
 
 int clamped_seq_len(const TestCase & test_case, int seq) {
@@ -125,6 +134,21 @@ std::vector<int32_t> make_block_table(
         // exercises the partitioned long-context variant.
         result[4 * test_case.max_blocks + 1] = -1;
         result[9 * test_case.max_blocks + 7] = physical_blocks + 9;
+    }
+    if (test_case.gap_mode != 0) {
+        for (int seq = 0; seq < n_seq; ++seq) {
+            const int mode = test_case.gap_mode == 4 ? 1 + seq % 3 : test_case.gap_mode;
+            const int n_blocks = (clamped_seq_len(test_case, seq) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            for (int logical = 0; logical < n_blocks; ++logical) {
+                const bool is_tail = logical == n_blocks - 1;
+                const int partition_block = logical % 8;   // 8 blocks of 16 = one 128-token partition
+                const bool null_it =
+                    mode == 3 ||
+                    (!is_tail && mode == 1 && (partition_block == 1 || partition_block == 2 || partition_block == 5)) ||
+                    (!is_tail && mode == 2 && (logical / 8) % 2 == 1);
+                if (null_it) result[seq * test_case.max_blocks + logical] = -1;
+            }
+        }
     }
     return result;
 }
@@ -359,7 +383,7 @@ bool run_case(ggml_backend_t backend,
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
     ggml_tensor * output = tree
-        ? ggml_paged_attn_ext_tree(
+        ? (tree->chain ? ggml_paged_attn_ext_chain : ggml_paged_attn_ext_tree)(
             ctx, q, k, v, table, kv_seq_lens, active,
             positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
             tree_scratch_base, tree->scratch_stride)
@@ -390,6 +414,41 @@ bool run_case(ggml_backend_t backend,
         v_source[i] = std::sin(static_cast<float>(i) * 0.011f + 0.3f) * 0.30f;
     }
 
+    if (test_case.poison_stale) {
+        std::vector<char> mapped(static_cast<size_t>(physical_blocks), 0);
+        for (int32_t entry : block_table) {
+            if (block_is_valid(entry, physical_blocks)) mapped[static_cast<size_t>(entry)] = 1;
+        }
+        for (int block = 0; block < physical_blocks; ++block) {
+            if (mapped[static_cast<size_t>(block)]) continue;
+            for (int head = 0; head < N_HEAD_KV; ++head) {
+                for (int row = block * BLOCK_SIZE; row < (block + 1) * BLOCK_SIZE; ++row) {
+                    for (int d = 0; d < D; ++d) {
+                        const size_t at = (static_cast<size_t>(head) * pool_tokens + row) * D + d;
+                        k_source[at] = 2.0f;
+                        v_source[at] = 50.0f;
+                    }
+                }
+            }
+        }
+    }
+    if (test_case.poison_tail) {
+        for (size_t seq = 0; seq < test_case.kv_seq_lens.size(); ++seq) {
+            const int len = clamped_seq_len(test_case, static_cast<int>(seq));
+            const int tail = (len - 1) / BLOCK_SIZE;
+            const int32_t entry = block_table[seq * test_case.max_blocks + tail];
+            if (!block_is_valid(entry, physical_blocks)) continue;
+            for (int head = 0; head < N_HEAD_KV; ++head) {
+                for (int row = entry * BLOCK_SIZE + (len - tail * BLOCK_SIZE); row < (entry + 1) * BLOCK_SIZE; ++row) {
+                    for (int d = 0; d < D; ++d) {
+                        const size_t at = (static_cast<size_t>(head) * pool_tokens + row) * D + d;
+                        k_source[at] = 2.0f;
+                        v_source[at] = 50.0f;
+                    }
+                }
+            }
+        }
+    }
     const int64_t cache_rows = static_cast<int64_t>(pool_tokens) * N_HEAD_KV;
     const std::vector<uint8_t> k_data =
         quantize_rows(k_type, k_source, cache_rows);
@@ -402,7 +461,6 @@ bool run_case(ggml_backend_t backend,
     bool ok = !k_data.empty() && !v_data.empty() &&
               !k_reference.empty() && !v_reference.empty();
 
-    size_t wmma_launches = 0;
     if (ok) {
         ggml_backend_tensor_set(q, q_data.data(), 0,
                                 q_data.size() * sizeof(q_data[0]));
@@ -437,16 +495,22 @@ bool run_case(ggml_backend_t backend,
         // up as a mismatch instead of whatever the allocator left there.
         const std::vector<float> poison(ggml_nelements(output), 1.0e30f);
         ggml_backend_tensor_set(output, poison.data(), 0, ggml_nbytes(output));
-        const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-        wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
     }
 
     float max_abs_error = INFINITY;
+    int drifted_runs = 0;   // the same graph on the same inputs must give the same bits every launch
     if (ok) {
         std::vector<float> actual(ggml_nelements(output));
         ggml_backend_tensor_get(output, actual.data(), 0,
                                 actual.size() * sizeof(actual[0]));
+        std::vector<float> again(actual.size());
+        for (int rep = 0; rep < 31 && ok; ++rep) {
+            ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(output, again.data(), 0, again.size() * sizeof(again[0]));
+            if (std::memcmp(again.data(), actual.data(), actual.size() * sizeof(actual[0])) != 0) ++drifted_runs;
+        }
+        if (drifted_runs) { std::printf("paged attention %s: %d of 31 relaunches differ bitwise\n", test_case.name, drifted_runs); ok = false; }
         const std::vector<float> expected =
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
@@ -461,14 +525,7 @@ bool run_case(ggml_backend_t backend,
             max_abs_error =
                 std::max(max_abs_error, std::fabs(actual[i] - expected[i]));
         }
-        // The WMMA route accumulates the VKQ output in f16 (design: mirrors
-        // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
-        // absolute noise against the f32 reference; the decode route
-        // accumulates in f32 (~1e-5). Keyed on the launch counter rather than
-        // the env, so cases that fall back to V_DOT2 (tree mode, ineligible
-        // shapes) keep the strict bound.
-        const float tol = wmma_launches > 0 ? 2.0e-3f : MAX_ABS_ERROR;
-        ok = ok && max_abs_error < tol;
+        ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
     std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
@@ -562,6 +619,15 @@ void run_tree_case() {
                    &tree_slot_ids, nullptr, &tree_metadata));
     CHECK(run_case(backend, tree_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
                    &tree_slot_ids, nullptr, &tree_metadata));
+    // The same chains through the chain op (the WMMA route on gfx1201).
+    TreeMetadata chain_metadata = tree_metadata;
+    chain_metadata.chain = true;
+    for (const auto & kv : {std::make_pair(GGML_TYPE_F16, GGML_TYPE_F16),
+                            std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0),
+                            std::make_pair(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)}) {
+        CHECK(run_case(backend, tree_case, kv.first, kv.second,
+                       &tree_slot_ids, nullptr, &chain_metadata));
+    }
     ggml_backend_free(backend);
 }
 
@@ -584,6 +650,12 @@ void run_mixed_tree_case() {
     query_positions.insert(query_positions.end(), 16, -1);
     CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
                    &query_slots, &query_positions, &tree_metadata));
+    TreeMetadata chain_metadata = tree_metadata;
+    chain_metadata.chain = true;
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &query_slots, &query_positions, &chain_metadata));
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                   &query_slots, &query_positions, &chain_metadata));
     ggml_backend_free(backend);
 }
 
@@ -602,6 +674,34 @@ void run_cyclic_tree_case() {
     ggml_backend_free(backend);
 }
 
+// Stage C-3: chain verify (a tree with parent node-1) over KVFlash-style gapped block tables.
+// Every logical length stays the full logical length (as seq_lens_ does in a KVFlash arena); the
+// table carries null entries, the pool rows behind unmapped blocks hold poison (stale data of an
+// evicted chunk), and the chain's scratch rows sit beyond every mapped block.
+void run_gapped_chain_case(const TestCase & test_case, int width,
+                           std::vector<std::pair<ggml_type, ggml_type>> kv_types = {
+                               {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    TreeMetadata meta{width, 16, {}, std::vector<int32_t>(static_cast<size_t>(n_seq), width)};
+    std::vector<int32_t> slot_ids;
+    for (int s = 0; s < n_seq; ++s) {
+        for (int n = 0; n < width; ++n) {
+            meta.parent_ids.push_back(n - 1);   // a chain: node n's parent is n-1, the root's is -1
+            slot_ids.push_back(s);
+        }
+    }
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &slot_ids, nullptr, &meta));
+    }
+    meta.chain = true;   // the same gapped chains through the chain op
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &slot_ids, nullptr, &meta));
+    }
+    ggml_backend_free(backend);
+}
+
 void run_active_slot_case(const TestCase & test_case,
                           const std::vector<int32_t> & active_slot_ids) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -613,11 +713,13 @@ void run_active_slot_case(const TestCase & test_case,
 
 void run_ragged_case(const TestCase & test_case,
                      const std::vector<int32_t> & active_slot_ids,
-                     const std::vector<int32_t> & query_positions) {
+                     const std::vector<int32_t> & query_positions,
+                     std::vector<std::pair<ggml_type, ggml_type>> kv_types = {{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
-    CHECK(run_case(backend, test_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
-                   &active_slot_ids, &query_positions));
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &active_slot_ids, &query_positions));
+    }
     ggml_backend_free(backend);
 }
 
@@ -708,4 +810,498 @@ TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {
         {33, 1025},
         false,
     }, active_slot_ids, query_positions);
+}
+
+// A KVFlash slot's table has holes where chunks are paged out. Prefill and decode rows (no tree) attend around them
+// on every route: slot 0 has partial-null partitions, slot 1 whole-null ones, slot 2 an all-null table. A hole that
+// enters the softmax as a zero-score token dilutes the row: position 47 of slot 0 sees 16 mapped tokens and 32 holes.
+TEST_CASE(PagedAttention, RaggedRowsOverNullBlocksMatchReference) {
+    const std::vector<int32_t> active_slot_ids{0, 1, 2, 0, 1, 0, 0, -1};
+    const std::vector<int32_t> query_positions{1024, 516, 256, 300, 130, 47, INT32_MAX, -1};
+    run_ragged_case({"ragged-gap", 130, {1025, 517, 257}, false, 4, true, true}, active_slot_ids, query_positions,
+                    {{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}});
+}
+
+// gap_mode: 1 partial-null partitions, 2 whole-null partitions, 3 an all-null table, 4 one mode per slot.
+// poison_stale: unmapped pool blocks hold large K/V, so a read through a null entry fails the case.
+TEST_CASE(PagedAttention, ChainVerifyWidth16OverPartialNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-partial16", 130, {1025, 517, 257}, false, 1, true, true}, 16);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth8OverPartialNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-partial8", 130, {1025, 517, 257}, false, 1, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth16OverWholeNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-whole16", 130, {1025, 517, 257}, false, 2, true, true}, 16);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth8OverWholeNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-whole8", 130, {1025, 517, 257}, false, 2, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyOverAnAllNullTableReadsOnlyItsScratchRows) {
+    run_gapped_chain_case({"gap-allnull16", 130, {1025, 517, 257}, false, 3, true, true}, 16);
+    run_gapped_chain_case({"gap-allnull8", 130, {1025, 517, 257}, false, 3, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyWithADifferentGapPatternPerSlotMatchesReference) {
+    // slot 0 partial-null, slot 1 whole-null partitions, slot 2 all-null, in one verify batch
+    run_gapped_chain_case({"gap-mixed16", 130, {1025, 517, 257}, false, 4, true, true}, 16);
+    run_gapped_chain_case({"gap-mixed8", 130, {1025, 517, 257}, false, 4, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyOverGapsWithMixedKvTypesMatchesReference) {
+    run_gapped_chain_case({"gap-q8q4", 130, {1025, 517, 257}, false, 1, true, true}, 16,
+                          {{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}});
+}
+
+// ── Batch-composition invariance ────────────────────────────────────────────
+// A row's attention bits must not depend on what else is in the batch. The
+// KVFlash scorer picks between near-tie chunk scores, so a kernel whose
+// context split follows the batch (neighbour lengths, n_rows, the 256-rounded
+// launch length) turns two-lane scheduling noise into different picks
+// (pr_series/rc3_spec/WMMA_DETERMINISM.md: 31/55 requests differ run to run).
+// Row A, a decode row over a long committed prefix, is computed alone and then
+// inside batches of very different shapes; every A output must be
+// memcmp-identical to the alone run.
+namespace {
+
+struct InvarianceRow {
+    int slot;   // block-table column
+    int pos;    // causal position; -1 is a dead row
+};
+
+struct InvariancePool {
+    ggml_type kv_type;
+    int max_blocks;                 // block-table width: the config constant
+    int pool_tokens;
+    std::vector<int32_t> table;     // [max_blocks x n_slots]
+    std::vector<int32_t> seq_lens;  // per slot
+    std::vector<uint8_t> kv_bytes;  // one pool, used for K and for V
+};
+
+uint32_t invariance_rng = 0x9e3779b9u;
+float invariance_next() {
+    invariance_rng = invariance_rng * 1664525u + 1013904223u;
+    return ((int32_t) (invariance_rng >> 8) - 8388608) / 8388608.0f;
+}
+
+// Slots: 0 = A (a_len, optional KVFlash holes), 1 = long neighbour, 2 = short
+// neighbour. The neighbours alias A's physical blocks at an offset, so one pool
+// serves all three.
+InvariancePool make_invariance_pool(ggml_type kv_type, int a_len, int long_len,
+                                    int short_len, bool holes) {
+    InvariancePool pool;
+    pool.kv_type = kv_type;
+    pool.max_blocks = 8192;
+    const int pool_blocks = (std::max(a_len, long_len) + BLOCK_SIZE - 1) / BLOCK_SIZE + 4;
+    pool.pool_tokens = pool_blocks * BLOCK_SIZE;
+    pool.seq_lens = {a_len, long_len, short_len};
+    pool.table.assign((size_t) pool.max_blocks * 3, -1);
+    for (int s = 0; s < 3; ++s) {
+        const int n_blocks = (pool.seq_lens[s] + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        for (int b = 0; b < n_blocks; ++b) {
+            if (s == 0 && holes && (b / 4) % 3 == 1) continue;   // whole 64-token chunks missing
+            pool.table[(size_t) s * pool.max_blocks + b] = (b + 5 * s) % pool_blocks;
+        }
+    }
+    const size_t rows = (size_t) pool.pool_tokens * N_HEAD_KV;
+    std::vector<float> src(rows * D);
+    for (float & x : src) x = invariance_next();
+    pool.kv_bytes = quantize_rows(kv_type, src, (int64_t) rows);
+    return pool;
+}
+
+// Runs one batch and returns row `a_row`'s output (N_HEAD x D floats), empty on
+// failure. Q for a row is a function of its slot only, so A's query is the same
+// in every batch.
+std::vector<float> run_invariance_batch(ggml_backend_t backend, const InvariancePool & pool,
+                                        const std::vector<InvarianceRow> & rows,
+                                        int max_kv_seq_len, int a_row, size_t * wmma_launches) {
+    const int n_rows = (int) rows.size();
+    ggml_init_params params{};
+    params.mem_size = 8 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return {};
+
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_rows, N_HEAD);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, pool.kv_type, D, pool.pool_tokens, N_HEAD_KV);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx, pool.kv_type, D, pool.pool_tokens, N_HEAD_KV);
+    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, pool.max_blocks, 3);
+    ggml_tensor * seq_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+    ggml_tensor * active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+    for (ggml_tensor * t : {q, k, v, table, seq_lens, active, positions}) ggml_set_input(t);
+    ggml_tensor * output = ggml_paged_attn_ext(
+        ctx, q, k, v, table, seq_lens, active, positions,
+        1.0f / std::sqrt((float) D), BLOCK_SIZE, max_kv_seq_len);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx);
+        return {};
+    }
+
+    std::vector<float> q_data((size_t) D * n_rows * N_HEAD);
+    std::vector<int32_t> active_ids(n_rows), pos(n_rows);
+    for (int r = 0; r < n_rows; ++r) {
+        active_ids[r] = rows[r].slot;
+        pos[r] = rows[r].pos;
+        for (int h = 0; h < N_HEAD; ++h) {
+            for (int d = 0; d < D; ++d) {
+                q_data[((size_t) h * n_rows + r) * D + d] =
+                    std::sin((float) (rows[r].slot * 7919 + h * 263 + d) * 0.013f) * 0.25f;
+            }
+        }
+    }
+    ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+    ggml_backend_tensor_set(k, pool.kv_bytes.data(), 0, pool.kv_bytes.size());
+    ggml_backend_tensor_set(v, pool.kv_bytes.data(), 0, pool.kv_bytes.size());
+    ggml_backend_tensor_set(table, pool.table.data(), 0, pool.table.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(seq_lens, pool.seq_lens.data(), 0, pool.seq_lens.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(active, active_ids.data(), 0, active_ids.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
+    {
+        std::vector<float> sentinel(ggml_nelements(output), std::nanf(""));
+        ggml_backend_tensor_set(output, sentinel.data(), 0, ggml_nbytes(output));
+    }
+
+    const size_t before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
+    const bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    if (wmma_launches) *wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - before;
+
+    std::vector<float> a_out;
+    if (ok) {
+        std::vector<float> all(ggml_nelements(output));
+        ggml_backend_tensor_get(output, all.data(), 0, ggml_nbytes(output));
+        a_out.resize((size_t) N_HEAD * D);
+        for (int h = 0; h < N_HEAD; ++h) {
+            std::memcpy(a_out.data() + (size_t) h * D,
+                        all.data() + ((size_t) h * n_rows + a_row) * D, D * sizeof(float));
+        }
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return a_out;
+}
+
+int round_up(int x, int m) { return (x + m - 1) / m * m; }
+
+// One A length and KV type: A alone is the reference; every other batch must
+// reproduce A's bytes. Returns the number of batches whose A output differs.
+int invariance_mismatches(ggml_backend_t backend, ggml_type kv_type, int a_len, bool holes,
+                          size_t * wmma_launches) {
+    const int long_len = 100352, short_len = 300;
+    const InvariancePool pool = make_invariance_pool(kv_type, a_len, long_len, short_len, holes);
+    const InvarianceRow A{0, a_len - 1}, L{1, long_len - 1}, S{2, short_len - 1}, X{2, -1};
+    struct Batch {
+        const char * name;
+        std::vector<InvarianceRow> rows;
+        int a_row;
+        int max_kv_seq_len;
+    };
+    const Batch batches[] = {
+        {"alone",            {A},                         0, round_up(a_len, 256)},
+        {"short-before",     {S, A},                      1, round_up(a_len, 256)},
+        {"long-after",       {A, L},                      0, round_up(long_len, 256)},
+        {"long-before",      {L, A},                      1, round_up(long_len, 256)},
+        {"mixed-group",      {L, S, L, A, S},             3, round_up(long_len, 256)},
+        {"dead-rows",        {A, X, X, X, X, X, X},       0, round_up(a_len, 256)},
+        {"launch-4096",      {A},                         0, round_up(a_len, 4096)},
+        {"launch-table",     {A},                         0, 8192 * BLOCK_SIZE},
+        {"second-group",     {L, L, L, L, A, S, S},       4, round_up(long_len, 256)},
+        {"three-short",      {S, S, S, A},                3, round_up(a_len, 256)},
+    };
+    std::vector<float> reference;
+    int mismatches = 0;
+    for (const Batch & b : batches) {
+        size_t launches = 0;
+        const std::vector<float> out =
+            run_invariance_batch(backend, pool, b.rows, b.max_kv_seq_len, b.a_row, &launches);
+        bool finite = !out.empty();
+        for (float x : out) finite = finite && std::isfinite(x);
+        if (reference.empty()) {
+            reference = out;
+            if (wmma_launches) *wmma_launches = launches;
+        }
+        const bool same = finite && out.size() == reference.size() &&
+            std::memcmp(out.data(), reference.data(), out.size() * sizeof(float)) == 0;
+        size_t n_diff = 0;
+        for (size_t i = 0; i < std::min(out.size(), reference.size()); ++i) {
+            n_diff += std::memcmp(&out[i], &reference[i], sizeof(float)) != 0;
+        }
+        std::printf("paged attention invariance K/V=%-4s A=%-6d holes=%d %-13s rows=%zu max_kv=%-6d %s%s\n",
+                    ggml_type_name(kv_type), a_len, holes ? 1 : 0, b.name, b.rows.size(),
+                    b.max_kv_seq_len, same ? "SAME" : "DIFF", finite ? "" : " (non-finite)");
+        if (!same) {
+            ++mismatches;
+            std::printf("    %zu of %zu floats differ from the alone run\n", n_diff, reference.size());
+        }
+    }
+    return mismatches;
+}
+
+}  // namespace
+
+// The fixed context cuts are the batch-invariant mode's; default mode moves
+// them with the batch for occupancy.
+struct InvariantScope {
+    bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
+    ~InvariantScope() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
+};
+
+// The chain-vs-AR cases compare routes by the WMMA launch counter. A replayed CUDA graph launches no kernel from the
+// launcher, so with graphs on (GGML_HIP_GRAPHS, the CI build) an AR call that replays counts 0 launches.
+struct GraphsOffScope {
+    bool prev = ggml_backend_cuda_set_graphs_disabled_override(true);
+    ~GraphsOffScope() { ggml_backend_cuda_set_graphs_disabled_override(prev); }
+};
+
+TEST_CASE(PagedAttention, RowOutputBitsIndependentOfBatch) {
+    const InvariantScope invariant;
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (bool holes : {false, true}) {
+            for (int a_len : {70000, 20480, 4096}) {
+                const int mismatches =
+                    invariance_mismatches(backend, kv_type, a_len, holes, nullptr);
+                // Both routes (WMMA on gfx12, V_DOT2 on the 3090 and with
+                // LUCE_PAGED_WMMA=0) cut the context at fixed absolute blocks,
+                // so every length and batch shape must reproduce A's bits.
+                CHECK_EQUAL(0, mismatches);
+            }
+        }
+    }
+    ggml_backend_free(backend);
+}
+
+// ── Chain verify vs sequential AR ───────────────────────────────────────────
+// Spec decode must equal AR in bits. A chain verify of width k over a slot with
+// L committed tokens must give row n the bytes of the AR call at position L+n:
+// one query row, kv_seq_lens = L+n+1, the candidate rows read from the block
+// table. The chain call sees only the L committed rows through the table (the
+// rows above L hold poison there, as a rejected draft leaves them) and the
+// candidates' K/V in the scratch slab. On gfx1201 the AR call runs the WMMA
+// kernel, so a chain verify that drops to V_DOT2 differs in bits. The 3090 runs
+// V_DOT2 for both, so there this checks the layout and the scratch addressing,
+// not the route.
+namespace {
+
+struct ChainPool {
+    int committed;
+    int width;
+    int max_blocks;
+    int pool_tokens;
+    int scratch_base;
+    int scratch_stride;
+    std::vector<int32_t> table;
+    std::vector<uint8_t> k_ar, v_ar;       // candidate rows at their table positions
+    std::vector<uint8_t> k_chain, v_chain; // poison there, the candidates in the scratch slab
+};
+
+ChainPool make_chain_pool(ggml_type kv_type, int committed, int width, int max_blocks) {
+    ChainPool p;
+    p.committed = committed;
+    p.width = width;
+    p.max_blocks = max_blocks;
+    p.scratch_stride = 16;
+    const int live_blocks = (committed + width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int pool_blocks = live_blocks + 3;
+    p.scratch_base = pool_blocks * BLOCK_SIZE;
+    p.pool_tokens = p.scratch_base + p.scratch_stride;
+    p.table.assign(max_blocks, -1);
+    int stride = 7;   // any stride coprime with the pool size maps the logical blocks to distinct shuffled ones
+    while (std::gcd(stride, pool_blocks) != 1) ++stride;
+    for (int b = 0; b < live_blocks; ++b) p.table[b] = (b * stride + 2) % pool_blocks;
+    {   // the shuffle must be a permutation of distinct blocks
+        std::set<int32_t> seen(p.table.begin(), p.table.begin() + live_blocks);
+        GGML_ASSERT((int) seen.size() == live_blocks);
+    }
+    const auto row_of = [&](int token) {
+        return p.table[token / BLOCK_SIZE] * BLOCK_SIZE + token % BLOCK_SIZE;
+    };
+    const size_t rows = (size_t) p.pool_tokens * N_HEAD_KV;
+    std::vector<float> k_src(rows * D), v_src(rows * D);
+    for (float & x : k_src) x = invariance_next() * 0.5f;
+    for (float & x : v_src) x = invariance_next() * 0.5f;
+    std::vector<float> k_poison = k_src, v_poison = v_src;
+    for (int head = 0; head < N_HEAD_KV; ++head) {
+        for (int j = 0; j < width; ++j) {
+            const size_t at = ((size_t) head * p.pool_tokens + row_of(committed + j)) * D;
+            const size_t scratch = ((size_t) head * p.pool_tokens + p.scratch_base + j) * D;
+            for (int d = 0; d < D; ++d) {
+                k_src[scratch + d] = k_src[at + d];
+                v_src[scratch + d] = v_src[at + d];
+                k_poison[at + d] = 3.0f;
+                v_poison[at + d] = 60.0f;
+            }
+        }
+    }
+    // The chain pool carries the candidates in scratch; the AR pool keeps them in the table.
+    std::vector<float> k_chain_src = k_poison, v_chain_src = v_poison;
+    for (int head = 0; head < N_HEAD_KV; ++head) {
+        for (int j = 0; j < width; ++j) {
+            const size_t scratch = ((size_t) head * p.pool_tokens + p.scratch_base + j) * D;
+            for (int d = 0; d < D; ++d) {
+                k_chain_src[scratch + d] = k_src[scratch + d];
+                v_chain_src[scratch + d] = v_src[scratch + d];
+            }
+        }
+    }
+    p.k_ar = quantize_rows(kv_type, k_src, (int64_t) rows);
+    p.v_ar = quantize_rows(kv_type, v_src, (int64_t) rows);
+    p.k_chain = quantize_rows(kv_type, k_chain_src, (int64_t) rows);
+    p.v_chain = quantize_rows(kv_type, v_chain_src, (int64_t) rows);
+    return p;
+}
+
+// n_rows == 1: the AR decode call at kv_len. n_rows == width: the chain verify.
+// q is [head][row][D]. Returns the output in the same layout, empty on failure.
+std::vector<float> run_chain_or_ar(ggml_backend_t backend, ggml_type kv_type, const ChainPool & p,
+                                   bool chain, int kv_len, int max_kv_seq_len,
+                                   const std::vector<float> & q_data, int n_rows,
+                                   size_t * wmma_launches) {
+    ggml_init_params params{};
+    params.mem_size = 8 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return {};
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_rows, N_HEAD);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, kv_type, D, p.pool_tokens, N_HEAD_KV);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx, kv_type, D, p.pool_tokens, N_HEAD_KV);
+    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, p.max_blocks, 1);
+    ggml_tensor * seq_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+    ggml_tensor * parents = chain ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, p.width, 1) : nullptr;
+    ggml_tensor * sizes = chain ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1) : nullptr;
+    for (ggml_tensor * t : {q, k, v, table, seq_lens, active, parents, sizes}) {
+        if (t) ggml_set_input(t);
+    }
+    const float scale = 1.0f / std::sqrt((float) D);
+    ggml_tensor * output = chain
+        ? ggml_paged_attn_ext_chain(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
+                                    max_kv_seq_len, parents, sizes, p.scratch_base, p.scratch_stride)
+        : ggml_paged_attn_ext(ctx, q, k, v, table, seq_lens, active, nullptr, scale, BLOCK_SIZE,
+                              max_kv_seq_len);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    std::vector<float> result;
+    if (ggml_gallocr_alloc_graph(allocator, graph)) {
+        const std::vector<uint8_t> & kb = chain ? p.k_chain : p.k_ar;
+        const std::vector<uint8_t> & vb = chain ? p.v_chain : p.v_ar;
+        ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(k, kb.data(), 0, kb.size());
+        ggml_backend_tensor_set(v, vb.data(), 0, vb.size());
+        ggml_backend_tensor_set(table, p.table.data(), 0, p.table.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(seq_lens, &kv_len, 0, sizeof(int32_t));
+        const std::vector<int32_t> slots(n_rows, 0);
+        ggml_backend_tensor_set(active, slots.data(), 0, slots.size() * sizeof(int32_t));
+        if (chain) {
+            std::vector<int32_t> parent_ids(p.width);
+            for (int n = 0; n < p.width; ++n) parent_ids[n] = n - 1;
+            const int32_t size = p.width;
+            ggml_backend_tensor_set(parents, parent_ids.data(), 0, parent_ids.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(sizes, &size, 0, sizeof(int32_t));
+        }
+        const size_t before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
+        if (ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS) {
+            result.resize(ggml_nelements(output));
+            ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+        }
+        if (wmma_launches) *wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - before;
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return result;
+}
+
+// Returns the number of chain rows whose bytes differ from the AR call at the same position.
+int chain_vs_ar_mismatches(ggml_backend_t backend, ggml_type kv_type, int committed, int width,
+                           int max_blocks, bool expect_wmma) {
+    const ChainPool pool = make_chain_pool(kv_type, committed, width, max_blocks);
+    std::vector<float> q_data((size_t) D * width * N_HEAD);
+    for (float & x : q_data) x = invariance_next() * 0.5f;
+    size_t chain_launches = 0;
+    const std::vector<float> chain_out = run_chain_or_ar(
+        backend, kv_type, pool, true, committed, round_up(committed, 256), q_data, width, &chain_launches);
+    int mismatches = chain_out.empty() ? width : 0;
+    for (int n = 0; n < width && !chain_out.empty(); ++n) {
+        std::vector<float> q_row((size_t) D * N_HEAD);
+        for (int h = 0; h < N_HEAD; ++h) {
+            std::memcpy(q_row.data() + (size_t) h * D, q_data.data() + ((size_t) h * width + n) * D, D * sizeof(float));
+        }
+        size_t ar_launches = 0;
+        const std::vector<float> ar = run_chain_or_ar(
+            backend, kv_type, pool, false, committed + n + 1, round_up(committed + n + 1, 256), q_row, 1, &ar_launches);
+        bool same = ar.size() == (size_t) N_HEAD * D;
+        for (int h = 0; h < N_HEAD && same; ++h) {
+            same = std::memcmp(ar.data() + (size_t) h * D, chain_out.data() + ((size_t) h * width + n) * D,
+                               D * sizeof(float)) == 0;
+        }
+        mismatches += same ? 0 : 1;
+        if (n == 0 || !same) {
+            std::printf("paged attention chain-vs-AR K/V=%-4s L=%-5d k=%-2d row %-2d %s (AR wmma=%zu chain wmma=%zu)\n",
+                        ggml_type_name(kv_type), committed, width, n, same ? "SAME" : "DIFF",
+                        ar_launches, chain_launches);
+        }
+        // The route must be the same one: a chain that falls to V_DOT2 while AR runs WMMA is the bug.
+        if ((ar_launches > 0) != (chain_launches > 0)) ++mismatches;
+    }
+    if (expect_wmma && chain_launches == 0) ++mismatches;
+    return mismatches;
+}
+
+}  // namespace
+
+TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
+    const InvariantScope invariant;
+    const GraphsOffScope graphs_off;
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        // Where the WMMA route is eligible (RDNA4, LUCE_PAGED_WMMA not 0) the chain verify must run it too.
+        const bool expect_wmma = ggml_backend_cuda_paged_attn_wmma_route(
+            0, /*tree_mode=*/false, D, N_HEAD, N_HEAD_KV, kv_type, kv_type, BLOCK_SIZE);
+        // L odd and even, on and off a block edge, one and several partitions, a 130-block table.
+        for (int committed : {33, 64, 1025, 2047}) {
+            for (int width : {16, 8}) {
+                CHECK_EQUAL(0, chain_vs_ar_mismatches(backend, kv_type, committed, width, 130, expect_wmma));
+            }
+        }
+    }
+    ggml_backend_free(backend);
+}
+
+// The engine's shapes: committed lengths that are not multiples of the block size, one to a few
+// partitions, and block tables of every width from a few blocks (one partition, direct write) to
+// hundreds. The cut points and the direct/partials choice are launch constants of the table width, so a
+// chain whose launch sees a wider table than the AR call changes the bits of every row. The V_DOT2 route
+// runs on gfx1151 and, with LUCE_PAGED_WMMA=0, on gfx1201.
+TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBitsAcrossTableWidths) {
+    const InvariantScope invariant;
+    const GraphsOffScope graphs_off;
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    int total = 0, bad = 0;
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int max_blocks : {8, 9, 17, 130, 520, 8192}) {
+            for (int committed : {1, 5, 15, 16, 17, 100, 127, 128, 129, 130, 255, 257}) {
+                for (int width : {8, 16}) {
+                    if ((committed + width + BLOCK_SIZE - 1) / BLOCK_SIZE > max_blocks) continue;
+                    const int mismatches = chain_vs_ar_mismatches(backend, kv_type, committed, width, max_blocks, false);
+                    ++total;
+                    bad += mismatches != 0;
+                    if (mismatches != 0) {
+                        std::printf("  K/V=%-4s table=%d L=%d k=%d: %d rows differ\n",
+                                    ggml_type_name(kv_type), max_blocks, committed, width, mismatches);
+                    }
+                }
+            }
+        }
+    }
+    std::printf("paged attention chain-vs-AR table sweep: %d of %d shapes differ\n", bad, total);
+    CHECK_EQUAL(0, bad);
+    ggml_backend_free(backend);
 }

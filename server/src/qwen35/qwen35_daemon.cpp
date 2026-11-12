@@ -7,12 +7,27 @@
 #include "qwen35_daemon.h"
 #include "qwen35_backend.h"
 #include "common/daemon_loop.h"
+#include "common/kvflash_pool_flag.h"
+#include "common/kvflash_refusals.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace luce::common {
 
+int qwen35_daemon_kvflash_gate(const Qwen35DaemonArgs & args) {
+    const char * pool = std::getenv("LUCE_KVFLASH");
+    std::string refusal = kvflash_ddtree_refusal(args.ddtree_mode, kvflash_pool_requested(pool));
+    if (refusal.empty())
+        refusal = kvflash_min_tokens_refusal(kvflash_pool_requested(pool) && args.draft_path,
+                                             std::getenv("LUCE_MIN_TOKENS"));
+    if (refusal.empty()) return 0;
+    std::fprintf(stderr, "[kvflash] %s\n", refusal.c_str());
+    return 2;
+}
+
 int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
+    if (const int rc = qwen35_daemon_kvflash_gate(args)) return rc;
     Qwen35Config cfg;
     cfg.target_path        = args.target_path ? args.target_path : "";
     if (args.draft_path) cfg.draft_path = args.draft_path;

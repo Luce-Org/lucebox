@@ -8,8 +8,10 @@
 // formatting are shared with the classic worker so both paths emit
 // matching wire formats.
 
+#include "admit_timing.h"
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/chain_spec_shapes.h"
 #include "common/output_constraint.h"
 #include "common/spec_acceptance.h"
 #include "server/kv/parallel_prefix_txn.h"
@@ -48,9 +50,13 @@ struct SchedSlot {
     int prompt_left = 0;
     int prompt_new = 0;
     uint64_t admission_order = 0;
+    // started_at: the request's arrival (total wall, DONE elapsed). admitted_at: the successful attempt, where prefill_s starts;
+    // the wait between them is queue_s (see admit_timing.h).
     std::chrono::steady_clock::time_point started_at{};
+    std::chrono::steady_clock::time_point admitted_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
+    double queue_s = 0.0;
     int cached_prefix_tokens = 0;
     PrefixCaptureTxn cache_capture;
     int n_gen_cap = 0;
@@ -368,6 +374,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             /*prefilled_tokens=*/prompt_tokens - s.cached_prefix_tokens,
             /*effective_prompt_tokens=*/prompt_tokens,
         };
+        gen_timings.queue_s = s.queue_s;
         gen_timings.pflash = s.job->pflash_stats;
 
         if (!s.error) {
@@ -428,14 +435,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int out_tokens = (int)s.gen_tokens.size();
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
-            "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
+            "finish=%s slot=%d queue=%.1fs prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
             req.response_id.c_str(),
             s.error ? "false" : "true",
             req.prompt_tokens.size(), out_tokens, elapsed_s,
             elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0,
             s.client_disconnected ? "client_disconnect"
                                   : s.emitter->finish_reason().c_str(),
-            idx, s.prefill_s, decode_s,
+            idx, s.queue_s, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
 
         engine.retire(idx);
@@ -479,11 +486,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
     auto admit_job = [&](ServerJob * job) -> AdmissionDisposition {
         const ParsedRequest & req = job->req;
-        if (job->parallel_started_at ==
-                std::chrono::steady_clock::time_point{}) {
-            job->parallel_started_at = std::chrono::steady_clock::now();
-        }
-        const auto started_at = job->parallel_started_at;
+        const auto started_at = job->arrived_at;
+        // Everything before this attempt is queue_ms: the HTTP queue, Deferred retries, a shared-prefix wait and PFlash
+        // compression (its own compress_ms is in timings.pflash). This attempt, if it is admitted, is where prefill starts.
+        const auto attempt_at = std::chrono::steady_clock::now();
 
         // Same thinking-budget n_gen math as the classic worker loop.
         const bool budget_active = req.thinking_opt_in;
@@ -585,6 +591,20 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         }
 
+        // An engine that plans no prefix store (KVFlash slots) pins the head
+        // itself: it gets the same cut, found once, with the ring joined.
+        int head_cut = 0;
+        if (!prefix_supported && !req.images) {
+            if (job->shared_prefix_cut < 0) {
+                const auto boundaries = find_all_boundaries(
+                    req.prompt_tokens, prefix_cache_.chat_markers());
+                job->shared_prefix_cut = shared_prefixes_.head_cut(
+                    req.prompt_tokens, boundaries, !req.tools.empty());
+                kv_cache_.remember_prefix(req.prompt_tokens, boundaries);
+            }
+            head_cut = job->shared_prefix_cut;
+        }
+
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const PrefixStorePlan & requested_plan = cache_plan.plan;
@@ -598,7 +618,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             : engine.admit_bounded(
                   next_request_id, req.prompt_tokens, req.sampler,
                   (std::min)(n_gen_cap, engine.max_context() -
-                                            (int)req.prompt_tokens.size() + 1));
+                                            (int)req.prompt_tokens.size() + 1),
+                  SeqEngine::AdmitMeta{req.session.sid, req.session.client, head_cut});
 
         const PrefixStoreAdmission & prefix = ar.prefix_store;
         const std::string prefix_protocol_error = kv_cache_.admitted(
@@ -696,9 +717,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.prefilling = true;
         s.admission_order = next_admission_order++;
         s.started_at = started_at;
-        s.decode_started_at = started_at;  // sane on prefill failure
-        s.cached_prefix_tokens = prefix.restored.tokens;
-        s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
+        s.admitted_at = attempt_at;
+        s.queue_s = admit_timing(started_at, attempt_at, attempt_at).queue_s;
+        s.decode_started_at = attempt_at;  // sane on prefill failure
+        s.cached_prefix_tokens = admit_cached_tokens(prefix.restored.tokens, ar.resumed_tokens);
+        s.prompt_left = (int)req.prompt_tokens.size() - s.cached_prefix_tokens;
         s.prompt_new = s.prompt_left;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
@@ -1014,10 +1037,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 continue;
             }
             if (pflash_wants(job)) {
-                if (job->parallel_started_at ==
-                        std::chrono::steady_clock::time_point{}) {
-                    job->parallel_started_at = std::chrono::steady_clock::now();
-                }
                 job->req.pflash_cached_prefix = restorable_prefix_tokens(
                     job->req.prompt_tokens, job->req.disk_cache_policy);
                 {
@@ -1036,10 +1055,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (leader >= 0) {
                     const SchedSlot & l = slots[(size_t)leader];
                     const auto now = std::chrono::steady_clock::now();
-                    if (job->parallel_started_at ==
-                            std::chrono::steady_clock::time_point{}) {
-                        job->parallel_started_at = now;
-                    }
                     PrefixWaiter w;
                     w.job = job;
                     w.leader = leader;
@@ -1209,7 +1224,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     if (!budget_clear) arm_loop_close(i);
                     step_plan.decode.push_back(
                         {i, s.pending_tok,
-                         budget_clear && !s.job->req.sampler.constraint});
+                         luce::common::step_allows_speculation(
+                             budget_clear, s.job->req.sampler.constraint != nullptr, s.job->req.force_ar_decode)});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
@@ -1417,8 +1433,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // replay, matching the full response's completion-token count.
                 if (s.gen_tokens.empty()) {
                     s.decode_started_at = std::chrono::steady_clock::now();
-                    s.prefill_s = std::chrono::duration<double>(
-                        s.decode_started_at - s.started_at).count();
+                    s.prefill_s = admit_timing(s.started_at, s.admitted_at, s.decode_started_at).prefill_s;
                 }
                 advance_slot(s, out.token);
                 continue;

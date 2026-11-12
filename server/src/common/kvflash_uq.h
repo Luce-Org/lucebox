@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <utility>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,12 @@ inline KvFlashUqTake kvflash_uq_batch_take(int batch_start, int batch_tokens, in
     return t;
 }
 
+// The slot engine captures per cut: how many rows of the cut [pos, pos + n) are inside the window while the
+// plan still captures. No cut spans p.cut (the forced cut), so they are the cut's last rows.
+inline int kvflash_uq_cut_rows(const KvFlashUqPlan & p, int pos, int n) {
+    return p.capture && pos + n <= p.cut ? std::max(0, pos + n - std::max(pos, p.win_lo)) : 0;
+}
+
 // The captured rows of one session, keyed by {hi, hash of ids[0, hi)}. Not persisted into snapshots.
 struct KvFlashUqStore {
     int lo = -1, hi = -1, n = 0;    // the n rows are the queries of positions [hi - n, hi)
@@ -93,11 +100,21 @@ inline uint64_t kvflash_uq_hash(const std::vector<int32_t> & ids, int upto) {
 // Up to this many sessions keep a store (host memory: n rows * layers * q heads * head dim floats each).
 constexpr size_t kKvFlashUqMaxStores = 8;
 
+// The store holds the rows of the question that ends at hi after the prompt prefix with this hash.
+inline bool kvflash_uq_holds(const KvFlashUqStore & s, int hi, uint64_t hash) { return !s.empty() && s.hi == hi && s.hash == hash; }
+// Is the store the question rows of this prompt's own ids (a session's history)? The window lies in it, n rows fit the window, the
+// rows are whole, and the key is the hash of the ids [0, hi). A slot's store outlives the session that captured it until the next
+// one replaces it; a bundle save keeps only rows that pass this.
+inline bool kvflash_uq_belongs(const KvFlashUqStore & s, const std::vector<int32_t> & ids) {
+    return !s.empty() && s.lo >= 0 && s.lo < s.hi && s.hi <= (int)ids.size() && s.n <= s.hi - s.lo && !s.rows.empty() &&
+           s.rows.size() % (size_t)s.n == 0 && s.hash == kvflash_uq_hash(ids, s.hi);
+}
+
 // LRU of stores, most recent first, keyed by {hi, hash of ids[0, hi)}: the key is the content of the
 // prompt prefix, so a store stays valid whatever the pager or history did since.
 inline int kvflash_uq_find(const std::vector<KvFlashUqStore> & v, int hi, uint64_t hash) {
     for (size_t i = 0; i < v.size(); i++)
-        if (!v[i].empty() && v[i].hi == hi && v[i].hash == hash) return (int)i;
+        if (kvflash_uq_holds(v[i], hi, hash)) return (int)i;
     return -1;
 }
 // Moves entry i to the front (a hit).
@@ -125,10 +142,20 @@ inline int kvflash_uq_cut(const KvFlashHumanTurn & t, int n_queries, int kv_offs
 // A mode-4 rewind to r replays the window from the new pool when r reaches back to its start.
 inline bool kvflash_uq_rewind_recaptures(const KvFlashUqPlan & p, int r) { return p.n > 0 && r <= p.win_lo; }
 
-// Append the stored rows to the scorer's query list (no-op for an empty store).
-inline void kvflash_uq_append_queries(std::vector<const float *> & qs, const KvFlashUqStore & s, size_t qsize) {
-    if (s.empty() || qsize == 0 || s.rows.size() != (size_t)s.n * qsize) return;
-    for (int i = 0; i < s.n; i++) qs.push_back(s.rows.data() + (size_t)i * qsize);
+// LUCE_KVFLASH_UQ_QUERIES: the rows of the latest human question join the scorer's queries, one hit or miss line per
+// reselect. `st` is the store holding this request's question; null or unusable, `miss` says why. The store and the
+// selector decide alone: a call too large for the GPU scorer runs on the CPU scorer with the same queries.
+// Returns the miss reason, nullptr on a hit.
+inline const char * kvflash_uq_join(std::vector<const float *> & qs, const KvFlashUqStore * st, const char * miss, size_t qsize, size_t n_v2) {
+    const char * why = n_v2 == 0 ? "no-v2-selector"
+        : !st || st->empty() || qsize == 0 || st->rows.size() != (size_t)st->n * qsize ? (miss && *miss ? miss : "no-store") : nullptr;
+    if (why) {
+        std::fprintf(stderr, "[kvflash] uq miss reason=%s\n", why);
+        return why;
+    }
+    for (int i = 0; i < st->n; i++) qs.push_back(st->rows.data() + (size_t)i * qsize);
+    std::fprintf(stderr, "[kvflash] uq hit lo=%d hi=%d n=%d\n", st->lo, st->hi, st->n);
+    return nullptr;
 }
 
 // Why the feature must stay off for the process ("" = ids present, on). Tool results can only be told

@@ -737,6 +737,9 @@ void KvCache::consider_pin(int slot, const std::vector<int32_t> & prompt,
         }
         return;
     }
+    // A pooled payload is never written (DiskPrefixCache::save), so its pin
+    // would have no file and be warmed again after every restart.
+    if (checkpoints_.kind(Checkpoint::of_cache_slot(slot)) == CheckpointKind::pooled) return;
     // Without a disk tier for this engine a pin keeps only its token ids
     // (warmed again after a restart), so it needs a pins file that lasts.
     const bool files = pins_have_files();

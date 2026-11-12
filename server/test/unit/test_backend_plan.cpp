@@ -118,6 +118,21 @@ void test_deepseek_options_land_in_execution() {
     CHECK(plan.execution().chunk == 512);
 }
 
+void test_explicit_max_concurrency_one_is_distinguished_from_the_default() {
+    BackendPreparation unset = resolve(plain_args(), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(unset));
+    CHECK(std::get<BackendPlan>(unset).execution().max_concurrency == 1);
+    CHECK(!std::get<BackendPlan>(unset).execution().max_concurrency_set);
+
+    BackendArgs args = plain_args();
+    args.max_concurrency = 1;
+    args.max_concurrency_set = true;
+    BackendPreparation set = resolve(std::move(args), "qwen35");
+    CHECK(std::holds_alternative<BackendPlan>(set));
+    CHECK(std::get<BackendPlan>(set).execution().max_concurrency == 1);
+    CHECK(std::get<BackendPlan>(set).execution().max_concurrency_set);
+}
+
 void test_qwen4exp_defaults_to_auto_chunks() {
     BackendPreparation result = resolve(plain_args(), "qwen4exp");
     CHECK(std::holds_alternative<BackendPlan>(result));
@@ -180,39 +195,39 @@ void test_explicit_specla_tau_is_preserved() {
     CHECK(plan.speculation().ddtree_tau == 2.5f);
 }
 
-void test_kvflash_falls_back_to_ordinary_ddtree() {
+// SpecLA with KVFlash used to fall back to ordinary DDTree and run. DDTree with KVFlash
+// is refused at startup (the DDTree loop does not settle terminal steps like AR),
+// so --specla is refused too, with or without an explicit tau.
+void check_kvflash_specla_fallback_is_refused(bool explicit_tau) {
     BackendArgs args = plain_args();
     args.draft_path = "/models/draft.gguf";
     args.specla_mode = true;
+    if (explicit_tau) {
+        args.ddtree_tau = 2.5f;
+        args.ddtree_tau_explicit = true;
+    }
     BackendAdmissionContext admission;
     admission.kvflash = KvFlashRequest::Auto;
 
     BackendPreparation result =
         resolve(std::move(args), "qwen35", admission);
-    CHECK(std::holds_alternative<BackendPlan>(result));
-    const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(!plan.speculation().specla_mode);
-    CHECK(plan.speculation().ddtree_mode);
-    CHECK(std::isinf(plan.speculation().ddtree_tau));
-    CHECK(plan.warnings().size() == 1);
+    CHECK(std::holds_alternative<BackendPreparationFailure>(result));
+    if (!std::holds_alternative<BackendPreparationFailure>(result)) return;
+    const BackendPreparationFailure & failure =
+        std::get<BackendPreparationFailure>(result);
+    CHECK(failure.error == BackendPreparationError::FeatureCompatibility);
+    // The user passed --specla, never --ddtree: the error names --specla.
+    CHECK(failure.message.find("--specla cannot run with --kvflash") != std::string::npos);
+    CHECK(failure.message.find("drop --ddtree") == std::string::npos);  // not a flag the user passed
+    CHECK(failure.warnings.empty());
 }
 
-void test_kvflash_fallback_preserves_explicit_tau() {
-    BackendArgs args = plain_args();
-    args.draft_path = "/models/draft.gguf";
-    args.specla_mode = true;
-    args.ddtree_tau = 2.5f;
-    args.ddtree_tau_explicit = true;
-    BackendAdmissionContext admission;
-    admission.kvflash = KvFlashRequest::Auto;
+void test_kvflash_specla_fallback_to_ddtree_is_refused() {
+    check_kvflash_specla_fallback_is_refused(false);
+}
 
-    BackendPreparation result =
-        resolve(std::move(args), "qwen35", admission);
-    CHECK(std::holds_alternative<BackendPlan>(result));
-    const BackendPlan & plan = std::get<BackendPlan>(result);
-    CHECK(!plan.speculation().specla_mode);
-    CHECK(plan.speculation().ddtree_mode);
-    CHECK(plan.speculation().ddtree_tau == 2.5f);
+void test_kvflash_specla_fallback_with_explicit_tau_is_refused() {
+    check_kvflash_specla_fallback_is_refused(true);
 }
 
 void test_unsupported_specla_falls_back_without_hidden_tau() {
@@ -279,13 +294,14 @@ void test_no_draft_target_only_disables_speculation() {
 TEST_CASE(BackendPlanFixture, backend_plan_suite) {
     test_plan_owns_the_effective_request();
     test_deepseek_options_land_in_execution();
+    test_explicit_max_concurrency_one_is_distinguished_from_the_default();
     test_qwen4exp_defaults_to_auto_chunks();
     test_qwen4exp_split_placement_lands_in_placement();
     test_specla_without_fast_rollback_falls_back();
     test_supported_specla_selects_ddtree();
     test_explicit_specla_tau_is_preserved();
-    test_kvflash_falls_back_to_ordinary_ddtree();
-    test_kvflash_fallback_preserves_explicit_tau();
+    test_kvflash_specla_fallback_to_ddtree_is_refused();
+    test_kvflash_specla_fallback_with_explicit_tau_is_refused();
     test_unsupported_specla_falls_back_without_hidden_tau();
     test_unsupported_specla_preserves_explicit_ddtree_options();
     test_supported_specla_requires_a_draft();

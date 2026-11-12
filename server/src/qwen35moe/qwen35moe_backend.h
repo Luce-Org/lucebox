@@ -45,6 +45,7 @@ public:
 protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
     bool post_kvflash_init_gate() override;
+    const char * kvflash_arch() const override { return "qwen35moe"; }
     bool run_ar_decode_path(int committed, ThinkingBudget & budget,
                             std::vector<int32_t> & out_tokens,
                             const DaemonIO & io,

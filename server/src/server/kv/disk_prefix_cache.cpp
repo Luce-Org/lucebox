@@ -182,6 +182,17 @@ bool DiskPrefixCache::init() {
     return true;
 }
 
+void DiskPrefixCache::use_layout(const std::array<uint8_t, 16> & id) {
+    if (off()) return;
+    std::lock_guard<std::mutex> lock(disk_->mu_);
+    layout_id_ = id;
+    layout_known_ = true;
+    layout_from_disk_ = false;  // named, not learned: nothing to verify against a live model
+    layout_dir_ = config_.cache_dir + "/" + hex_string(layout_id_.data(), 16);
+    std::error_code ec;
+    fs::create_directories(layout_dir_, ec);
+}
+
 DiskDrainResult DiskPrefixCache::drain(double max_seconds) {
     if (!disk_) return DiskDrainResult{};
     DiskStore::Owner owner;

@@ -24,6 +24,8 @@
 #include "cluster/cluster_worker_main.h"
 #include "common/chain_rollback_policy.h"
 #include "common/gguf_inspect.h"
+#include "common/kvflash_concurrent_gate.h"
+#include "common/kvflash_sessions_plan.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/paged_attention_config.h"
@@ -274,7 +276,9 @@ static void print_usage(const char * prog) {
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
-        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on; with --kvflash\n"
+        "                      the default is exact rollback and this flag opts in; greedy\n"
+        "                      output then differs from AR on some prompts)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --specla            Enable speculative linear-attention verification\n"
         "                       when supported (Qwen3.6 uses DDTree automatically)\n"
@@ -366,6 +370,9 @@ static void print_usage(const char * prog) {
         "                              ~/.cache/lucebox/kv-cache; off disables it)\n"
         "                              On Windows: %LOCALAPPDATA%/lucebox/kv-cache\n"
         "  --no-kv-cache               Same as --kv-cache-dir off\n"
+        "  --kv-sessions on|off        Park KVFlash sessions under <kv-cache-dir>/sessions/ and resume\n"
+        "                              them after a restart, inside the one cache budget\n"
+        "                              (default: on whenever --kvflash and a cache dir are on)\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB, hard cap with LRU eviction,\n"
         "                              clamped to the free space (default: 131072 = 128 GB)\n"
         "  --kv-cache-ttl <hours>      Delete snapshots unused for this long (default: 72, 0 = never)\n"
@@ -447,6 +454,7 @@ struct ModelOptions {
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
     double spark_vram_gib = 0.0;   // --spark-vram: total VRAM target in GiB (0=use card)
     std::string cache_type_k;  // explicit --cache-type-k override
+    bool shared_prefix_given = false;
     std::string cache_type_v;  // explicit --cache-type-v override
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
@@ -483,6 +491,7 @@ struct ModelOptions {
     // Keep process-wide options inert until the selected model is loaded.
     std::string adaptive_experts_tau;
     std::string kvflash_pool, kvflash_policy, kvflash_tau;
+    luce::common::KvFlashSessionsFlag kv_sessions = luce::common::KvFlashSessionsFlag::automatic;
 
     // Track whether the operator passed the legacy --max-tokens alias.
     // When set and --default-max-tokens is NOT also passed, --max-tokens
@@ -822,6 +831,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                     "[server] --max-concurrency must be an integer\n");
                 return 2;
             }
+            bargs.max_concurrency_set = true;
         } else if (std::strcmp(argv[i], "--admission-coalesce-ms") == 0 &&
                    i + 1 < argc) {
             const char * value = argv[++i];
@@ -911,6 +921,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
+            bargs.fast_rollback_explicit = true;
         } else if (std::strcmp(argv[i], "--specla") == 0) {
             bargs.specla_mode = true;
             bargs.fast_rollback = true;
@@ -1152,6 +1163,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             const std::string dir = argv[++i];
             sconfig.disk_cache_dir =
                 (dir == "off" || dir == "none" || dir.empty()) ? std::string() : dir;
+        } else if (std::strcmp(argv[i], "--kv-sessions") == 0 && i + 1 < argc) {
+            if (!luce::common::kvflash_sessions_flag_parse(argv[++i], model.kv_sessions)) {
+                std::fprintf(stderr, "--kv-sessions expects on or off, got %s\n", argv[i]);
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--no-kv-cache") == 0) {
             sconfig.disk_cache_dir.clear();
         } else if (std::strcmp(argv[i], "--kv-cache-shutdown-flush") == 0 && i + 1 < argc) {
@@ -1196,6 +1212,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] --shared-prefix must be auto, freeze or off\n");
                 return 2;
             }
+            model.shared_prefix_given = true;
         } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
             std::fprintf(stderr, "[server] --disk-prefix-cache-compress is retired and has no effect\n");
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
@@ -1537,6 +1554,50 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default.
+    // Paged attention with KVFlash is the concurrent engine: per-slot recall on qwen35 (the serial mode-4
+    // profile, installed here unless the operator set the full recall env or asked for LRU), LRU otherwise;
+    // tau is refused.
+    const char * env_pool = std::getenv("LUCE_KVFLASH");
+    const bool concurrent_kvflash = model.bargs.paged_attention &&
+        (!model.kvflash_pool.empty() || luce::common::kvflash_pool_requested(env_pool));
+    if (concurrent_kvflash) {
+        const luce::common::KvFlashLookup env_lookup = [](const char * k) { return std::getenv(k); };
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        const luce::common::KvFlashProfileRequest rq = luce::common::kvflash_concurrent_request(
+            arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
+        const luce::common::KvFlashProfile profile = luce::common::kvflash_resolve_concurrent_profile(rq);
+        if (!profile.ok) {
+            std::fprintf(stderr, "[kvflash] %s\n", profile.error.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "%s\n", profile.log_line.c_str());
+        if (profile.install_recall_defaults) {
+            apply_env_defaults("KVFlash concurrent recall", luce::server::kvflash_recall_env(arch, /*mode5=*/false));
+            const std::string bad = luce::common::kvflash_merged_profile_error(
+                arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
+            if (!bad.empty()) {
+                std::fprintf(stderr, "[kvflash] concurrent recall defaults conflict with a set value: %s\n", bad.c_str());
+                return 2;
+            }
+        }
+        if (profile.policy == "lru-only") set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
+    } else if (!model.kvflash_pool.empty()) {
+        // Mode 4 unless LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter
+        // (flag or env) and its PFlash GGUFs are set.
+        const std::string drafter_flag = model.sconfig.pflash_drafter_path;
+        const bool mode5 = luce::server::kvflash_mode5_requested([&](const char * k) {
+            if (drafter_flag.size() && std::string_view(k) == "LUCE_KVFLASH_DRAFTER") return drafter_flag;
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        });
+        std::fprintf(stderr, "[kvflash] recall profile: %s\n", mode5
+            ? "mode 5 (PFlash 2.0 drafter scorer)"
+            : "mode 4 (exact scorer; mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)");
+        apply_env_defaults("KVFlash recall",
+            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, mode5));
+    }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())
@@ -1753,6 +1814,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             cluster_cfg.timeout_ms, n_env);
     }
 
+    // PFlash compression beside the concurrent KVFlash arena is outside C1.3.
+    if (bargs.paged_attention && sconfig.pflash &&
+        (luce::common::kvflash_pool_requested(std::getenv("LUCE_KVFLASH")))) {
+        std::fprintf(stderr, "[kvflash] concurrent KVFlash cannot be combined with PFlash\n");
+        return 2;
+    }
     BackendAdmissionContext backend_admission;
     backend_admission.pflash_enabled =
         sconfig.pflash;
@@ -1870,7 +1937,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // the concurrent budget and no single-sequence superseded pruning.
     sconfig.concurrent_prefix_cache =
         backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0;
-
     const AgentTurnCacheChoice agent_turn = resolve_agent_turn_cache(
         model.agent_turn_cache,
         !backend_cache.paged_attention && backend_execution.max_concurrency <= 1,
@@ -2058,6 +2124,30 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (model.expert_device && !apply_expert_device(*model.expert_device, backend_plan)) {
         return 2;
+    }
+    // KVFlash sessions on disk: the directory's DiskStore is opened here and kept for the process; the engine
+    // finds it by directory and attaches the session store as its tenant.
+    static std::vector<std::shared_ptr<DiskStore>> sessions_disks;
+    {
+        const char * old_dir = std::getenv("LUCE_KVFLASH_SLOT_BUNDLE_DIR");
+        const auto plan = luce::common::kvflash_sessions_plan(
+            concurrent_kvflash, model.kv_sessions, sconfig.disk_cache_dir, old_dir ? old_dir : "");
+        if (!plan.note.empty()) std::fprintf(stderr, "[kvflash] %s\n", plan.note.c_str());
+        if (plan.on) {
+            DiskCacheConfig dc;
+            dc.cache_dir = plan.root;
+            dc.budget_bytes = sconfig.disk_cache_budget_mb * (size_t)(1024 * 1024);
+            dc.min_tokens = sconfig.disk_cache_min_tokens;
+            dc.ttl_seconds = disk_cache_ttl_seconds(sconfig.disk_cache_ttl_hours);
+            bool failed = false;
+            auto disk = DiskStore::open(dc, nullptr, nullptr, failed);
+            if (disk) {
+                sessions_disks.push_back(disk);
+                set_environment_variable("LUCE_KVFLASH_SESSIONS_DIR", plan.root.c_str(), true);
+            } else {
+                std::fprintf(stderr, "[kvflash] sessions stay in memory: cannot open %s\n", plan.root.c_str());
+            }
+        }
     }
     auto backend_owner = create_backend(backend_plan);
     if (!backend_owner) {
@@ -2551,6 +2641,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 "[server] level-2 force-close DISABLED: text %.40s... "
                 "tokenizes to empty.\n", close_text.c_str());
         }
+    }
+
+    const SharedPrefixMode shared_prefix = effective_shared_prefix_mode(
+        model.shared_prefix_given, sconfig.shared_prefix, sconfig.concurrent_prefix_cache,
+        backend_owner->prefill_cuts_at_restore_points());
+    if (shared_prefix != sconfig.shared_prefix) {
+        sconfig.shared_prefix = shared_prefix;
+        std::fprintf(stderr,
+            "[server] --shared-prefix defaults to freeze on the concurrent path "
+            "(this engine does not cut prefill at the restore points); pass auto to learn\n");
     }
 
     loaded.engine =

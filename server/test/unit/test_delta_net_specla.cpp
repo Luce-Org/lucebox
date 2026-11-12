@@ -145,6 +145,16 @@ PendingFactors make_pending_factors(const CaseInputs & in) {
 
 float max_abs_diff(const std::vector<float> & a,
                    const std::vector<float> & b);
+
+// Floats whose bits differ: the batch-invariance question (spec verify vs the
+// single-token step kernels) is bit equality, not a tolerance.
+size_t bit_diffs(const std::vector<float> & a, const std::vector<float> & b) {
+    size_t n = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
+    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+        n += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+    }
+    return n;
+}
 std::vector<int32_t> chain_parents(int n);
 std::vector<int32_t> random_tree_parents(int n, unsigned seed);
 
@@ -382,6 +392,67 @@ void run_hld_delayed_case(ggml_backend_t backend) {
               "HLD delayed-update durable-state diff %.3e", durable_diff);
     std::printf("%-28s HLD out=%.3e durable=%.3e\n",
                 "hld-delayed-tree", out_diff, durable_diff);
+}
+
+// ssm_conv_specla over a chain with nothing pending vs ssm_conv_step (the kernel
+// plain decode and chain verify run), same history and inputs: reports how many
+// output floats differ in bits.
+void run_conv_specla_vs_step_case(ggml_backend_t backend) {
+    constexpr int C = 128, K = 4, N = 16;
+    const std::vector<int32_t> parents = chain_parents(N);
+    const auto schedule = make_specla_hld_schedule(parents.data(), N, /*pending_count=*/0);
+    std::mt19937 rng(777);
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    std::vector<float> x((size_t)C*N), weight((size_t)K*C), state((size_t)(K - 1)*C);
+    for (auto * vec : {&x, &weight, &state}) for (float & value : *vec) value = nd(rng);
+
+    auto run = [&](bool specla, std::vector<float> & out) {
+        GraphEnv env;
+        ggml_context * ctx = env.ctx;
+        ggml_init_params fp_ip{};
+        fp_ip.mem_size = 4*ggml_tensor_overhead();
+        fp_ip.no_alloc = true;
+        ggml_context * fp_ctx = ggml_init(fp_ip);
+        ggml_tensor * pending_bank = ggml_new_tensor_3d(fp_ctx, GGML_TYPE_F32, C, 1, N);
+        ggml_tensor * current_bank = ggml_new_tensor_3d(fp_ctx, GGML_TYPE_F32, C, 1, N);
+        ggml_backend_buffer_t fp_buf = ggml_backend_alloc_ctx_tensors(fp_ctx, backend);
+        ggml_tensor * tx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, N, 1);
+        ggml_tensor * tw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
+        ggml_tensor * ts = specla ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K - 1, C)
+                                  : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, C, 1);
+        ggml_tensor * meta = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)schedule.packed.size());
+        ggml_tensor * ptr_table = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 8);
+        for (ggml_tensor * t : {tx, tw, ts, meta, ptr_table}) ggml_set_input(t);
+        ggml_tensor * result = specla
+            ? ggml_ssm_conv_specla(ctx, tx, tw, ts, meta, ptr_table, 1, 0, 0,
+                                   schedule.n_boundaries, schedule.n_chains, schedule.n_waves,
+                                   schedule.max_parallel_chains)
+            : ggml_ssm_conv_step(ctx, tx, tw, ts, nullptr);
+        ggml_set_output(result);
+        ggml_build_forward_expand(env.gf, result);
+        bool ok = fp_buf && env.alloc_and_run(backend);
+        if (ok) {
+            set_f32(tx, x); set_f32(tw, weight); set_f32(ts, state);
+            if (specla) {
+                ggml_backend_tensor_set(meta, schedule.packed.data(), 0, schedule.packed.size()*sizeof(int32_t));
+                int64_t ptrs[8]{};
+                ptrs[3] = (int64_t)(intptr_t)pending_bank->data;
+                ptrs[7] = (int64_t)(intptr_t)current_bank->data;
+                ggml_backend_tensor_set(ptr_table, ptrs, 0, sizeof(ptrs));
+            }
+            ok = ggml_backend_graph_compute(backend, env.gf) == GGML_STATUS_SUCCESS;
+            if (ok) out = get_f32(result, 0, (size_t)C*N);
+        }
+        if (fp_buf) ggml_backend_buffer_free(fp_buf);
+        ggml_free(fp_ctx);
+        return ok;
+    };
+    std::vector<float> spec, step;
+    const bool ok = run(true, spec) && run(false, step);
+    CHECK_MSG(ok, "conv specla/step compute failed");
+    if (!ok) return;
+    std::printf("%-28s ssm_conv_specla vs ssm_conv_step: bits-differ=%zu/%zu max=%.3e\n",
+                "conv-specla-vs-step", bit_diffs(spec, step), step.size(), max_abs_diff(spec, step));
 }
 
 void run_hld_conv_delayed_case(ggml_backend_t backend) {
@@ -685,8 +756,8 @@ void run_hld_case(ggml_backend_t backend, const char * name,
     CHECK_MSG(durable_diff == 0.0f,
               "%s: zero-pending verify mutated durable state %.3e",
               name, durable_diff);
-    std::printf("%-28s HLD out=%.3e durable=%.3e\n",
-                name, out_diff, durable_diff);
+    std::printf("%-28s HLD out=%.3e durable=%.3e bits-differ=%zu/%zu\n",
+                name, out_diff, durable_diff, bit_diffs(ref.attn, hld.out), ref.attn.size());
 }
 
 void test_hld_schedule() {
@@ -835,6 +906,7 @@ int main() {
                  true, kOutTol);
     run_hld_delayed_case(backend);
     run_hld_conv_delayed_case(backend);
+    run_conv_specla_vs_step_case(backend);
     run_factorized_conv_commit_case(backend);
 
     // Chain drafts vs the plain fused op.

@@ -148,6 +148,24 @@ TEST_CASE(KvflashUqFixture, cut_follows_the_question_not_the_store) {
     CHECK(kvflash_uq_cut(t, 0, 0, 1000) == -1);           // off
     CHECK(kvflash_uq_cut(KvFlashHumanTurn{}, 64, 0, 1000) == -1);
 }
+TEST_CASE(KvflashUqFixture, a_store_holds_a_question_by_its_end_and_prefix_hash) {
+    const KvFlashUqStore st = mk(300, 7);
+    CHECK(kvflash_uq_holds(st, 300, 7));
+    CHECK(!kvflash_uq_holds(st, 300, 8));                  // another prompt prefix
+    CHECK(!kvflash_uq_holds(st, 364, 7));                  // another question
+    CHECK(!kvflash_uq_holds(KvFlashUqStore{}, -1, 0));     // nothing stored, no question
+}
+TEST_CASE(KvflashUqFixture, cut_rows_are_the_cuts_last_rows_inside_the_window) {
+    auto p = kvflash_uq_plan(KvFlashHumanTurn{1000, 1100}, 64, 0, 5000);   // window [1036, 1100)
+    CHECK(kvflash_uq_cut_rows(p, 512, 512) == 0);          // [512, 1024): before the window
+    CHECK(kvflash_uq_cut_rows(p, 1024, 76) == 64);         // [1024, 1100): the whole window
+    CHECK(kvflash_uq_cut_rows(p, 1024, 30) == 18);         // [1024, 1054): its first 18 rows
+    CHECK(kvflash_uq_cut_rows(p, 1054, 46) == 46);         // [1054, 1100): the rest
+    CHECK(kvflash_uq_cut_rows(p, 1100, 512) == 0);         // behind it
+    CHECK(kvflash_uq_cut_rows(p, 1024, 512) == 0);         // a cut over the question's end: its last rows are not the window
+    p.capture = false;                                     // stored, or not in this prefill
+    CHECK(kvflash_uq_cut_rows(p, 1024, 76) == 0);
+}
 TEST_CASE(KvflashUqFixture, rewind_below_the_window_recaptures) {
     const auto p = kvflash_uq_plan(KvFlashHumanTurn{100, 300}, 64, 0, 1000);   // window [236, 300)
     CHECK(kvflash_uq_rewind_recaptures(p, 97));            // start of the human turn
@@ -157,7 +175,7 @@ TEST_CASE(KvflashUqFixture, rewind_below_the_window_recaptures) {
 }
 
 // ---- scorer: an extra aligned query raises that chunk -----------------------
-TEST_CASE(KvflashUqFixture, extra_query_raises_its_chunk_in_the_cpu_selector) {
+TEST_CASE(KvflashUqFixture, the_question_rows_join_by_the_store_and_selector_alone_and_raise_their_chunk) {
     SynthCfg c;
     c.L = 2; c.HK = 2; c.G = 3; c.D = 64; c.CT = 16; c.NB = 24; c.KT = GGML_TYPE_Q8_0;
     c.sealed = 100; c.N = 8; c.keep_newest = 4; c.tail = 16;
@@ -184,16 +202,20 @@ TEST_CASE(KvflashUqFixture, extra_query_raises_its_chunk_in_the_cpu_selector) {
     st.n = 1; st.rows.assign(s.qs.begin() + (long)hot * (long)s.QS, s.qs.begin() + (long)(hot + 1) * (long)s.QS);
 
     std::vector<const float *> with_uq = base;
-    kvflash_uq_append_queries(with_uq, st, s.QS);
+    CHECK(kvflash_uq_join(with_uq, &st, "", s.QS, base.size()) == nullptr);
     REQUIRE(with_uq.size() == base.size() + 1);
     const auto sel_base = select(base), sel_uq = select(with_uq);
     CHECK(sel_uq[(size_t)chunk] > sel_base[(size_t)chunk] * 1.5f);
     // Monotone: max over queries never lowers any chunk.
     for (size_t i = 0; i < sel_base.size(); i++) CHECK(sel_uq[i] >= sel_base[i]);
-    // N = 0 (empty store): the query list is untouched, byte for byte.
+    // No store, an empty one, rows of another shape or no selector queries: the reason is named and the query list
+    // is untouched, byte for byte. The store and the selector decide alone: nothing about the device does.
     KvFlashUqStore none;
     std::vector<const float *> same = base;
-    kvflash_uq_append_queries(same, none, s.QS);
+    CHECK(std::string(kvflash_uq_join(same, &none, "", s.QS, base.size())) == "no-store");
+    CHECK(std::string(kvflash_uq_join(same, nullptr, "window-not-in-prefill", s.QS, base.size())) == "window-not-in-prefill");
+    CHECK(std::string(kvflash_uq_join(same, &st, "", s.QS + 1, base.size())) == "no-store");
+    CHECK(std::string(kvflash_uq_join(same, &st, "", s.QS, 0)) == "no-v2-selector");
     CHECK((same == base));
 }
 
@@ -215,4 +237,20 @@ TEST_CASE(KvflashUqFixture, uq_gate_requires_every_id) {
     CHECK(kvflash_uq_gate(-1, U, END, TR) == "<|im_start|> id missing");
     CHECK(kvflash_uq_gate(S, -1, END, TR) == "user id missing");
     CHECK(kvflash_uq_gate(S, U, -1, TR) == "<|im_end|> id missing");
+}
+
+// A bundle save keeps a slot's rows only when they are the session's own: the slot's store outlives the session that captured it.
+TEST_CASE(KvflashUqFixture, a_store_belongs_to_the_history_it_was_captured_from) {
+    const std::vector<int32_t> ids{5, 6, 7, 8, 9, 10, 11, 12};
+    KvFlashUqStore s;
+    s.lo = 4; s.hi = 7; s.n = 2; s.hash = kvflash_uq_hash(ids, 7); s.rows = {1.f, 2.f, 3.f, 4.f};
+    CHECK(kvflash_uq_belongs(s, ids));
+    auto other = ids; other[2] = 99;                                                       // another session's tokens before the window's end
+    CHECK(!kvflash_uq_belongs(s, other));
+    other = ids; other[7] = 99;                                                            // tokens after it do not matter (the session grew)
+    CHECK(kvflash_uq_belongs(s, other));
+    CHECK(!kvflash_uq_belongs(s, std::vector<int32_t>(ids.begin(), ids.begin() + 6)));   // a history shorter than the window's end
+    KvFlashUqStore t = s; t.n = 4;                    CHECK(!kvflash_uq_belongs(t, ids));   // more rows than the window holds
+    t = s; t.rows.pop_back();                         CHECK(!kvflash_uq_belongs(t, ids));   // ragged rows
+    CHECK(!kvflash_uq_belongs(KvFlashUqStore{}, ids));
 }
