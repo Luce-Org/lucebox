@@ -256,6 +256,11 @@ struct TargetWeights {
     int32_t im_start_id  = -1;
     int32_t assistant_id = -1;
     int32_t newline_id   = -1;
+    // Role-token ids for the KVFlash recall turn cuts and preamble pin; -1 when absent.
+    int32_t user_id      = -1;
+    int32_t system_id    = -1;
+    int32_t im_end_id    = -1;
+    int32_t tool_response_id = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
@@ -483,6 +488,10 @@ struct TargetCache {
     // cache. When > 1, ssm_state/conv_state carry a trailing slot axis and the
     // paged metadata tensors widen to n_seq_slots columns.
     int n_seq_slots = 1;
+    // K/V is a slot pool sized by ctx_alloc (shared by slots, or the KVFlash
+    // arena), not one sequence's capacity. True whenever n_seq_slots > 1; an
+    // explicit request makes a one-slot cache a pool too.
+    bool slot_pool = false;
 
     // When true, K is FWHT-rotated in the graph before writing to the
     // standard-type cache (Q4_0/Q8_0/etc), and Q is rotated at attention
@@ -586,6 +595,20 @@ struct TargetCache {
     // kv_k_rotated) query per full-attention layer, written by the graph
     // when QwenGraphInputs::q_capture is set. F32 [head_dim, n_head, n_fa].
     ggml_tensor * q_cap = nullptr;
+    // The last q_cap_all_tokens tokens' queries of a batch, F32 [head_dim, T, n_head, n_fa]
+    // (selector v2 and the user-question queries). Only a KVFlash process allocates it.
+    ggml_tensor * q_cap_all = nullptr;
+    int q_cap_all_tokens = 0;
+    // Spec verify query stage (KVFlash only): the query of each verify row,
+    // F32 [head_dim, n_head, q_stage_rows, n_fa]; row r of layer l is one
+    // contiguous q_cap plane (see kvflash_q_stage_view). After acceptance the backend copies the last
+    // accepted row into q_cap, so q_cap holds what AR holds. q_stage_base/n
+    // are the position and row count of the last staged pass.
+    ggml_tensor * q_stage = nullptr;
+    int q_stage_rows = 0;
+    int q_stage_base = -1;
+    int q_stage_n = 0;
+    bool q_stage_on = false;   // the backend wants verify passes to stage
 
     // Paged-attention metadata, resident next to the K/V pool (only when the
     // cache was created with paged_attention). Living here instead of as
@@ -839,7 +862,8 @@ bool create_target_cache(const TargetWeights & w,
                          bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool slot_pool = false);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -860,7 +884,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool slot_pool = false);
 
 void free_target_cache(TargetCache & c);
 
@@ -880,6 +905,21 @@ void reset_recurrent_state(TargetCache & c);
 // slab may still hold the previous occupant's state, and the admitted
 // prompt's chunked prefill advances its state in this slab directly.
 void reset_recurrent_slot(TargetCache & c, int slot);
+
+// One slot's SSM + conv slabs copied to host: a ladder rung (C1.3-04). The slab
+// is the same bytes reset_recurrent_slot zeroes; restore validates every layer
+// size before it writes anything.
+struct SlotStateSnapshot {
+    std::vector<std::vector<uint8_t>> ssm, conv;   // one entry per delta layer
+    size_t bytes() const {
+        size_t n = 0;
+        for (const auto & v : ssm) n += v.size();
+        for (const auto & v : conv) n += v.size();
+        return n;
+    }
+};
+bool snapshot_slot_state(const TargetCache & c, int slot, SlotStateSnapshot & out);
+bool restore_slot_state(TargetCache & c, int slot, const SlotStateSnapshot & snap);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
@@ -1052,6 +1092,10 @@ struct QwenGraphInputs {
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
     bool q_capture = false;
+    // Packed batches: the capture window ends at this token (exclusive); 0 = n_tokens.
+    int  q_capture_end = 0;
+    // Stage every row's query into cache.q_stage (spec verify under KVFlash).
+    bool q_stage = false;
 
     // SpecLA topology masks for the fully factorized compatibility route.
     ggml_tensor * specla_m_strict = nullptr;

@@ -95,7 +95,7 @@ TEST_CASE(KvflashPflashMapFixture, an_unknown_role_token_is_a_named_error_and_no
 namespace {
 std::map<std::string, std::string> release_env() {
     return {{"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
-            {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PARSER", "latest_user"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
+            {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
             {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"}, {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"}, {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"},
             {"PFLASH_QUERY_CANDIDATES", "1"}, {"PFLASH_QUERY_PIN", "512"}, {"PFLASH_DRAFTER_SESSIONS", "2"}};
 }
@@ -106,6 +106,11 @@ std::string gate(const std::map<std::string, std::string> & e, int slots) {
 TEST_CASE(KvflashPflashMapFixture, the_release_profile_passes_the_mode_5_gate) {
     CHECK(gate(release_env(), 1).empty());
     CHECK(gate(release_env(), 2).empty());
+}
+TEST_CASE(KvflashPflashMapFixture, the_gate_does_not_require_the_query_parser_the_scorer_ignores) {
+    auto e = release_env();
+    CHECK(e.count("PFLASH_SELECT_QUERY_PARSER") == 0);
+    CHECK(gate(e, 1).empty());
 }
 TEST_CASE(KvflashPflashMapFixture, an_unset_select_mode_is_refused_naming_it) {
     auto e = release_env(); e.erase("PFLASH_SELECT_MODE");

@@ -178,7 +178,8 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     if (status != PagedKvStatus::Ok) {
         r.status = status == PagedKvStatus::SequenceSlotsExhausted ||
                            status == PagedKvStatus::BlocksExhausted
-            ? AdmitStatus::busy : AdmitStatus::failed;
+            ? AdmitStatus::busy
+            : status == PagedKvStatus::CapacityExceeded ? AdmitStatus::capacity_exceeded : AdmitStatus::failed;
         r.error = status == PagedKvStatus::BlocksExhausted
             ? "not enough unreserved KV blocks for the prompt and decode headroom"
             : paged_kv_status_string(status);
@@ -262,6 +263,22 @@ void SeqSlotManager::commit_prefill(int slot) {
     SeqSlot & s = slots_[(size_t)slot];
     if (s.cur_pos != s.prompt_len) return;
     s.phase = SeqSlotPhase::decode;
+}
+
+bool SeqSlotManager::rewind_prefill(int slot, int pos) {
+    if (!is_prefilling(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (pos < 0 || pos > s.cur_pos || !s.staged_tokens.empty()) return false;
+    if (pos == s.cur_pos) return true;
+    const PagedKvStatus status = kv_.rollback_append(
+        s.handle, static_cast<uint32_t>(s.cur_pos - pos));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr, "[parallel] slot %d prefill rewind to %d failed: %s\n",
+                     slot, pos, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos = pos;
+    return true;
 }
 
 SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
@@ -382,7 +399,7 @@ bool SeqSlotManager::reserve_decode(const std::vector<int> & growth) {
 }
 
 bool SeqSlotManager::detach_kv(int slot) {
-    if (!is_active(slot)) return false;
+    if (!kv_.parkable() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.parked() || !s.staged_tokens.empty()) return false;
     if (kv_.clear(s.handle) != PagedKvStatus::Ok) return false;
@@ -427,7 +444,7 @@ bool SeqSlotManager::attach_kv(int slot) {
 }
 
 bool SeqSlotManager::evict_for_recompute(int slot, int32_t pending_token) {
-    if (!is_active(slot)) return false;
+    if (!kv_.parkable() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.recomputing() || !s.staged_tokens.empty()) return false;
     // A request that cannot fit the pool even alone can never resume;

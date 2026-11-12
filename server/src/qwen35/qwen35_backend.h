@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/kvflash_concurrent_gate.h"
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
@@ -20,6 +21,7 @@
 #include "step_graph.h"
 #include "ddtree.h"
 
+#include <chrono>
 #include <limits>
 #include <map>
 #include "dflash_feature_ring.h"
@@ -30,8 +32,18 @@
 #include "qwen35_vision.h"
 #include "pflash/pflash_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
+#include "kvflash_arena.h"         // shared page stream of the slot pagers
+#include "kvflash_slot_pager.h"    // one slice of the arena per slot
+#include "common/concurrency/kvflash_slot_kv.h"
+#include "common/kvflash_step_driver.h"
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
+#include "pflash/kvflash_drafter_scorer.h"  // KvFlashPFlash2Scorer (mode 5)
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
+#include "kvflash_prefill_reselect.h"
+#include "kvflash_m5_rescore.h"
+#include "kvflash_m4_reuse.h"
+#include "kvflash_query_capture.h" // per-token query capture counts
+#include "kvflash_uq.h"            // LUCE_KVFLASH_UQ_QUERIES store
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -45,6 +57,8 @@
 namespace luce::common {
 
 class Qwen35TensorParallelContext;
+struct KvFlashMassPlanes;
+class KvFlashGpuMass;
 class Qwen35ImagePrompt;
 struct Qwen35ImageRows;
 
@@ -72,6 +86,7 @@ struct Qwen35Config {
     // recurrent state + one block-table column each) and serves them through
     // a Qwen35SeqEngine instead of generate().
     int          max_concurrency = 1;
+    bool         max_concurrency_set = false;  // explicit --max-concurrency, even 1
     // Total paged K/V pool size in tokens shared by all slots
     // (--kv-pool-tokens; rounded up to whole 16-token blocks).
     // 0 derives the shared physical capacity from available device memory.
@@ -93,6 +108,7 @@ struct Qwen35Config {
 
     // Speculative decode strategy
     bool         fast_rollback   = true;
+    bool         fast_rollback_explicit = false;  // opts in to fast rollback under --kvflash
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
     // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
@@ -110,6 +126,10 @@ struct Qwen35Config {
 };
 
 // ── Backend class ───────────────────────────────────────────────────────
+
+// C1.4: the last n_wanted of the `captured` query rows in cache.q_cap_all (packed batches).
+int kvflash_read_captured_queries_tail(const TargetCache & cache, const KvFlashQkDims & d, int captured, int n_wanted,
+                                       std::vector<float> & q_all);
 
 class Qwen35Backend : public ModelBackend {
 public:
@@ -228,6 +248,8 @@ protected:
     // Hook after kvflash pool sizing, before create_target_cache: a subclass
     // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
     virtual bool post_kvflash_init_gate() { return true; }
+    // The architecture the concurrent KVFlash gate is decided on (arch-exact).
+    virtual const char * kvflash_arch() const { return "qwen35"; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
@@ -263,7 +285,9 @@ protected:
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
     // pflash drafter is loaded it becomes the reselect scorer (every
-    // kvflash_tau_ decoded tokens). Forces AR decode (no spec).
+    // kvflash_tau_ decoded tokens). With a draft model the serial path
+    // speculates too: spec steps stay AR-equivalent (see do_spec_decode);
+    // --ddtree with KVFlash is refused at startup.
     // Protected: the MoE subclass routes its pipelined decode loops and
     // hybrid prefill through the same pager/history/reselect state.
     KvFlashPager                   kvflash_pager_;
@@ -273,6 +297,7 @@ protected:
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
     std::string                    kvflash_drafter_path_; // LUCE_KVFLASH_DRAFTER
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
+    int                            kvflash_mask_pos_ = -1;   // decode position the cached mask was cut at
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
@@ -293,6 +318,106 @@ protected:
     int                     kvflash_qk_pooled_upto_ = 0;   // chunks pooled so far
     // Pool keys for every chunk sealed before `committed` not pooled yet.
     void kvflash_qk_pool_to(int committed);
+    // LUCE_KVFLASH_PREFILL_RESELECT=4|5: reselect the pool by exact attention mass (4) or the
+    // drafter's scores (5) at the last user turn (pooled prefill, qk policy only).
+    int                     kvflash_prefill_reselect_ = 0;   // 0 off, 4 exact scorer, 5 drafter scorer
+    // One request, prefill through decode: whatever score_hook and score ledger
+    // the prefill reselect installs is undone on every exit, so the next request
+    // (possibly another user) starts from the arm's policy hook, not this query's.
+    struct ReselectRequestScope {
+        luce::common::ScopedScoreHook hook;
+        std::vector<float> & scores;
+        ReselectRequestScope(luce::common::KvFlashPager & p, std::vector<float> & s)
+            : hook(p), scores(s) {}
+        ~ReselectRequestScope() { scores.clear(); }
+    };
+    std::unique_ptr<KvFlashPFlash2Scorer> kvflash_pflash2_;  // borrows drafter_ctx_
+    int                     kvflash_recall_blocks_ = 0;      // LUCE_KVFLASH_RECALL_BLOCKS (R-LRU)
+    int                     kvflash_m5_rescore_tokens_ = 0;  // LUCE_KVFLASH_M5_RESCORE_TOKENS: 0 = score every turn
+    std::vector<float>      kvflash_m5_scores_;              // the drafter scores behind kvflash_m5_last_ (kvflash_scores_ is cleared per request)
+    luce::common::KvFlashM5Last kvflash_m5_last_;            // last mode-5 scoring; reset when scoring is skipped for another reason (a diverged prefix fails its hash)
+    int                     kvflash_select_queries_ = 0;     // queries kept per prefill (kQueryCaptureTokens in mode 4, else 0): selector v2, 0 = v1
+    int                     kvflash_select_unit_ = luce::common::kKvFlashRecallUnit;   // LUCE_KVFLASH_SELECT_UNIT: chunks per recall unit; budget stays 10 * k chunks
+    std::vector<float>      kvflash_q_tail_;                 // this prefill's last prompt queries, oldest first (selector v2)
+    std::vector<uint8_t>    kvflash_exact_buf_;              // pageable fallback for the bulk D2H copy of the pool K
+    ggml_backend_buffer_t   kvflash_exact_pin_ = nullptr;    // pinned host buffer for it, reused across reselects
+    bool                    kvflash_exact_pin_failed_ = false;
+    // LUCE_KVFLASH_PREAMBLE_ROWS: pool rows reserved inside LUCE_KVFLASH for the pinned
+    // system+tools preamble (tokens, chunk multiple); kvflash_preamble_rows_ = R clamped to it. 0 = off.
+    int                     kvflash_preamble_reserve_ = 0;
+    int                     kvflash_preamble_rows_ = 0;
+    int                     kvflash_preamble_end_ = 0;       // preamble end of the current request's prompt
+    // Pins the preamble chunks (ids: the full prompt, null = reuse the last end). Returns the chunks pinned.
+    void kvflash_uq_append(std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2);
+    int  kvflash_apply_preamble_pin(const std::vector<int32_t> * ids, bool log);
+    // LUCE_KVFLASH_UQ_QUERIES: the latest human question's last N queries, kept next to kvflash_history_.
+    int                     kvflash_uq_queries_ = 0;
+    std::vector<luce::common::KvFlashUqStore> kvflash_uq_stores_;   // LRU (front = newest), keyed by {hi, hash ids[0,hi)}
+    int                     kvflash_uq_req_hi_ = -1;         // this request's question end (-1 = none), and the key of its prefix
+    uint64_t                kvflash_uq_req_hash_ = 0;
+    std::string             kvflash_uq_miss_;                // why the store is not usable this request
+    bool                    kvflash_gpu_failed_ = false;     // the GPU scorer refused or failed once: the CPU scorer for the rest of the process
+    std::unique_ptr<KvFlashGpuMass> kvflash_gpu_mass_;       // lazily built on target_backend_, buffers reused across reselects
+    KvFlashQkDims kvflash_exact_dims() const;
+    // Same contract as kvflash_exact_scores with planes (selector v2); false = unavailable, the CPU scorer must run.
+    bool kvflash_exact_scores_gpu(int sealed, const std::vector<const float *> & qs,
+                                  std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes);
+    // C1.4: the same scorers over any pager whose block_of() are arena ids against cache_.attn_k
+    // (a slot pager); the single-slot calls above run them on kvflash_pager_.
+    bool kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                     std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes);
+    bool kvflash_exact_scores_on(KvFlashPager & p, int sealed, const std::vector<const float *> & qs,
+                                 std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> * planes);
+    // C1.4: the per-slot recall profile is on: mode 4 (exact scorer, queries) or mode 5 (pflash2 scorer), with recall blocks.
+    bool kvflash_slot_recall_profile() const {
+        return kvflash_recall_blocks_ > 0 &&
+               ((kvflash_prefill_reselect_ == 4 && kvflash_select_queries_ > 0) || kvflash_prefill_reselect_ == 5);
+    }
+    // Mode 5: chunk scores of `ids` (the whole prompt) from the drafter's PFlash 2.0 request path; loads the
+    // drafter on first use. False = unavailable (the turn stays LRU).
+    bool kvflash_pflash2_scores(const std::vector<int32_t> & ids, int chunk_tokens, std::vector<float> & out, double & ms);
+    // Exact attention mass of each query over all sealed chunks (resident
+    // chunks read from the pool, host-backed ones from the pager's host copy).
+    // planes: also the per-chunk top/max plane aggregates (fast scorer only).
+    bool kvflash_exact_scores(int sealed, const std::vector<const float *> & qs,
+                              std::vector<std::vector<float>> & outs,
+                              std::vector<KvFlashMassPlanes> * planes = nullptr);
+    // Score the chunks sealed before `sealed_tokens` with the query in q_cap.
+    bool kvflash_prefill_score(int sealed_tokens, double & score_ms);
+    // do_prefill's recall decisions before its batch loop (see the definition).
+    struct KvflashRecallSetup {
+        luce::common::KvFlashMode4Plan rw;   // rw.run: mode 4 rewinds the pass over [rw.r, end)
+        int    m5_r = -1;                     // single pass (mode 5, or mode 4 on a continuing turn): apply the pick when the prefill reaches this position
+        double m5_ms = 0.0;
+        const char * apply_note = "; pflash2";
+        bool   m4_track = false;              // mode 4: keep this prefill's tail queries and prompt for the next request (kvflash_m4_last_)
+        luce::common::KvFlashUqPlan uqp;
+        bool   uq_capturing = false;
+        int    uq_cut = -1;
+    };
+    KvflashRecallSetup kvflash_recall_setup(const std::vector<int32_t> & tokens, const std::vector<int32_t> & kvf_ids,
+                                            int kv_offset, int prompt_len, bool kvf_reselect, bool images, bool kvf_paged);
+    // The recall budget of a pick made at `committed` for a prompt ending at `end`.
+    luce::common::KvFlashRecallIn kvflash_recall_in(int committed, int end) const;
+    // What the last mode-4 request left for a turn that continues its question (kvflash_m4_reuse.h); valid only
+    // after a prefill that ran to its end.
+    luce::common::KvFlashM4Last kvflash_m4_last_;
+    bool                    kvflash_m4_single_ = true;   // LUCE_KVFLASH_M4_SINGLE=0: every mode-4 turn takes the two-pass path
+    // Select (recall / tail logic) from kvflash_scores_ and reselect the pool.
+    // The pool room kept for the rest of the prefill is derived from `end`.
+    void kvflash_prefill_apply(int committed, int end, int q_tok,
+                               double score_ms, const char * note);
+    // The same over any pager and score vector (which must outlive the hook installed on p).
+    // reserve_chunks < 0: derived from `end`. slot >= 0 names a slot pager in the log line and
+    // leaves the serial preamble inputs out of the recall budget.
+    void kvflash_prefill_apply_on(KvFlashPager & p, std::vector<float> & scores, int committed, int end,
+                                  int reserve_chunks, int q_tok, double score_ms, const char * note, int slot);
+    // Mode 4: q_cap holds q(end-1) from the first pass over [r, end).
+    // Score, restore the scratch state at r (zero state when zero_state), truncate
+    // the pager to r, reselect. 1 = rewound (re-run [r, end)), 0 = nothing
+    // changed, -1 = fatal.
+    int kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_state, int r, int end);
+    bool                    kvflash_score_pool_recent_ = false;  // LUCE_KVFLASH_SCORE_POOL_RECENT: mode 4 scores on the recency pool
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
     // `full_prompt` (optional) supplies the real ids of the restored prefix
@@ -313,15 +438,20 @@ protected:
     int  kvflash_live_cut_peek(const std::vector<int32_t> & prompt) const;
     bool kvflash_live_restore_active_ = false;   // set around the suffix do_prefill
     int  kvflash_gen_ckpt_pos_ = -1;             // S9: G of the last generation-end rung
-    // Upload the slot-validity mask (host rebuild on epoch change, device
+    // Upload the slot-validity mask (host rebuild on epoch or decode-position change, device
     // upload every step — the input's buffer region is reused by compute).
-    void kvflash_upload_mask();
+    void kvflash_upload_mask(int cur_pos);
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
     void kvflash_maybe_reselect(int generated);
+    // Spec: copy the staged verify query of position new_committed - 1 into
+    // q_cap, so the next reselection reads AR's query. False when that row is
+    // not staged (q_cap is left as is).
+    bool kvflash_q_cap_from_stage(int new_committed);
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
     void kvflash_ensure_scorer();
+    bool kvflash_load_drafter();
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────
@@ -434,6 +564,25 @@ private:
     int concurrent_slots() const {
         return cfg_.max_concurrency > 1 ? cfg_.max_concurrency : 1;
     }
+    // Whether the seq engine serves requests: N > 1 as before, or an explicit
+    // --max-concurrency (even 1) under paged attention (C1.3-02).
+    bool seq_engine_wanted() const {
+        return luce::common::seq_engine_wanted(
+            {cfg_.paged_attention, concurrent_slots(), cfg_.max_concurrency_set, kvflash_active(),
+             luce::common::kvflash_concurrent_test_switch()});
+    }
+
+    // KVFlash slots (C1.3-05): one arena of N slices, a pager per slot, the host
+    // ledger, the SlotKv over them and the step driver. Declared before the
+    // engine, which borrows them; the arena is destroyed last (its members
+    // synchronize its stream).
+    bool init_kvflash_slots(int n_slots, int quota_chunks, int max_ctx, int64_t scratch_row,
+                            int max_prefills, int mixed, int long_mixed, int long_threshold, int idle);
+    std::unique_ptr<luce::common::KvFlashArena>                       kvf_arena_;
+    std::vector<std::unique_ptr<luce::common::KvFlashSlotPager>>      kvf_pagers_;
+    std::unique_ptr<luce::common::KvFlashHostLedger>                  kvf_ledger_;
+    std::unique_ptr<luce::common::KvFlashSlotKv>                      kvf_kv_;
+    std::unique_ptr<luce::common::KvFlashStepDriver>                  kvf_driver_;
 
     // Built by init() when the backend has more than one decode slot. It
     // borrows this backend's weights, cache, step graph and paged pool —
@@ -458,6 +607,12 @@ private:
     // A chunk starts at every absolute `restore_points` position (see
     // GenerateRequest::restore_points), so a snapshot at one is exact and a
     // restore from it reproduces a cold prefill.
+    // Gives the prefill-only cache the storage speculative decode rolls back
+    // with. Every speculative step snapshots the recurrent state, so the
+    // snapshot pair is always attached; the per-token checkpoint buffers
+    // (about 2.4 GB on Qwen3.8-27B at block size 16) only when fast rollback
+    // or DDTree capture into them.
+    bool attach_rollback_storage(int max_verify_tokens, bool enable_specla);
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
@@ -493,7 +648,8 @@ private:
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       bool * forced_close_out,
-                      bool * degenerate_close_out);
+                      bool * degenerate_close_out,
+                      size_t reselect_origin = SIZE_MAX);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
     // Allocates the next paged K/V row and uploads this step's block-table /

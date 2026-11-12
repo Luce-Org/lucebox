@@ -105,6 +105,10 @@ profile and the requirements checked at startup.
 | `LUCE_KVFLASH_SESSION` | on (unset or any value but `0`) | The one switch for KVFlash session restore on the Qwen3.5 backend: the DeltaNet state ladder, live restore from the running session and the turn checkpoints (at generation end and after the last assistant header). Set `0` to turn all of them off, so every request re-prefills from the last server snapshot (this is the cold arm of the Gate A test). Only has an effect when `--kvflash` is active. It does not gate the 512-token prefill grid or the turn cuts (batch boundaries after each assistant header), which always apply to pooled prefill so that both arms run the same batches. See [PREFIX_CACHE.md](PREFIX_CACHE.md#kvflash-session-restore). |
 | `LUCE_KVFLASH_STATE_LADDER_MIB` | 3072 | Memory budget in MiB for the DeltaNet state ladder (the state-only checkpoints that make live restore possible); the least recently used checkpoints are evicted past it. Read once at first use. Lower it on small GPUs or when other buffers need the space; raise it for very long sessions that need more rungs. |
 | `LUCE_KVFLASH_RESTORE_CONSUME` | unset (off) | OPT-IN: `1` saves pooled KVFlash snapshots in the prefix cache and restores them, so a repeat request prefills only the suffix after the cached prefix. Unset or `0` keeps the old behavior: pooled snapshots are refused and the request re-prefills. Pooled snapshots are never written to the disk cache. |
+| `LUCE_KVFLASH_CONCURRENT_TEST` | unset (off) | TEST ONLY: `1` opens the concurrent KVFlash slot engine (`--paged-attention` with `--kvflash`, and an explicit `--max-concurrency` routing to the slot engine) for the GPU gates. Not a supported configuration. On RDNA4 it also requires `LUCE_PAGED_WMMA=0`, because the WMMA paged kernel (on by default there) does not yet skip evicted blocks. |
+| `LUCE_KVFLASH_HOST_MIB` | 16384 | Host memory budget in MiB for the paged-out state of the concurrent KVFlash slots; admissions beyond it are refused. Must be a positive integer, otherwise startup fails. Lower it on hosts with less free RAM. |
+| `LUCE_KVFLASH_HOST_BACKING` | `pinned` | Host memory of the concurrent KVFlash slots' paged-out chunks: `pinned` (page-locked, a refused allocation fails the page-out), `pageable` (never asks for pinned memory; slower copies) or `auto` (pinned, and a pager whose pinned allocation is refused switches to pageable and logs `[kvflash] host backing: pageable`). An unknown value is logged and read as `pinned`. |
+| `LUCE_KVFLASH_STEP_TRACE` | unset | DEBUG: logs per-step timings of the concurrent KVFlash slot engine. |
 | `LUCE_KVFLASH_DEBUG_RESIDENT` | unset | DEBUG: when set, logs a `[kvflash-dbg]` line after each prefill with the resident chunk ranges and a hash of the score ledger. Leave unset in production. |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFIX_CACHE_MAX_MIB` | auto | Container-entrypoint equivalent of `--prefix-cache-max-mib`; not read directly by the native binary. |
@@ -128,6 +132,17 @@ profile and the requirements checked at startup.
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
 | `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
 | `LUCE_PC_DEEP_FIRST_MAX_HEAD` | 2048 | Longest system/tools head (tokens) that gives up its own pin for the whole-prompt snapshot above; longer heads keep the head pin. |
+| `LUCE_KVFLASH_PREFILL_RESELECT` | 4 with `--kvflash` on qwen35, else 0. Set 5 for mode 5: `--kvflash` then installs the mode-5 profile when the drafter (`--prefill-drafter` or `LUCE_KVFLASH_DRAFTER`) and `PFLASH_SCORING_HEAD_GGUF`, `PFLASH_SEGMENT_PROBE_GGUF`, `PFLASH_REQUEST_PROBE_GGUF` are set | Recall mode of the serial KVFlash pool. 0 off (recency pool only), 4 reselects by the exact attention mass at the last user turn before writing it, 5 takes the PFlash drafter's scores (KVFlash 2.0; with mode 5 `--kvflash` also installs the PFlash selection settings it was measured with). Other values are off. Needs the qk policy. Off under tensor parallelism. The server logs which profile it installed. |
+| `LUCE_KVFLASH_M5_RESCORE_TOKENS` | 16384 | Mode 5: while the latest user message is unchanged and the prompt extends the last scored one (up to a 64-token re-rendered tail), the drafter is not run; the turn reselects at R from the last drafter scores. The drafter re-scores once this many tokens follow the common prefix. 0 = score every turn. |
+| `LUCE_KVFLASH_RESELECT_SCORER` | `pflash2` (mode 5) or `exact` (mode 4) with `--kvflash` on qwen35 | The scorer the recall mode needs: `exact` for mode 4, `pflash2` for mode 5. A mismatch turns recall off and logs why. |
+| `LUCE_KVFLASH_RECALL_BLOCKS` | 6 with `--kvflash` on qwen35, else 0 | A/B: recall budget in 10-chunk blocks (10 x N chunks) kept beside the newest chunks; `LUCE_KVFLASH_SELECT_UNIT` sets the size of each picked unit, so the defaults (6, unit 2) pick 30 units of 2 chunks. 0 keeps the pool on recency plus the drafter or exact scores of the newest chunks only; it is not a plain recency pool under modes 4 and 5. A pool too small for the preamble pins, the recall and the turn runs as a recency pool (logged). |
+| `LUCE_KVFLASH_SELECT_UNIT` | 2 with `--kvflash` on qwen35, else 10 | A/B: chunks per recall unit; the recall budget stays 10 x `LUCE_KVFLASH_RECALL_BLOCKS` chunks. |
+| `LUCE_KVFLASH_SCORE_POOL_RECENT` | 1 with `--kvflash` on qwen35, else 0 | A/B: =1 scores mode 4 on the recency pool, so the first pass of a request does not run under the previous request's pool. =0 turns that off. |
+| `LUCE_KVFLASH_PREAMBLE_ROWS` | 1152 with `--kvflash` on qwen35, else 0 | Pool rows (rounded up to a chunk) reserved inside `--kvflash N` for the pinned system+tools preamble, so the history budget is N minus the reserve and the pool, and the decode cost, stay N. A reserve that leaves no history row (>= N) turns the pin off with a log line. 0 turns the pin off. |
+| `LUCE_KVFLASH_UQ_QUERIES` | 64 with `--kvflash` in mode 4, 0 in mode 5, else 0 | The last N (at most 64) queries of the latest human turn join the selector's queries. 0 off. Serial path only; off under tensor parallelism. |
+| `LUCE_KVFLASH_GPU_SCORE_FUSED` | 1 | KILL SWITCH: mode 4's exact GPU scorer runs the fused chunk-mass kernel and keeps the evicted K it reads on the device between calls (about 1.06 MiB of VRAM per evicted chunk at q8_0, taken only under the scorer's free-memory guard). Used when the KV cache K is q8_0 with a head dim that is a multiple of 32 and at most 256; any other K, a kernel failure, or =0 scores with the logits graph and uploads the evicted K on every call, as before. |
+| `LUCE_KVFLASH_VICTIM_BLOCKS` | mode 5: 2 x the pool blocks (1088 MiB at `--kvflash 16384`); otherwise 0 | Mode 5 paging: paged-out chunks keep a device copy in a FIFO tier of this many blocks, so recalling one is a device copy instead of a host-link copy. The bytes and the resident pool are the same either way. 0 turns it off; a failed allocation logs and falls back to host copies. |
+| `PFLASH_TW_HOST_REDUCE` | unset | A/B: `1` makes the drafter scorer read back the full today's-window probabilities and average them on the host (the old path); unset reduces on the device and reads back one value per token. |
 
 ## Full inventory (generated)
 
@@ -136,6 +151,16 @@ profile and the requirements checked at startup.
 - `LUCE_CHUNKED` - qwen35_target_graph.cpp
 - `LUCE_DRAFT_FP16` - draft_safetensors_loader.cpp
 - `LUCE_DRAFT_SWA` - server_main.cpp
+- `LUCE_KVFLASH_HOST_BACKING` - kvflash_host_backing.h
+- `LUCE_KVFLASH_PREAMBLE_ROWS` - kvflash_prefill_reselect.h
+- `LUCE_KVFLASH_PREFILL_RESELECT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_M5_RESCORE_TOKENS` - qwen35_backend.cpp
+- `LUCE_KVFLASH_RECALL_BLOCKS` - qwen35_backend.cpp
+- `LUCE_KVFLASH_RESELECT_SCORER` - qwen35_backend.cpp
+- `LUCE_KVFLASH_SCORE_POOL_RECENT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_SELECT_UNIT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_GPU_SCORE_FUSED` - qwen35_backend.cpp
+- `LUCE_KVFLASH_UQ_QUERIES` - kvflash_query_capture.h
 - `LUCE_KV_F16` - kv_quant.cpp
 - `LUCE_KV_K` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_KV_Q4` - kv_quant.cpp
