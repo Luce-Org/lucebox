@@ -129,6 +129,7 @@ TEST_CASE(KvflashPagerRecallFixture, slot_mask_hides_rows_above_the_decode_posit
 TEST_CASE(KvflashPagerRecallFixture, chunk_version_changes_only_when_its_rows_are_written) {
     Harness h;
     KvFlashPager p;
+    p.set_pinned_host_backing(false);  // CPU tensors: pageable staging, no cudaMallocHost (stub-driver CI)
     REQUIRE(p.attach(cfg(), h.k, h.v));
     must(p.alloc_span(0, 14 * kChunk));
     const uint64_t v2 = p.chunk_version(2), v3 = p.chunk_version(3);
