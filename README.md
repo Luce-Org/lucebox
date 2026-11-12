@@ -4,312 +4,270 @@
   </a>
 </p>
 
+<h3 align="center">Fast local inference on heterogeneous consumer hardware</h3>
+
+<p align="center">
+  <a href="#models">Models</a> · <a href="#quick-start"><b>Quick start</b></a> · <a href="#hardware">Hardware</a> · <a href="#documentation">Docs</a> · <a href="https://www.lucebox.com/blog/">Blog</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a>
+</p>
+
 <p align="center">
   <a href="https://www.lucebox.com/"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=f5c842&labelColor=090909" alt="lucebox.com"></a>
   <a href="https://huggingface.co/Lucebox"><img src="https://img.shields.io/badge/HuggingFace-f5c842?style=for-the-badge&logo=huggingface&logoColor=f5c842&labelColor=090909" alt="HuggingFace"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
-  <a href="https://www.lucebox.com/blog/"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
-  <a href="#tutorials"><img src="https://img.shields.io/badge/Tutorials-f5c842?style=for-the-badge&logo=youtube&logoColor=f5c842&labelColor=090909" alt="Tutorials"></a>
-</p>
-
-<p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-e8e8ed?style=for-the-badge&labelColor=090909" alt="Apache 2.0"></a>
-  <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12%2B-e8e8ed?style=for-the-badge&logo=nvidia&logoColor=e8e8ed&labelColor=090909" alt="CUDA 12+"></a>
-  <a href="https://rocm.docs.amd.com/projects/HIP/en/latest/"><img src="https://img.shields.io/badge/HIP-7%2B-e8e8ed?style=for-the-badge&logo=amd&logoColor=e8e8ed&labelColor=090909" alt="HIP 7+"></a>
-  <a href="https://isocpp.org"><img src="https://img.shields.io/badge/C%2B%2B-17-e8e8ed?style=for-the-badge&logo=cplusplus&logoColor=e8e8ed&labelColor=090909" alt="C++17"></a>
 </p>
+
+Lucebox is an open-source inference engine for AMD's R9700 and Ryzen AI MAX+, on their own or together in one machine. It runs Qwen 3.8, DeepSeek V4 and V4.1, and MOSS-Image, and it generates faster than llama.cpp, Strata and DwarfStar on the same hardware. It's the engine inside every [Lucebox](https://www.lucebox.com/).
 
 <p align="center">
-  <strong>Speculative inference for heterogeneous machines and consumer GPUs.</strong><br/>
-  Custom kernels, speculative prefill and decoding, tuned for each model and hardware target.
+  <a href="https://www.lucebox.com/engine"><img src="assets/engine-head-to-head.png" alt="Lucebox against llama.cpp, Strata and DwarfStar: decode, prefill and image generation" width="100%" /></a>
+  <sub>"Whole box" is the R9700 and the Ryzen AI MAX+ together. <a href="https://www.lucebox.com/engine">Full results</a></sub>
 </p>
 
----
+## Features
 
-## Inference Engine Optimizations
+Lucebox is fast with:
 
-| Optimization | Measured setup | Result |
-|---|---|---:|
-| [DFlash2](https://www.lucebox.com/blog/qwen38-r9700) | Qwen 3.8 27B on one R9700 | **208.1 tok/s** average, **227.8 tok/s** peak |
-| [DSpark](https://www.lucebox.com/blog/deepseek-v4-flash-0731) | DeepSeek V4 on Strix Halo, native top-6 | **32.7 tok/s** high-acceptance median; **27.9 tok/s** mixed-eval average |
-| [PFlash + KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **6.1×** prefill, **411 s to 67.3 s** |
-| [Luce Spark](optimizations/spark/README.md) | Laguna XS.2 33B on RTX 3090 | **~100 tok/s** in **14.6 GiB** |
-| [KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **152.3 tok/s** with an 8K pool |
-| [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
-| [Paged attention + continuous batching](https://www.lucebox.com/blog/continuous-batching/) | Qwen 3.8 27B + DFlash2 on R9700; DeepSeek V4 Flash AR on Strix Halo | **300.9 tok/s** total at 5 clients (Qwen); **48.4 tok/s** output-window at 4 clients (DeepSeek) |
-| [Three-tier experts](server/docs/DS41.md) | DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | **25-26 tok/s** decode on code; **118-121 tok/s** prefill at 4K, at the profile's 128K context |
-| [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
-| [Image generation](optimizations/image_gen/README.md) | MOSS-Image 5B at 1024×1024, 8 steps, on one R9700 | **3.1 s** per image in luce_server; **1.5-1.8×** a DGX Spark on ComfyUI, **4.0×** stable-diffusion.cpp |
-| [Vision (image input)](https://www.lucebox.com/blog/vision-llm-inference) | Qwen 3.8 27B vision on R9700 + DeepSeek V4 Flash Vision on Strix Halo, together | **3.2×** the image-question throughput of a DGX Spark (58 vs 18 a minute); **2.4×** faster at 8 users with the same model file |
+- Speculative decoding on every model: DFlash2 for Qwen 3.8 27B, MTP for Flash-Next, DSpark for DeepSeek
+- Two chips as one machine: attention, KV cache and the busiest experts on the R9700, the other experts on the Ryzen AI MAX+
+- Paged attention and continuous batching for several users
+- A prefix cache built for agents, up to 92.2% hit rate on [AgentX](https://github.com/Luce-Org/lucebox/pull/989)
+- [PFlash](#long-prompts): long prompts compressed before prefill, first token 3.7x sooner on average
+- [KVFlash](#long-prompts): KV cache paged to system memory, decode speed flat from 64K to 256K tokens
+- HIP kernels tuned for RDNA4 (`gfx1201`) and RDNA3.5 (`gfx1151`), plus a CUDA build for NVIDIA
 
----
+and easy to use with:
 
-## Supported Models and Drafters
+- OpenAI Chat Completions and Responses, and the Anthropic Messages API
+- Claude Code, Codex, OpenCode, Hermes, [OMP](https://omp.sh/), Pi, OpenClaw and Open WebUI, out of the box
+- Image input on Qwen 3.8 27B and DeepSeek V4 and V4.1, and image generation with MOSS-Image
+- Launch profiles for each model, picked from the GPUs it finds
 
-Each badge opens the exact weights used by the measured setup. Drafter badges open the published quant, or the source checkpoint when conversion is required.
+## Models
 
-| Model | 🤗 Weights | Optimization (blog) | Phase | Result |
-|---|---|---|:---:|---|
-| **Qwen 3.5 0.8B** | <a href="https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/model.safetensors-00001-of-00001.safetensors"><img src="https://img.shields.io/badge/target-BF16-f5c842?style=flat-square&labelColor=090909" alt="target: BF16"></a> | <a href="https://www.lucebox.com/blog/megakernel"><img src="https://img.shields.io/badge/Megakernel-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="Megakernel"></a> | Prefill + decode | **1.9×** prefill; **1.55×** decode |
-| **Qwen 3.8 27B**<br><sub>on R9700</sub> | <a href="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf"><img src="https://img.shields.io/badge/target-UD--IQ4__XS-f5c842?style=flat-square&labelColor=090909" alt="target: UD-IQ4_XS"></a><br><a href="https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors"><img src="https://img.shields.io/badge/drafter-DFlash2%20source%20%E2%86%92%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DFlash2 source → Q8_0"></a> | <a href="https://www.lucebox.com/blog/qwen38-r9700"><img src="https://img.shields.io/badge/DFlash2-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DFlash2"></a> | Decode | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
-| **Laguna XS 2.1 33B** | <a href="https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf"><img src="https://img.shields.io/badge/target-Q4__K__M-f5c842?style=flat-square&labelColor=090909" alt="target: Q4_K_M"></a><br><a href="https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf"><img src="https://img.shields.io/badge/scorer-Qwen3%200.6B%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="scorer: Qwen3 0.6B Q8_0"></a> | <a href="https://www.lucebox.com/blog/pflash"><img src="https://img.shields.io/badge/PFlash-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="PFlash"></a> <a href="https://www.lucebox.com/blog/kvflash"><img src="https://img.shields.io/badge/KVFlash-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="KVFlash"></a> | Prefill | **6.1×**, **411 s to 67.3 s** at 256K |
-| **Laguna XS 2.1 33B** | <a href="https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf"><img src="https://img.shields.io/badge/target-Q4__K__M-f5c842?style=flat-square&labelColor=090909" alt="target: Q4_K_M"></a><br><a href="https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf"><img src="https://img.shields.io/badge/drafter-DFlash%20Q4-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DFlash Q4"></a> | <a href="https://www.lucebox.com/blog/dflash27b"><img src="https://img.shields.io/badge/DFlash-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DFlash"></a> | Decode | **1.7×** at 256K |
-| **Gemma 4 26B-A4B** | <a href="https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"><img src="https://img.shields.io/badge/target-Q4__K__M-f5c842?style=flat-square&labelColor=090909" alt="target: Q4_K_M"></a><br><a href="https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf"><img src="https://img.shields.io/badge/drafter-DFlash%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DFlash Q8_0"></a> | <a href="https://www.lucebox.com/blog/dflash27b"><img src="https://img.shields.io/badge/DFlash-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DFlash"></a> | Decode | **1.31×** |
-| **Gemma 4 31B IT** | <a href="https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf"><img src="https://img.shields.io/badge/target-Q4__K__M-f5c842?style=flat-square&labelColor=090909" alt="target: Q4_K_M"></a><br><a href="https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf"><img src="https://img.shields.io/badge/drafter-DFlash%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DFlash Q8_0"></a> | <a href="https://www.lucebox.com/blog/dflash27b"><img src="https://img.shields.io/badge/DFlash-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DFlash"></a> | Decode | **3.2×** |
-| **DeepSeek V4 Flash**<br><sub>on Strix Halo</sub> | <a href="https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf"><img src="https://img.shields.io/badge/target-ROCmFPX%20MIX%20Strix-f5c842?style=flat-square&labelColor=090909" alt="target: ROCmFPX MIX Strix"></a><br><a href="https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf"><img src="https://img.shields.io/badge/drafter-DSpark%20Q4RMFP4-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DSpark Q4RMFP4"></a> | <a href="https://www.lucebox.com/blog/deepseek-v4-flash-0731"><img src="https://img.shields.io/badge/DSpark-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DSpark"></a> | Decode | **42 tok/s** at 8K and **39 tok/s** on code and math with the plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
-| **DeepSeek V4.1 Flash**<br><sub>R9700 + Strix Halo + SSD, `ds41-halo` (applied by default)</sub> | <a href="https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf"><img src="https://img.shields.io/badge/target-ROCMFP2S-f5c842?style=flat-square&labelColor=090909" alt="target: ROCMFP2S"></a><br><a href="https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf"><img src="https://img.shields.io/badge/drafter-DSpark%20MXFP4--Q8-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DSpark MXFP4-Q8"></a> | <a href="https://www.lucebox.com/blog/deepseek-v4-flash-0731"><img src="https://img.shields.io/badge/DSpark-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DSpark"></a> | Decode | **25.4-25.8 tok/s** on code, **16.8-17.5 tok/s** after a 4K prompt, at the profile's 128K context ([guide](server/docs/DS41.md)) |
-| **DeepSeek V4.1 Flash**<br><sub>R9700 + Ryzen AI Max+ PRO 495 192 GB, `--profile ds41-r9700-gorgon`</sub> | <a href="https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf"><img src="https://img.shields.io/badge/target-ROCMFP2S-f5c842?style=flat-square&labelColor=090909" alt="target: ROCMFP2S"></a><br><a href="https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf"><img src="https://img.shields.io/badge/drafter-DSpark%20Q2K--Q4K-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DSpark Q2K-Q4K"></a> | <a href="https://www.lucebox.com/blog/deepseek-v4-flash-0731"><img src="https://img.shields.io/badge/DSpark-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DSpark"></a> | Prefill + decode | **985-1,019 tok/s** prefill at 14K-25K, **48.7 tok/s** decode on code, every expert resident ([guide](server/docs/DS41.md#running-on-an-r9700-with-a-192-gb-ryzen-ai-max)) |
-| **Ling 3.0 Flash 124B-A5.1B**<br><sub>on DGX Spark</sub> | <a href="https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF"><img src="https://img.shields.io/badge/target-Q4__K__M-f5c842?style=flat-square&labelColor=090909" alt="target: Q4_K_M"></a> | Autoregressive | Decode | **34.6 tok/s** median AR |
-| **Qwen 3.8 Flash-Next**<br><sub>on Strix Halo</sub> | <a href="https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"><img src="https://img.shields.io/badge/target-UD--Q4__K__XL-f5c842?style=flat-square&labelColor=090909" alt="target: UD-Q4_K_XL"></a><br><a href="https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"><img src="https://img.shields.io/badge/drafter-MTP%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: MTP Q8_0"></a> | <a href="server/docs/QWEN4EXP.md"><img src="https://img.shields.io/badge/MTP-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="MTP"></a> | Decode | **40 tok/s** on a short reply, **1.8×** autoregressive decode ([guide](server/docs/QWEN4EXP.md)) |
-| **Qwen 3.8 Flash-Next**<br><sub>R9700 + Strix Halo, `--profile qwen-next-r9700-strix`</sub> | <a href="https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"><img src="https://img.shields.io/badge/target-UD--Q4__K__XL-f5c842?style=flat-square&labelColor=090909" alt="target: UD-Q4_K_XL"></a><br><a href="https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"><img src="https://img.shields.io/badge/drafter-MTP%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: MTP Q8_0"></a> | <a href="server/docs/QWEN4EXP.md"><img src="https://img.shields.io/badge/MTP-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="MTP"></a> <a href="server/docs/QWEN4EXP.md#running-on-an-r9700--strix-halo"><img src="https://img.shields.io/badge/Expert%20split-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="Expert split"></a> | Prefill + decode | **75 tok/s** decode, **1.86×** the Strix Halo alone; **1,820 tok/s** prefill at 16K ([guide](server/docs/QWEN4EXP.md#running-on-an-r9700--strix-halo)) |
-| **Qwen 3.8 27B Vision**<br><sub>on R9700</sub> | <a href="https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-IQ4_XS-pure.gguf"><img src="https://img.shields.io/badge/target-IQ4__XS-f5c842?style=flat-square&labelColor=090909" alt="target: IQ4_XS"></a><br><a href="https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-mmproj-Q8_0.gguf"><img src="https://img.shields.io/badge/vision-mmproj%20Q8__0-8ab4f8?style=flat-square&labelColor=090909" alt="vision: mmproj Q8_0"></a><br><a href="https://huggingface.co/Lucebox/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q8_0.gguf"><img src="https://img.shields.io/badge/drafter-DFlash2%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="drafter: DFlash2 Q8_0"></a> | <a href="https://www.lucebox.com/blog/qwen38-r9700"><img src="https://img.shields.io/badge/DFlash2-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="DFlash2"></a> <a href="https://www.lucebox.com/blog/vision-llm-inference"><img src="https://img.shields.io/badge/Image%20input-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="Image input"></a> | Image questions | **2.4×** vs llama.cpp on DGX Spark at 8 users (10.5 s vs 25.4 s); **2.1×** for one user |
-| **DeepSeek V4 Flash Vision**<br><sub>encoder on R9700, 4 users at once</sub> | <a href="https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf"><img src="https://img.shields.io/badge/target-ROCmFPX%20MIX%20Strix-f5c842?style=flat-square&labelColor=090909" alt="target: ROCmFPX MIX Strix"></a><br><a href="https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf"><img src="https://img.shields.io/badge/vision-mmproj%20BF16-8ab4f8?style=flat-square&labelColor=090909" alt="vision: mmproj BF16"></a> | <a href="https://www.lucebox.com/blog/vision-llm-inference"><img src="https://img.shields.io/badge/Image%20input-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="Image input"></a> | Image questions | **1.5×** sooner first token with 16 images when the R9700 encodes |
-| **MOSS-Image SFT 5B**<br><sub>on R9700, text to image</sub> | <a href="https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_sft_bf16.safetensors"><img src="https://img.shields.io/badge/target-BF16%20source%20%E2%86%92%20int8%20convrot-f5c842?style=flat-square&labelColor=090909" alt="target: BF16 source → int8 convrot"></a><br><a href="https://huggingface.co/Lucebox/Qwen3.5-9B-GGUF/blob/main/Qwen3.5-9B-Q8_0.gguf"><img src="https://img.shields.io/badge/text%20encoder-Qwen3.5%209B%20Q8__0-e8e8ed?style=flat-square&labelColor=090909" alt="text encoder: Qwen3.5 9B Q8_0"></a><br><a href="https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors"><img src="https://img.shields.io/badge/VAE-FLUX.2-8ab4f8?style=flat-square&labelColor=090909" alt="VAE: FLUX.2"></a> | <a href="optimizations/image_gen/README.md"><img src="https://img.shields.io/badge/Native%20engine%2C%20int8%20kernels-1c1c1f?style=flat-square&labelColor=1c1c1f" alt="Native engine, int8 kernels"></a> | Image generation | **3.1 s** per 1024×1024 image at 8 steps in luce_server; **1.5-1.8×** a DGX Spark on ComfyUI ([results](optimizations/image_gen/RESULTS.md)) |
+| Model | Runs on | Speed | Files |
+|---|---|---|---|
+| [Qwen 3.8 27B](https://www.lucebox.com/blog/qwen38-r9700) | R9700, up to 8 users | 95.4 tok/s | [target](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf), [drafter](https://huggingface.co/Lucebox/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q8_0.gguf) |
+| [Qwen 3.8 27B Vision](https://www.lucebox.com/blog/vision-llm-inference) | R9700, up to 8 users | 8 users 2.4x faster than llama.cpp on a DGX Spark | [target](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-IQ4_XS-pure.gguf), [vision](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF/blob/main/Qwen3.8-27B-mmproj-Q8_0.gguf) |
+| [Qwen 3.8 Flash-Next](server/docs/QWEN4EXP.md) | R9700 + Ryzen AI MAX+, or the Ryzen AI MAX+ alone, up to 4 users | 81.5 tok/s | [target](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf), [MTP](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) |
+| [DeepSeek V4.1 Flash](server/docs/DS41.md) | R9700 + Ryzen AI MAX+ | 25.4 tok/s on 128 GB, 51.1 on 192 GB | [target](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf), drafter for [128 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf) or [192 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf) |
+| [DeepSeek V4 Flash](server/docs/DS4.md) | Ryzen AI MAX+ | 27.9 tok/s | [target](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf), [drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) |
+| [MOSS-Image 5B](optimizations/image_gen/README.md) | R9700 | 2.74 s per 1024x1024 image | [model](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_sft_bf16.safetensors) |
 
-## Tested Machines (GPU/APU)
+Every model runs on both the 128 GB and the 192 GB Ryzen AI MAX+. All the language models take PFlash, and the Qwen models KVFlash.
 
-The engine is not tied to one reference card. NVIDIA architectures are selected by CMake; HIP builds should target the device's exact `gfx` architecture.
+## Hardware
 
-| | Architecture | Hardware | Runtime | Details |
-|:---:|---|---|---|---|
-| <img src="assets/gpus/r9700.png" width="750" /> | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 7.2 | [Qwen 3.8 R9700 quick start](#run-the-server) |
-| <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 7.2 | [DeepSeek V4 Strix profile](server/docs/RECOMMENDED_SETUPS.md#deepseek-v4-on-strix-halo) |
-| <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XT / XTX | ROCm 6+ | [DeepSeek V4 dual AMD profile](server/docs/DS4.md#radeon-rx-7900-xt--strix-halo-true-top-k-6) |
-| <img src="assets/gpus/3090.png" width="750" /> | Ampere `sm_86` | RTX 3090 | CUDA 12+ | [Qwen 3.8 NVLink result](https://github.com/Luce-Org/lucebox/pull/637) and [Megakernel results](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) |
-| <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8+ | [Qwen 3.8 single-GPU result](https://github.com/Luce-Org/lucebox/pull/637) |
-| <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | [Qwen 3.5 NVFP4 results](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
-| <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 4090 | CUDA 12+ | [Linux](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--cachyos-bare-metal-community) and [WSL2](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) community runs |
-| <img src="assets/gpus/2080ti.png" width="750" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | [DFlash results](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70`, Pascal `sm_61` | V100, P40 | CUDA 12.0 | [CUDA quick start](server/README.md#quick-start) |
-| Not pictured | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | [Thor quick start](server/README.md#jetson-agx-thor-sm_110-cuda-130) |
+Lucebox is built for two AMD chips, alone or in the same machine:
 
-### Single-device results
+- Radeon AI PRO R9700 (RDNA4, `gfx1201`), 32 GB
+- Ryzen AI MAX+ 395 or 495 (RDNA3.5 iGPU, `gfx1151`), 128 or 192 GB of unified memory
 
-| Hardware | Model | Measured result |
+Together, the R9700 runs what every token touches and the iGPU holds what doesn't fit on the card:
+
+| Model | On the R9700 | On the Ryzen AI MAX+ |
 |---|---|---|
-| **R9700** | [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors) | **208.1 tok/s** HumanEval average; **227.8 tok/s** best request |
-| **Strix Halo** | [DeepSeek V4 ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | **42 tok/s** decode and **320 tok/s** prefill at 8K, **36 tok/s** at 123K, **39 tok/s** on code and math, **25 tok/s** on prose, all six routed experts, plain launch ([PR #729](https://github.com/Luce-Org/lucebox/pull/729)) |
-| **RTX 5090** | Qwen 3.8 27B | **110.6 tok/s** for a 26,758-token prompt and 1,024-token continuation ([PR #637](https://github.com/Luce-Org/lucebox/pull/637)) |
+| Qwen 3.8 Flash-Next | attention, KV cache, dense layers, MTP drafter | the routed experts, 72 GiB |
+| DeepSeek V4.1 Flash, 128 GB | dense layers, drafter, about 10 GiB of the busiest experts | the next busiest experts; the rest stream from the SSD |
+| DeepSeek V4.1 Flash, 192 GB | dense layers, drafter, about 12 GiB of the busiest experts | every other expert, about 150 GiB |
+| Qwen 3.8 27B | the whole model and its drafter | free for a second model |
 
-### Heterogeneous and parallel results
+The R9700 can sit in a PCIe slot or an OCuLink dock; a x4 link is enough.
 
-| Hardware | Configuration | Measured result |
-|---|---|---|
-| **2x RTX 3090 + NVLink** | Qwen 3.8 target tensor parallel + DFlash2 | **79.7 tok/s**, **2.16×** autoregressive decode ([PR #637](https://github.com/Luce-Org/lucebox/pull/637)) |
-| **RX 7900 XT + Strix Halo** | DeepSeek V4 with all six experts + DSpark verification width 4 | **45.0 to 47.7 tok/s** decode; **111.2 tok/s** prefill at 132,981 tokens ([PR #604](https://github.com/Luce-Org/lucebox/pull/604#qualified-results)) |
-| **R9700 + Strix Halo** | DeepSeek V4 across both AMD devices | **86 tok/s** decode; **788 tok/s** prefill at 2K |
-| **R9700 + Strix Halo** | Qwen 3.8 Flash-Next, routed experts on the Strix Halo + MTP | **75.5 tok/s** decode (1.86× the Strix Halo alone); **44-45 tok/s** after a 16K prompt; **1,820 tok/s** prefill at 16K ([PR #827](https://github.com/Luce-Org/lucebox/pull/827)) |
+| <img src="assets/gpus/r9700.png" width="180" /> | <img src="assets/gpus/ryze395.png" width="180" /> | <img src="assets/gpus/gb10.png" width="180" /> | <img src="assets/gpus/3090.png" width="180" /> |
+|:---:|:---:|:---:|:---:|
+| R9700, ROCm 7.2 | Ryzen AI MAX+ 395 / 495, ROCm 7.2 | DGX Spark (GB10), CUDA 12.9 | RTX 3090, CUDA 12+ |
 
-These runs use different prompts, quantizations, and inference policies. They show which configurations work; they are not a cross-hardware ranking.
+The CUDA build runs on NVIDIA GPUs from Volta onward, and CI tests it on a DGX Spark. The HIP build also runs on the RX 7900 XT and XTX. Community results: [RTX 4090 and 2080 Ti](server/RESULTS.md), [RTX 5090 and two RTX 3090s](https://github.com/Luce-Org/lucebox/pull/637).
 
-## Recommended Setups
+## Quick start
 
-See [Recommended server setups](server/docs/RECOMMENDED_SETUPS.md) for the model and hardware matrix, including single-GPU and mixed-GPU profiles.
+You need Linux with ROCm 7.2 or newer. Only have one of the two chips? See [one chip or another card](#one-chip-or-another-card).
 
-The DS4 guide also documents the Strix long-context sparse-verifier profile and
-PFlash integration. PFlash is on by default when its drafter and trained
-scoring head are given and the target supports it (the Qwen3.5 family and
-DeepSeek V4, in a launch PFlash combines with); it is lossy prompt compression, so turn it off
-(`--pflash off`) for exact-retrieval and matched true-context benchmarks.
-
-## Client Harnesses
-
-[`harness/`](harness/) runs Lucebox through popular coding clients and checks server compatibility.
-
-<table>
-<tr>
-<td width="50%" valign="middle">
-
-<a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="100%" /></a>
-
-</td>
-<td width="50%" valign="middle">
-
-| Client | Launcher |
-|--------|----------|
-| Claude Code | [`run_claude_code.sh`](harness/clients/run_claude_code.sh) |
-| Codex | [`run_codex.sh`](harness/clients/run_codex.sh) |
-| OpenCode | [`run_opencode.sh`](harness/clients/run_opencode.sh) |
-| Hermes | [`run_hermes.sh`](harness/clients/run_hermes.sh) |
-| [OMP](https://omp.sh/) | [`run_omp.sh`](harness/clients/run_omp.sh) |
-| Pi | [`run_pi.sh`](harness/clients/run_pi.sh) |
-| OpenClaw | [`run_openclaw.sh`](harness/clients/run_openclaw.sh) |
-| Open WebUI | [`run_openwebui.sh`](harness/clients/run_openwebui.sh) |
-
-</td>
-</tr>
-</table>
-
-Set the server binary and model paths, then run a launcher:
+**1. Build for both chips.**
 
 ```bash
-LUCE_SERVER_BIN=server/build/luce_server \
-LUCE_TARGET=server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
-LUCE_DRAFT=server/models/draft/qwen38-dflash2-q8_0.gguf \
-MAX_CTX=32768 \
-harness/clients/run_codex.sh
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox
+cmake -S server -B server/build-hip -DCMAKE_BUILD_TYPE=Release \
+  -DLUCE_GPU_BACKEND=hip -DLUCE_HIP_ARCHITECTURES="gfx1201;gfx1151"
+cmake --build server/build-hip --target luce_server -j"$(nproc)"
 ```
 
-See the [harness guide](harness/README.md) for setup, no-draft targets, and benchmarks.
+For Flash-Next, add `-DGGML_HIP_GRAPHS=ON`.
 
-## Quick Start With Docker
+**2. Give the iGPU its memory.** By default Linux lets the iGPU use only part of the RAM. Add these to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then `sudo update-grub` and reboot:
 
-Prebuilt images on GHCR track `main`. Mount the weights and serve the OpenAI-compatible API on `:8000`.
+```text
+# 128 GB: 96 GiB for the iGPU
+amdgpu.gttsize=98304 ttm.pages_limit=25165824
 
-<table>
-<tr>
-<td width="38%" valign="middle">
+# 192 GB: 176 GiB for the iGPU
+amdgpu.gttsize=180224 ttm.pages_limit=46137344
+```
 
-| GPU | Image tag |
-|-----|-----------|
-| NVIDIA (CUDA 12+) | `:cuda12` |
-| AMD (ROCm 6+) | `:rocm` |
-
-Put the target in `server/models/` and its matching drafter in `server/models/draft/`.
-
-</td>
-<td width="62%" valign="middle">
-
-<img src="assets/docker.png" alt="Lucebox prebuilt Docker images for NVIDIA and AMD" width="100%" />
-
-</td>
-</tr>
-</table>
-
-Run the image for your GPU:
+**3. Check the GPU order.**
 
 ```bash
-# NVIDIA
-docker run --rm --gpus all -p 8000:8080 \
-  -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
-  ghcr.io/luce-org/lucebox-hub:cuda12
+./server/build-hip/luce_server --list-devices
+```
 
-# AMD
+The profiles expect the R9700 as `hip:0` and the iGPU as `hip:1`. External cards sometimes show up the other way round; if so, prefix the commands below with `HIP_VISIBLE_DEVICES=1,0`.
+
+**4. Start a model.** The server picks the profile that matches your GPUs and listens on port 8080.
+
+```bash
+# Qwen 3.8 Flash-Next: attention and the MTP drafter on the R9700, experts on the iGPU
+hf download Lucebox/Qwen3.8-Flash-Next-GGUF \
+  UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000{1,2,3,4}-of-00004.gguf \
+  MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --local-dir models/flash-next
+./server/build-hip/luce_server \
+  models/flash-next/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --draft models/flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --profile qwen-next-r9700-strix
+```
+
+```bash
+# DeepSeek V4.1 Flash, 128 GB: busiest experts on the R9700, more on the iGPU, the rest on the SSD
+hf download Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF \
+  DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
+  DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf --local-dir models/ds41
+ulimit -l unlimited
+./server/build-hip/luce_server models/ds41/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
+  --draft models/ds41/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
+
+# DeepSeek V4.1 Flash, 192 GB: busiest experts on the R9700, every other expert on the iGPU
+hf download Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF \
+  DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
+  DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf --local-dir models/ds41
+./server/build-hip/luce_server models/ds41/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf \
+  --draft models/ds41/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf
+```
+
+```bash
+# Qwen 3.8 27B: the model and its DFlash2 drafter on the R9700
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-IQ4_XS.gguf --local-dir models
+hf download Lucebox/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-Q8_0.gguf --local-dir models
+./server/build-hip/luce_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --draft models/Qwen3.8-27B-DFlash2-Q8_0.gguf
+```
+
+```bash
+# DeepSeek V4 Flash: on the iGPU
+hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
+  DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf --local-dir models
+hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
+  DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf --local-dir models
+./server/build-hip/luce_server models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
+  --draft models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
+  --target-device auto --profile ds4-strix
+```
+
+Try it:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Write a Python LRU cache."}],"max_tokens":256}'
+```
+
+For more than one user, add:
+
+| Model | Flags |
+|---|---|
+| Qwen 3.8 27B | `--paged-attention --max-concurrency 8 --kv-pool-tokens 204800` |
+| Qwen 3.8 Flash-Next | `--max-concurrency 4` |
+| DeepSeek V4.1 Flash | `--paged-attention --max-concurrency 4 --ds4-prefill sparse` in place of `--draft` |
+
+### One chip or another card
+
+On an R9700 alone, run the 27B as above. On a Ryzen AI MAX+ alone, run Flash-Next without `--profile` and DeepSeek V4 as above; DeepSeek V4.1 fits on the iGPU alone with 192 GB. [Recommended setups](server/docs/RECOMMENDED_SETUPS.md) has every single-chip launch.
+
+With an RX 7900 XT or XTX next to the iGPU, add `gfx1100` to the build and set the devices yourself (`--target-device hip:0 --expert-device hip:1`); DeepSeek V4 has a [tested recipe](https://github.com/Luce-Org/lucebox/pull/604) for this pair. An NVIDIA card can split a model's layers with the iGPU through the [mixed CUDA and HIP build](server/docs/MIXED_BACKEND.md).
+
+### Docker
+
+Prebuilt images track `main`: `:rocm` for AMD, `:cuda12` for NVIDIA. Put the model in `server/models/` and its drafter in `server/models/draft/`; `luce_server` flags like `--profile` go after the image name.
+
+```bash
 docker run --rm --device /dev/kfd --device /dev/dri \
   --group-add video --group-add render --security-opt seccomp=unconfined \
   -p 8000:8080 -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
   ghcr.io/luce-org/lucebox-hub:rocm
+
+docker run --rm --gpus all -p 8000:8080 \
+  -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  ghcr.io/luce-org/lucebox-hub:cuda12
 ```
 
-The container picks the GPU the model fits on (a discrete card before an integrated one, else the largest) and sizes the context from that GPU's memory. `serve` is the default command, so `luce_server` flags can follow the image name directly (or `serve`); they replace the values the container would pass. `--target-device`, `--max-ctx` and `--profile` all work:
+For compose, see the header of [`server/scripts/entrypoint.sh`](server/scripts/entrypoint.sh).
+
+## Long prompts
+
+PFlash reads a long prompt with a small model first and gives the main model only the parts that matter for the question ([how it works](https://www.lucebox.com/blog/pflash-v2)). KVFlash keeps part of the KV cache on the GPU and the rest in system memory, so decode speed holds as the context grows ([how it works](https://www.lucebox.com/blog/kvflash)).
 
 ```bash
-# Show the GPUs, the model, and the device auto placement would use
-docker run --rm <gpu flags> -v ... ghcr.io/luce-org/lucebox-hub:rocm devices
+hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-BF16.gguf --local-dir models/pflash
+hf download Lucebox/pflash-scorer-head seg-scoring-head.gguf --local-dir models/pflash
+hf download Lucebox/pflash-segment-probe segment-probe.gguf --local-dir models/pflash
+hf download Lucebox/pflash-request-probe request-probe.gguf --local-dir models/pflash
 
-# DeepSeek V4 on Strix Halo with its qualified profile (DSpark drafter in models/draft/)
-docker run --rm <gpu flags> -p 8000:8080 -v ... ghcr.io/luce-org/lucebox-hub:rocm --profile ds4-strix
+# PFlash: add to any launch above
+PFLASH_SCORING_HEAD_GGUF=models/pflash/seg-scoring-head.gguf \
+PFLASH_SEGMENT_PROBE_GGUF=models/pflash/segment-probe.gguf \
+PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
+./server/build-hip/luce_server <model and flags as above> \
+  --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf
 
-# Pin a device
-docker run --rm <gpu flags> -p 8000:8080 -v ... ghcr.io/luce-org/lucebox-hub:rocm --target-device hip:1
+# KVFlash: sizes itself from free GPU memory
+./server/build-hip/luce_server <model and flags as above> \
+  --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf --kvflash auto
 ```
 
-Environment variables such as `LUCE_TARGET`, `LUCE_TARGET_DEVICE`, `LUCE_MAX_CTX` and `LUCE_ARGS` cover the same settings for compose files; see the header of [`server/scripts/entrypoint.sh`](server/scripts/entrypoint.sh).
+With both chips, `--prefill-drafter-device hip:1` runs the small model on the iGPU. PFlash starts at 16K tokens and `--pflash off` turns it off. Every setting is in the [PFlash reference](server/docs/PFLASH_CONFIGURATION.md).
 
-## Run the Server
+## Coding agents
 
-This quick start runs the R9700 profile above. The complete flag reference is in the [server guide](server/README.md#server-parameter-reference).
+The server speaks the OpenAI and Anthropic APIs, so coding agents connect to it as they are. [`harness/`](harness/) has a launcher for each, and there's a [video of the OpenClaw setup](https://www.youtube.com/watch?v=PysoxVGfvRE):
 
 ```bash
-# build (ROCm 7.2+, RDNA4)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
-cd lucebox
-cmake -S server -B server/build-hip -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-  -DLUCE_GPU_BACKEND=hip \
-  -DLUCE_HIP_ARCHITECTURES=gfx1201 \
-  -DGGML_HIP_MMQ_MFMA=ON \
-  -DGGML_HIP_NO_VMM=ON
-cmake --build server/build-hip --target luce_server -j"$(nproc)"
-
-# target and DFlash2 drafter
-mkdir -p models
-huggingface-cli download unsloth/Qwen3.8-27B-GGUF \
-  Qwen3.8-27B-UD-IQ4_XS.gguf --local-dir models
-huggingface-cli download incoai/Qwen3.8-27B-DFlash2 --local-dir models/dflash2
-python server/scripts/convert_dflash_to_gguf.py \
-  models/dflash2/model.safetensors models/qwen38-dflash2-f16.gguf
-python server/scripts/quantize_dflash_draft.py \
-  models/qwen38-dflash2-f16.gguf models/qwen38-dflash2-q8_0.gguf --scheme q8_0
-
-# launch the measured profile
-./server/build-hip/luce_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
-  --draft models/qwen38-dflash2-q8_0.gguf \
-  --draft-block-size 16 --max-ctx 131072 \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --port 8216
-
-curl -s http://127.0.0.1:8216/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Write a Python LRU cache."}],
-       "max_tokens":256,"temperature":0}'
+LUCE_SERVER_BIN=server/build-hip/luce_server \
+LUCE_TARGET=models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+LUCE_DRAFT=models/Qwen3.8-27B-DFlash2-Q8_0.gguf \
+MAX_CTX=32768 \
+harness/clients/run_codex.sh
 ```
-
-To serve up to `N` concurrent requests, use this launch command with the same Qwen target and DFlash2 drafter. Set `N` to the desired concurrency (5 below). Qwen automatically sizes the shared KV pool from available GPU memory.
-
-```bash
-N=5
-./server/build-hip/luce_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
-  --draft models/qwen38-dflash2-q8_0.gguf \
-  --draft-block-size 16 --max-ctx 16384 \
-  --paged-attention --max-concurrency "$N" \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --port 8216
-```
-
-See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-batching/) for Qwen and DeepSeek V4 Flash results, latency measurements, and launch settings.
 
 ## Documentation
 
 | Topic | Guide |
 |---|---|
-| Recommended model and hardware profiles | [Recommended setups](server/docs/RECOMMENDED_SETUPS.md) |
-| Runtime parameters | [Server parameter reference](server/README.md#server-parameter-reference) |
-| OpenAI Chat Completions, Responses, and Anthropic Messages | [API reference](server/docs/API.md) |
-| CUDA, HIP, and mixed-device placement | [Mixed-backend guide](server/docs/MIXED_BACKEND.md) |
-| DeepSeek V4 single-device and heterogeneous profiles | [DeepSeek V4 guide](server/docs/DS4.md) |
-| DeepSeek V4.1 Flash on R9700 + Strix Halo + SSD | [DeepSeek V4.1 guide](server/docs/DS41.md) |
-| Image input (Qwen3.8, DeepSeek V4 Flash Vision) | [Image input guide](docs/image-input.md) |
-| Image generation (MOSS-Image on R9700) | [Image generation](optimizations/image_gen/README.md) |
-| Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
-| Server internals | [Architecture](server/docs/ARCHITECTURE.md) |
-| Client integration and qualification | [Harness guide](harness/README.md) |
-| Server engine components | [Engine components](server/docs/ENGINE_COMPONENTS.md) |
+| Model and hardware profiles | [Recommended setups](server/docs/RECOMMENDED_SETUPS.md) |
+| DeepSeek V4.1 Flash | [DeepSeek V4.1 guide](server/docs/DS41.md) |
+| DeepSeek V4 Flash | [DeepSeek V4 guide](server/docs/DS4.md) |
+| Qwen 3.8 Flash-Next | [Flash-Next guide](server/docs/QWEN4EXP.md) |
+| Long prompts | [PFlash reference](server/docs/PFLASH_CONFIGURATION.md), [prefix cache](server/docs/PREFIX_CACHE.md) |
+| Images | [Image input](docs/image-input.md), [MOSS-Image](optimizations/image_gen/README.md) |
+| APIs | [API reference](server/docs/API.md) |
+| Flags and environment | [Server parameters](server/README.md#server-parameter-reference), [environment](server/docs/ENVIRONMENT.md) |
+| CUDA, HIP and two-chip placement | [Mixed-backend guide](server/docs/MIXED_BACKEND.md) |
+| How the server is built | [Architecture](server/docs/ARCHITECTURE.md), [engine components](server/docs/ENGINE_COMPONENTS.md) |
 
-Benchmarks stay with each implementation: [DFlash](server/RESULTS.md), [PFlash](optimizations/pflash/), [Spark](optimizations/spark/), [KVFlash](optimizations/kvflash/), [Megakernel](optimizations/megakernel/), and [image generation](optimizations/image_gen/RESULTS.md).
+## Research
 
----
+[`optimizations/`](optimizations/) holds the research the engine grew out of: the [Megakernel](optimizations/megakernel/), [Luce Spark](optimizations/spark/), and the first [PFlash](optimizations/pflash/) and [KVFlash](optimizations/kvflash/) experiments. Video walkthroughs: [Spark](https://www.youtube.com/watch?v=LB1aVj9lNhg), [DFlash](https://www.youtube.com/watch?v=vbPGvvSB8IQ), [Turboquant](https://www.youtube.com/watch?v=uTOOrfhrnBk), [PFlash](https://www.youtube.com/watch?v=NWeKUL9Bc6Y), [Megakernel](https://www.youtube.com/watch?v=e6jY4goVIu0), [KVFlash](https://www.youtube.com/watch?v=8rTVCRWvRDo).
 
-## Tutorials
+## The Lucebox machine
 
-Video tutorials for each optimization and the harness setup.
-
-|   |   |   |
-|:-:|:-:|:-:|
-| **Luce Spark**<br>[▶ YouTube](https://www.youtube.com/watch?v=LB1aVj9lNhg) | **Luce DFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=vbPGvvSB8IQ) | **Luce Turboquant**<br>[▶ YouTube](https://www.youtube.com/watch?v=uTOOrfhrnBk) |
-| **OpenClaw harness setup**<br>[▶ YouTube](https://www.youtube.com/watch?v=PysoxVGfvRE) | **Luce PFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=NWeKUL9Bc6Y) | **Luce Megakernel**<br>[▶ YouTube](https://www.youtube.com/watch?v=e6jY4goVIu0) |
-| **Luce KVFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=8rTVCRWvRDo) |   |   |
-
----
-
-## The Lucebox Machine
-
-Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. Lucebox Zero 495 pairs the R9700 with the Ryzen AI MAX+ PRO 495 (128 or 192 GB) and ships this open engine ready to run.
+Lucebox Zero 495 pairs the R9700 with the Ryzen AI MAX+ PRO 495 (128 or 192 GB) and ships with this engine ready to run: private data, no per-token bill.
 
 <p align="center">
-  <a href="https://www.lucebox.com/"><img src="assets/lucebox.png" alt="Lucebox local AI PC" width="85%" /></a>
+  <a href="https://www.lucebox.com/"><img src="assets/lucebox.png" alt="Lucebox Zero 495" width="85%" /></a>
 </p>
 
-See the hardware and current benchmarks at [lucebox.com](https://www.lucebox.com/).
+## Contributing
 
----
-
-## Request for Contributions
-
-We welcome focused contributions to CUDA and HIP kernels, speculative inference, support for more consumer GPUs and APUs, performance benchmarks, and client harnesses.
-
----
+We welcome work on HIP and CUDA kernels, speculative decoding, new consumer GPUs and APUs, benchmarks and client harnesses. Open an issue or join us on [Discord](https://discord.gg/yHfswqZmJQ).
 
 ## Citation
 
@@ -324,15 +282,6 @@ We welcome focused contributions to CUDA and HIP kernels, speculative inference,
 
 ---
 
-## Community
-
-- **Discord**: [discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
-- **Website**: [lucebox.com](https://www.lucebox.com/)
-- **Issues**: [github.com/Luce-Org/lucebox/issues](https://github.com/Luce-Org/lucebox/issues)
-- **Blog**: [lucebox.com/blog](https://www.lucebox.com/blog/)
-
----
-
 <p align="center">
-  <sub><a href="LICENSE">Apache 2.0</a> · <a href="https://www.lucebox.com/">Lucebox.com</a></sub>
+  <sub><a href="LICENSE">Apache 2.0</a> · <a href="https://www.lucebox.com/">lucebox.com</a> · <a href="https://www.lucebox.com/blog/">Blog</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://github.com/Luce-Org/lucebox/issues">Issues</a></sub>
 </p>
