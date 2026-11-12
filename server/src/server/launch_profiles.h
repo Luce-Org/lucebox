@@ -397,6 +397,20 @@ inline bool kvflash_mode5_requested(const std::function<std::string(const char *
     return true;
 }
 
+// Startup line for the recall profile. The profile only sets variables that are not already set, so the mode
+// that runs is the operator's LUCE_KVFLASH_PREFILL_RESELECT when present, else the profile's (5 if mode5, else 4).
+inline std::string kvflash_recall_banner(std::string_view arch, bool mode5,
+                                         const std::function<std::string(const char *)> & get) {
+    if (arch != "qwen35") return "recall profile not applied (it is qwen35-only)";
+    const std::string preset = get("LUCE_KVFLASH_PREFILL_RESELECT");
+    const std::string mode = !preset.empty() ? preset : (mode5 ? "5" : "4");
+    std::string s = "recall profile: mode " + mode;
+    if (!preset.empty()) s += " (LUCE_KVFLASH_PREFILL_RESELECT set by the environment)";
+    else if (mode == "4") s += " (exact scorer; mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)";
+    else s += " (PFlash 2.0 drafter scorer)";
+    return s;
+}
+
 inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch, bool mode5) {
     if (arch != "qwen35") return {};
     using P = KvflashRecallProfile;

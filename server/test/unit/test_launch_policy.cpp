@@ -816,11 +816,35 @@ struct LaunchPolicyFixture : CommonFixture {
         env["LUCE_KVFLASH_PREFILL_RESELECT"] = "4";
         CHECK(!kvflash_mode5_requested(get));
     }
+
+    void test_kvflash_banner_prints_the_resolved_reselect_mode() {
+        std::map<std::string, std::string> env;
+        const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        const auto has = [](const std::string & s, const char * t) { return s.find(t) != std::string::npos; };
+        std::string b = kvflash_recall_banner("qwen35", false, get);                 // nothing preset: the profile's default
+        CHECK(has(b, "mode 4"));
+        CHECK(has(b, "LUCE_KVFLASH_PREFILL_RESELECT=5"));                              // how to get mode 5
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "0";                                    // preset value wins over the profile
+        b = kvflash_recall_banner("qwen35", false, get);
+        CHECK(has(b, "mode 0"));
+        CHECK(!has(b, "mode 4"));
+        CHECK(has(b, "set by the environment"));
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "5";                                    // 5 without its GGUFs: still 5, not 4
+        b = kvflash_recall_banner("qwen35", false, get);
+        CHECK(has(b, "mode 5"));
+        CHECK(!has(b, "mode 4"));
+        env.clear();
+        CHECK(has(kvflash_recall_banner("qwen35", true, get), "mode 5"));
+        b = kvflash_recall_banner("llama", false, get);                                // profile is qwen35 only
+        CHECK(has(b, "not applied"));
+        CHECK(!has(b, "mode"));
+    }
 };
 
 }  // namespace
 
 TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
+    test_kvflash_banner_prints_the_resolved_reselect_mode();
     test_auto_device_prefers_discrete_gpu_that_fits();
     test_auto_device_moves_large_model_to_device_that_fits();
     test_auto_device_falls_back_to_largest();

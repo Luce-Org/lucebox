@@ -321,7 +321,7 @@ static void print_usage(const char * prog) {
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
-        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: qk on qwen35 with --kvflash, else drafter)\n"
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -1548,11 +1548,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             const char * v = std::getenv(k);
             return std::string(v ? v : "");
         });
-        std::fprintf(stderr, "[kvflash] recall profile: %s\n", mode5
-            ? "mode 5 (PFlash 2.0 drafter scorer)"
-            : "mode 4 (exact scorer; mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)");
-        apply_env_defaults("KVFlash recall",
-            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, mode5));
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        std::fprintf(stderr, "[kvflash] %s\n", luce::server::kvflash_recall_banner(arch, mode5, [](const char * k) {
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        }).c_str());
+        apply_env_defaults("KVFlash recall", luce::server::kvflash_recall_env(arch, mode5));
     }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
