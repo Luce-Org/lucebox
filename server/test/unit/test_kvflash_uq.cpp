@@ -155,6 +155,18 @@ TEST_CASE(KvflashUqFixture, rewind_below_the_window_recaptures) {
     CHECK(!kvflash_uq_rewind_recaptures(p, 237));          // rewind stays after the window start
     CHECK(!kvflash_uq_rewind_recaptures(kvflash_uq_plan(KvFlashHumanTurn{}, 64, 0, 1000), 0));
 }
+TEST_CASE(KvflashUqFixture, a_capped_rewind_inside_the_window_moves_to_the_window_end) {
+    // kvflash_mode4_plan's tail cap can put R inside the question's window. Replayed from there, the window's tail would
+    // be recomputed under the new pool while its stored rows keep the old pool's: R moves to the window's end instead.
+    const auto p = kvflash_uq_plan(KvFlashHumanTurn{100, 300}, 64, 0, 1000);   // window [236, 300)
+    CHECK(kvflash_uq_snap_rewind(p, 237) == 300);
+    CHECK(kvflash_uq_snap_rewind(p, 299) == 300);
+    CHECK(kvflash_uq_snap_rewind(p, 236) == 236);          // at the window start: the whole window is recaptured
+    CHECK(kvflash_uq_snap_rewind(p, 97) == 97);
+    CHECK(kvflash_uq_snap_rewind(p, 300) == 300);          // at or after the end: the window is not replayed
+    CHECK(kvflash_uq_snap_rewind(p, 500) == 500);
+    CHECK(kvflash_uq_snap_rewind(kvflash_uq_plan(KvFlashHumanTurn{}, 64, 0, 1000), 250) == 250);   // UQ off
+}
 
 // ---- scorer: an extra aligned query raises that chunk -----------------------
 TEST_CASE(KvflashUqFixture, extra_query_raises_its_chunk_in_the_cpu_selector) {

@@ -55,12 +55,23 @@ struct KvFlashMode4Plan {
     int  r = -1;
     bool run = false;
 };
+// The longest turn a recall replays: the pool minus the pins, the recall and two chunks of room (kvflash_recall_gate's
+// PoolTooSmall bound), one of them the turn's partial chunk. 0: no room for a replay (uncapped: the gate refuses).
+inline int kvflash_max_turn_tokens(int chunk_tokens, int n_pool_blocks, int pin_reserve_chunks, int recall_chunks) {
+    const int room = n_pool_blocks - pin_reserve_chunks - recall_chunks - 2;
+    return chunk_tokens > 0 && room > 1 ? (room - 1) * chunk_tokens : 0;
+}
+
+// max_turn_tokens > 0: a turn longer than that rewinds to its tail only. Uncapped, a cold single turn (R in chunk 0)
+// or a turn longer than the pool skipped the recall and ran LRU only, dropping whatever the pool could not hold.
 inline KvFlashMode4Plan kvflash_mode4_plan(const std::vector<int32_t> & tokens, int kv_offset,
-                                           int32_t im_start, int32_t user) {
+                                           int32_t im_start, int32_t user, int max_turn_tokens = 0) {
     KvFlashMode4Plan p;
     if (tokens.empty()) return p;
     const int idx = kvflash_last_user_turn(tokens, im_start, user);
     p.r = kv_offset + (idx > 0 ? idx : 0);
+    const int end = kv_offset + (int)tokens.size();
+    if (max_turn_tokens > 0 && end - p.r > max_turn_tokens) p.r = end - max_turn_tokens;
     p.run = true;
     return p;
 }
