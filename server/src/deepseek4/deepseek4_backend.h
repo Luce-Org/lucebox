@@ -348,16 +348,24 @@ private:
                (!w_.moe_hybrid ||
                 (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)));
     }
-    // The shared staged pass needs the whole model on one GPU. With
-    // heterogeneous experts, a text prompt stages one bounded chunk per call
-    // through the regular sparse layer-major prefill instead.
-    bool staged_text_uses_chunks() const { return text_staging_available() && w_.moe_hybrid; }
-    // Image prompts on a heterogeneous placement stage the same way: whole
-    // image blocks per chunk, each chunk once the encoder has published the
-    // rows of the images it holds.
+    // The shared staged pass needs the whole model on one GPU and implements
+    // V4's plain pre-mix only. With heterogeneous experts, or on a model with
+    // the staggered pre-mix and Engram layers (V4.1), a prompt stages one
+    // bounded chunk per call through the regular sparse layer-major prefill
+    // instead.
+    bool staged_pass_supported() const {
+        return !w_.moe_hybrid && !w_.hc_staggered_pre && !w_.engram_runtime;
+    }
+    bool staged_chunks_available() const {
+        return !w_.moe_hybrid || (moe_hybrid_ && (expert_runtime_.compute || expert_backend_));
+    }
+    bool staged_text_uses_chunks() const {
+        return text_staging_available() && !staged_pass_supported();
+    }
+    // Image prompts stage the same way: whole image blocks per chunk, each
+    // chunk once the encoder has published the rows of the images it holds.
     bool staged_images_use_chunks() const {
-        return image_capable_ && vision_ && w_.moe_hybrid && moe_hybrid_ &&
-               (expert_runtime_.compute || expert_backend_);
+        return image_capable_ && vision_ && !staged_pass_supported() && staged_chunks_available();
     }
     // Rows the next chunk of `item` takes (whole image blocks for an image
     // prompt), 0 when the remaining prefix cannot be chunked.

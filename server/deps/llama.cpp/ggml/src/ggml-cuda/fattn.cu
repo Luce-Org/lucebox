@@ -742,7 +742,8 @@ static void ds4_launch_indexed_rows_topk(
     }
 }
 
-template <typename KV, typename Mask, bool ANALYTIC_CAUSAL = false>
+template <typename KV, typename Mask, bool ANALYTIC_CAUSAL = false,
+          bool GLOBAL_SCRATCH = false>
 __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         float       * dst,
         const float * q,
@@ -767,15 +768,23 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
         ds4_inverse_rope_params inverse_rope,
         const float * inverse_rope_coefficients,
         const float * forward_rope_coefficients,
-        bool          skip_sparse_value_gaps) {
+        bool          skip_sparse_value_gaps,
+        float       * global_scratch,
+        size_t        global_scratch_stride,
+        int           token_base) {
     constexpr int D = 512;
-    const int t = (int) blockIdx.x;
+    const int t = (int) blockIdx.x + (GLOBAL_SCRATCH ? token_base : 0);
     const int h = (int) blockIdx.y;
     const int tid = (int) threadIdx.x;
     if (t >= n_tokens || h >= n_heads) return;
 
     extern __shared__ float scratch[];
     float * scores = scratch;
+    if constexpr (GLOBAL_SCRATCH) {
+        scores = global_scratch +
+            ((size_t) blockIdx.y * gridDim.x + blockIdx.x) *
+            global_scratch_stride;
+    }
     float * block_scores = scores + n_kv;
     float * block_keep = block_scores + n_comp_blocks;
     float * q_rope_tail = block_keep + n_comp_blocks;
@@ -1090,6 +1099,49 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
             out[2 * tid + 0] = y0;
             out[2 * tid + 1] = y1;
         }
+    }
+}
+
+// The single-head kernel keeps one score per KV row plus the block selector's
+// arrays in its scratch. When that outgrows a workgroup's LDS (64 KiB on
+// RDNA, about 15K KV rows) the same kernel keeps the scratch in global memory
+// instead, a slice of tokens per launch so the buffer stays bounded. Every
+// score is computed and consumed in the same order either way, so the output
+// is the one the LDS kernel would give.
+template <typename KV, typename Mask, bool ANALYTIC_CAUSAL, typename... Args>
+static void ds4_launch_flash_attn_d512_shared_kv(
+        ggml_backend_cuda_context & ctx, dim3 grid, size_t shmem,
+        cudaStream_t stream, Args... args) {
+    // The launch must fit the kernel's static arrays (the block reductions'
+    // and value_bounds) beside the dynamic scratch.
+    static const size_t static_lds = [] {
+        hipFuncAttributes attr = {};
+        CUDA_CHECK(hipFuncGetAttributes(&attr, reinterpret_cast<const void *>(
+            ds4_flash_attn_d512_shared_kv_kernel<
+                KV, Mask, ANALYTIC_CAUSAL, false>)));
+        return (size_t) attr.sharedSizeBytes;
+    }();
+    const size_t lds_limit =
+        ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    if (shmem + static_lds <= lds_limit) {
+        ds4_flash_attn_d512_shared_kv_kernel<KV, Mask, ANALYTIC_CAUSAL, false>
+            <<<grid, 256, shmem, stream>>>(args..., nullptr, (size_t) 0, 0);
+        return;
+    }
+    const size_t stride = shmem / sizeof(float);
+    const size_t token_bytes = (size_t) grid.y * shmem;
+    constexpr size_t scratch_budget = (size_t) 256 << 20;
+    const int n_tokens = (int) grid.x;
+    const int slice = (int) std::min<size_t>(
+        (size_t) n_tokens, std::max<size_t>(1, scratch_budget / token_bytes));
+    ggml_cuda_pool_alloc<float> scratch_alloc(
+        ctx.pool(), (size_t) slice * grid.y * stride);
+    for (int t0 = 0; t0 < n_tokens; t0 += slice) {
+        const dim3 slice_grid(
+            (unsigned) std::min(slice, n_tokens - t0), grid.y, 1);
+        ds4_flash_attn_d512_shared_kv_kernel<KV, Mask, ANALYTIC_CAUSAL, true>
+            <<<slice_grid, 256, 0, stream>>>(
+                args..., scratch_alloc.get(), stride, t0);
     }
 }
 
@@ -3706,8 +3758,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         // single-head analytic kernel when WMMA is not selected.
         if (contiguous_causal) {
             if (kv_f16) {
-                ds4_flash_attn_d512_shared_kv_kernel<half, half, true>
-                    <<<grid, 256, shmem, stream>>>(
+                ds4_launch_flash_attn_d512_shared_kv<half, half, true>(
+                        ctx, grid, shmem, stream,
                         (float *) dst->data, (const float *) Q->data,
                         q_stride_token, q_stride_head,
                         (const half *) K->data, (const half *) V->data,
@@ -3720,8 +3772,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         forward_rope_coefficients,
                         skip_sparse_value_gaps);
             } else {
-                ds4_flash_attn_d512_shared_kv_kernel<float, float, true>
-                    <<<grid, 256, shmem, stream>>>(
+                ds4_launch_flash_attn_d512_shared_kv<float, float, true>(
+                        ctx, grid, shmem, stream,
                         (float *) dst->data, (const float *) Q->data,
                         q_stride_token, q_stride_head,
                         (const float *) K->data, (const float *) V->data,
@@ -4067,8 +4119,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
 
     if (kv_f16 && (!mask || mask->type == GGML_TYPE_F16)) {
         if (contiguous_causal) {
-            ds4_flash_attn_d512_shared_kv_kernel<half, half, true>
-                <<<grid, 256, shmem, stream>>>(
+            ds4_launch_flash_attn_d512_shared_kv<half, half, true>(
+                    ctx, grid, shmem, stream,
                     (float *) dst->data, (const float *) Q->data,
                     q_stride_token, q_stride_head,
                     (const half *) K->data, (const half *) V->data, nullptr,
@@ -4080,8 +4132,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                     forward_rope_coefficients,
                     skip_sparse_value_gaps);
         } else {
-            ds4_flash_attn_d512_shared_kv_kernel<half, half, false>
-                <<<grid, 256, shmem, stream>>>(
+            ds4_launch_flash_attn_d512_shared_kv<half, half, false>(
+                    ctx, grid, shmem, stream,
                     (float *) dst->data, (const float *) Q->data,
                     q_stride_token, q_stride_head,
                     (const half *) K->data, (const half *) V->data,
@@ -4096,8 +4148,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         }
     } else if (kv_f32 && (!mask || mask->type == GGML_TYPE_F32)) {
         if (contiguous_causal) {
-            ds4_flash_attn_d512_shared_kv_kernel<float, float, true>
-                <<<grid, 256, shmem, stream>>>(
+            ds4_launch_flash_attn_d512_shared_kv<float, float, true>(
+                    ctx, grid, shmem, stream,
                     (float *) dst->data, (const float *) Q->data,
                     q_stride_token, q_stride_head,
                     (const float *) K->data, (const float *) V->data,
@@ -4110,8 +4162,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                     forward_rope_coefficients,
                     skip_sparse_value_gaps);
         } else {
-            ds4_flash_attn_d512_shared_kv_kernel<float, float, false>
-                <<<grid, 256, shmem, stream>>>(
+            ds4_launch_flash_attn_d512_shared_kv<float, float, false>(
+                    ctx, grid, shmem, stream,
                     (float *) dst->data, (const float *) Q->data,
                     q_stride_token, q_stride_head,
                     (const float *) K->data, (const float *) V->data,
@@ -4125,8 +4177,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                     skip_sparse_value_gaps);
         }
     } else if (kv_f32 && mask && mask->type == GGML_TYPE_F16) {
-        ds4_flash_attn_d512_shared_kv_kernel<float, half, false>
-            <<<grid, 256, shmem, stream>>>(
+        ds4_launch_flash_attn_d512_shared_kv<float, half, false>(
+                ctx, grid, shmem, stream,
                 (float *) dst->data, (const float *) Q->data,
                 q_stride_token, q_stride_head,
                 (const float *) K->data, (const float *) V->data,
