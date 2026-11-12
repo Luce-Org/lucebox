@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <vector>
 
 namespace luce::common {
 
@@ -42,6 +43,23 @@ inline int kvflash_uq_queries() {
 // Only a KVFlash process (LUCE_KVFLASH names a pool) allocates it.
 inline int kvflash_q_stage_rows(int max_verify_tokens) {
     return kvflash_pool_process() ? std::max(max_verify_tokens, 0) : 0;
+}
+
+// Selector-v2 query tail (kvflash_q_tail_): rows are query vectors of `qsize` floats, oldest first, the last
+// row being the prompt's final token (position end-1). Positions are implicit.
+inline void kvflash_q_tail_append(std::vector<float> & tail, const std::vector<float> & rows, size_t qsize, int keep_rows) {
+    tail.insert(tail.end(), rows.begin(), rows.end());
+    const size_t keep = (size_t)std::max(keep_rows, 0) * qsize;
+    if (tail.size() > keep) tail.erase(tail.begin(), tail.end() - (long)keep);
+}
+
+// A rewind to R recomputes [R, end) under a new pool: drop the tail rows at positions >= R so the second
+// pass captures them again. A tail that is not whole rows cannot be addressed, so it is cleared.
+inline void kvflash_q_tail_trim(std::vector<float> & tail, size_t qsize, int end, int r) {
+    if (qsize == 0 || tail.size() % qsize != 0) { tail.clear(); return; }
+    const size_t n = tail.size() / qsize;
+    const size_t drop = std::min(n, (size_t)std::max(end - r, 0));
+    tail.resize((n - drop) * qsize);
 }
 
 } // namespace luce::common
