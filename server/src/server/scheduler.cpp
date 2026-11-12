@@ -8,6 +8,7 @@
 // formatting are shared with the classic worker so both paths emit
 // matching wire formats.
 
+#include "admit_timing.h"
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/output_constraint.h"
@@ -48,9 +49,13 @@ struct SchedSlot {
     int prompt_left = 0;
     int prompt_new = 0;
     uint64_t admission_order = 0;
+    // started_at: the first admit attempt (total wall, DONE elapsed). admitted_at: the successful attempt, where prefill_s starts;
+    // the wait between them is queue_s (see admit_timing.h).
     std::chrono::steady_clock::time_point started_at{};
+    std::chrono::steady_clock::time_point admitted_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
+    double queue_s = 0.0;
     int cached_prefix_tokens = 0;
     PrefixCaptureTxn cache_capture;
     int n_gen_cap = 0;
@@ -368,6 +373,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             /*prefilled_tokens=*/prompt_tokens - s.cached_prefix_tokens,
             /*effective_prompt_tokens=*/prompt_tokens,
         };
+        gen_timings.queue_s = s.queue_s;
         gen_timings.pflash = s.job->pflash_stats;
 
         if (!s.error) {
@@ -428,14 +434,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int out_tokens = (int)s.gen_tokens.size();
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
-            "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
+            "finish=%s slot=%d queue=%.1fs prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
             req.response_id.c_str(),
             s.error ? "false" : "true",
             req.prompt_tokens.size(), out_tokens, elapsed_s,
             elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0,
             s.client_disconnected ? "client_disconnect"
                                   : s.emitter->finish_reason().c_str(),
-            idx, s.prefill_s, decode_s,
+            idx, s.queue_s, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
 
         engine.retire(idx);
@@ -484,6 +490,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             job->parallel_started_at = std::chrono::steady_clock::now();
         }
         const auto started_at = job->parallel_started_at;
+        // ponytail: a PFlash job stamps parallel_started_at when staged for the drafter, so its compression time now reads as queue_ms
+        // (its own compress_ms is in timings.pflash); prefill_ms no longer includes it.
+        // This attempt, if it is admitted, is where prefill starts: a Deferred retry's wait is queue, not prefill.
+        const auto attempt_at = std::chrono::steady_clock::now();
 
         // Same thinking-budget n_gen math as the classic worker loop.
         const bool budget_active = req.thinking_opt_in;
@@ -598,7 +608,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             : engine.admit_bounded(
                   next_request_id, req.prompt_tokens, req.sampler,
                   (std::min)(n_gen_cap, engine.max_context() -
-                                            (int)req.prompt_tokens.size() + 1));
+                                            (int)req.prompt_tokens.size() + 1),
+                  SeqEngine::AdmitMeta{req.session.sid, req.session.client});
 
         const PrefixStoreAdmission & prefix = ar.prefix_store;
         const std::string prefix_protocol_error = kv_cache_.admitted(
@@ -696,9 +707,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.prefilling = true;
         s.admission_order = next_admission_order++;
         s.started_at = started_at;
-        s.decode_started_at = started_at;  // sane on prefill failure
-        s.cached_prefix_tokens = prefix.restored.tokens;
-        s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
+        s.admitted_at = attempt_at;
+        s.queue_s = admit_timing(started_at, attempt_at, attempt_at).queue_s;
+        s.decode_started_at = attempt_at;  // sane on prefill failure
+        s.cached_prefix_tokens = admit_cached_tokens(prefix.restored.tokens, ar.resumed_tokens);
+        s.prompt_left = (int)req.prompt_tokens.size() - s.cached_prefix_tokens;
         s.prompt_new = s.prompt_left;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
@@ -1417,8 +1430,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // replay, matching the full response's completion-token count.
                 if (s.gen_tokens.empty()) {
                     s.decode_started_at = std::chrono::steady_clock::now();
-                    s.prefill_s = std::chrono::duration<double>(
-                        s.decode_started_at - s.started_at).count();
+                    s.prefill_s = admit_timing(s.started_at, s.admitted_at, s.decode_started_at).prefill_s;
                 }
                 advance_slot(s, out.token);
                 continue;

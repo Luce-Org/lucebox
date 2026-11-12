@@ -10,6 +10,7 @@
 #include "scoped_env.h"
 #include <fstream>
 
+#include "server/admit_timing.h"
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
 #include "server/tool_checks.h"
@@ -77,6 +78,8 @@
 #include <array>
 #include <mutex>
 #include <thread>
+#include <poll.h>
+#include <chrono>
 #include <tuple>
 #include <vector>
 #include <limits>
@@ -358,6 +361,25 @@ struct SchedulerTestHarness {
 
 struct HttpServerTestAccess {
     using PreparedPrompt = HttpServer::PreparedPrompt;
+    static void handle_client(HttpServer & server, int fd) { server.handle_client(fd); }
+    static void add_sse_subscriber(HttpServer & server, int fd) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        server.sse_fds_.push_back(fd);
+    }
+    static size_t sse_subscribers(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        return server.sse_fds_.size();
+    }
+    static void broadcast_token(HttpServer & server, const std::string & text) { server.broadcast_token(text); }
+    static bool parse_endpoint(HttpServer & server, const std::string & path, const json & body,
+                               const std::string & header_lines, ParsedRequest & req) {
+        req.headers = luce::common::kvflash_parse_headers(header_lines);
+        bool count_only = false;
+        return server.parse_endpoint_request(path, body, req, count_only);
+    }
+    static ParsedRequest inner_request(HttpServer & server, const ParsedRequest & outer, const json & body) {
+        return server.make_inner_request(&outer.headers, body);
+    }
     static std::string apply_pflash_compression(
             HttpServer & server, const ParsedRequest & req) {
         HttpServer::PreparedPrompt prepared;
@@ -12803,6 +12825,226 @@ struct SpecRoundBackend : MockBackend {
 // A request the parallel scheduler decoded with drafted rounds reports, in
 // its response usage and its /status perf record, that it speculated and
 // the rounds' acceptance.
+// The scheduler hands the request's session identity to admit_bounded().
+class MetaRecordingEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 16, 32, 16}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override { return admitted_(); }
+    AdmitResult admit_bounded(uint64_t, const std::vector<int32_t> &, const SamplerCfg &, int,
+                              const AdmitMeta & m) override {
+        meta = m;
+        ++admits;
+        return admitted_();
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) result.decode.push_back({input.slot, 7, false, {}});
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = 7;
+            result.prefills.push_back(out);
+        }
+        return result;
+    }
+    void retire(int) override {}
+    AdmitMeta meta{"unset", "unset"};
+    int admits = 0;
+private:
+    static AdmitResult admitted_() {
+        AdmitResult result;
+        result.status = AdmitResult::Status::admitted;
+        result.slot = 0;
+        return result;
+    }
+};
+
+struct MetaRecordingBackend : MockBackend {
+    MetaRecordingEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// A request through the dialect's parse (headers + body) and the scheduler: the identity the engine admits with.
+static SeqEngine::AdmitMeta admitted_meta_for(const std::string & path, const json & body, const std::string & header_lines) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    auto backend_owner = std::make_unique<MetaRecordingBackend>();
+    MetaRecordingBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    TEST_ASSERT(HttpServerTestAccess::parse_endpoint(server, path, body, header_lines, job.req));
+    job.req.prompt_tokens.assign(8, 100);
+    job.req.max_output = 4;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "meta";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        TEST_ASSERT(job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; }));
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(tok_path.c_str());
+    return backend.engine.meta;
+}
+
+// B2 (CM5 screen): --tool-checks runs the request as inner passes; they dropped the header, so every session was anon/anon:N.
+TEST_CASE(ServerUnitFixture, test_tool_check_inner_pass_keeps_the_session_identity_of_the_outer_request) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    LuceEngine engine(std::make_unique<MockBackend>());
+    ServerConfig config;
+    config.tool_checks = true;
+    HttpServer server(engine, tokenizer, config);
+    const json body = {{"model", "m"}, {"max_tokens", 4},
+                       {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+                       {"tools", json::array({{{"type", "function"}, {"function", {{"name", "f"}, {"parameters", {{"type", "object"}}}}}}})}};
+    const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> cases = {
+        {"x-opencode-session-id: ses_test1\r\n", {"ses_test1", "opencode"}},
+        {"X-Claude-Code-Session-Id: cc\r\n", {"cc", "claude"}},
+        {"X-Session-Id: g\r\n", {"g", "header"}}};
+    for (const auto & c : cases) {
+        ParsedRequest outer;
+        TEST_ASSERT(HttpServerTestAccess::parse_endpoint(server, "/v1/chat/completions", body, c.first, outer));
+        TEST_ASSERT(outer.session.sid == c.second.first && outer.session.client == c.second.second);
+        const ParsedRequest inner = HttpServerTestAccess::inner_request(server, outer, body);
+        TEST_ASSERT(inner.session.sid == c.second.first);
+        TEST_ASSERT(inner.session.client == c.second.second);
+        // the replan / final-check passes are further inner requests of the same outer one: the identity holds for each
+        json again = body;
+        again["messages"].push_back({{"role", "assistant"}, {"content", "draft"}});
+        again["messages"].push_back({{"role", "user"}, {"content", "check again"}});
+        for (const json & next : {again, body}) {
+            const ParsedRequest pass = HttpServerTestAccess::inner_request(server, outer, next);
+            TEST_ASSERT(pass.session.sid == c.second.first && pass.session.client == c.second.second);
+        }
+    }
+    unlink(tok_path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_scheduler_admits_with_the_session_identity_of_both_dialects) {
+    const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+    for (const char * path : {"/v1/chat/completions", "/v1/messages"}) {
+        json body = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}};
+        auto m = admitted_meta_for(path, body, "Host: x\r\nX-OpenCode-Session-Id: ses_oc\r\n");
+        TEST_ASSERT(m.sid == "ses_oc" && m.client == "opencode");
+        m = admitted_meta_for(path, body, "x-session-affinity: aff\r\n");
+        TEST_ASSERT(m.sid == "aff" && m.client == "opencode");
+        m = admitted_meta_for(path, body, "X-Claude-Code-Session-Id: cc\r\nX-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "cc" && m.client == "claude");
+        m = admitted_meta_for(path, body, "X-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "g" && m.client == "header");
+        // the body: extra_body wins over the top-level field, a header over both
+        body["session_id"] = "top";
+        m = admitted_meta_for(path, body, "");
+        TEST_ASSERT(m.sid == "top" && m.client == "body");
+        body["extra_body"] = {{"session_id", "extra"}};
+        m = admitted_meta_for(path, body, "");
+        TEST_ASSERT(m.sid == "extra" && m.client == "body");
+        m = admitted_meta_for(path, body, "X-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "g" && m.client == "header");
+        // nothing: no identity (the engine makes the request anonymous)
+        m = admitted_meta_for(path, {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}}, "x-parent-session-id: p\r\n");
+        TEST_ASSERT(m.sid.empty() && m.client.empty());
+    }
+}
+
+// A real HTTP request through the socket path (read_http_request -> HttpRequest -> route_request ->
+// ParsedRequest -> scheduler -> engine): what the engine admits with, how many admits, the response head.
+struct SocketAdmission { SeqEngine::AdmitMeta meta; int admits = 0; std::string response; };
+
+static SocketAdmission admitted_over_socket(const std::vector<std::string> & request_bodies_and_headers) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    auto backend_owner = std::make_unique<MetaRecordingBackend>();
+    MetaRecordingBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    SocketAdmission out;
+    // pairs of (extra header lines, JSON body); the last connection's identity is returned
+    for (size_t i = 0; i + 1 < request_bodies_and_headers.size(); i += 2) {
+        int fds[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        const std::string & body = request_bodies_and_headers[i + 1];
+        const std::string http = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + request_bodies_and_headers[i] +
+            "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        TEST_ASSERT(write(fds[1], http.data(), http.size()) == (ssize_t)http.size());
+        HttpServerTestAccess::handle_client(server, fds[0]);   // closes fds[0]
+        out.response.clear();
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(fds[1], buf, sizeof buf)) > 0) out.response.append(buf, (size_t)n);
+        close(fds[1]);
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    unlink(tok_path.c_str());
+    out.meta = backend.engine.meta;
+    out.admits = backend.engine.admits;
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture, test_session_headers_travel_the_socket_path_into_the_engine_admission) {
+    const std::string body = json({{"model", "m"}, {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}, {"max_tokens", 4}}).dump();
+    // the harness headers, mixed case, among others, through read_http_request and the HttpRequest -> ParsedRequest copy
+    auto r = admitted_over_socket({"X-OpenCode-Session-Id: ses_sock\r\nUser-Agent: t\r\n", body});
+    TEST_ASSERT(r.admits == 1);
+    TEST_ASSERT(r.meta.sid == "ses_sock" && r.meta.client == "opencode");
+    r = admitted_over_socket({"x-claude-code-session-id: cc_sock\r\n", body});
+    TEST_ASSERT(r.meta.sid == "cc_sock" && r.meta.client == "claude");
+    r = admitted_over_socket({"", body});
+    TEST_ASSERT(r.admits == 1 && r.meta.sid.empty() && r.meta.client.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_an_unusable_session_id_is_no_identity_at_the_http_boundary_and_the_request_is_served) {
+    const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+    json too_long = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4},
+                     {"session_id", std::string(luce::common::kKvFlashSidMax + 1, 's')}};
+    json control = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}, {"session_id", std::string("a\x01" "b")}};
+    const std::string ok = json({{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}}).dump();
+    // body identity over the bound: served without an identity, not refused
+    auto r = admitted_over_socket({"", too_long.dump()});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // header identity over the bound: the same
+    r = admitted_over_socket({"X-Session-Id: " + std::string(luce::common::kKvFlashSidMax + 100, 'h') + "\r\n", ok});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // a control character in the id: the same, it never reaches the log
+    r = admitted_over_socket({"", control.dump()});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // the next request, on the same server, keeps its own identity (both requests of the pair are admitted)
+    r = admitted_over_socket({"", too_long.dump(), "X-Session-Id: fine\r\n", ok});
+    TEST_ASSERT(r.admits == 2);
+    TEST_ASSERT(r.meta.sid == "fine" && r.meta.client == "header");
+}
+
 TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -18115,6 +18357,38 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
 }
 
+// A request that waited for admission: the wait is queue_s, the prefill starts at the successful admit.
+// Before: prefill_s ran from the first attempt (265 s reported for a real 131 s prefill that waited 134 s).
+TEST_CASE(ServerUnitFixture, test_admit_timing_prefill_excludes_the_deferred_wait) {
+    using clk = std::chrono::steady_clock;
+    const clk::time_point t0{}, admitted = t0 + std::chrono::seconds(134), end = admitted + std::chrono::seconds(131);
+    const auto t = luce::common::admit_timing(t0, admitted, end);
+    TEST_ASSERT(t.queue_s == 134.0);
+    TEST_ASSERT(t.prefill_s == 131.0);
+    // admitted at the first attempt: no queue, prefill is the whole
+    const auto n = luce::common::admit_timing(t0, t0, t0 + std::chrono::seconds(7));
+    TEST_ASSERT(n.queue_s == 0.0 && n.prefill_s == 7.0);
+}
+
+// A sticky resume at L prefills only the tokens past L: the usage timings, the perf record and the step planner count them as cached.
+TEST_CASE(ServerUnitFixture, test_admit_cached_tokens_counts_a_sticky_resume) {
+    using luce::common::admit_cached_tokens;
+    TEST_ASSERT(admit_cached_tokens(0, 49700) == 49700);   // a 50000-token session resumed at 49700: 300 prefilled
+    TEST_ASSERT(admit_cached_tokens(8192, 0) == 8192);     // a prefix-cache restore, no resume
+    TEST_ASSERT(admit_cached_tokens(0, 0) == 0);           // cold
+    TEST_ASSERT(admit_cached_tokens(4096, 1024) == 4096);  // never less than either source
+}
+
+TEST_CASE(ServerUnitFixture, test_usage_timings_carry_queue_ms_apart_from_prefill_ms) {
+    GenTimings t;
+    t.prefill_s = 131.0;
+    t.queue_s = 134.25;
+    json j = build_timings_json(t, /*completion_tokens=*/1);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 131000.0);
+    TEST_ASSERT(j.contains("queue_ms") && j["queue_ms"].get<double>() == 134250.0);
+    TEST_ASSERT(build_timings_json(GenTimings{}, 0)["queue_ms"].get<double>() == 0.0);
+}
+
 TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
     GenTimings t{0.012, 0.25, true, 8192, 64, 8256, true};
     json j = build_timings_json(t, /*completion_tokens=*/10);
@@ -22055,4 +22329,51 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
+}
+
+// ─── HTTP edge bounds: status-event fan-out ─────────────────────────────
+
+namespace {
+struct SseRig {
+    std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    std::unique_ptr<LuceEngine> engine;
+    std::unique_ptr<HttpServer> server;
+    SseRig() {
+        TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+        engine = std::make_unique<LuceEngine>(std::make_unique<MetaRecordingBackend>());
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 4096;
+        config.prefix_cache_cap = 0;
+        server = std::make_unique<HttpServer>(*engine, tokenizer, config);
+    }
+    ~SseRig() { server.reset(); unlink(tok_path.c_str()); }
+};
+}
+
+TEST_CASE(ServerUnitFixture, test_a_stuck_status_subscriber_does_not_block_a_broadcast_to_another) {
+    SseRig rig;
+    int stuck[2], live[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, stuck) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, live) == 0);
+    // Fill the stuck subscriber's send buffer: its peer (stuck[1]) never reads.
+    const std::string chunk(4096, 'x');
+    while (send(stuck[0], chunk.data(), chunk.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, stuck[0]);   // first in the list
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, live[0]);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread broadcaster([&] { HttpServerTestAccess::broadcast_token(*rig.server, "hello"); });
+    pollfd pfd{live[1], POLLIN, 0};
+    const int ready = poll(&pfd, 1, 400);
+    const auto reached = std::chrono::steady_clock::now() - t0;
+    broadcaster.join();
+    const auto returned = std::chrono::steady_clock::now() - t0;
+    TEST_ASSERT(ready == 1);                                                   // the live subscriber got it within 400 ms
+    TEST_ASSERT(reached < std::chrono::milliseconds(400));
+    TEST_ASSERT(returned < std::chrono::milliseconds(400));                    // and the caller was not stalled
+    TEST_ASSERT(HttpServerTestAccess::sse_subscribers(*rig.server) == 1);      // the stuck one was dropped
+    close(stuck[1]);
+    close(live[1]);
 }
