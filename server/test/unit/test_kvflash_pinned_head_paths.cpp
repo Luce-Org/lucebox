@@ -24,6 +24,7 @@
 #include "../../src/common/kvflash_slot_bundle.h"
 #include "../../src/common/kvflash_session_store.h"
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <vector>
@@ -437,12 +438,51 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_session_restored_at_startup_has_its_h
 
 TEST_CASE(KvflashPinnedHeadPathsFixture, the_binding_a_restored_session_parks_with_is_the_one_it_restored_with) {
     const Parked p = parked_with_head();
-    World w;
-    REQUIRE(startup(w, p, p.slot, p.hash, kK, p.hist) == 1);
-    // the engine's park writes st.preamble from the binder only when k > 0; a second park must see the same head
-    const KvFlashHeadBinding hb = w.binder.binding(p.slot);
-    CHECK(hb.k == kK);
-    CHECK(kvflash_hex16(hb.hash) == kvflash_hex16(p.hash));
+    for (bool rebind : {true, false}) {
+        World w;
+        if (rebind) {
+            REQUIRE(startup(w, p, p.slot, p.hash, kK, p.hist) == 1);
+        } else {
+            REQUIRE(w.kv->adopt_parked(p.slot, 0x99, 1200, p.blob.data(), p.blob.size()) == PagedKvStatus::Ok);
+            w.binder = KvFlashHeadBinder(kN);                    // init_heads_ without kvflash_rebind_restored
+            REQUIRE(restored_unbound(w, p.slot, kK));
+        }
+        SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+        auto prompt = p.hist;
+        prompt.push_back(42);                                   // resume the restored history, then park again
+        w.kv->set_next_total_tokens((int64_t)prompt.size() + 60);
+        w.kv->set_next_resume(p.slot, (uint32_t)p.hist.size());
+        REQUIRE(mgr.admit_at(p.slot, 2, prompt, SamplerCfg{}, (int)p.hist.size()).status == SeqEngine::AdmitResult::Status::admitted);
+        REQUIRE(prefill(w, mgr, p.slot, 1));
+        mgr.commit_prefill(p.slot);
+        std::vector<int32_t> hist;
+        REQUIRE(mgr.park(p.slot, hist));
+
+        KvFlashParkStats st;
+        st.tokens = hist.size();
+        // Mirror server/src/qwen35/concurrency/qwen35_seq_engine.cpp:1496 (inline park-time binding).
+        if (const KvFlashHeadBinding hb = w.binder.binding(p.slot); hb.k > 0) { st.preamble = kvflash_hex16(hb.hash); st.preamble_chunks = hb.k; }
+        const std::string root = (std::filesystem::temp_directory_path() / "kvflash_pinned_head_repark").string();
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root + "/sessions");
+        KvFlashSessionBook book;
+        book.init(kN);
+        book.enable_store(KvFlashSessionStore(root), 0x99);
+        book.begin_session(p.slot, "claude", "S", 1000);
+        REQUIRE(book.publish_park(p.slot, st, 1001));
+        std::vector<uint8_t> meta;
+        REQUIRE(kvflash_bundle_read(book.store().dir(book[p.slot].key) + "/meta.json", meta, kKvFlashMetaMax));
+        KvFlashSessionEntry persisted;
+        REQUIRE(kvflash_meta_unpack(std::string_view((const char *)meta.data(), meta.size()), persisted));
+        if (rebind) {
+            CHECK(persisted.preamble_chunks == kK);
+            CHECK(persisted.preamble == kvflash_hex16(p.hash));
+        } else {
+            CHECK(persisted.preamble_chunks == 0);
+            CHECK(persisted.preamble.empty());
+        }
+        std::filesystem::remove_all(root);
+    }
 }
 
 TEST_CASE(KvflashPinnedHeadPathsFixture, a_session_restored_into_the_other_slot_index_rebinds_too) {
