@@ -37,10 +37,18 @@
 #include <vector>
 
 #include <cerrno>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <climits>
+#include <direct.h>
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#else
 #include <fcntl.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace luce::common {
 
@@ -419,6 +427,33 @@ inline bool kvflash_bundle_assemble(const KvFlashSlotHead & h, size_t chunk_byte
 
 // ---- files ------------------------------------------------------------------------------------
 
+// The POSIX file calls of the store, and their MSVC CRT equivalents (the style of disk_store.cpp).
+#if defined(_WIN32)
+inline long kvflash_pid() { return (long)_getpid(); }
+inline bool kvflash_fsync(FILE * f) { return _commit(_fileno(f)) == 0; }
+inline bool kvflash_fseek(FILE * f, uint64_t off) { return _fseeki64(f, (__int64)off, SEEK_SET) == 0; }
+inline bool kvflash_ftruncate(FILE * f, uint64_t bytes) { return _chsize_s(_fileno(f), (__int64)bytes) == 0; }
+inline bool kvflash_mkdir(const std::string & dir) { return _mkdir(dir.c_str()) == 0; }
+// rename() does not replace an existing file there; std::filesystem::rename does (MoveFileEx).
+inline bool kvflash_rename(const std::string & from, const std::string & to) { std::error_code ec; std::filesystem::rename(from, to, ec); return !ec; }
+inline int kvflash_open_ro(const std::string & path) { return _open(path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT); }
+// No pread: a seek and a read on the caller's own descriptor (every reader here opens its own).
+inline bool kvflash_pread(int fd, uint8_t * dst, size_t n, uint64_t off) {
+    return n <= (size_t)INT_MAX && _lseeki64(fd, (__int64)off, SEEK_SET) == (__int64)off && _read(fd, dst, (unsigned)n) == (int)n;
+}
+inline void kvflash_close(int fd) { _close(fd); }
+#else
+inline long kvflash_pid() { return (long)::getpid(); }
+inline bool kvflash_fsync(FILE * f) { return ::fsync(fileno(f)) == 0; }
+inline bool kvflash_fseek(FILE * f, uint64_t off) { return ::fseeko(f, (off_t)off, SEEK_SET) == 0; }
+inline bool kvflash_ftruncate(FILE * f, uint64_t bytes) { return ::ftruncate(fileno(f), (off_t)bytes) == 0; }
+inline bool kvflash_mkdir(const std::string & dir) { return ::mkdir(dir.c_str(), 0755) == 0; }
+inline bool kvflash_rename(const std::string & from, const std::string & to) { return std::rename(from.c_str(), to.c_str()) == 0; }
+inline int kvflash_open_ro(const std::string & path) { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+inline bool kvflash_pread(int fd, uint8_t * dst, size_t n, uint64_t off) { return ::pread(fd, dst, n, (off_t)off) == (ssize_t)n; }
+inline void kvflash_close(int fd) { ::close(fd); }
+#endif
+
 // Test seam: a hook that makes one I/O step fail (op "write": an atomic file replace, "fsync": a
 // directory fsync, "stat": an existence query of the session store), given the step's path. Unset in
 // production (one empty std::function test per step).
@@ -431,13 +466,13 @@ inline bool kvflash_io_fails(std::string_view op, const std::string & path) { co
 template <class More>
 inline bool kvflash_bundle_write_stream(const std::string & path, const std::vector<uint8_t> & head, More && more) {
     if (kvflash_io_fails("write", path)) return false;
-    const std::string tmp = path + ".tmp." + std::to_string((long)::getpid());
+    const std::string tmp = path + ".tmp." + std::to_string(kvflash_pid());
     FILE * f = std::fopen(tmp.c_str(), "wb");
     if (!f) return false;
     auto put = [f](const uint8_t * d, size_t n) { return std::fwrite(d, 1, n, f) == n; };
-    const bool ok = put(head.data(), head.size()) && more(put) && std::fflush(f) == 0 && ::fsync(fileno(f)) == 0;
+    const bool ok = put(head.data(), head.size()) && more(put) && std::fflush(f) == 0 && kvflash_fsync(f);
     const bool closed = std::fclose(f) == 0;
-    if (!ok || !closed || std::rename(tmp.c_str(), path.c_str()) != 0) { std::remove(tmp.c_str()); return false; }
+    if (!ok || !closed || !kvflash_rename(tmp, path)) { std::remove(tmp.c_str()); return false; }
     return true;
 }
 
@@ -466,11 +501,15 @@ inline bool kvflash_bundle_read(const std::string & path, std::vector<uint8_t> &
 // directory (EINVAL) is taken as is.
 inline bool kvflash_fsync_dir(const std::string & dir) {
     if (kvflash_io_fails("fsync", dir)) return false;
+#if defined(_WIN32)
+    return true;   // a directory cannot be fsynced there: the rename is as durable as NTFS makes it (disk_store.cpp)
+#else
     const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return false;
     const bool ok = ::fsync(fd) == 0 || errno == EINVAL;
     ::close(fd);
     return ok;
+#endif
 }
 
 // ---- a park on disk: commit, load, cleanup -----------------------------------------------------
@@ -499,7 +538,7 @@ struct KvFlashBundleCommit {
 // kvflash_bundle_clean removes what the surviving head does not name.
 inline bool kvflash_bundle_commit(const KvFlashBundleCommit & c, int crash_after_step = 0) {
     for (const auto & r : c.records) if (r.second.size() + kKvFlashRecordTag != c.record_bytes) return false;
-    if (c.new_dir && ::mkdir(c.dir.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    if (c.new_dir && !kvflash_mkdir(c.dir) && errno != EEXIST) return false;
     const std::string log = c.dir + "/" + kvflash_bundle_log_name(c.log_gen);
     FILE * f = std::fopen(log.c_str(), c.new_log ? "wb" : "r+b");
     if (!f) return false;
@@ -513,18 +552,18 @@ inline bool kvflash_bundle_commit(const KvFlashBundleCommit & c, int crash_after
             std::vector<uint8_t> buf(c.record_bytes);
             ok = src != nullptr;
             for (size_t i = 0; ok && i < c.copies.size(); ++i)
-                ok = ::fseeko(src, (off_t)c.copies[i], SEEK_SET) == 0 && std::fread(buf.data(), 1, buf.size(), src) == buf.size() && put(buf.data(), buf.size());
+                ok = kvflash_fseek(src, c.copies[i]) && std::fread(buf.data(), 1, buf.size(), src) == buf.size() && put(buf.data(), buf.size());
             if (src) std::fclose(src);
         }
     } else {
-        ok = ::ftruncate(fileno(f), (off_t)c.log_bytes) == 0 && ::fseeko(f, (off_t)c.log_bytes, SEEK_SET) == 0;
+        ok = kvflash_ftruncate(f, c.log_bytes) && kvflash_fseek(f, c.log_bytes);
     }
     for (size_t i = 0; ok && i < c.records.size(); ++i) {
         const auto & [chunk, payload] = c.records[i];
         const auto tag = kvflash_record_tag(chunk, c.gen, payload.data(), payload.size());
         ok = put(tag.data(), tag.size()) && put(payload.data(), payload.size());
     }
-    ok = ok && std::fflush(f) == 0 && ::fsync(fileno(f)) == 0;
+    ok = ok && std::fflush(f) == 0 && kvflash_fsync(f);
     if (std::fclose(f) != 0 || !ok) return false;
     if (crash_after_step == 1) return false;
     for (const auto & [name, bytes] : c.files) if (!kvflash_bundle_write(c.dir + "/" + name, bytes)) return false;
@@ -596,10 +635,10 @@ inline bool kvflash_bundle_load(const std::string & dir, uint64_t identity, size
         return false;
     }
     const std::string log = kvflash_bundle_log_name(l.head.log_gen);
-    const int fd = ::open((dir + "/" + log).c_str(), O_RDONLY | O_CLOEXEC);
+    const int fd = kvflash_open_ro(dir + "/" + log);
     if (fd < 0) { why = "no " + log; return false; }
-    const bool ok = kvflash_bundle_assemble(l.head, chunk_bytes, [fd](uint64_t off, uint8_t * dst, size_t n) { return ::pread(fd, dst, n, (off_t)off) == (ssize_t)n; }, l.pager, why);
-    ::close(fd);
+    const bool ok = kvflash_bundle_assemble(l.head, chunk_bytes, [fd](uint64_t off, uint8_t * dst, size_t n) { return kvflash_pread(fd, dst, n, off); }, l.pager, why);
+    kvflash_close(fd);
     if (!ok) { why = log + ": " + why; return false; }
     auto slab = [&](const char * kind, uint32_t id, std::vector<std::vector<uint8_t>> & ssm, std::vector<std::vector<uint8_t>> & conv) {
         if (id == 0) return true;
@@ -650,11 +689,11 @@ inline bool kvflash_slab_file_valid(const std::string & path, size_t max_bytes) 
 // memory: the log is streamed one record at a time, each slab is walked, no pager blob is built.
 inline bool kvflash_bundle_validate(const std::string & dir, const KvFlashSlotHead & h, size_t chunk_bytes, size_t slab_max, std::string & why) {
     const std::string log = kvflash_bundle_log_name(h.log_gen);
-    const int fd = ::open((dir + "/" + log).c_str(), O_RDONLY | O_CLOEXEC);
+    const int fd = kvflash_open_ro(dir + "/" + log);
     if (fd < 0) { why = "no " + log; return false; }
-    const bool ok = kvflash_bundle_walk(h, chunk_bytes, [fd](uint64_t off, uint8_t * dst, size_t n) { return ::pread(fd, dst, n, (off_t)off) == (ssize_t)n; },
+    const bool ok = kvflash_bundle_walk(h, chunk_bytes, [fd](uint64_t off, uint8_t * dst, size_t n) { return kvflash_pread(fd, dst, n, off); },
                                         [](size_t, const uint8_t *) {}, why);
-    ::close(fd);
+    kvflash_close(fd);
     if (!ok) { why = log + ": " + why; return false; }
     for (uint32_t id : kvflash_head_gens(h))
         if (id && !kvflash_slab_file_valid(dir + "/" + kvflash_bundle_slab_name(id), slab_max)) { why = "slab " + kvflash_bundle_slab_name(id) + ": missing, over " + std::to_string(slab_max) + " bytes or a bad format"; return false; }
