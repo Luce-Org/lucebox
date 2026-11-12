@@ -236,6 +236,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit_in_(
 
     r.status = AdmitStatus::admitted;
     r.slot = slot;
+    r.resumed_tokens = resume_pos;   // the prompt before it is the slot's already: a parked resume, an attached head
     return r;
 }
 

@@ -381,3 +381,21 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_second_session_with_the_same_system_a
     CHECK(third.prefill_from == 0);
     CHECK(w.heads.size() == 2);
 }
+
+// The report's cached tokens come from AdmitResult::resumed_tokens (scheduler: admit_cached_tokens): an admit that starts
+// the prompt at an attached head of L tokens says so, as a parked resume does; a cold admit says 0.
+TEST_CASE(KvflashPinnedHeadPathsFixture, an_admit_on_an_attached_head_reports_the_heads_tokens_as_resumed) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const Captured a = capture_on_miss(w, mgr, 1, 3000);
+    const int b_slot = 1 - a.slot;
+    REQUIRE(kvflash_head_attach(*w.kv, w.binder, b_slot, 0x77, w.heads.at(a.hash)));
+    const auto p = prompt_of(2600, 1);
+    w.kv->set_next_total_tokens((int64_t)p.size() + 60);
+    w.kv->set_next_resume(b_slot, kK * kChunk);
+    const auto r = mgr.admit_at(b_slot, 2, p, SamplerCfg{}, kK * kChunk);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    CHECK(r.resumed_tokens == kK * kChunk);
+    mgr.retire(a.slot);
+    CHECK(admit_cold(w, mgr, 3, prompt_of(1500, 2), a.slot).resumed_tokens == 0);
+}

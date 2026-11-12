@@ -783,7 +783,6 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                              result.slot, L, history, (int)prompt.size() - L, rr.ckpt, rr.trunk, extra_[(size_t)result.slot].pos);
                 begin_resume_(result.slot);
                 plan_slot_turn_(result.slot, prompt, L);
-                result.resumed_tokens = L;
                 return result;
             }
             evict_session_(pick.slot, result.error.c_str());   // the pool refused (host budget): cold below
