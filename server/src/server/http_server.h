@@ -662,6 +662,14 @@ struct ParsedRequest {
     int                       client_prompt_tokens = -1;
 };
 
+// `ignore_eos: true` in the request body (an extension vLLM and llama.cpp also take): an end
+// token does not stop the generation, which runs to the output cap.
+inline bool request_ignores_eos(const ParsedRequest & req) {
+    if (!req.raw_body.is_object()) return false;
+    const auto it = req.raw_body.find("ignore_eos");
+    return it != req.raw_body.end() && it->is_boolean() && it->get<bool>();
+}
+
 inline int usage_prompt_tokens(const ParsedRequest & req) {
     return req.client_prompt_tokens >= 0 ? req.client_prompt_tokens
                                          : (int) req.prompt_tokens.size();

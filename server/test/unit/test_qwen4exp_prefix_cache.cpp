@@ -45,23 +45,25 @@ static void rollback_reset() {
     Qwen4ExpCache c;
     c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
     auto tensor = [&]() { return ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16); };
-    c.ssm_state = {tensor()}; c.conv_state = {tensor()}; c.ple_conv_state = {tensor()};
-    c.spec_ssm_rows.resize(1); c.spec_conv_rows.resize(1);
-    c.spec_ssm_rows[0][0] = tensor(); c.spec_conv_rows[0][0] = tensor();
+    // No recurrent layer: its rollback is a device replay (ggml_backend_cuda_gdn_chain_commit, GPU smoke); the
+    // conv and PLE histories are the queued copies this checks.
+    c.conv_state = {tensor()}; c.ple_conv_state = {tensor()};
+    c.spec_conv_rows.resize(1);
+    c.spec_conv_rows[0][0] = tensor();
     c.spec_ple = c.spec_ple_rows[0] = tensor();
     c.buf = ggml_backend_alloc_ctx_tensors_from_buft(c.ctx, ggml_backend_cpu_buffer_type());
     CHECK(c.buf);
     ggml_backend_buffer_clear(c.buf, 0x3f);
     c.spec_pos = 0; c.spec_tokens = 2;
     CHECK(qwen4exp_verify_rollback(&delayed, Qwen4ExpWeights{}, c, 0, 1));
-    CHECK(pending.size() == 3); // the final rejected step is still in flight
+    CHECK(pending.size() == 2); // the final rejected step is still in flight
     reset_qwen4exp_state(&delayed, c);
     ggml_backend_synchronize(&delayed); // any late rollback must not undo reset
-    for (auto * t : {c.ssm_state[0], c.conv_state[0], c.ple_conv_state[0]}) {
+    for (auto * t : {c.conv_state[0], c.ple_conv_state[0]}) {
         CHECK(bytes(t) == std::vector<char>(ggml_nbytes(t), 0));
     }
     free_qwen4exp_cache(c);
-    std::puts("PASS pending MTP rollback completes before recurrent/conv/PLE reset");
+    std::puts("PASS pending MTP rollback completes before conv/PLE reset");
 }
 
 // Test-only readbacks: production checkpoints remain on the device. Report
@@ -126,7 +128,7 @@ struct Qwen4ExpPrefixTest {
     static void unhook(Qwen4ExpBackend & b) { b.decode_check_ = {}; }
     // Split mode: the hot experts and their lookup tables are resident on the target.
     static bool hot_experts_resident(const Qwen4ExpBackend & b) {
-        return b.weights_.hot && !b.weights_.hot_lut.empty();
+        return b.weights_.hot != nullptr;
     }
     static size_t limit(Qwen4ExpBackend & b, size_t bytes) {
         return std::exchange(b.snapshot_budget_, bytes);
@@ -189,6 +191,34 @@ struct Qwen4ExpPrefixTest {
         std::puts("PASS pressure replaces only a strict ancestor; keeps both when they fit");
     }
 
+    // State-only backups count their point state against the allowance; dropping a deferred snapshot's rows copies
+    // it out of the live cache first.
+    static void state_budget() {
+        Qwen4ExpBackend b({});
+        b.backend_ = b.snap_backend_ = ggml_backend_cpu_init();
+        CHECK(b.backend_);
+        auto & c = b.cache_;
+        c.ctx = ggml_init({8 * ggml_tensor_overhead(), nullptr, true});
+        c.max_ctx = 8; c.cur_pos = 4;
+        c.attn_k = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, 8, 2)};
+        c.ssm_state = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2)};
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, b.backend_);
+        CHECK(c.buf);
+        b.tokens_ = {1, 2, 3, 4}; b.logits_ = {1}; b.weights_.n_vocab = 1;
+        const size_t state = b.snapshot_state_bytes_estimate(4);
+        CHECK(state > 0 && state < b.snapshot_bytes_estimate(4) && !b.snapshot_drop_kv(0));
+        CHECK(b.snapshot_save(0));
+        c.cur_pos = 6; b.tokens_ = {1, 2, 3, 4, 5, 6};
+        CHECK(b.snapshot_save_deferred(1));
+        CHECK(b.snapshot_drop_kv(0) && b.snapshot_state_only(0) && !b.snapshot_drop_kv(0));
+        CHECK(b.snapshot_cur_pos(0) == 4 && b.snapshots_[0].tokens.size() == 4 && !b.snapshot_state_only(1));
+        // The backup, the deferred snapshot and one more fit where three whole ones would not.
+        b.snapshot_budget_ = state + 2 * b.snapshot_bytes_estimate(6);
+        CHECK(b.snapshot_save(2));
+        b.snapshot_free(2);
+        CHECK(b.snapshot_drop_kv(1) && b.live_slot_ < 0 && b.snapshot_state_only(1) && b.snapshot_cur_pos(1) == 6);
+        std::puts("PASS state-only backups: the allowance counts their state; a deferred snapshot is copied out first");
+    }
 };
 } // namespace luce::common
 
@@ -265,6 +295,147 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
                 store == backend ? "device" : "system");
 }
 
+// A state-only backup restores, with the rows of a deeper snapshot of its prompt, the very bytes its whole snapshot
+// restored; a donor that cannot supply the rows is refused before the cache changes.
+static void state_backup(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
+    // `mtp`: the first concurrency slot's layout; without it, the other slots'. The draft layer's tensors come last,
+    // so both layouts get the same trunk bytes from the same seed.
+    auto make = [&](Qwen4ExpCache & c, bool mtp) {
+        c.max_ctx = 63;
+        c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
+        auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, 64, 2); };
+        c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+        for (int i = 0; i < 2; ++i) {
+            c.indexer_raw.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx));
+            c.indexer_k.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx / 4 + 1));
+            c.ssm_state.push_back(ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2));
+            c.conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16));
+            c.ple_conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 9, 16));
+        }
+        if (mtp) {
+            c.mtp_k = kv(); c.mtp_v = kv();
+            c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16);
+        }
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
+        CHECK(c.buf);
+    };
+    // Distinct bytes in every row and head, so a strip taken from the wrong place shows.
+    auto pattern = [](ggml_tensor * t, int seed) {
+        std::vector<uint8_t> b(ggml_nbytes(t));
+        for (size_t i = 0; i < b.size(); ++i) b[i] = (uint8_t) (seed + 13 * i + (i >> 8));
+        ggml_backend_tensor_set(t, b.data(), 0, b.size());
+    };
+    auto fill = [&](Qwen4ExpCache & c) {
+        int seed = 1;
+        for (auto * t = ggml_get_first_tensor(c.ctx); t; t = ggml_get_next_tensor(c.ctx, t)) pattern(t, seed += 37);
+    };
+    // The conversation moves on: new point state; the rows below the old position stay as they were.
+    auto advance = [&](Qwen4ExpCache & c, int seed) {
+        for (const auto * group : {&c.ssm_state, &c.conv_state, &c.ple_conv_state}) {
+            for (auto * t : *group) pattern(t, seed += 37);
+        }
+        if (c.mtp_prev_hidden) pattern(c.mtp_prev_hidden, seed + 37);
+    };
+    auto at = [](Qwen4ExpCache & c, int pos, int blocks, int64_t bucket, std::vector<int32_t> ple) {
+        c.cur_pos = pos; c.indexer_blocks = blocks; c.kv_bucket_base = bucket; c.ple_prev = std::move(ple);
+        c.mtp_prev_pos = c.mtp_k ? pos - 1 : -1;
+    };
+    auto prompt = [](int n, int32_t first) {
+        std::vector<int32_t> ids((size_t) n);
+        for (int i = 0; i < n; ++i) ids[(size_t) i] = first + i;
+        return ids;
+    };
+    // Every byte of the cache, then its host fields.
+    auto image = [](const Qwen4ExpCache & c) {
+        std::vector<char> all;
+        for (auto * t = ggml_get_first_tensor(c.ctx); t; t = ggml_get_next_tensor(c.ctx, t)) {
+            const auto b = bytes(t);
+            all.insert(all.end(), b.begin(), b.end());
+        }
+        const int64_t fields[] = {c.cur_pos, c.indexer_blocks, c.mtp_prev_pos, c.kv_bucket_base, c.spec_pos,
+                                  c.spec_tokens};
+        all.insert(all.end(), (const char *) fields, (const char *) (fields + 6));
+        const char * ple = (const char *) c.ple_prev.data();
+        all.insert(all.end(), ple, ple + c.ple_prev.size() * sizeof(int32_t));
+        return all;
+    };
+    auto save = [&](Qwen4ExpCache & c, Qwen4ExpSnapshot & s, std::vector<int32_t> tokens) {
+        CHECK(save_qwen4exp_snapshot(backend, store, c, s));
+        s.tokens = std::move(tokens);
+    };
+
+    Qwen4ExpCache c, plain;   // plain: a slot without the MTP draft layer
+    make(c, true); make(plain, false);
+    // At 30 tokens 7 blocks are complete and 5 pooled: pooling is lazy.
+    Qwen4ExpSnapshot backup, whole, plain_whole;
+    for (auto * cache : {&c, &plain}) { fill(*cache); at(*cache, 30, 5, 512, {11, 12}); }
+    save(c, backup, prompt(30, 1)); save(c, whole, prompt(30, 1)); save(plain, plain_whole, prompt(30, 1));
+    Qwen4ExpSnapshot deeper, plain_deeper, thin, unrelated, unpooled, shallow;
+    for (auto * cache : {&c, &plain}) { advance(*cache, 101); at(*cache, 50, 12, 1024, {21, 22}); }
+    save(c, deeper, prompt(50, 1)); save(plain, plain_deeper, prompt(50, 1)); save(c, thin, prompt(50, 1));
+    save(c, unrelated, prompt(50, 2));
+    at(c, 50, 3, 1024, {21, 22});
+    save(c, unpooled, prompt(50, 1));
+    at(c, 20, 5, 512, {11, 12});
+    save(c, shallow, prompt(20, 1));
+
+    const size_t whole_bytes = ggml_backend_buffer_get_size(backup.buf);
+    CHECK(!drop_qwen4exp_snapshot_rows(plain, backup));   // saved with the draft layer: not this layout
+    CHECK(drop_qwen4exp_snapshot_rows(c, backup) && backup.state_only && !drop_qwen4exp_snapshot_rows(c, backup));
+    CHECK(drop_qwen4exp_snapshot_rows(c, thin));
+    CHECK(backup.cur_pos == 30 && backup.indexer_blocks == 5 && backup.mtp_prev_pos == 29 &&
+          backup.kv_bucket_base == 512 && backup.tokens == prompt(30, 1));
+    size_t host = 0;
+    CHECK(ggml_backend_buffer_get_size(backup.buf) < whole_bytes);
+    CHECK(ggml_backend_buffer_get_size(backup.buf) <= qwen4exp_snapshot_bytes(store, c, 30, &host, false));
+    CHECK(host >= ggml_get_mem_size(backup.ctx) + backup.strips.capacity() * sizeof(backup.strips[0]));
+    CHECK(qwen4exp_snapshot_bytes(store, c, 30, nullptr, false) ==
+          qwen4exp_snapshot_bytes(store, c, 63, nullptr, false));   // the same at every length
+
+    // The reference: the whole snapshot restored over a dirty cache.
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, whole, c));
+    const auto expected = image(c);
+    CHECK(c.cur_pos == 30 && c.indexer_blocks == 5 && c.mtp_prev_pos == 29 && c.kv_bucket_base == 512);
+    // No donor, itself, a state-only one, a shallower one, one with fewer pooled blocks or of another prompt: refused,
+    // with the cache as it was.
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    at(c, 7, 1, 0, {});
+    const auto dirty = image(c);
+    const std::vector<const Qwen4ExpSnapshot *> refused = {nullptr, &backup, &thin, &shallow, &unpooled, &unrelated};
+    for (const Qwen4ExpSnapshot * donor : refused) {
+        CHECK(!restore_qwen4exp_snapshot(backend, backup, c, donor));
+        CHECK(image(c) == dirty);
+    }
+    CHECK(restore_qwen4exp_snapshot(backend, backup, c, &deeper) && image(c) == expected);
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, whole, c, &shallow) && image(c) == expected);   // whole: no donor
+
+    // Into a slot without the draft layer, from either donor.
+    ggml_backend_buffer_clear(plain.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, whole, plain));
+    const auto plain_expected = image(plain);
+    for (const Qwen4ExpSnapshot * donor : {&deeper, &plain_deeper}) {
+        ggml_backend_buffer_clear(plain.buf, 0xa5);
+        CHECK(restore_qwen4exp_snapshot(backend, backup, plain, donor) && image(plain) == plain_expected);
+    }
+    // A donor without the draft layer: the trunk, and no draft state, as from a whole snapshot without it.
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, plain_whole, c) && c.mtp_prev_pos == -1);
+    const auto undrafted = image(c);
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, backup, c, &plain_deeper) && image(c) == undrafted);
+
+    for (auto * s : {&backup, &whole, &plain_whole, &deeper, &plain_deeper, &thin, &unrelated, &unpooled, &shallow}) {
+        free_qwen4exp_snapshot(*s);
+    }
+    free_qwen4exp_cache(c);
+    free_qwen4exp_cache(plain);
+    std::printf("PASS state-only backup restores with a deeper snapshot's rows byte for byte, refuses donors that "
+                "cannot supply them (%s memory)\n", store == backend ? "device" : "system");
+}
+
 static void memory(ggml_backend_t backend) {
     // Declare production geometry without allocating its multi-GB payload.
     Qwen4ExpCache c;
@@ -287,7 +458,10 @@ static void memory(ggml_backend_t backend) {
     c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 10240);
     CHECK(qwen4exp_snapshot_bytes(backend, c, 65536) == 2366224384ULL);
     CHECK(qwen4exp_snapshot_bytes(backend, c, 131072) == 4614371328ULL);
-    std::puts("PASS device bytes (MTP): 64Ki=2366224384 128Ki=4614371328");
+    // A state-only backup: the recurrent, conv and PLE state and the MTP carry row, at any length.
+    CHECK(qwen4exp_snapshot_bytes(backend, c, 65536, nullptr, false) == 118079488ULL);
+    CHECK(qwen4exp_snapshot_bytes(backend, c, 131072, nullptr, false) == 118079488ULL);
+    std::puts("PASS device bytes (MTP): 64Ki=2366224384 128Ki=4614371328 state-only=118079488");
     free_qwen4exp_cache(c);
 }
 
@@ -428,6 +602,22 @@ static void model(const char * path, int width, int chunk, int ctx, int expert_g
     r.snap_slot = 0; r.snap_pos = 2051;
     cold = b.generate(r, {}); // replenish the ancestor for the remaining lifecycle
     CHECK(cold.ok() && b.snapshot_cur_pos(0) == 2051);
+    // A state-only backup of the ancestor restores with the rows of the deeper snapshot, as the whole one did;
+    // without them it recomputes.
+    r.snap_slot = 1; r.snap_pos = 2200;
+    CHECK(b.restore_and_generate(0, r, {}).ok() && b.snapshot_cur_pos(1) == 2200);
+    CHECK(b.snapshot_drop_kv(0) && b.snapshot_state_only(0) && b.snapshot_cur_pos(0) == 2051);
+    auto backup = r;
+    backup.snap_slot = -1; backup.restore_kv_slot = 1;
+    warm = b.restore_and_generate(0, backup, {});
+    CHECK(warm.ok() && warm.tokens == cold.tokens && warm.restored_prefix_tokens == 2051);
+    backup.restore_kv_slot = -1;
+    warm = b.restore_and_generate(0, backup, {});
+    CHECK(warm.ok() && warm.tokens == cold.tokens && warm.restored_prefix_tokens == 0);
+    b.snapshot_free(1);
+    r.snap_slot = 0; r.snap_pos = 2051;
+    cold = b.generate(r, {});
+    CHECK(cold.ok() && b.snapshot_cur_pos(0) == 2051 && !b.snapshot_state_only(0));
     // A changed suffix uses the shallower checkpoint; changing the prefix or
     // shortening it must recompute, never truncate the recurrent state.
     r.prompt[2201] = 42;
@@ -577,11 +767,16 @@ static void model(const char * path, int width, int chunk, int ctx, int expert_g
 int main(int argc, char ** argv) {
     rollback_reset();
     Qwen4ExpPrefixTest::budget();
+    Qwen4ExpPrefixTest::state_budget();
     auto backend = argc > 1 ? ggml_backend_cuda_init(0) : ggml_backend_cpu_init();
     CHECK(backend);
     copies(backend, backend);
+    state_backup(backend, backend);
     const ggml_backend_t store = create_snapshot_backend(backend);
-    if (store != backend) copies(backend, store);
+    if (store != backend) {
+        copies(backend, store);
+        state_backup(backend, store);
+    }
     free_snapshot_backend(store, backend);
     memory(backend);
     kvflash(backend);

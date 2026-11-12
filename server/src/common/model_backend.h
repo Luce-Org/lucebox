@@ -377,6 +377,20 @@ struct ModelBackend {
         return 0;
     }
 
+    // State-only snapshots. A snapshot of a prompt that a deeper resident
+    // snapshot extends repeats that one's attention rows; snapshot_drop_kv()
+    // frees them and keeps what the position alone determines (recurrent
+    // state, decode seed). Restoring it takes the rows from the deeper
+    // snapshot named by GenerateRequest::restore_kv_slot. The estimate is the
+    // system-memory bytes one holds; 0 when the backend takes none, and then
+    // snapshot_drop_kv() always fails and leaves the snapshot as it was.
+    virtual size_t snapshot_state_bytes_estimate(int tokens) const {
+        (void)tokens;
+        return 0;
+    }
+    virtual bool snapshot_drop_kv(int slot) { (void)slot; return false; }
+    virtual bool snapshot_state_only(int slot) const { (void)slot; return false; }
+
     // Snapshot bytes the backend admits when it enforces its own allowance
     // (SIZE_MAX: no allowance). The prefix cache's automatic resident limit
     // stays within it, so the cache evicts before the backend refuses a capture.

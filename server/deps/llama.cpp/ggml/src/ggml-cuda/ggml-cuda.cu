@@ -130,6 +130,7 @@ static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
 static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+static thread_local int ggml_cuda_mmvq_invariant_max_ncols_value = 0;
 
 static thread_local ggml_cuda_qwen4exp_profile qwen4exp_profile = GGML_CUDA_QWEN4EXP_OFF;
 
@@ -197,8 +198,25 @@ extern "C" void ggml_backend_cuda_mul_mat_whole_row_lanes(ggml_tensor * mul_mat)
     ggml_set_op_params_i32(mul_mat, 1, GGML_CUDA_WHOLE_ROW_LANES);
 }
 
+extern "C" void ggml_backend_cuda_mul_mat_id_grouped(ggml_tensor * mul_mat_id) {
+    GGML_ASSERT(mul_mat_id != nullptr && mul_mat_id->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(mul_mat_id, 1, GGML_CUDA_MMID_GROUPED);
+}
+
 bool ggml_cuda_mmvq_batch_invariant() {
     return ggml_cuda_mmvq_batch_invariant_enabled;
+}
+
+extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
+    GGML_ASSERT(max_ncols == 0 || (max_ncols >= MMVQ_MAX_BATCH_SIZE && max_ncols <= MMVQ_INVARIANT_MAX_BATCH_SIZE));
+    const int previous = ggml_cuda_mmvq_invariant_max_ncols_value;
+    ggml_cuda_mmvq_invariant_max_ncols_value = max_ncols;
+    return previous;
+}
+
+int ggml_cuda_mmvq_invariant_max_ncols() {
+    return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
+                                                        : MMVQ_MAX_BATCH_SIZE;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3164,7 +3182,7 @@ static int ggml_cuda_mmvq_max_ncols() {
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
     if (ggml_cuda_mmvq_batch_invariant_enabled) {
-        return MMVQ_MAX_BATCH_SIZE;
+        return ggml_cuda_mmvq_invariant_max_ncols();
     }
     return ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override : configured;
@@ -3238,8 +3256,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, dst->ne[2], dst->ne[1]*dst->ne[2])) {
+    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_for(tensor, cc)) {
         return false;
     }
     if (cc <= GGML_CUDA_CC_PASCAL) {
@@ -3335,8 +3352,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 #endif
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
+    if (ids && (ggml_cuda_mmvq_mmid_grouped_for(up, cc) || ggml_cuda_mmvq_mmid_grouped_for(gate, cc))) {
         return false;
     }
 
@@ -5038,7 +5054,7 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 // then copies the usual way.
 // A contiguous same-size copy between two CUDA backends on different devices,
 // each tensor in a CUDA buffer on its backend's device: the copies below
-// qualify only then, as ggml_backend_cuda_cpy_tensor_async's peer path does.
+// qualify only then.
 static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                           const ggml_tensor * src, const ggml_tensor * dst) {
 #ifdef GGML_CUDA_NO_PEER_COPY
@@ -5186,8 +5202,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                     ggml_cuda_flush_peer_copy_batch("peer-pair-change");
                 }
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                if (ggml_cuda_peer_copy_kernel_enabled() &&
-                    ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+                // The kernel copies exactly what cudaMemcpyPeerAsync below would, ggml_nbytes(dst) bytes from
+                // src->data, so a strided copy joins the batch too (a verify's top-k ids, a view of the router's
+                // sorted rows). A hop whose copies all join leaves as the producer graph's tail instead of a copy
+                // kernel, a runtime blit and a second copy kernel, each followed by a launch gap.
+                if (ggml_cuda_peer_copy_kernel_enabled()) {
                     if (batch.n_descs == ggml_cuda_copy_batch_max) {
                         ggml_cuda_backend_entry(cuda_ctx_src);
                         ggml_cuda_set_device(cuda_ctx_src->device);

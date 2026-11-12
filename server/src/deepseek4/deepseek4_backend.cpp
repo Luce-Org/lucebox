@@ -1485,7 +1485,8 @@ void DeepSeek4Backend::release_paged_decode_graphs() {
     ds4_trim_device_pools(backend_, moe_hybrid_.get());
 }
 
-bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from) {
+bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from,
+                                            const DeepSeek4Snapshot * rows_from) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
         ? dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get()) : nullptr;
@@ -1500,7 +1501,7 @@ bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item, const DeepSeek
     item.staging->prefill_mode = PrefillAttentionMode::Sparse;
     item.done = item.restored = 0;
     if (from) {
-        if (!deepseek4_snapshot_restore(*from, *item.staging)) {
+        if (!deepseek4_snapshot_restore(*from, *item.staging, rows_from)) {
             item.error = "prefix checkpoint could not be restored";
             return false;
         }
@@ -2024,8 +2025,9 @@ bool DeepSeek4Backend::validate_model_features() const {
         return false;
     }
     // Paged V4.1 serving is qualified with the default expert-owner kernels
-    // only: with these switches it has faulted the GPU (see DS41.md, known
-    // limits), so refuse them until that is understood.
+    // only: these switches were on when paged serving faulted the GPU in
+    // September (the fault the record explains is in DS41.md, Reliability),
+    // so they stay refused.
     if (cfg_.paged_attention) {
         for (const char * name : DEEPSEEK41_PAGED_UNQUALIFIED_ENV) {
             if (env_flag_enabled(name)) {
@@ -4627,18 +4629,42 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
              (!snapshot_saved && i < spec_snap_to && i + n_tok > spec_snap_from));
         return n_tok >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && i + n_tok < n_total && !at_snap && !capture;
     };
+    // The bands of a pass that a pass sized to the device left for the next.
+    std::vector<int> pass_rest;
     for (int i = 0; i < n_total;) {
         if (io.is_cancelled()) return pos;
 
         if (layer_major_prompt) {
             std::vector<int> bands;
+            bands.swap(pass_rest);
+            const bool rest = !bands.empty();
             int span = 0;
-            while (i + span < n_total) {
+            for (int n : bands) span += n;
+            while (!rest && i + span < n_total) {
                 const int n = plan_chunk(i + span, pos + span, snapshot_saved);
                 if (!plain_chunk(i + span, n, snapshot_saved)) break;
                 if (!bands.empty() && span + n > DS4_LAYER_MAJOR_PROMPT_SPAN) break;
                 bands.push_back(n);
                 span += n;
+            }
+            // Two bands or more run layer-major, as does one with the replay
+            // tail or one split off a pass that ran layer-major.
+            const bool layer_major = bands.size() >= 2 || (!bands.empty() && (replay || rest));
+            // A pass whose residual does not fit on the device runs with it on
+            // the host and without the pipeline, much slower, and later passes
+            // find less free memory than the first. Run the leading bands that
+            // fit, and the rest as the next pass: a split never changes which
+            // bands run layer-major, or how. Cluster ranks plan their passes
+            // alike, so they keep whole passes.
+            const bool cluster_ranks = cache_.cluster_rt && cache_.cluster_rt->size() > 1;
+            if (layer_major && bands.size() > 2 && !cluster_ranks) {
+                const int tail_if_last = replay && i + span == replay_from &&
+                    n_total - replay_from >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ? n_total - replay_from : 0;
+                const int run = deepseek4_layer_major_pass_bands(
+                    bands, tail_if_last, deepseek4_layer_major_device_rows(cfg_.device.gpu, w_));
+                pass_rest.assign(bands.begin() + run, bands.end());
+                bands.resize((size_t) run);
+                for (int n : pass_rest) span -= n;
             }
             // The replay rows ride along as the pass's last band for layers
             // [0, cut]; the chunk below then runs only the layers past it.
@@ -4651,7 +4677,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
             if (tail_merged) bands.back() += tail_rows;
             else if (with_tail) bands.push_back(tail_rows);
-            if (bands.size() >= 2 || (replay && !bands.empty())) {
+            if (layer_major) {
                 const int pass_rows = span + tail_rows;
                 std::vector<float> embed((size_t) w_.n_embd * (size_t) pass_rows);
                 if (!w_.embedder.embed(tokens.data() + i, pass_rows, embed.data())) return -1;
@@ -5246,7 +5272,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         (kv_offset == 0 || prefill_retry_slot_ >= 0)) {
         release_prefill_arenas();
         cache_.pipeline_off = true;
-        const bool restored = kv_offset == 0 || snapshot_restore(prefill_retry_slot_);
+        const bool restored = kv_offset == 0 ||
+            snapshot_restore(prefill_retry_slot_, prefill_retry_rows_slot_);
         std::fprintf(stderr, "[deepseek4] prefill failed; retrying once from pos %d with the pipeline off%s\n",
                      kv_offset, restored ? "" : " (snapshot restore failed)");
         if (restored) committed = run_prefill();
@@ -5572,7 +5599,31 @@ size_t DeepSeek4Backend::staged_checkpoint_bytes(int tokens) const {
     return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, nullptr);
 }
 
+size_t DeepSeek4Backend::staged_checkpoint_state_bytes() const {
+    if (!cfg_.paged_attention || !cache_.ctx || !snap_backend_) return 0;
+    return ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, 0, nullptr);
+}
+
 size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
+    return snapshot_bytes(tokens, /*rows=*/true);
+}
+
+size_t DeepSeek4Backend::snapshot_state_bytes_estimate(int tokens) const {
+    // Cluster workers hold their own share of a snapshot; the head keeps
+    // those whole.
+    return cluster_ ? 0 : snapshot_bytes(tokens, /*rows=*/false);
+}
+
+bool DeepSeek4Backend::snapshot_drop_kv(int slot) {
+    if (cluster_ || cfg_.paged_attention || !snapshot_used(slot)) return false;
+    return deepseek4_snapshot_drop_rows(snapshots_[slot]);
+}
+
+bool DeepSeek4Backend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < PREFIX_SLOTS && snapshots_[slot].state_only;
+}
+
+size_t DeepSeek4Backend::snapshot_bytes(int tokens, bool rows) const {
     // Paged serving keeps no single-sequence snapshots.
     if (cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) {
         return 0;
@@ -5590,7 +5641,9 @@ size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
     aux.n_logits = n_logits;
     aux.spec_feat = n_features ? &kDeclared : nullptr;
     aux.n_spec_feat = n_features;
-    const size_t bytes = ds4_declared_snapshot_bytes(cache_, w_, snap_backend_, tokens, &aux);
+    // Without its rows a snapshot is the layout of an empty prompt.
+    const size_t bytes = ds4_declared_snapshot_bytes(
+        cache_, w_, snap_backend_, rows ? tokens : 0, &aux);
     return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
@@ -5672,6 +5725,8 @@ ModelBackend::SnapshotRef DeepSeek4Backend::snapshot_ref(int slot) const {
     // Paged concurrent serving has no monolithic cache to restore into.
     if (cfg_.paged_attention || !snapshot_used(slot)) return ref;
     const auto & snap = snapshots_[slot];
+    // A state-only snapshot is not a whole state to write or copy.
+    ref.pooled = snap.state_only;
     // Only snapshots that carry the serialization sidecar are exportable.
     if (!snap.meta_snap || !snap.last_logits_snap || !snap.spec_feat_snap) {
         return ref;
@@ -5741,8 +5796,11 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
     return true;
 }
 
-bool DeepSeek4Backend::snapshot_restore(int slot) {
+bool DeepSeek4Backend::snapshot_restore(int slot, int rows_slot) {
     if (!snapshot_used(slot)) return false;
+    const DeepSeek4Snapshot * rows_from =
+        snapshots_[slot].state_only && rows_slot != slot && snapshot_used(rows_slot)
+            ? &snapshots_[rows_slot] : nullptr;
 
     std::vector<float> restored_logits;
     std::vector<float> restored_features;
@@ -5753,7 +5811,7 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
         return false;
     }
 
-    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_)) {
+    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from)) {
         return false;
     }
     last_logits_ = std::move(restored_logits);
@@ -5783,13 +5841,15 @@ GenerateResult DeepSeek4Backend::restore_and_generate_impl(
                      snap_pos, req.prompt.size());
         return generate_impl(req, io);
     }
-    if (!snapshot_restore(slot)) {
+    if (!snapshot_restore(slot, req.restore_kv_slot)) {
         result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
         return result;
     }
     prefill_retry_slot_ = slot;
+    prefill_retry_rows_slot_ = req.restore_kv_slot;
     result = generate_from_state(req, io, snap_pos);
     prefill_retry_slot_ = -1;
+    prefill_retry_rows_slot_ = -1;
     if (result.ok()) result.restored_prefix_tokens = snap_pos;
     return result;
 }

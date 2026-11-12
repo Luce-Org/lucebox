@@ -227,8 +227,9 @@ static int64_t concurrent_fixed_cache_bytes(
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
+    ( !(w).eos_disabled &&                                                \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
-   || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+   || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) ) )
 
 static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
                                         const TargetWeights & w) {
@@ -1343,11 +1344,52 @@ bool Qwen35Backend::snapshot_used(int slot) const {
            (live_snapshot_deferred_ && slot == live_snapshot_slot_);
 }
 
-bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+bool Qwen35Backend::restore_target_cache_from_snapshot(int slot, int kv_slot) {
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
-    return restore_target_cache(prefix_snapshots_[slot], cache_);
+    return restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                snapshot_kv_source(slot, kv_slot));
+}
+
+bool Qwen35Backend::state_only_snapshots() const {
+    // Concurrent serving keeps its checkpoints through the SeqEngine
+    // (drop_prefix_kv). A KVFlash pool keeps state-only rungs of its own
+    // beside the live cache (state_ladder_), and its pooled snapshots carry
+    // the pool layout of their own position. Tensor-parallel and split-GPU
+    // snapshots hold shards on several devices; their row split is not
+    // implemented, so they stay whole.
+    return !cfg_.paged_attention && !kvflash_active() && !tensor_parallel_ &&
+           !split_gpus_ && snap_backend_ != nullptr;
+}
+
+const PrefixSnapshot * Qwen35Backend::snapshot_kv_source(int slot, int kv_slot) const {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].state_only ||
+        kv_slot < 0 || kv_slot >= PREFIX_SLOTS || kv_slot == slot) {
+        return nullptr;
+    }
+    return prefix_snapshots_[kv_slot].ctx ? &prefix_snapshots_[kv_slot] : nullptr;
+}
+
+size_t Qwen35Backend::snapshot_state_bytes_estimate(int tokens) const {
+    if (!state_only_snapshots() || tokens <= 0) return 0;
+    return estimate_target_cache_state_bytes(
+        w_, cache_, tokens, ggml_backend_get_default_buffer_type(snap_backend_));
+}
+
+bool Qwen35Backend::snapshot_drop_kv(int slot) {
+    if (!state_only_snapshots() || slot < 0 || slot >= PREFIX_SLOTS) return false;
+    // A deferred snapshot is the live state: copy it out, then it is a
+    // snapshot like any other.
+    if (slot == live_snapshot_slot_) {
+        materialize_live_snapshot();
+        live_snapshot_slot_ = -1;
+    }
+    return drop_prefix_snapshot_kv(prefix_snapshots_[slot]);
+}
+
+bool Qwen35Backend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < PREFIX_SLOTS && prefix_snapshots_[slot].state_only;
 }
 
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
@@ -1440,7 +1482,7 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     ref.buf      = snap.buf;
     ref.cur_pos  = snap.cur_pos;
     ref.last_tok = snap.last_tok;
-    ref.pooled   = snap.is_pooled;
+    ref.pooled   = snap.is_pooled || snap.state_only;   // neither holds dense K/V: never written
     return ref;
 }
 
@@ -1894,6 +1936,11 @@ void Qwen35Backend::release_scratch() {
 
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
+    struct EosScope {
+        bool & flag;
+        ~EosScope() { flag = false; }
+    } eos_scope{w_.eos_disabled};
+    w_.eos_disabled = req.ignore_eos;
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     generating_ = true;
@@ -2090,6 +2137,11 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
+    struct EosScope {
+        bool & flag;
+        ~EosScope() { flag = false; }
+    } eos_scope{w_.eos_disabled};
+    w_.eos_disabled = req.ignore_eos;
     // The live cache already is this snapshot when it was saved (or kept,
     // deferred) after the previous generation and nothing ran since.
     const bool live_restore = slot >= 0 && slot == live_snapshot_slot_ &&
@@ -2195,7 +2247,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             const bool restored = consume
                 ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
                    kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
-                : restore_target_cache(prefix_snapshots_[slot], cache_);
+                : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                       snapshot_kv_source(slot, req.restore_kv_slot));
             if (!restored) {
                 std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
                              slot, luce_last_error());

@@ -75,6 +75,9 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
     // Prompt forwards end at every restore point (see run()); 4096-token
     // spacing keeps them long enough for the expert reads to pay off.
     int restore_point_spacing() const override { return 4096; }
@@ -105,6 +108,8 @@ private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored, int restore_slot = -1);
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
+    // Bytes of a snapshot of `tokens` positions, with or without its per-position rows.
+    size_t snapshot_bytes(int tokens, bool rows) const;
     bool create_main_cache();
     void size_kvflash_pool();
     int kvflash_pool_for(int ctx) const;

@@ -160,6 +160,9 @@ public:
     // (kQwen35OffGridLeadTokens), so a closer restore point starts no chunk.
     int  snapshot_granularity() const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
     MemoryReport memory_report() const override;
     // memory_report() for an explicit cache and snapshot array.
     static MemoryReport memory_report_for(const TargetCache & cache,
@@ -249,7 +252,8 @@ protected:
     std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
     bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
     std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
-    bool restore_target_cache_from_snapshot(int slot);
+    // `kv_slot`: the deeper snapshot a state-only one takes its rows from.
+    bool restore_target_cache_from_snapshot(int slot, int kv_slot = -1);
 
     // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
     DraftWeights & draft_weights() { return dw_; }
@@ -434,6 +438,12 @@ private:
     // Copies a deferred live snapshot into its slot before the live state
     // changes; a no-op otherwise.
     void materialize_live_snapshot();
+    // Single-sequence snapshots whose rows are their own tensors: the K/V of
+    // one is a prefix of a deeper one's.
+    bool state_only_snapshots() const;
+    // The dense snapshot `kv_slot` whose rows a state-only `slot` restores
+    // with; nullptr when `slot` needs none, or `kv_slot` cannot serve.
+    const PrefixSnapshot * snapshot_kv_source(int slot, int kv_slot) const;
     std::unique_ptr<Qwen35TensorParallelContext> tensor_parallel_;
     bool           split_gpus_     = false;
 

@@ -35,6 +35,7 @@
 #include "common/backend_ipc.h"
 #include "common/pflash_drafter_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
+#include "common/moe_overlap.h"
 #include "common/moe_hybrid_placement.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
@@ -6513,6 +6514,129 @@ TEST_CASE(ServerUnitFixture, test_free_slot_taken_before_live_slot) {
 
 // (g) A new turn supersedes the intermediate turns of its conversation. The
 // shallowest ancestor (shared head), protected pins and sibling branches stay.
+// The turns behind a conversation's newest snapshot repeat its attention
+// rows: with state backups they stay, state only, and thin out with distance.
+TEST_CASE(ServerUnitFixture, test_state_backups_keep_superseded_turns) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(8, tokenizer);
+    cache.set_state_backup_bytes(2);
+
+    // head, then five turns of two tokens each.
+    std::vector<std::vector<int32_t>> turns = {{1, 100}};
+    for (int i = 1; i <= 5; ++i) {
+        turns.push_back(turns.back());
+        turns.back().insert(turns.back().end(), {i % 2 ? 3 : 4, 100 + i});
+    }
+    for (int i = 0; i <= 5; ++i) {
+        cache.confirm_inline_snap(i, (int)turns[i].size(), turns[i], false, 10 * (i + 1));
+    }
+    // Behind turn 5: turn 4 (2 tokens back) and turn 3 (4 back) stay, turn 2
+    // (6 back, less than twice 4) goes, turn 1 (8 back) stays. The head is
+    // the shallowest ancestor: untouched.
+    std::vector<int> keep_state;
+    TEST_ASSERT(cache.prune_superseded_ancestors(5, nullptr, &keep_state) == std::vector<int>({2}));
+    TEST_ASSERT(keep_state == std::vector<int>({4, 3, 1}));
+    for (const int slot : keep_state) cache.mark_state_only(slot, 2);
+    TEST_ASSERT(cache.stats().in_use == 5);
+    TEST_ASSERT(cache.stats().resident_bytes == 10 + 60 + 3 * 2);
+    TEST_ASSERT(cache.state_only(4) && cache.state_only(1) && !cache.state_only(5) && !cache.state_only(0));
+    // A backup restores with the rows of the newest snapshot, and is never
+    // written to disk.
+    TEST_ASSERT(cache.kv_source_slot(4) == 5 && cache.kv_source_slot(5) == -1);
+    TEST_ASSERT(!cache.persist_on_evict(4) && cache.persist_on_evict(5));
+    // An edit of the last message resumes from the previous turn, an edit
+    // three turns back from the nearest backup behind it.
+    std::vector<int32_t> edited = turns[4];
+    edited.insert(edited.end(), {3, 900});
+    TEST_ASSERT(cache.lookup(edited) == std::make_pair(4, (int)turns[4].size()));
+    std::vector<int32_t> older = turns[2];
+    older.insert(older.end(), {3, 901});
+    TEST_ASSERT(cache.lookup(older) == std::make_pair(1, (int)turns[1].size()));
+    // Pruning again changes nothing, and asks for no row twice.
+    keep_state.clear();
+    TEST_ASSERT(cache.prune_superseded_ancestors(5, nullptr, &keep_state).empty());
+    TEST_ASSERT(keep_state.empty());
+    TEST_ASSERT(cache.take_orphaned_state_backups().empty());
+
+    // The newest snapshot leaves: its backups have no rows to restore with.
+    cache.invalidate_inline_snap(5);
+    TEST_ASSERT(cache.kv_source_slot(4) == -1);
+    TEST_ASSERT(cache.lookup(edited) == std::make_pair(0, (int)turns[0].size()));
+    auto orphans = cache.take_orphaned_state_backups();
+    std::sort(orphans.begin(), orphans.end());
+    TEST_ASSERT(orphans == std::vector<int>({1, 3, 4}));
+    TEST_ASSERT(cache.stats().in_use == 1 && cache.stats().resident_bytes == 10);
+
+    // Without a list to keep them in, a commit frees what it supersedes as
+    // before (the concurrent path).
+    PrefixCache plain(8, tokenizer);
+    plain.set_state_backup_bytes(2);
+    for (int i = 0; i <= 3; ++i) {
+        plain.confirm_inline_snap(i, (int)turns[i].size(), turns[i], false, 10);
+    }
+    TEST_ASSERT(plain.prune_superseded_ancestors(3) == std::vector<int>({1}));
+    unlink(path.c_str());
+}
+
+// A capture counts what its commit gives back: a dense turn behind it keeps
+// a state backup's bytes, and a state backup gives back nothing.
+TEST_CASE(ServerUnitFixture, test_state_backups_budget_credit) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::vector<int32_t> head = {1, 100};
+    std::vector<int32_t> t1 = head;
+    t1.insert(t1.end(), {3, 101});
+    std::vector<int32_t> t2 = t1;
+    t2.insert(t2.end(), {4, 102});
+    std::vector<int32_t> t3 = t2;
+    t3.insert(t3.end(), {3, 103});
+    std::vector<int32_t> other = {1, 100, 3, 700};
+    const auto size = [](int) { return (size_t)40; };
+
+    // Budget 90: head 10 + another conversation 30 + turn 2 at 40 = 80. A
+    // capture of 40 over turn 2 fits only with what turn 2 gives back: all
+    // 40 without backups, 40 - 15 with them, which is not enough, so the
+    // other conversation's leaf makes the room.
+    for (const size_t backup : {(size_t)0, (size_t)15}) {
+        PrefixCache cache(8, tokenizer, /*max_resident_bytes=*/90);
+        cache.set_prunes_superseded(true);
+        cache.set_state_backup_bytes(backup);
+        cache.confirm_inline_snap(0, (int)head.size(), head, false, 10);
+        cache.confirm_inline_snap(1, (int)other.size(), other, false, 30);
+        cache.confirm_inline_snap(2, (int)t2.size(), t2, false, 40);
+        auto capture = cache.reserve_inline_snap(
+            t3, (int)t2.size(), false, (int)t3.size(), /*restore_source_slot=*/2, size);
+        TEST_ASSERT(capture.active());
+        TEST_ASSERT(backup == 0 ? capture.slot() != 1 : capture.slot() == 1);
+        capture.cancel();
+    }
+    unlink(path.c_str());
+}
+
+// The conversation being served keeps its backups while another one still
+// has a leaf to give; then its own turns go, before any head.
+TEST_CASE(ServerUnitFixture, test_evict_keeps_served_conversation_backups) {
+    // 0 head, 1 and 2 turns behind the served leaf 4, 3 another conversation's leaf.
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 7}, {9, 1, 2, 3},
+    };
+    // Nobody served: a turn behind a newest snapshot goes first, as before.
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    // Leaf 4 served: the other conversation's leaf goes before its turns.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 4) == 3);
+    // The other conversation served: this one's turns are fair game.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // No other leaf left: the served conversation's own turns, oldest first.
+    ids = {{9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // A turn behind another conversation's newest snapshot still goes first.
+    ids = {{9}, {9, 1}, {9, 1, 2}, {9, 7}, {9, 7, 8}, {9, 7, 8, 6}, {9, 1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 6) == 3);
+}
+
 TEST_CASE(ServerUnitFixture, test_prune_superseded_ancestors) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -16839,6 +16963,210 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) 
     TEST_ASSERT(count_mul_mat_id(out.cold_nodes) == 3 * n_tokens);
 
     ggml_free(ctx);
+}
+
+// Overlapping owners (moe_overlap.h) with ROCmFP2 owners and a shared expert:
+// every node has an owner, the secondary owner's nodes come before the main
+// owner's in graph order, and the join is last. Token by token, the input
+// crosses to the secondary owner once, not per token, and each owner runs three
+// products per token. With batch-invariant rows (moe_overlap.h, 3), each owner
+// runs one grouped product per projection over all rows instead, with no
+// per-row concat. check = false (one row) only builds. Returns the graph's
+// nodes, op by op, with their placement.
+static std::string check_moe_hybrid_overlap_owners(int n_tokens, bool batch_invariant_rows, bool check = true) {
+    luce_unsetenv("LUCE_MOE_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_DS4_TP_GROUPED_MMVQ");
+
+    ggml_init_params params{};
+    params.mem_size = 32 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    constexpr int n_embd = 32;
+    constexpr int n_ff = 32;
+    constexpr int n_expert = 4;
+    constexpr int n_used = 2;
+
+    MoeHybridConfig cfg;
+    cfg.n_embd = n_embd;
+    cfg.n_ff_exp = n_ff;
+    cfg.n_expert = n_expert;
+    cfg.n_expert_used = n_used;
+
+    MoeHybridLayerStorage storage;
+    storage.gate_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.gate_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.up_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0_ROCMFP2, n_embd, n_ff, 2);
+    storage.down_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_0_ROCMFPX, n_ff, n_embd, 2);
+    storage.hot_local_by_global = {0, 1, -1, -1};
+    storage.cold_local_by_global = {-1, -1, 0, 1};
+
+    MoeLayerDesc desc;
+    desc.ffn_gate_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+    desc.ffn_up_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+    desc.ffn_down_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_ff, n_embd);
+    const std::vector<const ggml_tensor *> weights_list = {
+        storage.gate_hot, storage.up_hot, storage.down_hot,
+        storage.gate_cold, storage.up_cold, storage.down_cold,
+        desc.ffn_gate_shexp, desc.ffn_up_shexp, desc.ffn_down_shexp};
+
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
+    MoeHybridGraphInputs out;
+    out.overlap_owners = true;
+    out.batch_invariant_rows = batch_invariant_rows;
+    const bool built = build_moe_hybrid_ffn_graph(
+        ctx, gf, cfg, desc, storage, input, ids, weights, n_tokens,
+        out, /*include_shared=*/true, /*allow_fused_combine=*/false,
+        MoeHybridJoinMode::OwnerPartialSums, MoeHybridRouteBalance::Disabled);
+    TEST_ASSERT(built);
+    TEST_ASSERT(out.output != nullptr);
+    TEST_ASSERT(out.join_nodes.size() == 1);
+    ggml_build_forward_expand(gf, out.output);
+
+    const auto in = [](const std::vector<ggml_tensor *> & list, const ggml_tensor * t) {
+        return std::find(list.begin(), list.end(), t) != list.end();
+    };
+    std::string nodes;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s:%s:%lld,%lld,%lld,%lld:%c%c%c", ggml_op_name(t->op), ggml_type_name(t->type),
+                      (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                      in(out.hot_nodes, t) || in(out.hot_remap_nodes, t) ? 'h' : '-',
+                      in(out.cold_nodes, t) || in(out.cold_remap_nodes, t) ? 'c' : '-',
+                      in(out.join_nodes, t) ? 'j' : '-');
+        nodes += buf;
+        for (size_t k = 0; k < sizeof(t->op_params) / sizeof(t->op_params[0]); ++k) {
+            nodes += ":" + std::to_string(t->op_params[k]);
+        }
+        nodes += "\n";
+    }
+    if (!check) {
+        ggml_free(ctx);
+        return nodes;
+    }
+    const auto is_view = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+               t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+    };
+    const auto reads_weight = [&](const ggml_tensor * t) {
+        for (const ggml_tensor * src : t->src) {
+            if (src && std::find(weights_list.begin(), weights_list.end(), src) != weights_list.end()) return true;
+        }
+        return false;
+    };
+    const auto cold = [&](const ggml_tensor * t) {
+        return in(out.cold_nodes, t) || in(out.cold_remap_nodes, t);
+    };
+    const auto hot = [&](const ggml_tensor * t) {
+        return in(out.hot_nodes, t) || in(out.hot_remap_nodes, t);
+    };
+
+    // Every node reachable from the output has an owner (or reads a weight,
+    // which places it with that weight).
+    int unplaced = 0;
+    std::vector<const ggml_tensor *> stack{out.output};
+    std::vector<const ggml_tensor *> seen;
+    while (!stack.empty()) {
+        const ggml_tensor * t = stack.back();
+        stack.pop_back();
+        if (!t || std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+        seen.push_back(t);
+        if (t->op != GGML_OP_NONE && !is_view(t) && !cold(t) && !hot(t) &&
+            !in(out.join_nodes, t) && !reads_weight(t)) {
+            std::fprintf(stderr, "unplaced node %s (%s)\n", t->name, ggml_op_name(t->op));
+            ++unplaced;
+        }
+        for (const ggml_tensor * src : t->src) stack.push_back(src);
+    }
+    TEST_ASSERT(unplaced == 0);
+
+    // Graph order: every secondary-owner node before every main-owner expert
+    // or shared-expert node; the join after all of them.
+    int last_cold = -1, first_hot = ggml_graph_n_nodes(gf), last_owner = -1, join_at = -1;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (cold(t)) last_cold = i;
+        if (in(out.hot_nodes, t) && i < first_hot) first_hot = i;
+        if (cold(t) || hot(t)) last_owner = i;
+        if (t == out.join_nodes[0]) join_at = i;
+    }
+    TEST_ASSERT(last_cold >= 0);
+    TEST_ASSERT(last_cold < first_hot);
+    TEST_ASSERT(join_at > last_owner);
+
+    // The input crosses to the secondary owner in one copy; the main owner
+    // reads it in place; no copies per token.
+    const auto count_cont_of_input = [&](const std::vector<ggml_tensor *> & list) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == GGML_OP_CONT && node->src[0] == input) ++count;
+        }
+        return count;
+    };
+    const auto count_op = [](const std::vector<ggml_tensor *> & list, ggml_op op) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == op) ++count;
+        }
+        return count;
+    };
+    // (Shared rows: the owners' products read the input as it is, one copy to
+    // the secondary owner from the scheduler.)
+    TEST_ASSERT(count_cont_of_input(out.cold_nodes) == (batch_invariant_rows ? 0 : 1));
+    TEST_ASSERT(count_cont_of_input(out.hot_nodes) == 0);
+    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_CONT) <= 1);
+    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_CONT) == 0);
+
+    // Products: three per token, or with shared rows one grouped product per
+    // projection over all rows (gate, up, down), whose rows share each expert's
+    // reads, and no per-row concat.
+    ggml_tensor * marked = moe_overlap_expert_product(
+        ctx, storage.gate_hot, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens), ids);
+    const auto count_grouped = [&](const std::vector<ggml_tensor *> & list) {
+        int count = 0;
+        for (const ggml_tensor * node : list) {
+            if (node && node->op == GGML_OP_MUL_MAT_ID && node->op_params[1] == marked->op_params[1]) {
+                TEST_ASSERT(node->ne[2] == n_tokens);
+                ++count;
+            }
+        }
+        return count;
+    };
+    const int products = batch_invariant_rows ? 3 : 3 * n_tokens;
+    TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_MUL_MAT_ID) == products);
+    TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_MUL_MAT_ID) == products);
+    TEST_ASSERT(count_grouped(out.hot_nodes) == (batch_invariant_rows ? 3 : 0));
+    TEST_ASSERT(count_grouped(out.cold_nodes) == (batch_invariant_rows ? 3 : 0));
+    if (batch_invariant_rows) {
+        TEST_ASSERT(count_op(out.hot_nodes, GGML_OP_CONCAT) == 0);
+        TEST_ASSERT(count_op(out.cold_nodes, GGML_OP_CONCAT) == 0);
+    }
+
+    ggml_free(ctx);
+    return nodes;
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_order_and_placement) {
+    check_moe_hybrid_overlap_owners(/*n_tokens=*/2, /*batch_invariant_rows=*/false);
+}
+
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_overlap_owners_shared_rows) {
+    for (int n_tokens : {2, 4, 6, 8}) {
+        check_moe_hybrid_overlap_owners(n_tokens, /*batch_invariant_rows=*/true);
+    }
+    // One row: the same graph, node for node, whether or not the rows run
+    // batch-invariant products (a one-row step has nothing to share).
+    const std::string plain = check_moe_hybrid_overlap_owners(1, false, /*check=*/false);
+    const std::string invariant = check_moe_hybrid_overlap_owners(1, true, /*check=*/false);
+    TEST_ASSERT(!plain.empty());
+    TEST_ASSERT(plain == invariant);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -594,6 +594,18 @@ void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
     }
 }
 
+size_t Qwen35SeqEngine::estimate_prefix_state_bytes(int tokens) const {
+    return tokens > 0 ? estimate_paged_target_cache_state_bytes(b_.cache_) : 0;
+}
+
+bool Qwen35SeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    return index >= 0 &&
+        b_.prefix_snapshots_[index].layout == PrefixSnapshot::Layout::paged &&
+        b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens &&
+        drop_prefix_snapshot_kv(b_.prefix_snapshots_[index]);
+}
+
 bool Qwen35SeqEngine::arm_capture(
         int slot, PrefixCaptureTicket ticket, int restored_tokens) {
     if (slot < 0 || slot >= slots_.slot_count()) return false;
@@ -624,6 +636,13 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             plan.restore.tokens < (int)prompt.size();
         PrefixSnapshot * snap = metadata_valid
             ? &b_.prefix_snapshots_[restore_index] : nullptr;
+        // The rows of a state-only checkpoint come from the deeper one the
+        // plan names; a stale name fails the restore below.
+        const int kv_index = checkpoint_index(plan.restore_kv);
+        const PrefixSnapshot * kv_from =
+            kv_index >= 0 && kv_index != restore_index &&
+            b_.prefix_snapshots_[kv_index].cur_pos == plan.restore_kv.tokens
+                ? &b_.prefix_snapshots_[kv_index] : nullptr;
         const auto restore_started = std::chrono::steady_clock::now();
         if (snap && snap->ctx &&
             snap->layout == PrefixSnapshot::Layout::paged &&
@@ -639,7 +658,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
                 seeded.new_blocks.size());
             restored = table_ok && restore_paged_target_cache(
                 *snap, b_.cache_, slot, sequence.block_table,
-                (int)pool_.block_size());
+                (int)pool_.block_size(), kv_from);
         }
         const uint64_t restore_elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(

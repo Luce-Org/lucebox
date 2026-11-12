@@ -474,7 +474,47 @@ Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence
 path frees the ancestors it supersedes, keeping only the shallowest one (the
 shared system/tools head) and protected tool pins. A conversation therefore
-holds about two snapshots instead of one per turn. Chains that are abandoned,
+holds about two snapshots instead of one per turn.
+
+**State backups.** A superseded turn repeats the per-position rows of the
+snapshot that supersedes it; only the state of its own position is its own.
+Where the backend can drop a snapshot's rows, the superseded turns are
+therefore kept instead of freed, as *state-only backups*. A prompt that
+departs from the conversation before its end (an edited or retried last
+message, a second request from the same point, a client that drops its last
+turns) restores the deepest backup it still extends, with the rows of the
+newer snapshot (`[pc] state backup slot=N ... restores with the rows of
+slot=M`), and prefills only what follows.
+
+The policy is the same for every backend and both serving paths
+(`KvCache::trim_superseded`). Backups thin out with distance: the previous
+turn is kept, then one at least twice as far behind the newest snapshot as the
+last one kept, and so on, so a conversation holds a number that grows with the
+logarithm of its length and a prompt that departs d tokens back resumes within
+about 2d of its end. A backup is never written to disk and leaves RAM with the
+last snapshot whose rows can restore it. Under the resident limit, the backups
+of the conversation being served are evicted after the leaves of the other
+conversations, not before.
+
+A backend takes part by saying what one backup holds and by dropping and
+borrowing rows (`ModelBackend::snapshot_state_bytes_estimate`,
+`snapshot_drop_kv`, `GenerateRequest::restore_kv_slot`; for concurrent
+serving `SeqEngine::estimate_prefix_state_bytes`, `drop_prefix_kv`,
+`PrefixStorePlan::restore_kv`):
+
+| Backend | A backup keeps | Size | Rows it borrows |
+|---|---|---|---|
+| Qwen3.5/3.6/3.8, MoE variants | recurrent and conv state, drafter features | about 370 MB (27B) | attention K/V |
+| Qwen3.8-Flash-Next | recurrent, conv and PLE state, draft hidden state, logits | about 118 MB | attention K/V, indexer keys and pooled blocks, draft-layer K/V |
+| DeepSeek V4 / V4.1 | raw window, compressor windows, HC state, logits, features | tens of MB | compressed and index rows |
+
+Single-sequence and concurrent serving both take part for these three. They
+rely on a prefix's rows not depending on how it was reached, which holds
+because these backends start a prefill chunk at every restore point
+(`GenerateRequest::restore_points`). Not covered, and unchanged: a KVFlash pool
+(Qwen keeps state-only rungs of its own beside the live cache there), layer
+split and cluster serving, and the other backends, which keep the previous
+turn whole while the limit holds it. Chains that are abandoned,
 for example after a client compacts its context, are bounded by
 `--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
 the oldest leaf first. When no single entry makes enough room, it evicts several,
@@ -647,3 +687,24 @@ With right-sized snapshots, typical save/restore transfers are small:
 The old full-size approach (1.5 GB per snapshot) is eliminated. System RAM
 footprint is proportional to actual token count, enabling many more cached
 prefixes with no VRAM cost.
+
+## Measuring the hit rate
+
+`scripts/bench_agentx_cache.py` replays the public coding-agent traces of the AgentX
+benchmark against a running server and reports the share of prompt tokens read from the
+cache, next to the share a cache that never misses would read on the same requests. The
+client is the official AgentX harness running its `agentx` scenario unchanged, so the
+harness itself checks the benchmark's rules and marks the run `submission_valid`; the
+report prints that verdict.
+
+```bash
+python3 server/scripts/bench_agentx_cache.py run --url http://127.0.0.1:8080 \
+    --model qwen3.8-27b --tokenizer Qwen/Qwen3.8-27B --sessions 1 --out results/agentx-1
+```
+
+The default corpus is the official 256K one (every request at most 256,000 tokens): serve
+it with `--max-ctx 262144`. The traces hold the shape of real Claude Code sessions and no
+text, so the client sends filler text of the recorded lengths, replays the recorded
+replies, and asks for each reply at its recorded length with `ignore_eos`. They carry no tool calls: the [Agent Turn Cache](API.md#agent-turn-cache),
+which keeps the state a tool-call turn leaves behind, does not take part, and every turn
+resumes from the end of the previous prompt.

@@ -36,19 +36,24 @@ static __device__ __forceinline__ float paged_attn_lane_value(float x, int src) 
 
 // Lane (lane ^ offset)'s copy of x. RDNA moves it inside the VALU, with DPP
 // within each row of 16 lanes and a row swap for offset 16, instead of a
-// cross-lane shuffle through LDS.
+// cross-lane shuffle through LDS. full_warp promises that every lane of the
+// warp is active: DPP may then zero a lane whose source lane is inactive,
+// which cannot happen, and that freedom lets the compiler fold the move into
+// the add or max that consumes it. Without the promise such a lane keeps its
+// own value.
+template<bool full_warp = false>
 static __device__ __forceinline__ float paged_attn_xor_lane(float x, int offset) {
 #if defined(GGML_USE_HIP) && defined(RDNA)
     const int xi = __float_as_int(x);
     switch (offset) {
         case 1:  return __int_as_float(__builtin_amdgcn_update_dpp(
-                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 1, 0xF, 0xF, false));
+                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 1, 0xF, 0xF, full_warp));
         case 2:  return __int_as_float(__builtin_amdgcn_update_dpp(
-                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 2, 0xF, 0xF, false));
+                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 2, 0xF, 0xF, full_warp));
         case 4:  return __int_as_float(__builtin_amdgcn_update_dpp(
-                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 4, 0xF, 0xF, false));
+                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 4, 0xF, 0xF, full_warp));
         case 8:  return __int_as_float(__builtin_amdgcn_update_dpp(
-                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 8, 0xF, 0xF, false));
+                     xi, xi, PAGED_ATTN_DPP_ROW_XMASK | 8, 0xF, 0xF, full_warp));
         case 16: return __int_as_float(__builtin_amdgcn_permlanex16(
                      xi, xi, PAGED_ATTN_PERMLANEX16_SEL_LO, PAGED_ATTN_PERMLANEX16_SEL_HI,
                      false, false));
@@ -60,10 +65,11 @@ static __device__ __forceinline__ float paged_attn_xor_lane(float x, int offset)
 
 // warp_reduce_sum and warp_reduce_max with the same butterfly, so the same
 // additions and comparisons in the same order, through paged_attn_xor_lane.
+// Like them, these reductions run on the whole warp.
 static __device__ __forceinline__ float paged_attn_warp_sum(float x) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        x += paged_attn_xor_lane(x, offset);
+        x += paged_attn_xor_lane<true>(x, offset);
     }
     return x;
 }
@@ -71,7 +77,7 @@ static __device__ __forceinline__ float paged_attn_warp_sum(float x) {
 static __device__ __forceinline__ float paged_attn_warp_max(float x) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, paged_attn_xor_lane(x, offset));
+        x = fmaxf(x, paged_attn_xor_lane<true>(x, offset));
     }
     return x;
 }
@@ -92,13 +98,13 @@ static __device__ __forceinline__ float paged_attn_reduce_group(float (&sums)[n]
         for (int i = 0; i < half; ++i) {
             const float keep = upper ? sums[half + i] : sums[i];
             const float send = upper ? sums[i] : sums[half + i];
-            sums[i] = keep + paged_attn_xor_lane(send, offset);
+            sums[i] = keep + paged_attn_xor_lane<true>(send, offset);
         }
     }
     float sum = sums[0];
 #pragma unroll
     for (int offset = WARP_SIZE / (2 * n); offset > 0; offset >>= 1) {
-        sum += paged_attn_xor_lane(sum, offset);
+        sum += paged_attn_xor_lane<true>(sum, offset);
     }
     return sum;
 }

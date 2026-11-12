@@ -887,6 +887,7 @@ void test_deepseek41_paged_unqualified_switches() {
     CHECK(deepseek41_paged_unqualified_env("LUCE_DS4_TP_GROUPED_MMVQ"));
     CHECK(deepseek41_paged_unqualified_env("LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK"));
     CHECK(deepseek41_paged_unqualified_env("GGML_CUDA_BATCH_PEER_COPIES"));
+    CHECK(deepseek41_paged_unqualified_env("LUCE_MOE_Q8_HANDOFF"));
     CHECK(!deepseek41_paged_unqualified_env("LUCE_DS4_FUSE_ROUTER"));
     // Paged steps always run what this one selects, so it changes nothing.
     CHECK(!deepseek41_paged_unqualified_env("LUCE_DS4_TP_NATIVE_ROUTE_WIDTH"));

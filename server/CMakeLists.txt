@@ -589,6 +589,7 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_graph.cpp
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
+    src/qwen4exp/qwen4exp_hot.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
@@ -2093,6 +2094,11 @@ if(LUCE_TESTS)
     endif()
     add_executable(test_ds41_mmid_width_invariance test/unit/test_ds41_mmid_width_invariance.cpp)
     target_link_libraries(test_ds41_mmid_width_invariance PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "hip")
+        # The device's gfx name: RDNA3 / RDNA4 must take the grouped kernel for ROCmFP2.
+        target_compile_definitions(test_ds41_mmid_width_invariance PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_ds41_mmid_width_invariance PRIVATE hip::host)
+    endif()
     # Five tokens: the DSpark verify width (q=5) of the DS4.1 profiles.
     add_test(NAME test_ds41_mmid_width_invariance COMMAND test_ds41_mmid_width_invariance 5 64)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
@@ -2320,6 +2326,13 @@ if(LUCE_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     target_link_libraries(test_qwen4exp_prefix_cache PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
     add_test(NAME qwen4exp_prefix_cache COMMAND test_qwen4exp_prefix_cache)
+    # Guards the batched verify's QSA rows: one synthetic full-attention layer (no model file), each slot's rows
+    # against consecutive T=1 decode steps, bit for bit. Compiles qwen4exp_graph.cpp into the test for its builders.
+    add_executable(test_qwen4exp_batched_verify_qsa test/unit/test_qwen4exp_batched_verify_qsa.cpp)
+    target_include_directories(test_qwen4exp_batched_verify_qsa PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen4exp_batched_verify_qsa PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME qwen4exp_batched_verify_qsa COMMAND test_qwen4exp_batched_verify_qsa)
+    set_tests_properties(qwen4exp_batched_verify_qsa PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_forward.cpp")
         add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)

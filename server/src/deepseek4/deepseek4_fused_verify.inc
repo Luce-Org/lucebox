@@ -1607,6 +1607,17 @@ static bool ds4_build_fused_verify_graph(
                 streamed = &streamed_owner;
             }
             inputs.router_nodes = router_nodes;
+            // A paged step's owners overlap (moe_overlap.h): the secondary
+            // GPU's experts are queued once the routes exist, and the join
+            // ends the main GPU's split, so its own experts and the shared
+            // expert run beside them instead of after them. Paged steps only
+            // (the measured case); not with a device join, which joins on the
+            // device itself, nor for a cluster or streamed layer, whose
+            // partials are combined on the secondary device or wait for host
+            // answers.
+            inputs.overlap_owners = paged_mode && pair_capabilities.native_gpu_handoff &&
+                                    !allow_direct_device_join && !cluster_hybrid && !streamed;
+            if (inputs.overlap_owners) hybrid_schedule_graph = gf;
             inputs.prefetch_next.clear();
             inputs.prefetch_bytes = 0;
             inputs.wait_work.clear();
@@ -1622,6 +1633,12 @@ static bool ds4_build_fused_verify_graph(
                     target_nodes.push_back(joined);
                 }
             }
+            // The staggered pre-mix model computes every step of several rows
+            // with batch-invariant products (the compute scopes of the verify
+            // and of the gathered paged step), so the rows of overlapping
+            // owners share their expert products and each row still decodes
+            // as it does alone.
+            inputs.batch_invariant_rows = w.hc_staggered_pre;
             const MoeHybridLayerStorage & hybrid_layer =
                 hybrid->layers[(size_t) il];
             const bool has_hot_routed =
@@ -1647,12 +1664,10 @@ static bool ds4_build_fused_verify_graph(
             // decode are bit-identical), and a paged sequence's row would
             // depend on how many rows share its step.
             // So a paged step runs what LUCE_DS4_TP_NATIVE_ROUTE_WIDTH
-            // selects, whatever that switch says. That adds no expert kernel a
-            // one-row step does not run: paged serving refuses grouped MMVQ,
-            // so ROCmFP2 owners run each row as its own one-row chain
-            // (moe_owner_branch_tokenwise), and only the route remap, the row
-            // concat and the owner join see the whole step, as they did in
-            // the 4 + 2 form. Paged steps also never balance routes
+            // selects, whatever that switch says. Each owner then runs the
+            // one-row chain over all of the step's rows (moe_overlap.h, 3),
+            // under batch-invariant products, so every row gets the bytes it
+            // gets alone. Paged steps also never balance routes
             // dynamically: that balance applies up to five rows only, so it
             // would make a row depend on its company again.
             // LUCE_DS4_TP_HEAD4_TAIL2=1 restores the decomposition for verify
@@ -2085,7 +2100,10 @@ static bool ds4_build_fused_verify_graph(
             }
             for (ggml_tensor * node : inputs.join_nodes) {
                 pin_main(node);
-                if (targeted_join_split) {
+                if (inputs.overlap_owners) {
+                    // Overlapping owners: the main GPU's split ends at the join.
+                    moe_overlap_mark_join(fg.sched, node);
+                } else if (targeted_join_split) {
                     ggml_backend_sched_add_late_cross_input_split_node(
                         fg.sched, node);
                 }

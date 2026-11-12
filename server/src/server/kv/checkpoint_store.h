@@ -33,6 +33,12 @@ public:
     // System-memory bytes a checkpoint of the first `tokens` positions
     // holds; 0 when the store cannot tell.
     virtual size_t estimate_bytes(int tokens) const = 0;
+    // State-only checkpoints (ModelBackend::snapshot_drop_kv): the bytes one
+    // holds (0: the store takes none), turning a checkpoint into one, and
+    // whether it is one.
+    virtual size_t estimate_state_bytes(int tokens) const { (void)tokens; return 0; }
+    virtual bool drop_kv(Checkpoint checkpoint) { (void)checkpoint; return false; }
+    virtual bool state_only(Checkpoint checkpoint) const { (void)checkpoint; return false; }
 
     virtual bool used(Checkpoint checkpoint) const = 0;
     // The positions (KV rows) the checkpoint holds; 0 when unused.
@@ -60,6 +66,9 @@ public:
     int restore_point_spacing() const override;
     bool prefill_cuts_at_restore_points() const override;
     size_t estimate_bytes(int tokens) const override;
+    size_t estimate_state_bytes(int tokens) const override;
+    bool drop_kv(Checkpoint checkpoint) override;
+    bool state_only(Checkpoint checkpoint) const override;
     bool used(Checkpoint checkpoint) const override;
     int position(Checkpoint checkpoint) const override;
     void free(Checkpoint checkpoint) override;
@@ -113,6 +122,10 @@ public:
     // cache can write and read them (slots()).
     bool in_backend_slots() const;
     size_t estimate_bytes(int tokens) const;
+    // State-only checkpoints: SeqEngine::estimate_prefix_state_bytes and
+    // drop_prefix_kv.
+    size_t estimate_state_bytes(int tokens) const;
+    bool drop_kv(Checkpoint checkpoint, int tokens);
 
     static PrefixStoreRef ref(Checkpoint checkpoint, int tokens) {
         return {checkpoint.id, tokens};

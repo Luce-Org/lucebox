@@ -252,6 +252,51 @@ static void test_pipeline_parts_follow_each_band() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_layer_major_passes_fit_the_device() {
+    std::fprintf(stderr, "  test_layer_major_passes_fit_the_device ...");
+    using Bands = std::vector<int>;
+    // The fit rule both the pass planner and the residual placement use:
+    // rows * row_bytes + headroom < free.
+    const size_t H = DS4_LAYER_MAJOR_RESIDUAL_HEADROOM;
+    const size_t rb = 4 * 4096 * sizeof(float);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(0, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + rb, rb) == 0);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + rb + 1, rb) == 1);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + 5 * rb, rb) == 4);
+    TEST_ASSERT(deepseek4_layer_major_residual_rows(H + 5 * rb + 1, rb) == 5);
+    for (size_t free_b : {H - 1, H, H + 1, H + rb, H + rb + 1, H + 5 * rb, H + 5 * rb + 1, H + 7 * rb + 3}) {
+        const size_t rows = deepseek4_layer_major_residual_rows(free_b, rb);
+        for (size_t n = 1; n <= 8; ++n) {
+            TEST_ASSERT((n <= rows) == (n * rb + H < free_b));
+        }
+    }
+    const Bands b5(5, 640);
+    // No bound (the device residual off, or no row fits): the whole pass.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 0) == 5);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 128, -1) == 5);
+    // Everything fits, the tail included; equality fits.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 128, 3328) == 5);
+    // The tail joins only the last band: without it four bands fit.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 129, 3328) == 4);
+    // The most bands that fit; equality fits.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 2560) == 4);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 2559) == 3);
+    // Two bands at least ...
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1280) == 2);
+    // ... and when not even two fit, the whole pass (its residual is on the
+    // host either way).
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1279) == 5);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(b5, 0, 1) == 5);
+    // Passes of two bands or fewer stay whole.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 640}, 0, 100) == 2);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640}, 0, 100) == 1);
+    // Uneven bands.
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 512, 700, 640}, 0, 1852) == 3);
+    TEST_ASSERT(deepseek4_layer_major_pass_bands(Bands{640, 512, 700, 640}, 0, 1851) == 2);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 struct DeepSeek4FixtureOptions {
     bool include_vocab_size = true;
     uint32_t vocab_size = 128;
@@ -4452,6 +4497,118 @@ static bool init_two_shard_split(DeepSeek4LayerSplitAdapter & adapter) {
         }
     }
     return true;
+}
+
+// A snapshot that a deeper one extends keeps the state of its own position
+// and restores with the deeper one's compressed and index rows.
+static void test_state_only_snapshot_restores_with_deeper_rows() {
+    std::fprintf(stderr, "  test_state_only_snapshot_restores_with_deeper_rows ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
+    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+    auto & cache = backend.cache_;
+    auto & layer = cache.layers[0];
+    write_tensor_pattern(layer.raw_kv, 3);
+    write_tensor_pattern(layer.comp_kv, 17);
+    write_tensor_pattern(layer.index_comp_kv, 29);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 41);
+    write_tensor_pattern(layer.attn_compressor.state_score, 53);
+    write_tensor_pattern(layer.indexer_compressor.state_kv, 67);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 79);
+    const auto raw_at_turn = read_tensor_bytes(layer.raw_kv);
+    const auto attn_kv_at_turn = read_tensor_bytes(layer.attn_compressor.state_kv);
+    const auto index_score_at_turn = read_tensor_bytes(layer.indexer_compressor.state_score);
+    const auto comp_rows = read_tensor_rows(layer.comp_kv, 2);
+    const auto index_rows = read_tensor_rows(layer.index_comp_kv, 2);
+
+    // The turn at 8 positions.
+    cache.cur_pos = 8;
+    layer.n_comp = 2;
+    layer.n_index_comp = 2;
+    backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+    backend.last_logits_pos_ = 8;
+    backend.spec_feat_window_.clear();
+    TEST_ASSERT(backend.snapshot_save(0));
+    // The same prompt at 16: the same leading rows, the state of position 16.
+    write_tensor_pattern(layer.raw_kv, 101);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 103);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 107);
+    cache.cur_pos = 16;
+    layer.n_comp = 4;
+    layer.n_index_comp = 4;
+    backend.last_logits_ = {7.0f, 7.0f, 7.0f};
+    backend.last_logits_pos_ = 16;
+    TEST_ASSERT(backend.snapshot_save(1));
+
+    const size_t whole = ggml_backend_buffer_get_size(backend.snapshots_[0].buf);
+    TEST_ASSERT(!backend.snapshot_state_only(0));
+    TEST_ASSERT(backend.snapshot_drop_kv(0));
+    TEST_ASSERT(backend.snapshot_state_only(0) && !backend.snapshot_state_only(1));
+    TEST_ASSERT(backend.snapshot_used(0) && backend.snapshot_cur_pos(0) == 8);
+    TEST_ASSERT(backend.snapshots_[0].layers[0].comp_kv->ne[1] == 1);
+    TEST_ASSERT(backend.snapshots_[0].layers[0].n_comp == 2);
+    const auto & aux = backend.snapshot_aux_[0];
+    const size_t retained = ggml_backend_buffer_get_size(backend.snapshots_[0].buf) +
+        (aux.last_logits.size() + aux.spec_feat_window.size()) * sizeof(float);
+    // (The two rows of this tiny cache round to the same aligned size as one.)
+    TEST_ASSERT(ggml_backend_buffer_get_size(backend.snapshots_[0].buf) <= whole);
+    TEST_ASSERT(backend.snapshot_state_bytes_estimate(8) == retained);
+    TEST_ASSERT(backend.snapshot_state_bytes_estimate(16) == retained);
+    // Not a whole state: nothing writes it to disk, and it has no rows to
+    // drop twice.
+    TEST_ASSERT(backend.snapshot_ref(0).pooled && !backend.snapshot_ref(1).pooled);
+    TEST_ASSERT(!backend.snapshot_drop_kv(0));
+
+    const auto clear = [&]() {
+        ggml_backend_buffer_clear(cache.buf, 0);
+        cache.cur_pos = 0;
+        layer.n_comp = 0;
+        layer.n_index_comp = 0;
+        backend.last_logits_.clear();
+        backend.last_logits_pos_ = -1;
+    };
+    clear();
+    // Alone or with itself it has no rows.
+    TEST_ASSERT(!backend.snapshot_restore(0));
+    TEST_ASSERT(!backend.snapshot_restore(0, 0));
+    TEST_ASSERT(cache.cur_pos == 0);
+    TEST_ASSERT(backend.snapshot_restore(0, 1));
+    TEST_ASSERT(cache.cur_pos == 8 && layer.n_comp == 2 && layer.n_index_comp == 2);
+    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
+    TEST_ASSERT(backend.last_logits_pos_ == 8);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_at_turn);
+    TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_kv) == attn_kv_at_turn);
+    TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_score) == index_score_at_turn);
+    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 2) == comp_rows);
+    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 2) == index_rows);
+    // Only the turn's rows are written.
+    const auto third = read_tensor_rows(layer.comp_kv, 3);
+    TEST_ASSERT(std::all_of(third.begin() + (ptrdiff_t) comp_rows.size(), third.end(),
+                            [](uint8_t b) { return b == 0; }));
+
+    // A snapshot that is not deeper cannot give the rows; a whole snapshot
+    // ignores the one named.
+    cache.cur_pos = 4;
+    layer.n_comp = 1;
+    layer.n_index_comp = 1;
+    backend.last_logits_ = {1.0f, 1.0f, 1.0f};
+    backend.last_logits_pos_ = 4;
+    TEST_ASSERT(backend.snapshot_save(2));
+    TEST_ASSERT(!backend.snapshot_restore(0, 2));
+    TEST_ASSERT(backend.snapshot_restore(1, 2));
+    TEST_ASSERT(cache.cur_pos == 16 && layer.n_comp == 4);
+
+    backend.cfg_.paged_attention = true;
+    TEST_ASSERT(backend.snapshot_state_bytes_estimate(8) == 0);
+    TEST_ASSERT(!backend.snapshot_drop_kv(1));
+    backend.cfg_.paged_attention = false;
+    for (int slot = 0; slot < 3; ++slot) backend.snapshot_free(slot);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static void test_snapshot_bytes_estimate_matches_saved_snapshot() {
@@ -9637,6 +9794,7 @@ int main(int argc, char ** argv) {
     test_compressor_pooling_correctness(backend);
     test_moe_expert_major_default_threshold();
     test_pipeline_parts_follow_each_band();
+    test_layer_major_passes_fit_the_device();
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
@@ -9696,6 +9854,7 @@ int main(int argc, char ** argv) {
     test_dspark_q5_replay_alignment_guard();
     test_dspark_chain_graph_cache_generation(backend);
     test_snapshot_save_restore();
+    test_state_only_snapshot_restores_with_deeper_rows();
     test_monolithic_snapshot_preserves_decode_state();
     test_memory_report_matches_buffers();
     test_memory_report_counts_paged_and_staging_caches();
