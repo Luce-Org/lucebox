@@ -458,6 +458,28 @@ def http_json(
         return exc.code, parsed, elapsed
 
 
+def stream_error_text(payload: Any) -> str:
+    """Render a mid-stream error payload for the probe report."""
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    return text[-500:]
+
+
+UNREADABLE_STREAM_ERROR = "stream error event without a readable payload"
+
+
+def stream_end_check(completed: bool, error: str | None) -> dict[str, Any]:
+    """Report how a stream ended.
+
+    A real client needs the protocol's terminal event, so a stream that stops
+    early or carries an error is a failure even when text arrived first.
+    """
+    return {
+        "stream_ok": completed and error is None,
+        "stream_completed": completed,
+        "stream_error": error,
+    }
+
+
 def http_sse(
     url: str,
     payload: dict[str, Any],
@@ -482,6 +504,8 @@ def http_sse(
     token_deltas = 0
     text = ""
     status = 0
+    done = False
+    stream_error = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
@@ -491,6 +515,7 @@ def http_sse(
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    done = True
                     break
                 if first is None:
                     first = time.perf_counter()
@@ -500,6 +525,10 @@ def http_sse(
                     events.append(data)
                     continue
                 events.append(obj)
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error") is not None and stream_error is None:
+                    stream_error = stream_error_text(obj["error"])
                 choices = obj.get("choices") or []
                 if choices:
                     delta = choices[0].get("delta") or {}
@@ -520,14 +549,19 @@ def http_sse(
         }
     elapsed = time.perf_counter() - t0
     check = text_check(text, expect_substring)
+    end = stream_end_check(done, stream_error)
     return {
-        "ok": status == 200 and token_deltas > 0 and check["generated_ok"],
+        "ok": (
+            status == 200 and token_deltas > 0
+            and check["generated_ok"] and end["stream_ok"]
+        ),
         "status": status,
         "seconds": round(elapsed, 3),
         "first_token_seconds": round(first - t0, 3) if first else None,
         "events": len(events),
         "token_deltas": token_deltas,
         **check,
+        **end,
         "tail": events[-3:],
     }
 
@@ -800,6 +834,9 @@ def probe_anthropic_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     events = 0
     text_deltas = 0
     text = ""
+    stopped = False
+    stream_error = None
+    event_name = None
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             status = resp.status
@@ -807,6 +844,11 @@ def probe_anthropic_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line.startswith("event:"):
                     events += 1
+                    event_name = line[6:].strip()
+                    # The event name alone marks an error, so a payload that
+                    # is malformed or cut off cannot hide it.
+                    if event_name == "error" and stream_error is None:
+                        stream_error = UNREADABLE_STREAM_ERROR
                 elif line.startswith("data:") and first is None:
                     first = time.perf_counter()
                 if line.startswith("data:"):
@@ -815,6 +857,13 @@ def probe_anthropic_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
                     except json.JSONDecodeError:
                         obj = None
                     if isinstance(obj, dict):
+                        kinds = {event_name, obj.get("type")}
+                        if "error" in kinds and stream_error in (None, UNREADABLE_STREAM_ERROR):
+                            stream_error = stream_error_text(obj.get("error") or obj)
+                        # Completion needs the event's payload too: a stream
+                        # cut right after the event name is still truncated.
+                        if "message_stop" in kinds:
+                            stopped = True
                         delta = obj.get("delta") or {}
                         piece = delta.get("text") or delta.get("thinking") or ""
                         if piece:
@@ -829,14 +878,19 @@ def probe_anthropic_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
     elapsed = time.perf_counter() - t0
     check = text_check(text, EXPECTED_MARKER)
+    end = stream_end_check(stopped, stream_error)
     return {
-        "ok": status == 200 and text_deltas > 0 and check["generated_ok"],
+        "ok": (
+            status == 200 and text_deltas > 0
+            and check["generated_ok"] and end["stream_ok"]
+        ),
         "status": status,
         "seconds": round(elapsed, 3),
         "first_token_seconds": round(first - t0, 3) if first else None,
         "events": events,
         "text_deltas": text_deltas,
         **check,
+        **end,
     }
 
 
@@ -902,6 +956,12 @@ def probe_responses(base_url: str, *, include_long: bool = False) -> list[dict[s
     return probes
 
 
+# response.incomplete is a normal ending: the probe caps max_output_tokens, and
+# the server reports a turn that hit that cap as incomplete rather than failed.
+RESPONSES_TERMINAL_EVENTS = frozenset({"response.completed", "response.incomplete"})
+RESPONSES_ERROR_EVENTS = frozenset({"response.failed", "error"})
+
+
 def probe_responses_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -914,6 +974,9 @@ def probe_responses_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     events = 0
     event_types: set[str] = set()
     text = ""
+    stream_error = None
+    completed = False
+    event_name = None
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             status = resp.status
@@ -921,7 +984,12 @@ def probe_responses_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line.startswith("event:"):
                     events += 1
-                    event_types.add(line[6:].strip())
+                    event_name = line[6:].strip()
+                    event_types.add(event_name)
+                    # The event name alone marks an error, so a payload that
+                    # is malformed or cut off cannot hide it.
+                    if event_name in RESPONSES_ERROR_EVENTS and stream_error is None:
+                        stream_error = UNREADABLE_STREAM_ERROR
                     if first is None:
                         first = time.perf_counter()
                 elif line.startswith("data:"):
@@ -930,6 +998,18 @@ def probe_responses_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
                     except json.JSONDecodeError:
                         obj = None
                     if isinstance(obj, dict):
+                        kinds = {event_name, obj.get("type")}
+                        if (
+                            kinds & RESPONSES_ERROR_EVENTS
+                            and stream_error in (None, UNREADABLE_STREAM_ERROR)
+                        ):
+                            response = obj.get("response")
+                            detail = response.get("error") if isinstance(response, dict) else None
+                            stream_error = stream_error_text(detail or obj)
+                        # Completion needs the event's payload too: a stream
+                        # cut right after the event name is still truncated.
+                        if kinds & RESPONSES_TERMINAL_EVENTS:
+                            completed = True
                         piece = obj.get("delta") or ""
                         if piece:
                             text += str(piece)
@@ -942,14 +1022,19 @@ def probe_responses_sse(url: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
     elapsed = time.perf_counter() - t0
     check = text_check(text, EXPECTED_MARKER)
+    end = stream_end_check(completed, stream_error)
     return {
-        "ok": status == 200 and events > 0 and check["generated_ok"],
+        "ok": (
+            status == 200 and events > 0
+            and check["generated_ok"] and end["stream_ok"]
+        ),
         "status": status,
         "seconds": round(elapsed, 3),
         "first_event_seconds": round(first - t0, 3) if first else None,
         "events": events,
         "event_types": sorted(event_types),
         **check,
+        **end,
     }
 
 

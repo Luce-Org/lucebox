@@ -98,6 +98,12 @@ python3 harness/client_test_runner.py probe \
   --json-out /tmp/lucebox_harness_probe.json
 ```
 
+A streaming probe passes only when the stream ends the way the client expects:
+`[DONE]` for Chat Completions, `message_stop` for Anthropic Messages, and
+`response.completed` or `response.incomplete` for Responses. A stream that
+stops early or carries an error event fails even if some text arrived first;
+the probe reports this in `stream_completed` and `stream_error`.
+
 Add `--install-packages` when you also want the runner to install/smoke the
 client packages. Without it, the HTTP protocol probes still run.
 
