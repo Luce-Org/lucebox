@@ -22,6 +22,7 @@
 #include "../../src/common/kvflash_arena.h"
 #include "../../src/common/kvflash_pinned_head.h"
 #include "../../src/common/kvflash_slot_bundle.h"
+#include "../../src/common/kvflash_session_store.h"
 
 #include <map>
 #include <memory>
@@ -398,4 +399,66 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, an_admit_on_an_attached_head_reports_th
     CHECK(r.resumed_tokens == kK * kChunk);
     mgr.retire(a.slot);
     CHECK(admit_cold(w, mgr, 3, prompt_of(1500, 2), a.slot).resumed_tokens == 0);
+}
+
+// ---- start-up order: init_bundles_ adopts, then init_heads_ installs a fresh binder and head_k_max -------------------
+
+namespace {
+// A parked session with a pinned head, as the engine's park left it: its blob, history, hash and the slot it parked in.
+struct Parked { std::vector<uint8_t> blob; std::vector<int32_t> hist; uint64_t hash = 0; int slot = -1; };
+Parked parked_with_head() {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const Captured a = capture_on_miss(w, mgr, 1, 1200);
+    must(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
+    mgr.commit_prefill(a.slot);
+    Parked p;
+    must(mgr.park(a.slot, p.hist));
+    p.blob = w.s[(size_t)a.slot]->serialize();
+    p.hash = a.hash; p.slot = a.slot;
+    return p;
+}
+// What the constructor does: adopt (no binder yet: no rebind), init_heads_ (a fresh binder), then the one pass.
+int startup(World & w, const Parked & p, int slot, uint64_t hash, int k, const std::vector<int32_t> & hist) {
+    must(w.kv->adopt_parked(slot, 0x99, 1200, p.blob.data(), p.blob.size()) == PagedKvStatus::Ok);
+    w.binder = KvFlashHeadBinder(kN);
+    return kvflash_rebind_restored(*w.kv, w.binder, kK, {{slot, &hist, kvflash_hex16(hash), k}});
+}
+}
+
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_session_restored_at_startup_has_its_head_bound_with_slot_pins_equal_to_the_pager_pins) {
+    const Parked p = parked_with_head();
+    World w;
+    CHECK(startup(w, p, p.slot, p.hash, kK, p.hist) == 1);
+    CHECK(bound(w, p.slot, kK));                                  // binder k, slot pins and the pager's hard pins all agree
+    CHECK(w.binder.binding(p.slot).hash == p.hash);
+    CHECK(kvflash_pinned_prefix(*w.s[(size_t)p.slot]) == kK);
+}
+
+TEST_CASE(KvflashPinnedHeadPathsFixture, the_binding_a_restored_session_parks_with_is_the_one_it_restored_with) {
+    const Parked p = parked_with_head();
+    World w;
+    REQUIRE(startup(w, p, p.slot, p.hash, kK, p.hist) == 1);
+    // the engine's park writes st.preamble from the binder only when k > 0; a second park must see the same head
+    const KvFlashHeadBinding hb = w.binder.binding(p.slot);
+    CHECK(hb.k == kK);
+    CHECK(kvflash_hex16(hb.hash) == kvflash_hex16(p.hash));
+}
+
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_session_restored_into_the_other_slot_index_rebinds_too) {
+    const Parked p = parked_with_head();
+    World w;
+    const int other = 1 - p.slot;
+    CHECK(startup(w, p, other, p.hash, kK, p.hist) == 1);
+    CHECK(bound(w, other, kK));
+    CHECK(unbound(w, p.slot, kK));                                // the other slot is untouched
+}
+
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_rebind_that_fails_leaves_the_restored_session_unbound_and_unpinned) {
+    const Parked p = parked_with_head();
+    World w;
+    auto other = p.hist;
+    other[5] ^= 1;                                                // the history no longer starts with the head
+    CHECK(startup(w, p, p.slot, p.hash, kK, other) == 0);
+    CHECK(unbound(w, p.slot, kK));                                // not half-bound: no binding, no pins, the pager's pins released
 }
