@@ -104,6 +104,25 @@ class ChatStreamProbeTests(unittest.TestCase):
             _sse(*frames),
         )
 
+    def test_non_object_chunks_are_ignored(self) -> None:
+        result = self.probe((None, [1, 2]), (None, 7), CHAT_DELTA, CHAT_FINISH, CHAT_DONE)
+
+        self.assertTrue(result["ok"])
+
+    def test_null_error_field_is_not_an_error(self) -> None:
+        chunk = (None, {"error": None, "choices": [{"delta": {"content": "lucebox"}}]})
+
+        result = self.probe(chunk, CHAT_FINISH, CHAT_DONE)
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["stream_error"])
+
+    def test_empty_error_object_fails(self) -> None:
+        result = self.probe(CHAT_DELTA, (None, {"error": {}}), CHAT_DONE)
+
+        self.assertFalse(result["ok"])
+        self.assertIsNotNone(result["stream_error"])
+
     def test_complete_stream_passes(self) -> None:
         result = self.probe(CHAT_DELTA, CHAT_FINISH, CHAT_DONE)
 
@@ -126,10 +145,29 @@ class ChatStreamProbeTests(unittest.TestCase):
 
 class AnthropicStreamProbeTests(unittest.TestCase):
     def probe(self, *frames: tuple[str | None, object]) -> dict:
+        return self.probe_bytes(_sse(*frames))
+
+    def probe_bytes(self, body: bytes) -> dict:
         return _run_stream_probe(
             lambda: runner.probe_anthropic_sse("http://test/v1/messages", {}),
-            _sse(*frames),
+            body,
         )
+
+    def test_error_event_with_unparseable_data_fails(self) -> None:
+        result = self.probe(
+            ANTHROPIC_START, ANTHROPIC_DELTA, ("error", "not json"), ANTHROPIC_STOP
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIsNotNone(result["stream_error"])
+
+    def test_stream_cut_after_message_stop_header_fails(self) -> None:
+        body = _sse(ANTHROPIC_START, ANTHROPIC_DELTA) + b"event: message_stop\n"
+
+        result = self.probe_bytes(body)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["stream_completed"])
 
     def test_complete_stream_passes(self) -> None:
         result = self.probe(ANTHROPIC_START, ANTHROPIC_DELTA, ANTHROPIC_STOP)
@@ -153,10 +191,29 @@ class AnthropicStreamProbeTests(unittest.TestCase):
 
 class ResponsesStreamProbeTests(unittest.TestCase):
     def probe(self, *frames: tuple[str | None, object]) -> dict:
+        return self.probe_bytes(_sse(*frames))
+
+    def probe_bytes(self, body: bytes) -> dict:
         return _run_stream_probe(
             lambda: runner.probe_responses_sse("http://test/v1/responses", {}),
-            _sse(*frames),
+            body,
         )
+
+    def test_stream_cut_after_completed_header_fails(self) -> None:
+        body = _sse(RESPONSES_CREATED, RESPONSES_DELTA) + b"event: response.completed\n"
+
+        result = self.probe_bytes(body)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["stream_completed"])
+
+    def test_failed_event_with_unparseable_data_fails(self) -> None:
+        result = self.probe(
+            RESPONSES_CREATED, RESPONSES_DELTA, ("response.failed", "not json")
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIsNotNone(result["stream_error"])
 
     def test_completed_stream_passes(self) -> None:
         result = self.probe(
