@@ -1023,6 +1023,36 @@ TEST_CASE(KvflashSessionStoreFixture, r17b_a_waiting_resume_restores_no_other_di
     fs::remove_all(root);
 }
 
+// R17c: a parked session the prompt extends serves it: the admission reads no disk bundle and evicts no parked session first.
+TEST_CASE(KvflashSessionStoreFixture, r17c_a_resident_session_the_prompt_extends_restores_no_disk_session) {
+    const std::string root = fresh_root("kvflash_s10b_resident_first");
+    {
+        KvFlashSessionStore seed(root);
+        commit_session(seed, "anon", "anon:5", {1, 2, 3}, 0x10, 100);   // B, ownerless, on disk, shares the prefix
+    }
+    KvFlashSessionBook book;
+    book.init(2);
+    book.enable_store(KvFlashSessionStore(root), ID);
+    rescan(book.store());
+    const std::vector<bool> active = {false, false};
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6}, resident = {1, 2, 3, 4};   // A: parked in slot 0, the prompt extends it
+    const std::vector<KvFlashOwnedSession> owners = {{{0, &resident, 7}, "anon", "anon:4"}};
+    const std::vector<KvFlashResumeWait> waits(2);                                       // no resume wait
+    const KvFlashSessionId who{"anon:9", "anon"};
+    int restores = 0;
+    auto restore = [&] {
+        if (book.plan_restore(who.client, who.sid, prompt, 0, active).pick == KvFlashRestorePick::load) ++restores;
+        return KvFlashRestore::absent;
+    };
+    const bool serves = kvflash_resident_serves(owners, waits, who.client, who.sid, prompt, 0);
+    CHECK(kvflash_admit_gate(book, who, active, serves, restore) == KvFlashAdmitVerdict::proceed);
+    CHECK(restores == 0);                                            // A serves: B is not read, no slot is taken or evicted
+    const KvFlashSessionPick p = kvflash_pick_parked_owner(owners, who.client, who.sid, prompt, 0);
+    CHECK(p.slot == 0);
+    CHECK(p.lcp == 4);                                               // resumes from A's full history
+    fs::remove_all(root);
+}
+
 TEST_CASE(KvflashSessionStoreFixture, r01_an_oversized_meta_is_refused_instead_of_published_unreadable) {
     const std::string root = fresh_root("kvflash_s10b_r01c");
     KvFlashSessionBook book;

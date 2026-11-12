@@ -174,6 +174,17 @@ inline KvFlashSessionPick kvflash_pick_with_wait(const KvFlashSessionPick & pick
     return {slot, std::max(pick.slot == slot ? pick.lcp : 0, wait.lcp)};
 }
 
+// Does a parked session already serve this request, so no stored session is restored (and no parked one evicted) for it? One the
+// request's owner/content pick resumes, or one whose resume wait holds for it. `waits` is per slot (L == 0: no wait).
+inline bool kvflash_resident_serves(const std::vector<KvFlashOwnedSession> & owners, const std::vector<KvFlashResumeWait> & waits,
+                                    const std::string & client, const std::string & sid, const std::vector<int32_t> & prompt, int e_role) {
+    if (kvflash_pick_parked_owner(owners, client, sid, prompt, e_role).exact()) return true;
+    for (const auto & o : owners)
+        if (waits[(size_t)o.parked.slot].L > 0 &&
+            kvflash_pick_with_wait({}, o.parked.slot, (int)o.parked.history->size(), waits[(size_t)o.parked.slot], prompt, client, sid).exact()) return true;
+    return false;
+}
+
 // ---- the slot's bundle bookkeeping -----------------------------------------------------------
 
 // What the engine keeps per slot about the session's directory. A slot reused by another session
@@ -962,12 +973,13 @@ inline KvFlashAdmitVerdict kvflash_admit_gate(const KvFlashSessionBook & book, c
 
 // The same checks, then the storage tier: a session in storage that cannot be restored yet waits instead of being admitted cold.
 // `restore` brings a stored session back (called only when the first two pass, and once).
-// `waiting`: a parked session holds a resume wait for this request (kvflash_pick_with_wait): the request resumes it, so no other
-// stored session is restored first (each retry would otherwise read a bundle and evict again).
+// `resident`: a parked session already serves this request (kvflash_resident_serves: its owner/content pick is exact, or it holds a
+// resume wait for it): the request resumes it, so no stored session is restored first (that would read a bundle and evict, possibly the
+// very session the prompt extends).
 template <class Restore>
-inline KvFlashAdmitVerdict kvflash_admit_gate(const KvFlashSessionBook & book, const KvFlashSessionId & who, const std::vector<bool> & active, bool waiting, Restore && restore) {
+inline KvFlashAdmitVerdict kvflash_admit_gate(const KvFlashSessionBook & book, const KvFlashSessionId & who, const std::vector<bool> & active, bool resident, Restore && restore) {
     const KvFlashAdmitVerdict v = kvflash_admit_gate(book, who, active);
-    if (v != KvFlashAdmitVerdict::proceed || waiting) return v;
+    if (v != KvFlashAdmitVerdict::proceed || resident) return v;
     return restore() == KvFlashRestore::busy ? KvFlashAdmitVerdict::restore_busy : KvFlashAdmitVerdict::proceed;
 }
 

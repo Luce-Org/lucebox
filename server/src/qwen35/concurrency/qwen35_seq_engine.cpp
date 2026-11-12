@@ -669,12 +669,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         const KvFlashSessionId id = kvflash_admit_identity(book_, {who.sid, who.client}, active_slots_(), request_id);
         who.sid = id.sid; who.client = id.client;
     }
-    bool waiting = false;   // a parked session a busy resume left rewound is resumed by this request
-    for (int i = 0; i < slots_.slot_count(); ++i)
-        if (parked_[(size_t)i].valid && parked_[(size_t)i].wait.L > 0 &&
-            kvflash_pick_with_wait({}, i, (int)parked_[(size_t)i].history.size(), parked_[(size_t)i].wait, prompt, who.client, who.sid).exact()) waiting = true;
+    std::vector<KvFlashResumeWait> waits((size_t)slots_.slot_count());   // a parked session serves this request (its prompt extends it, or a busy resume left it rewound): no disk session is restored first
+    for (int i = 0; i < slots_.slot_count(); ++i) waits[(size_t)i] = parked_[(size_t)i].wait;
+    const bool resident = kvflash_resident_serves(parked_list_(), waits, who.client, who.sid, prompt, e_role);
     bool restored = false;   // the restore outcome, for the admit plan below
-    switch (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_(), waiting, [&] {   // a session evicted to disk comes back into a slot, then resumes below
+    switch (kvflash_admit_gate(book_, {who.sid, who.client}, active_slots_(), resident, [&] {   // a session evicted to disk comes back into a slot, then resumes below
                 if (bundle_dir_.empty()) return KvFlashRestore::absent;
                 const KvFlashRestore rs = restore_from_disk_(who, prompt, e_role);
                 restored = rs == KvFlashRestore::restored;
