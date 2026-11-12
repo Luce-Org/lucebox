@@ -4,7 +4,7 @@
   </a>
 </p>
 
-<h3 align="center">Fast local inference on heterogeneous consumer hardware</h3>
+<h3 align="center">Fast local inference for heterogeneous consumer hardware</h3>
 
 <p align="center">
   <a href="#models">Models</a> · <a href="#quick-start"><b>Quick start</b></a> · <a href="#hardware">Hardware</a> · <a href="#documentation">Docs</a> · <a href="https://www.lucebox.com/blog/">Blog</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a>
