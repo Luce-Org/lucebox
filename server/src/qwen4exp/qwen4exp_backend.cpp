@@ -1097,20 +1097,44 @@ int Qwen4ExpBackend::snapshot_cur_pos(int slot) const {
 }
 
 size_t Qwen4ExpBackend::snapshot_bytes_estimate(int tokens) const {
+    return snapshot_bytes(tokens, /*rows=*/true);
+}
+
+size_t Qwen4ExpBackend::snapshot_state_bytes_estimate(int tokens) const {
+    // A KVFlash pool's rows are its slots: a snapshot exists only while they map positions one to one (a context
+    // within the pool), where a backup saves little, so its snapshots stay whole. Split mode keeps one row per
+    // position on either device, and a strip copy reaches both.
+    return cache_.kvflash ? 0 : snapshot_bytes(tokens, /*rows=*/false);
+}
+
+size_t Qwen4ExpBackend::snapshot_bytes(int tokens, bool rows) const {
     if (!snap_backend_ || !cache_.buf) return 0;
     const int n = std::clamp(tokens, 0, cache_.max_ctx);
     if (!n) return 0;
     size_t host = 0;
-    const size_t copies = qwen4exp_snapshot_bytes(snap_backend_, cache_, n, &host);
+    const size_t copies = qwen4exp_snapshot_bytes(snap_backend_, cache_, n, &host, rows);
     return copies + host + (size_t(n) + weights_.n_vocab +
         std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+}
+
+bool Qwen4ExpBackend::snapshot_drop_kv(int slot) {
+    if (!snapshot_state_bytes_estimate(1) || !snapshot_used(slot)) return false;
+    // A deferred snapshot is the live cache: copy it out first.
+    if (slot == live_slot_) snapshot_flush_deferred();
+    return snapshots_[slot].buf && drop_qwen4exp_snapshot_rows(cache_, snapshots_[slot]);
+}
+
+bool Qwen4ExpBackend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < kMaxSlots && snapshots_[slot].state_only;
 }
 
 bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
     size_t remaining = snapshot_budget_;
     for (int i = 0; i < kMaxSlots; ++i) {
         if (i == slot || i == replaced || !snapshot_used(i)) continue;
-        const size_t bytes = snapshot_bytes_estimate(snapshot_cur_pos(i));
+        // A state-only backup holds its point state alone.
+        const size_t bytes = snapshot_state_only(i) ? snapshot_state_bytes_estimate(snapshot_cur_pos(i))
+                                                    : snapshot_bytes_estimate(snapshot_cur_pos(i));
         if (bytes > remaining) return false;
         remaining -= bytes;
     }
@@ -1139,8 +1163,11 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
         live_slot_ = -1; // consume the zero-copy checkpoint before mutation
         std::fprintf(stderr, "[qwen4exp-snap] resident slot=%d pos=%d\n", slot, pos);
     } else {
-        snapshot_flush_deferred();
-        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_)) return generate_impl(req, io);
+        snapshot_flush_deferred();   // a deferred donor too: the restore below overwrites the live cache
+        // A state-only backup takes its rows from the deeper snapshot the request names; without it, recompute.
+        const int kv = req.restore_kv_slot;
+        const Qwen4ExpSnapshot * rows = kv >= 0 && kv < kMaxSlots && kv != slot ? &snapshots_[kv] : nullptr;
+        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
     }

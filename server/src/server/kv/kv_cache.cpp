@@ -39,6 +39,24 @@ KvLease KvCache::match(const KvMatchQuery & query) {
             index_.invalidate_inline_snap(inline_slot);
             continue;
         }
+        // A state-only backup restores with the rows of a deeper snapshot,
+        // which must hold at least the backup's positions (a chunk-aligned
+        // save can sit a little before its key).
+        Checkpoint restore_kv;
+        if (index_.state_only(inline_slot)) {
+            restore_kv = Checkpoint::of_cache_slot(index_.kv_source_slot(inline_slot));
+            if (!checkpoints_.used(restore_kv) || checkpoints_.state_only(restore_kv) ||
+                checkpoints_.position(restore_kv) <
+                    checkpoints_.position(Checkpoint::of_cache_slot(inline_slot))) {
+                checkpoints_.free(Checkpoint::of_cache_slot(inline_slot));
+                index_.invalidate_inline_snap(inline_slot);
+                continue;
+            }
+            std::fprintf(stderr,
+                "[pc] state backup slot=%d prefix_len=%d restores with the rows of slot=%d\n",
+                inline_slot, inline_len, restore_kv.cache_slot());
+        }
+        lease.restore_kv = restore_kv;
         index_.record_inline_hit(inline_slot, inline_len, prompt.size());
         consider_pin(inline_slot, prompt, query.client ? *query.client : std::string());
         lease.restore = Checkpoint::of_cache_slot(inline_slot);
@@ -76,6 +94,7 @@ KvLease KvCache::match(const KvMatchQuery & query) {
                 index_.abort_full_snap(lease.restore.cache_slot());
             }
             lease.restore = {};
+            lease.restore_kv = {};
             lease.prefix_len = 0;
             lease.using_restore = false;
             lease.disk_hit = false;
@@ -153,6 +172,7 @@ void KvCache::match_disk(KvLease & lease, const KvMatchQuery & query) {
                 }
             }
             lease.restore = staging;
+            lease.restore_kv = {};
             lease.prefix_len = hit_pos;
             lease.using_restore = true;
             lease.disk_hit = true;
@@ -190,6 +210,7 @@ void KvCache::prefill_scoped(KvLease & lease, const std::vector<int32_t> & promp
     disk_.learn_layout(staging);
     const bool saved = disk_.save(staging, prefix);
     lease.restore = staging;
+    lease.restore_kv = {};
     lease.prefix_len = boundary;
     lease.using_restore = true;
     lease.disk_hit = true;
@@ -224,7 +245,8 @@ void KvCache::admit(KvLease & lease, const std::vector<int32_t> & prompt,
             [this](int target_cut) {
                 return checkpoints_.estimate_bytes(target_cut);
             },
-            reachable_from, checkpoints_.restore_point_spacing(), query.learned_cut);
+            reachable_from, checkpoints_.restore_point_spacing(), query.learned_cut,
+            lease.using_restore ? lease.restore_kv.cache_slot() : -1);
         lease.snap = Checkpoint::of_cache_slot(lease.snap_reservation.slot());
         lease.snap_cut = lease.snap_reservation.target_cut();
     };
@@ -274,7 +296,9 @@ void KvCache::admit(KvLease & lease, const std::vector<int32_t> & prompt,
     // one-slot cache there may be no independent destination for a deeper
     // checkpoint; preserving the current hit is better than invalidating
     // it before restore starts.
-    if (lease.using_restore && lease.snap == lease.restore) {
+    if (lease.using_restore &&
+        (lease.snap == lease.restore ||
+         (lease.restore_kv.valid() && lease.snap == lease.restore_kv))) {
         lease.snap_reservation.cancel();
         lease.snap = {};
         lease.snap_cut = 0;
@@ -388,9 +412,20 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
     EngineCheckpoints & engine = *engine_;
     PrefixStorePlan & plan = out.plan;
     const auto hit = index_.lookup_candidate(prompt, (int)prompt.size() - 1);
+    int restore_kv_slot = -1;
     if (hit.first >= 0 && hit.second > 0 && hit.second < (int)prompt.size()) {
         out.restore_slot = hit.first;
         plan.restore = EngineCheckpoints::ref(Checkpoint::of_cache_slot(hit.first), hit.second);
+        // A state-only backup restores with the rows of a deeper checkpoint
+        // (lookup_candidate returns one only while such a checkpoint is resident).
+        if (index_.state_only(hit.first)) {
+            restore_kv_slot = index_.kv_source_slot(hit.first);
+            plan.restore_kv = EngineCheckpoints::ref(
+                Checkpoint::of_cache_slot(restore_kv_slot), index_.tokens(restore_kv_slot));
+            std::fprintf(stderr,
+                "[pc] state backup slot=%d prefix_len=%d restores with the rows of slot=%d\n",
+                hit.first, hit.second, restore_kv_slot);
+        }
     }
     // A deeper state on disk (the index answers without a read): load it
     // off this thread, then restore from the staging slot.
@@ -436,6 +471,8 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
             }
             out.disk_restore = true;
             out.restore_slot = -1;
+            restore_kv_slot = -1;
+            plan.restore_kv = {};
             plan.restore = EngineCheckpoints::ref(engine.staging(), pos);
         } else {
             std::fprintf(stderr, "[disk-cache] %s: disk state unusable, %s\n",
@@ -468,7 +505,8 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         return index_.reserve_inline_snap(
             prompt, restored_len, query.prefer_head, forced_cut, out.restore_slot,
             [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
-            /*reachable_from=*/0, checkpoints_.restore_point_spacing(), learned);
+            /*reachable_from=*/0, checkpoints_.restore_point_spacing(), learned,
+            restore_kv_slot);
     };
     PrefixCache::InlineReservation capture =
         reserve_capture(query.forced_cut, query.learned_cut);
@@ -502,7 +540,8 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         if (next_capture_id_ == 0) next_capture_id_ = 1;
         plan.capture.checkpoint = EngineCheckpoints::ref(
             Checkpoint::of_cache_slot(capture.slot()), capture.target_cut());
-        if (plan.restore.valid() && plan.capture.checkpoint == plan.restore) {
+        if ((plan.restore.valid() && plan.capture.checkpoint == plan.restore) ||
+            capture.slot() == restore_kv_slot) {
             capture.cancel();
             plan.capture = {};
         }
@@ -640,18 +679,13 @@ void KvCache::captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & even
             index_.set_disk_key(captured_slot, event.ticket.checkpoint.tokens);
             index_.set_aux(captured_slot, aux ? aux() : std::string());
         }
-        // A conversation's checkpoints are prefixes of each other; restores
-        // use only the deepest, so the ones it supersedes would hold memory
-        // the other conversations need.
-        std::vector<int> tokens;
-        const auto pruned = index_.prune_superseded_ancestors(captured_slot, &tokens);
-        for (size_t i = 0; i < pruned.size(); ++i) {
-            engine_->discard(Checkpoint::of_cache_slot(pruned[i]), tokens[i]);
-        }
+        trim_superseded(captured_slot);
     } else if (resolution == Resolution::failed) {
         std::fprintf(stderr, "[parallel-pc] capture failed checkpoint=%llu: %s\n",
                      (unsigned long long)event.ticket.checkpoint.id, event.error.c_str());
     }
+    // Whatever left RAM above may have been the rows a backup restored with.
+    free_orphaned_state_backups();
 }
 
 void KvCache::drop_read(const void * owner) {
@@ -1089,10 +1123,46 @@ void KvCache::evict_extra_victims(const PrefixCache::InlineReservation & reserva
 }
 
 void KvCache::trim_after_commit(int slot) {
-    for (const int released : index_.prune_superseded_ancestors(slot)) {
-        checkpoints_.free(Checkpoint::of_cache_slot(released));
-    }
+    trim_superseded(slot);
     enforce_budget(slot);
+}
+
+void KvCache::free_payload(int slot, int tokens) {
+    const Checkpoint checkpoint = Checkpoint::of_cache_slot(slot);
+    if (engine_) {
+        engine_->discard(checkpoint, tokens);
+    } else {
+        checkpoints_.free(checkpoint);
+    }
+}
+
+bool KvCache::drop_payload_kv(int slot, int tokens) {
+    const Checkpoint checkpoint = Checkpoint::of_cache_slot(slot);
+    return engine_ ? engine_->drop_kv(checkpoint, tokens) : checkpoints_.drop_kv(checkpoint);
+}
+
+size_t KvCache::state_payload_bytes(int tokens) const {
+    return engine_ ? engine_->estimate_state_bytes(tokens)
+                   : checkpoints_.estimate_state_bytes(tokens);
+}
+
+void KvCache::trim_superseded(int slot) {
+    // A conversation's checkpoints are prefixes of each other, and the
+    // superseded ones repeat the newest one's attention rows.
+    std::vector<int> tokens;
+    std::vector<int> keep_state;
+    const auto released = index_.prune_superseded_ancestors(
+        slot, &tokens, index_.state_backups() ? &keep_state : nullptr);
+    for (size_t i = 0; i < released.size(); ++i) free_payload(released[i], tokens[i]);
+    for (const int backup : keep_state) {
+        const int length = index_.tokens(backup);
+        if (drop_payload_kv(backup, length)) {
+            index_.mark_state_only(backup, state_payload_bytes(length));
+        } else {
+            free_payload(backup, length);
+            index_.invalidate_inline_snap(backup);
+        }
+    }
 }
 
 void KvCache::enforce_budget(int keep_slot) {
@@ -1100,6 +1170,13 @@ void KvCache::enforce_budget(int keep_slot) {
         write_out_slot(entry, "ram eviction");
         checkpoints_.free(Checkpoint::of_cache_slot(entry.slot));
     }
+    free_orphaned_state_backups();
+}
+
+void KvCache::free_orphaned_state_backups() {
+    std::vector<int> tokens;
+    const auto slots = index_.take_orphaned_state_backups(&tokens);
+    for (size_t i = 0; i < slots.size(); ++i) free_payload(slots[i], tokens[i]);
 }
 
 void KvCache::flush(const char * reason, double limit_s,

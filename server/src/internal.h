@@ -246,6 +246,9 @@ struct TargetWeights {
     // comparands with `>= 0` so the sentinel never matches a real token.
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
+    // Set for the length of a request that sends `ignore_eos: true`: no token ends
+    // the generation, which then runs to its output cap (single-sequence serving).
+    bool eos_disabled = false;
     // Token the chat template repeats once per image token; -1 when the
     // vocabulary has none (a model without image input).
     int32_t image_pad_id = -1;
@@ -267,6 +270,7 @@ struct TargetWeights {
 
 // Check if a token is an end-of-sequence marker for the given target weights.
 inline bool is_eos_tok(int tok, const TargetWeights & w) {
+    if (w.eos_disabled) return false;
     return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
         || (w.eos_id      >= 0 && tok == w.eos_id);
 }
@@ -656,11 +660,18 @@ struct PrefixSnapshot {
     bool                 is_pooled    = false;
     std::vector<uint8_t> kvflash_blob;
 
+    // State only (drop_prefix_snapshot_kv): the recurrent and conv state, the
+    // decode seed and the drafter features at cur_pos, with no attention KV.
+    // A deeper dense snapshot of the same tokens holds rows [0, cur_pos):
+    // restore_target_cache() takes them from it (kv_from).
+    bool state_only = false;
+
     // Only a full dense/paged ggml state may go to the SSD tier. An
     // OwnedSnapshot holds tensors only, so a pooled snapshot (KV in the pager
     // blob) would be written with no KV and restore garbage: never persist it.
     bool disk_persistable() const {
-        return !is_pooled && (layout == Layout::dense || layout == Layout::paged);
+        return !is_pooled && !state_only &&
+               (layout == Layout::dense || layout == Layout::paged);
     }
 };
 
@@ -681,8 +692,25 @@ bool snapshot_target_cache(const TargetWeights & w,
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =
 // snap.cur_pos. Does NOT touch ssm_intermediate / conv_input_cache —
 // those will be repopulated by the first decode step's verify forward.
+// `kv_from` (a dense snapshot of a longer prompt with the same first
+// snap.cur_pos tokens) supplies the attention rows [0, snap.cur_pos) of a
+// state-only `snap`; it is required for one and ignored otherwise.
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
-                          bool skip_kv = false);
+                          bool skip_kv = false,
+                          const PrefixSnapshot * kv_from = nullptr);
+
+// Free the attention KV of a snapshot (dense, or a paged checkpoint) and keep
+// the rest: the result is state-only and restores with the rows of a deeper
+// snapshot (see PrefixSnapshot::state_only). False, with `snap` unchanged,
+// when its rows are not in its own tensors (a KVFlash pool blob) or the
+// allocation fails.
+bool drop_prefix_snapshot_kv(PrefixSnapshot & snap);
+// Bytes a state-only snapshot of `token_count` positions holds; 0 when the
+// cache cannot take one.
+size_t estimate_target_cache_state_bytes(const TargetWeights & w,
+                                         const TargetCache & cache,
+                                         int token_count,
+                                         ggml_backend_buffer_type_t buft);
 
 // Can an attention K or V snapshot tensor (cur_pos rows) be adopted by this destination cache tensor?
 // Pure decision for Qwen35Backend::snapshot_adopt: type and per-row shape must match and the snapshot must
@@ -741,12 +769,18 @@ bool replace_paged_target_cache(
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and
 // must cover snap.cur_pos logical tokens.
+// A state-only `snap` takes its attention rows from `kv_from`, a deeper whole
+// checkpoint.
 bool restore_paged_target_cache(
     const PrefixSnapshot & snap,
     TargetCache & cache,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
-    int block_size);
+    int block_size,
+    const PrefixSnapshot * kv_from = nullptr);
+// Bytes a state-only paged checkpoint holds (any length); 0 when the cache
+// cannot take one.
+size_t estimate_paged_target_cache_state_bytes(const TargetCache & cache);
 
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries

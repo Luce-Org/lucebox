@@ -1958,6 +1958,11 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     // Commits prune the snapshots they supersede: single-sequence serving in
     // KvCache::trim_after_commit, the concurrent scheduler as each capture lands.
     prefix_cache_.set_prunes_superseded(true);
+    // Where the backend can drop a snapshot's attention rows, the turns a
+    // commit supersedes stay as state-only backups (0: it cannot, and they
+    // are freed as before). Concurrent serving asks its engine instead.
+    prefix_cache_.set_state_backup_bytes(
+        checkpoints_.estimate_state_bytes(config.max_ctx));
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -6843,6 +6848,8 @@ void HttpServer::remember_agent_turn(
     int source_pos = 0;
     auto consider_source = [&](int slot) {
         if (slot < 0 || !checkpoints_.used(checkpoint_of(slot))) return;
+        // A state-only backup is not a whole state to prefill from.
+        if (checkpoints_.state_only(checkpoint_of(slot))) return;
         const int pos = checkpoints_.position(checkpoint_of(slot));
         if (pos <= source_pos ||
             !http_detail::canonical_turn_matches_checkpoint(
@@ -6935,6 +6942,7 @@ void HttpServer::prepare_generation_inputs(
     // drafts against it decode autoregressively.
     inputs.request.force_ar_decode =
         req.sampler.constraint != nullptr && !backend_.speculates_under_constraint();
+    inputs.request.ignore_eos = request_ignores_eos(req);
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -7307,6 +7315,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     GenerateResult result;
     if (using_restore) {
+        gen_req.restore_kv_slot = cache.restore_kv.cache_slot();
         result = checkpoints_.restore_and_generate(restore_from, gen_req, io);
     } else {
         result = backend_.generate(gen_req, io);

@@ -6514,6 +6514,129 @@ TEST_CASE(ServerUnitFixture, test_free_slot_taken_before_live_slot) {
 
 // (g) A new turn supersedes the intermediate turns of its conversation. The
 // shallowest ancestor (shared head), protected pins and sibling branches stay.
+// The turns behind a conversation's newest snapshot repeat its attention
+// rows: with state backups they stay, state only, and thin out with distance.
+TEST_CASE(ServerUnitFixture, test_state_backups_keep_superseded_turns) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(8, tokenizer);
+    cache.set_state_backup_bytes(2);
+
+    // head, then five turns of two tokens each.
+    std::vector<std::vector<int32_t>> turns = {{1, 100}};
+    for (int i = 1; i <= 5; ++i) {
+        turns.push_back(turns.back());
+        turns.back().insert(turns.back().end(), {i % 2 ? 3 : 4, 100 + i});
+    }
+    for (int i = 0; i <= 5; ++i) {
+        cache.confirm_inline_snap(i, (int)turns[i].size(), turns[i], false, 10 * (i + 1));
+    }
+    // Behind turn 5: turn 4 (2 tokens back) and turn 3 (4 back) stay, turn 2
+    // (6 back, less than twice 4) goes, turn 1 (8 back) stays. The head is
+    // the shallowest ancestor: untouched.
+    std::vector<int> keep_state;
+    TEST_ASSERT(cache.prune_superseded_ancestors(5, nullptr, &keep_state) == std::vector<int>({2}));
+    TEST_ASSERT(keep_state == std::vector<int>({4, 3, 1}));
+    for (const int slot : keep_state) cache.mark_state_only(slot, 2);
+    TEST_ASSERT(cache.stats().in_use == 5);
+    TEST_ASSERT(cache.stats().resident_bytes == 10 + 60 + 3 * 2);
+    TEST_ASSERT(cache.state_only(4) && cache.state_only(1) && !cache.state_only(5) && !cache.state_only(0));
+    // A backup restores with the rows of the newest snapshot, and is never
+    // written to disk.
+    TEST_ASSERT(cache.kv_source_slot(4) == 5 && cache.kv_source_slot(5) == -1);
+    TEST_ASSERT(!cache.persist_on_evict(4) && cache.persist_on_evict(5));
+    // An edit of the last message resumes from the previous turn, an edit
+    // three turns back from the nearest backup behind it.
+    std::vector<int32_t> edited = turns[4];
+    edited.insert(edited.end(), {3, 900});
+    TEST_ASSERT(cache.lookup(edited) == std::make_pair(4, (int)turns[4].size()));
+    std::vector<int32_t> older = turns[2];
+    older.insert(older.end(), {3, 901});
+    TEST_ASSERT(cache.lookup(older) == std::make_pair(1, (int)turns[1].size()));
+    // Pruning again changes nothing, and asks for no row twice.
+    keep_state.clear();
+    TEST_ASSERT(cache.prune_superseded_ancestors(5, nullptr, &keep_state).empty());
+    TEST_ASSERT(keep_state.empty());
+    TEST_ASSERT(cache.take_orphaned_state_backups().empty());
+
+    // The newest snapshot leaves: its backups have no rows to restore with.
+    cache.invalidate_inline_snap(5);
+    TEST_ASSERT(cache.kv_source_slot(4) == -1);
+    TEST_ASSERT(cache.lookup(edited) == std::make_pair(0, (int)turns[0].size()));
+    auto orphans = cache.take_orphaned_state_backups();
+    std::sort(orphans.begin(), orphans.end());
+    TEST_ASSERT(orphans == std::vector<int>({1, 3, 4}));
+    TEST_ASSERT(cache.stats().in_use == 1 && cache.stats().resident_bytes == 10);
+
+    // Without a list to keep them in, a commit frees what it supersedes as
+    // before (the concurrent path).
+    PrefixCache plain(8, tokenizer);
+    plain.set_state_backup_bytes(2);
+    for (int i = 0; i <= 3; ++i) {
+        plain.confirm_inline_snap(i, (int)turns[i].size(), turns[i], false, 10);
+    }
+    TEST_ASSERT(plain.prune_superseded_ancestors(3) == std::vector<int>({1}));
+    unlink(path.c_str());
+}
+
+// A capture counts what its commit gives back: a dense turn behind it keeps
+// a state backup's bytes, and a state backup gives back nothing.
+TEST_CASE(ServerUnitFixture, test_state_backups_budget_credit) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::vector<int32_t> head = {1, 100};
+    std::vector<int32_t> t1 = head;
+    t1.insert(t1.end(), {3, 101});
+    std::vector<int32_t> t2 = t1;
+    t2.insert(t2.end(), {4, 102});
+    std::vector<int32_t> t3 = t2;
+    t3.insert(t3.end(), {3, 103});
+    std::vector<int32_t> other = {1, 100, 3, 700};
+    const auto size = [](int) { return (size_t)40; };
+
+    // Budget 90: head 10 + another conversation 30 + turn 2 at 40 = 80. A
+    // capture of 40 over turn 2 fits only with what turn 2 gives back: all
+    // 40 without backups, 40 - 15 with them, which is not enough, so the
+    // other conversation's leaf makes the room.
+    for (const size_t backup : {(size_t)0, (size_t)15}) {
+        PrefixCache cache(8, tokenizer, /*max_resident_bytes=*/90);
+        cache.set_prunes_superseded(true);
+        cache.set_state_backup_bytes(backup);
+        cache.confirm_inline_snap(0, (int)head.size(), head, false, 10);
+        cache.confirm_inline_snap(1, (int)other.size(), other, false, 30);
+        cache.confirm_inline_snap(2, (int)t2.size(), t2, false, 40);
+        auto capture = cache.reserve_inline_snap(
+            t3, (int)t2.size(), false, (int)t3.size(), /*restore_source_slot=*/2, size);
+        TEST_ASSERT(capture.active());
+        TEST_ASSERT(backup == 0 ? capture.slot() != 1 : capture.slot() == 1);
+        capture.cancel();
+    }
+    unlink(path.c_str());
+}
+
+// The conversation being served keeps its backups while another one still
+// has a leaf to give; then its own turns go, before any head.
+TEST_CASE(ServerUnitFixture, test_evict_keeps_served_conversation_backups) {
+    // 0 head, 1 and 2 turns behind the served leaf 4, 3 another conversation's leaf.
+    std::vector<std::vector<int32_t>> ids = {
+        {9}, {9, 1}, {9, 1, 2}, {9, 7}, {9, 1, 2, 3},
+    };
+    // Nobody served: a turn behind a newest snapshot goes first, as before.
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    // Leaf 4 served: the other conversation's leaf goes before its turns.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 4) == 3);
+    // The other conversation served: this one's turns are fair game.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // No other leaf left: the served conversation's own turns, oldest first.
+    ids = {{9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // A turn behind another conversation's newest snapshot still goes first.
+    ids = {{9}, {9, 1}, {9, 1, 2}, {9, 7}, {9, 7, 8}, {9, 7, 8, 6}, {9, 1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 6) == 3);
+}
+
 TEST_CASE(ServerUnitFixture, test_prune_superseded_ancestors) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;

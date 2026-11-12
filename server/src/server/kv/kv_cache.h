@@ -46,6 +46,9 @@ struct KvLease {
     // What the request restores from: an inline or exact-prompt
     // checkpoint, or the disk-staging one after a disk hit.
     Checkpoint restore;
+    // A state-only `restore` (PrefixCache::mark_state_only): the deeper
+    // snapshot whose attention rows it restores with. Invalid otherwise.
+    Checkpoint restore_kv;
     // Positions the backend restores: its own position, which may sit a
     // little before the entry's key (a chunk-aligned save).
     int prefix_len = 0;
@@ -307,9 +310,20 @@ public:
     // After a commit in `slot`: free what it supersedes, then evict to the
     // resident budget (enforce_budget).
     void trim_after_commit(int slot);
+    // The turns the checkpoint committed in `slot` supersedes: the ones
+    // worth keeping stay as state-only backups, where the store can drop
+    // their attention rows; the rest are freed. Both serving paths.
+    void trim_superseded(int slot);
+    // A checkpoint's payload on the path being served: the backend's
+    // snapshot slots, or the concurrent engine's store.
+    void free_payload(int slot, int tokens);
+    bool drop_payload_kv(int slot, int tokens);
+    size_t state_payload_bytes(int tokens) const;
     // Evict, writing out what is worth keeping, until the resident bytes
     // fit the budget again; never `keep_slot`.
     void enforce_budget(int keep_slot);
+    // Free the state-only backups whose deeper snapshot left RAM.
+    void free_orphaned_state_backups();
 
     // Graceful shutdown: write out every entry worth keeping, most recently
     // used first, while `limit_s` (counted from `started`) lasts; < 0: no

@@ -32,7 +32,9 @@ struct Qwen4ExpRow;
 // snapshots, the same payload the single-slot path keeps) on `snapshot_store`,
 // the device or system memory, restorable into any slot of the same layout.
 // The scheduler owns their identities (1..kPrefixCheckpoints) and LRU policy;
-// the engine enforces the backend's byte allowance on capture.
+// the engine enforces the backend's byte allowance on capture. A checkpoint a
+// deeper one supersedes can keep its point state alone (drop_prefix_kv) and
+// restores with the deeper one's rows (PrefixStorePlan::restore_kv).
 //
 // Every slot's cache carries the MTP draft layer and verify rollback state; the first slot's covers the widest verify
 // (its rollback buffers are close to 1 GiB), the others' at most kQwen4ExpBatchedVerifyRows rows. Admission takes the
@@ -71,6 +73,8 @@ public:
     AdmitResult admit_with_prefix(uint64_t request_id, const std::vector<int32_t> & prompt,
                                   const SamplerCfg & sampler, const PrefixStorePlan & plan) override;
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
+    size_t estimate_prefix_state_bytes(int tokens) const override;
+    bool drop_prefix_kv(PrefixStoreRef checkpoint) override;
     StepPlanLimits step_plan_limits(int decode_rows) const override;
     bool reserve_decode(const StepPlan & plan) override;
     StepResult step(const StepPlan & plan) override;
@@ -85,7 +89,9 @@ public:
 private:
     AdmitResult admit_cold(uint64_t request_id, const std::vector<int32_t> & prompt,
                            const SamplerCfg & sampler);
-    bool restore_prefix(int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint);
+    // `rows`: the deeper checkpoint a state-only `checkpoint` takes its rows from.
+    bool restore_prefix(int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint,
+                        PrefixStoreRef rows = {});
     PrefixStoreEvent capture_prefix(int slot, PrefixCaptureTicket ticket);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
     // Rows the slot's next prompt forward covers: up to one granule, the next

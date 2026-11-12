@@ -93,7 +93,8 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_text(
 
 bool DeepSeek4SeqEngine::stage_text_prompt(
         uint64_t request_id, int slot, const std::vector<int32_t> & prompt,
-        const std::vector<int> & restore_points, const DeepSeek4Snapshot * from) {
+        const std::vector<int> & restore_points, const DeepSeek4Snapshot * from,
+        const DeepSeek4Snapshot * rows_from) {
     // Short prompts prefill in the gathered batch; staging pays off once a
     // prompt spans many sixteen-row (one-row on the hybrid path) steps.
     constexpr int kMinStagedTextTokens = 64;
@@ -125,7 +126,7 @@ bool DeepSeek4SeqEngine::stage_text_prompt(
     pending.staged.prefix = prefix;
     pending.staged.cuts = std::move(cuts);
     pending.staged.staging = b_.image_staging_cache(slot);
-    if (!pending.staged.staging || !b_.begin_staged_prefill(pending.staged, from)) {
+    if (!pending.staged.staging || !b_.begin_staged_prefill(pending.staged, from, rows_from)) {
         return false;  // nothing seeded yet: the gathered prefill still works
     }
     SeqSlotManager::PrefillChunk seeded = slots_.seed_restored_prefix(slot, prefix);
@@ -249,6 +250,15 @@ void DeepSeek4SeqEngine::discard_prefix_store(PrefixStoreRef ref) {
     }
 }
 
+size_t DeepSeek4SeqEngine::estimate_prefix_state_bytes(int tokens) const {
+    return supports_prefix_store() && tokens > 0 ? b_.staged_checkpoint_state_bytes() : 0;
+}
+
+bool DeepSeek4SeqEngine::drop_prefix_kv(PrefixStoreRef ref) {
+    Checkpoint * checkpoint = find_checkpoint(ref);
+    return checkpoint && deepseek4_snapshot_drop_rows(checkpoint->snap);
+}
+
 SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_with_prefix(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler, const PrefixStorePlan & plan) {
@@ -273,8 +283,16 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_with_prefix(
     Checkpoint * from = find_checkpoint(plan.restore);
     const bool matches = from && plan.restore.tokens < int(prompt.size()) &&
         std::equal(from->tokens.begin(), from->tokens.end(), prompt.begin());
+    // A state-only checkpoint takes its rows from the deeper one the plan
+    // names, which must hold a prompt that extends it.
+    Checkpoint * rows = matches && from->snap.state_only ? find_checkpoint(plan.restore_kv) : nullptr;
+    if (rows && (rows == from || rows->tokens.size() < from->tokens.size() ||
+                 !std::equal(from->tokens.begin(), from->tokens.end(), rows->tokens.begin()))) {
+        rows = nullptr;
+    }
     const bool restored = matches && stage_text_prompt(request_id, result.slot, prompt,
-                                                       plan.restore_points, &from->snap);
+                                                       plan.restore_points, &from->snap,
+                                                       rows ? &rows->snap : nullptr);
     const uint64_t elapsed_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count());
     if (restored) {

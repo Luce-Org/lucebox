@@ -1087,6 +1087,13 @@ struct DeepSeek4Snapshot {
     // false when ctx/buf are shared with (and freed by) another owner, e.g.
     // one merged ondisk context bound into several layer-split shard snapshots.
     bool                  owns_storage = true;
+    // State only (deepseek4_snapshot_drop_rows): the compressed and index
+    // rows were dropped (one placeholder row each; n_comp and n_index_comp
+    // keep the logical counts), and a restore takes them from a deeper
+    // snapshot of a prompt that extends this one. What is left is what the
+    // position alone determines: the raw window, the compressor windows, HC
+    // state, logits and features.
+    bool                  state_only = false;
 };
 
 
