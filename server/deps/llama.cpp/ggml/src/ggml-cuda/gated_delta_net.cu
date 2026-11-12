@@ -114,6 +114,65 @@ __device__ __forceinline__ float gdn_subgroup_broadcast_lane0(float value, int w
     return __shfl_sync(0xffffffffU, value, 0, width);
 }
 
+// The grouped-cols kernel on RDNA4 and RDNA3.5, the targets it is checked bit
+// for bit on, loads each token's operands one token ahead in calls of more than
+// one token (LOAD_AHEAD, see the kernel) and keeps its cross-lane steps in the VALU instead of a ds_bpermute shuffle: a
+// 16-lane subgroup is one DPP row, so row_shl:N hands lane i the value of lane
+// i + N (the pairs and the order of gdn_subgroup_sum_lane0's adds, so the same
+// sums), row_share:0 hands every lane its row's lane 0, and readlane takes a
+// wave32 warp's lane 0 into a scalar register. Other targets shuffle and load
+// each token's operands at that token.
+#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3_5))
+#define GDN_GROUPED_RDNA 1
+
+// One level of the tree: lane i adds lane i + N of its row. The DPP control
+// word must be a compile-time constant, so N is a template argument.
+template <int N>
+__device__ __forceinline__ float gdn_row_shl_add(float value, int lane) {
+    const float other = __int_as_float(__builtin_amdgcn_update_dpp(
+        0, __float_as_int(value), 0x100 | N, 0xf, 0xf, false));
+    return lane < N ? value + other : value;
+}
+#endif // defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3_5))
+
+template <int WIDTH>
+__device__ __forceinline__ float gdn_grouped_sum_lane0(float value) {
+#if defined(GDN_GROUPED_RDNA)
+    static_assert(WIDTH == 16, "a DPP row is 16 lanes");
+    const int lane = threadIdx.x % WIDTH;
+    value = gdn_row_shl_add<8>(value, lane);
+    value = gdn_row_shl_add<4>(value, lane);
+    value = gdn_row_shl_add<2>(value, lane);
+    value = gdn_row_shl_add<1>(value, lane);
+    return value;
+#else
+    return gdn_subgroup_sum_lane0(value, WIDTH);
+#endif // defined(GDN_GROUPED_RDNA)
+}
+
+template <int WIDTH>
+__device__ __forceinline__ float gdn_grouped_broadcast_lane0(float value) {
+#if defined(GDN_GROUPED_RDNA)
+    static_assert(WIDTH == 16, "a DPP row is 16 lanes");
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(value), 0x150, 0xf, 0xf, false));
+#else
+    return gdn_subgroup_broadcast_lane0(value, WIDTH);
+#endif // defined(GDN_GROUPED_RDNA)
+}
+
+template <int WARP_THREADS>
+__device__ __forceinline__ float gdn_grouped_warp_lane0(float value) {
+#if defined(GDN_GROUPED_RDNA)
+    if constexpr (WARP_THREADS == 32) {
+        return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(value), 0));
+    } else {
+        return __shfl_sync(0xffffffffU, value, 0);
+    }
+#else
+    return __shfl_sync(0xffffffffU, value, 0);
+#endif // defined(GDN_GROUPED_RDNA)
+}
+
 template <int S_v>
 static __device__ __forceinline__ float * gdn_select_state(
         const int * active_slot_ids, float * dst, float * state_out,
@@ -405,7 +464,43 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <int S_v, int COLS, int WIDTH, int WARP_THREADS, bool TREE_MODE, bool WRITE_INTER, typename InterT = float>
+// One token's operands for a grouped-cols subgroup: its lanes' q and k rows, the v
+// entries of its columns (read by lane 0, which forms delta) and the raw gates
+// (read by thread 0, which forms g and beta for the warp).
+template <int COLS, int ROWS>
+struct gdn_grouped_token {
+    float q[ROWS];
+    float k[ROWS];
+    float v[COLS];
+    float g;
+    float beta;
+};
+
+template <int COLS, int ROWS, int WIDTH>
+static __device__ __forceinline__ void gdn_grouped_load_token(
+        const float * q_seq, const float * k_seq, const float * v_seq,
+        const float * g_seq, const float * beta_seq, int t,
+        int64_t sq2, int64_t sv2, int64_t sb2, int col_base, int lane,
+        gdn_grouped_token<COLS, ROWS> & out) {
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        out.q[r] = q_seq[t * sq2 + r * WIDTH + lane];
+        out.k[r] = k_seq[t * sq2 + r * WIDTH + lane];
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            out.v[c] = v_seq[t * sv2 + col_base + c];
+        }
+    }
+    if (threadIdx.x == 0) {
+        out.g    = g_seq[t * sb2];
+        out.beta = beta_seq[t * sb2];
+    }
+}
+
+template <int S_v, int COLS, int WIDTH, int WARP_THREADS, bool TREE_MODE, bool WRITE_INTER, typename InterT = float,
+          bool LOAD_AHEAD = false>
 __global__ void __launch_bounds__(WARP_THREADS * 8, 2)
 gated_delta_net_cuda_grouped_cols(const float * q,
                                   const float * k,
@@ -499,7 +594,41 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         }
     }
 
+    const float * q_seq = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_seq = k + iq3 * sq3 + iq1 * sq1;
+    const float * v_seq = v + sequence * sv3 + h_idx * sv1;
+    const int64_t gb_seq = sequence * sb3 + h_idx * sb1;
+    using token_operands = gdn_grouped_token<COLS, rows_per_lane>;
+#if defined(GDN_GROUPED_RDNA)
+    // LOAD_AHEAD: token t + 1's operands load while token t computes, so a step
+    // waits on the recurrence and not on memory. The kernel never writes q, k, v, g
+    // or beta, so only the time of each load moves: the values and every operation
+    // on them are the same, and so are the outputs.
+    constexpr bool load_ahead = LOAD_AHEAD;
+#else
+    constexpr bool load_ahead = false;
+#endif // defined(GDN_GROUPED_RDNA)
+    [[maybe_unused]] token_operands next = {};
+    if constexpr (load_ahead) {
+        if (n_tokens > 0) {
+            gdn_grouped_load_token<COLS, rows_per_lane, WIDTH>(q_seq, k_seq, v_seq, g + gb_seq, beta + gb_seq,
+                0, sq2, sv2, sb2, col_base, lane, next);
+        }
+    }
+
     for (int t = 0; t < n_tokens; ++t) {
+        token_operands cur;
+        if constexpr (load_ahead) {
+            cur = next;
+            if (t + 1 < n_tokens) {
+                gdn_grouped_load_token<COLS, rows_per_lane, WIDTH>(q_seq, k_seq, v_seq, g + gb_seq, beta + gb_seq,
+                    t + 1, sq2, sv2, sb2, col_base, lane, next);
+            }
+        } else {
+            gdn_grouped_load_token<COLS, rows_per_lane, WIDTH>(q_seq, k_seq, v_seq, g + gb_seq, beta + gb_seq,
+                t, sq2, sv2, sb2, col_base, lane, cur);
+        }
+
         if constexpr (TREE_MODE) {
             // DFS branch transition: this token continues from a state other
             // than the previous token's. Reload the register shard from the
@@ -535,28 +664,22 @@ gated_delta_net_cuda_grouped_cols(const float * q,
                 }
             }
         }
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
-
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-
         float g_val = 0.0f;
         float beta_val = 0.0f;
         if (threadIdx.x == 0) {
             if (gate_bias != nullptr) {
                 // raw-gate mode: g = exp(softplus(alpha_raw + bias) * A), beta = sigmoid(beta_raw)
-                const float a  = g[gb_offset] + gate_bias[h_idx];
+                const float a  = cur.g + gate_bias[h_idx];
                 const float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
                 g_val    = expf(sp * gate_A[h_idx]);
-                beta_val = 1.0f / (1.0f + expf(-beta[gb_offset]));
+                beta_val = 1.0f / (1.0f + expf(-cur.beta));
             } else {
-                g_val = expf(g[gb_offset]);
-                beta_val = beta[gb_offset];
+                g_val = expf(cur.g);
+                beta_val = cur.beta;
             }
         }
-        g_val = __shfl_sync(0xffffffffU, g_val, 0);
-        beta_val = __shfl_sync(0xffffffffU, beta_val, 0);
+        g_val = gdn_grouped_warp_lane0<WARP_THREADS>(g_val);
+        beta_val = gdn_grouped_warp_lane0<WARP_THREADS>(beta_val);
 
         constexpr int replay_log_width = 2*S_v + 1;
         float * replay_log_t = replay_log
@@ -564,8 +687,6 @@ gated_delta_net_cuda_grouped_cols(const float * q,
                 ((sequence * n_tokens + t) * H + h_idx) * replay_log_width
             : nullptr;
 
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
         float kv_partial[COLS];
 
 #pragma unroll
@@ -576,10 +697,7 @@ gated_delta_net_cuda_grouped_cols(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; ++r) {
             const int row = r * WIDTH + lane;
-            const float q_val = q_t[row];
-            const float k_val = k_t[row];
-            q_reg[r] = q_val;
-            k_reg[r] = k_val;
+            const float k_val = cur.k[r];
             if (replay_log_t && blockIdx.z == 0 && threadIdx.y == 0 &&
                 subgroup == 0) {
                 replay_log_t[1 + row] = k_val;
@@ -598,15 +716,15 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         float delta[COLS];
 #pragma unroll
         for (int c = 0; c < COLS; ++c) {
-            const float kv_col = gdn_subgroup_sum_lane0(kv_partial[c], WIDTH);
+            const float kv_col = gdn_grouped_sum_lane0<WIDTH>(kv_partial[c]);
             float delta_val = 0.0f;
             if (lane == 0) {
-                delta_val = (v_t[col_base + c] - g_val * kv_col) * beta_val;
+                delta_val = (cur.v[c] - g_val * kv_col) * beta_val;
                 if (replay_log_t) {
                     replay_log_t[1 + S_v + col_base + c] = delta_val;
                 }
             }
-            delta[c] = gdn_subgroup_broadcast_lane0(delta_val, WIDTH);
+            delta[c] = gdn_grouped_broadcast_lane0<WIDTH>(delta_val);
         }
 
         float attn_partial[COLS];
@@ -619,15 +737,15 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         for (int r = 0; r < rows_per_lane; ++r) {
 #pragma unroll
             for (int c = 0; c < COLS; ++c) {
-                const float new_state = fmaf(k_reg[r], delta[c], g_val * state_shard[c][r]);
+                const float new_state = fmaf(cur.k[r], delta[c], g_val * state_shard[c][r]);
                 state_shard[c][r] = new_state;
-                attn_partial[c] += new_state * q_reg[r];
+                attn_partial[c] += new_state * cur.q[r];
             }
         }
 
 #pragma unroll
         for (int c = 0; c < COLS; ++c) {
-            attn_partial[c] = gdn_subgroup_sum_lane0(attn_partial[c], WIDTH);
+            attn_partial[c] = gdn_grouped_sum_lane0<WIDTH>(attn_partial[c]);
         }
 
         if (lane == 0) {
@@ -1251,10 +1369,20 @@ static void launch_gated_delta_net(
                         constexpr int groups_per_warp = 32 / width;
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
                         dim3 grouped_block_dims(32, column_groups_per_block, 1);
-                        gated_delta_net_cuda_grouped_cols<128, cols, width, 32, TREE_MODE, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
-                            q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
-                            n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
+                        // Loading a token ahead pays only when there is a next token. With
+                        // one it would only hold registers, and so cost occupancy: on the
+                        // Strix Halo iGPU eight one-token sequences ran 10% slower with it.
+                        if (n_tokens > 1) {
+                            gated_delta_net_cuda_grouped_cols<128, cols, width, 32, TREE_MODE, WRITE_INTER, InterT, true><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
+                                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
+                                n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
+                                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
+                        } else {
+                            gated_delta_net_cuda_grouped_cols<128, cols, width, 32, TREE_MODE, WRITE_INTER, InterT, false><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
+                                q_d, k_d, v_d, g_d, b_d, s_d, active_slot_ids_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, replay_log_d, H,
+                                n_tokens, n_seqs, n_state_slots, sq1, sq2, sq3, sv1, sv2, sv3,
+                                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
+                        }
                     } else if (warp_size == 64) {
                         constexpr int groups_per_warp = 64 / width;
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
