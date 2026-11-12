@@ -26,6 +26,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const uint32_t * __restrict__ KV_live,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -766,6 +767,59 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// KV granule of the live-tile bitmap (ggml_flash_attn_ext_set_sparse_mask): every nbatch_fa of the kernels that read
+// the bitmap is a multiple of it.
+#define FATTN_KV_GRANULE 32
+
+// The live KV granules of a mask marked sparse: bit g%32 of word g/32 of a plane is set when any row of that mask
+// plane (any head plane ne32 too) holds a value other than -inf in columns [32g, 32g + 32) below ne11. One block per
+// word and plane. A kernel may skip a KV tile whose granules are all clear: every query row masks it out, so it adds
+// exact zeros to the softmax sums and leaves their maximum where it was.
+static __global__ void flash_attn_mask_to_KV_live(
+        const half * __restrict__ mask, uint32_t * __restrict__ KV_live, const int ne11, const int ne31, const int ne32,
+        const int64_t s31, const int64_t s32, const int64_t s33, const int words) {
+    const int word  = blockIdx.x;
+    const int plane = blockIdx.y;
+
+    __shared__ int live[32];
+    if (threadIdx.x < 32) {
+        live[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    const int col0 = word*(32*FATTN_KV_GRANULE);
+    const int ncol = min(32*FATTN_KV_GRANULE, ne11 - col0);
+    const half * m = mask + plane*s33 + col0;
+    const int n = ncol*ne31*ne32;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int col = i % ncol;
+        const int row = (i / ncol) % ne31;
+        const int p2  = i / (ncol*ne31);
+        if (__half2float(m[p2*s32 + row*s31 + col]) != -INFINITY) {
+            live[col / FATTN_KV_GRANULE] = 1;          // every writer stores the same value
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        uint32_t bits = 0;
+        for (int g = 0; g < 32; ++g) {
+            bits |= live[g] ? (1u << g) : 0u;
+        }
+        KV_live[plane*words + word] = bits;
+    }
+}
+
+// Whether any granule of KV columns [k0, k1) is live in a plane's bitmap (flash_attn_mask_to_KV_live).
+static __device__ __forceinline__ bool fattn_kv_live_any(const uint32_t * __restrict__ live, const int k0, const int k1) {
+    for (int g = k0 / FATTN_KV_GRANULE; g < (k1 + FATTN_KV_GRANULE - 1) / FATTN_KV_GRANULE; ++g) {
+        if ((live[g / 32] >> (g % 32)) & 1u) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1008,7 +1062,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool reads_kv_live = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1041,6 +1096,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<uint32_t> KV_live(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1137,6 +1193,18 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
             ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // A mask marked sparse (ggml_flash_attn_ext_set_sparse_mask) is scanned once into a live-granule bitmap per mask
+    // plane, for a kernel that skips the KV tiles every query row masks out.
+    if (reads_kv_live && mask && K->ne[1] >= 2*FATTN_KV_GRANULE &&
+            ggml_flash_attn_ext_get_sparse_mask(KQV)) {
+        const int words = (int) ((K->ne[1] + 32*FATTN_KV_GRANULE - 1) / (32*FATTN_KV_GRANULE));
+        KV_live.alloc(words*mask->ne[3]);
+        flash_attn_mask_to_KV_live<<<dim3(words, mask->ne[3], 1), dim3(256, 1, 1), 0, main_stream>>>(
+            (const half *) mask->data, KV_live.ptr, (int) K->ne[1], (int) mask->ne[1], (int) mask->ne[2],
+            mask->nb[1] / sizeof(half), mask->nb[2] / sizeof(half), mask->nb[3] / sizeof(half), words);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1245,6 +1313,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        KV_live.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
