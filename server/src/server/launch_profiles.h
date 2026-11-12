@@ -30,6 +30,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -385,6 +386,16 @@ struct KvflashRecallProfile {
     static constexpr int          uq_queries       = 64;
     static constexpr int          score_pool_recent = 1;     // mode 4 scores on the recency pool
 };
+
+// Startup line for the recall profile. The profile only sets variables that are not already set, so the mode
+// that runs is the operator's LUCE_KVFLASH_PREFILL_RESELECT when present, else the profile's 4.
+inline std::string kvflash_recall_banner(std::string_view arch,
+                                         const std::function<std::string(const char *)> & get) {
+    if (arch != "qwen35") return "recall profile not applied (it is qwen35-only)";
+    const std::string preset = get("LUCE_KVFLASH_PREFILL_RESELECT");
+    if (preset.empty()) return "recall profile: mode 4 (exact scorer)";
+    return "recall profile: mode " + preset + " (LUCE_KVFLASH_PREFILL_RESELECT set by the environment)";
+}
 
 inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
     if (arch != "qwen35") return {};

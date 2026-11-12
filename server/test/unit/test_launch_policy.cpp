@@ -765,11 +765,29 @@ struct LaunchPolicyFixture : CommonFixture {
             if (hit != expected.end()) CHECK(hit->second == entry.value);
         }
     }
+
+    void test_kvflash_banner_prints_the_resolved_reselect_mode() {
+        std::map<std::string, std::string> env;
+        const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        const auto has = [](const std::string & s, const char * t) { return s.find(t) != std::string::npos; };
+        std::string b = kvflash_recall_banner("qwen35", get);                        // nothing preset: the profile's default
+        CHECK(has(b, "mode 4"));
+        CHECK(!has(b, "set by the environment"));
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "0";                                    // preset value wins over the profile
+        b = kvflash_recall_banner("qwen35", get);
+        CHECK(has(b, "mode 0"));
+        CHECK(!has(b, "mode 4"));
+        CHECK(has(b, "set by the environment"));
+        b = kvflash_recall_banner("llama", get);                                       // profile is qwen35 only
+        CHECK(has(b, "not applied"));
+        CHECK(!has(b, "mode"));
+    }
 };
 
 }  // namespace
 
 TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
+    test_kvflash_banner_prints_the_resolved_reselect_mode();
     test_auto_device_prefers_discrete_gpu_that_fits();
     test_auto_device_moves_large_model_to_device_that_fits();
     test_auto_device_falls_back_to_largest();
