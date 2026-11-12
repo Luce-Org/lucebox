@@ -535,7 +535,8 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
 
     // ── The whole HC low-rank gate and mix on RDNA4 (hc_mix_from_xn): the down product with SCALE and SILU, then the
     // up product with the mix reduce and the q8_1 rows of the projection that reads the mix, in two launches. Node by
-    // node is the reference; the RDNA4 GPUs must fuse at 1..4 columns (several only under batch-invariant products).
+    // node is the reference; the RDNA4 GPUs must fuse at 1 column. Both products are MMVQ's: a batch-invariant product
+    // runs on MMQ at every column count, so there the fusion must not run (0 runs) and the graph still equals the nodes.
     // The fused launches never write the SILU rows, so a graph that reads them back (lo_out) must not fuse. Without
     // cn read back the allocator may put the mix in place on xn (whole rows apart, as in the decode graphs). With
     // from_norm xn is a plain RMS_NORM and MUL (hc_mix, the MTP draft's mixes): the fusion quantizes xn itself, and
@@ -597,7 +598,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         };
         const Profile prof(true);
         const Invariant inv(invariant);
-        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && T <= 4 && (T == 1 || invariant) && !lo_out;
+        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && T == 1 && !invariant && !lo_out;
         check(be, name, p, {}, Expect{{GGML_CUDA_QN_HC_MIX_RDNA4, fuses ? 1 : 0}}, reset);
     }
 
@@ -894,6 +895,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
 
     // ── Two Q8_0 products of the same activations (the GDN step's qkv and z) in one RDNA4 launch ────────────────────
     // Rows counts that take different block shapes (more and fewer than 1024 rows of 80 blocks) stay two launches.
+    // The launch is MMVQ's: batch-invariant products run on MMQ at every column count and stay two launches.
     void mmvq_twin(ggml_backend_t be, int T, int rows_a, int rows_b, bool invariant) {
         const std::string name = "mmvq_twin T=" + std::to_string(T) + " rows=" + std::to_string(rows_a) + "+" +
                                  std::to_string(rows_b) + (invariant ? "" : " (not batch-invariant)");
@@ -909,7 +911,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         const Profile prof(true);
         const Invariant inv(invariant);
         const bool same_shape = (rows_a > 1024) == (rows_b > 1024);
-        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && same_shape && (T == 1 || invariant);
+        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && same_shape && T == 1 && !invariant;
         check(be, name, p, {}, GGML_CUDA_QN_MMVQ_TWIN, fuses ? 1 : 0);
     }
 
@@ -1359,7 +1361,11 @@ TEST_CASE(QnSplitFusionsFixture, hc_mix_rdna4) {
         if (!hc_supported(be)) return;
         ran = true;
         for (int T : {1, 2, 3, 4, 8}) hc_mix_rdna4(be, T, true);
+        hc_mix_rdna4(be, 1, false);
         hc_mix_rdna4(be, 3, false);
+        hc_mix_rdna4(be, 1, false, /*lo_out=*/true);
+        hc_mix_rdna4(be, 1, false, /*lo_out=*/false, /*cn_out=*/false);
+        hc_mix_rdna4(be, 1, false, /*lo_out=*/false, /*cn_out=*/true, /*from_norm=*/true);
         hc_mix_rdna4(be, 3, true, /*lo_out=*/true);
         for (int T : {1, 2, 3, 4}) hc_mix_rdna4(be, T, true, /*lo_out=*/false, /*cn_out=*/false);
         for (int T : {1, 2, 3}) hc_mix_rdna4(be, T, true, /*lo_out=*/false, /*cn_out=*/true, /*from_norm=*/true);
