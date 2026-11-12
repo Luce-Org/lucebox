@@ -359,6 +359,42 @@ int main() {
               std::string::npos);
     }
 
+    {   // One slot's turn fails after the step produced its outputs (a KVFlash turn that cannot rewind): that slot's
+        // output alone is failed, with the reason; the other slot keeps its token and the step result stays valid.
+        SeqEngine::StepPlan plan;
+        plan.prefills.push_back({0, 8});
+        plan.prefills.push_back({1, 8});
+        SeqEngine::StepResult result;
+        SeqEngine::PrefillOutput done, advanced;
+        done.slot = 0;
+        done.status = SeqEngine::PrefillOutput::Status::completed;
+        done.token = 11;
+        advanced.slot = 1;
+        advanced.prefix_store.status = PrefixStoreEvent::Status::saved;
+        advanced.prefix_store.ticket.id = 7;
+        advanced.prefix_store.ticket.checkpoint = {3, 8};
+        advanced.prefix_store.bytes = 4096;
+        result.prefills = {done, advanced};
+        fail_prefill_output(result.prefills, 1, "turn rewind failed");
+        CHECK(validate_step_result(plan, result, 2).empty());
+        CHECK(result.prefills.size() == 2);
+        CHECK(result.prefills[0].status == SeqEngine::PrefillOutput::Status::completed);
+        CHECK(result.prefills[0].token == 11);
+        CHECK(result.prefills[1].slot == 1);
+        CHECK(result.prefills[1].status == SeqEngine::PrefillOutput::Status::failed);
+        CHECK(result.prefills[1].error == "turn rewind failed");
+        CHECK(result.prefills[1].prefix_store.status == PrefixStoreEvent::Status::none);
+
+        SeqEngine::StepResult none;   // a slot without an output in this step gets its failed one
+        fail_prefill_output(none.prefills, 1, "turn rewind failed");
+        CHECK(none.prefills.size() == 1);
+        CHECK(none.prefills[0].slot == 1);
+        CHECK(none.prefills[0].status == SeqEngine::PrefillOutput::Status::failed);
+        SeqEngine::StepPlan one;
+        one.prefills.push_back({1, 8});
+        CHECK(validate_step_result(one, none, 2).empty());
+    }
+
     for (const int slots : {2, 4}) {
         FakeSeqEngine engine(slots);
         const auto violations = check_seq_engine_contract(engine);

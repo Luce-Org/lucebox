@@ -208,6 +208,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.cache_type_v       = cache.cache_type_v;
         cfg.paged_attention    = cache.paged_attention;
         cfg.max_concurrency    = execution.max_concurrency;
+        cfg.max_concurrency_set = execution.max_concurrency_set;
         cfg.kv_pool_tokens     = cache.kv_pool_tokens;
         cfg.kv_pool_reserve_bytes = cache.kv_pool_reserve_bytes;
         cfg.kq_stride_pad      = cache.kq_stride_pad;
@@ -215,6 +216,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.draft_swa_window   = cache.draft_swa_window;
         cfg.draft_ctx_max      = cache.draft_ctx_max;
         cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.fast_rollback_explicit = speculation.fast_rollback_explicit;
         cfg.seq_verify         = speculation.seq_verify;
         cfg.specla_mode        = speculation.specla_mode;
         cfg.specla_top_k       = speculation.specla_top_k;

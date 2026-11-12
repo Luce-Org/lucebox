@@ -2222,50 +2222,49 @@ std::string HttpServer::resolve_status_html() {
     return {};
 }
 
-// Send data to an SSE client fd with a short (1s) timeout to avoid stalling
-// the inference worker. Returns false if the send fails or times out.
-static bool sse_try_send(SocketHandle fd, const void * data, size_t len) {
-    const char * p = static_cast<const char *>(data);
-    size_t sent = 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (sent < len) {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0) return false;
+// ponytail: ceilings of the HTTP edge. One handler thread per live connection,
+// 256 at most; a /status/events subscriber holds a descriptor but no thread, so
+// it is capped on its own at 32 and does not count against the 256.
+static constexpr int kMaxConnections = 256;
+static constexpr size_t kMaxStatusSubscribers = 32;
 
-        struct pollfd pfd = {fd, POLLOUT, 0};
-        int ret;
-        do {
-            ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
-        } while (ret < 0 && sock_is_eintr(sock_errno()));
-        if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
-        if (ret == 0) continue;
+// 503 + Retry-After, one non-blocking send: the caller (the accept loop, or a
+// handler about to close) must never wait on the peer.
+void HttpServer::send_busy_503(SocketHandle fd) {
+    std::string payload = format_http_response(503, "application/json",
+        "{\"error\":{\"message\":\"server busy\"}}\n");
+    payload.insert(payload.find("\r\n") + 2, "Retry-After: 1\r\n");
+    ::send(fd, payload.data(), payload.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+}
 
-        ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
-            return false;
-        }
-        sent += n;
+// Send one SSE event to every subscriber. The list is snapshotted under sse_mu_
+// and the sends run outside it, so registration never waits on a slow reader.
+// A send that fails or would block (event not fully accepted) drops the
+// subscriber. sse_send_mu_ serializes fan-outs, heartbeats and shutdown, the only
+// places that close a subscriber, so a snapshot never holds a closed fd.
+void HttpServer::sse_fanout(const std::string & event) {
+    std::lock_guard<std::mutex> send_lk(sse_send_mu_);
+    std::vector<SocketHandle> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(sse_mu_);
+        snapshot = sse_fds_;
     }
-    return true;
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : snapshot) {
+        const ssize_t n = ::send(fd, event.data(), event.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n != (ssize_t)event.size()) dead.push_back(fd);
+    }
+    if (dead.empty()) return;
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    for (SocketHandle fd : dead) {
+        socket_close(fd);
+        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd), sse_fds_.end());
+    }
 }
 
 // Broadcast current status as SSE event to all connected /status/events clients.
 void HttpServer::broadcast_status() {
-    std::string event = status_.to_sse_event();
-    std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<SocketHandle> dead;
-    for (SocketHandle fd : sse_fds_) {
-        if (!sse_try_send(fd, event.data(), event.size())) {
-            dead.push_back(fd);
-        }
-    }
-    for (SocketHandle fd : dead) {
-        socket_close(fd);
-        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
-                       sse_fds_.end());
-    }
+    sse_fanout(status_.to_sse_event());
 }
 
 // Broadcast a token text delta as an incremental SSE event.
@@ -2275,26 +2274,15 @@ void HttpServer::broadcast_token(const std::string & text) {
     // that replaces invalid UTF-8 with U+FFFD instead of throwing.
     json j;
     j["text"] = text;
-    std::string event = "event: token\ndata: " +
-        j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-    std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<SocketHandle> dead;
-    for (SocketHandle fd : sse_fds_) {
-        if (!sse_try_send(fd, event.data(), event.size())) {
-            dead.push_back(fd);
-        }
-    }
-    for (SocketHandle fd : dead) {
-        socket_close(fd);
-        sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
-                       sse_fds_.end());
-    }
+    sse_fanout("event: token\ndata: " +
+        j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
 }
 
 // Send an SSE comment as a heartbeat to detect disconnected clients when idle.
 // Uses non-blocking sends to avoid stalling the worker thread on slow clients.
 void HttpServer::sse_heartbeat() {
     static const char ping[] = ":heartbeat\n\n";
+    std::lock_guard<std::mutex> send_lk(sse_send_mu_);
     std::lock_guard<std::mutex> lk(sse_mu_);
     std::vector<SocketHandle> dead;
     for (SocketHandle fd : sse_fds_) {
@@ -2310,6 +2298,19 @@ void HttpServer::sse_heartbeat() {
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
+}
+
+// A closed status page keeps its slot until a send to it fails (an event, or the second idle heartbeat). When the
+// list is full, the subscribers whose peer has closed leave first, so reloads do not use up the cap.
+void HttpServer::sse_drop_closed_at_cap() {
+    std::lock_guard<std::mutex> send_lk(sse_send_mu_);
+    std::lock_guard<std::mutex> lk(sse_mu_);
+    if (sse_fds_.size() + sse_pending_ < kMaxStatusSubscribers) return;
+    sse_fds_.erase(std::remove_if(sse_fds_.begin(), sse_fds_.end(), [](SocketHandle fd) {
+        if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Connected) return false;
+        socket_close(fd);
+        return true;
+    }), sse_fds_.end());
 }
 
 HttpServer::~HttpServer() {
@@ -2331,6 +2332,7 @@ void HttpServer::shutdown() {
 
     // Close SSE client connections.
     {
+        std::lock_guard<std::mutex> send_lk(sse_send_mu_);
         std::lock_guard<std::mutex> lk(sse_mu_);
         for (SocketHandle fd : sse_fds_) socket_close(fd);
         sse_fds_.clear();
@@ -2538,6 +2540,12 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         int flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
+        if (active_clients_.load() >= kMaxConnections) {
+            send_busy_503(client_fd);
+            socket_close(client_fd);
+            continue;
+        }
+
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
         std::thread([this, client_fd]() {
@@ -2583,8 +2591,8 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
 
 void HttpServer::handle_client(SocketHandle fd) {
     HttpRequest hr;
-    if (!read_http_request(fd, hr)) {
-        send_error(fd, 400, "bad HTTP request");
+    if (const int status = read_http_request(fd, hr)) {
+        send_error(fd, status, status == 408 ? "request timeout" : "bad HTTP request");
         socket_close(fd);
         return;
     }
@@ -2682,6 +2690,19 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     // Status SSE stream: hold connection open and push updates.
     if (hr.method == "GET" && hr.path == "/status/events") {
+        sse_drop_closed_at_cap();
+        {
+            std::lock_guard<std::mutex> lk(sse_mu_);
+            // A slot is reserved here, counting live and pending subscribers, so
+            // two handlers cannot both pass for the last slot. The socket writes
+            // below stay outside the mutex.
+            if (sse_fds_.size() + sse_pending_ >= kMaxStatusSubscribers) {
+                send_busy_503(fd);
+                socket_close(fd);
+                return;
+            }
+            ++sse_pending_;
+        }
         // Send SSE headers.
         const char * headers =
             "HTTP/1.1 200 OK\r\n"
@@ -2690,17 +2711,20 @@ void HttpServer::handle_client(SocketHandle fd) {
             "Connection: keep-alive\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
-        if (!send_all(fd, headers, std::strlen(headers))) {
+        // Send initial state immediately.
+        const std::string initial = status_.to_sse_event();
+        if (!send_all(fd, headers, std::strlen(headers)) ||
+            !send_all(fd, initial.data(), initial.size())) {
+            std::lock_guard<std::mutex> lk(sse_mu_);
+            --sse_pending_;
             socket_close(fd);
             return;
         }
-        // Send initial state immediately.
-        std::string initial = status_.to_sse_event();
-        send_all(fd, initial.data(), initial.size());
         // Register for future broadcasts. The fd is NOT closed here — it stays
         // open until the client disconnects (detected on next broadcast send).
         {
             std::lock_guard<std::mutex> lk(sse_mu_);
+            --sse_pending_;   // the reservation becomes the registration
             sse_fds_.push_back(fd);
         }
         return;  // Do NOT close fd — it's now owned by the SSE broadcast loop.
@@ -3088,6 +3112,7 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    req.force_ar_decode = body.value("luce_force_ar_decode", false);
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -3134,6 +3159,7 @@ bool HttpServer::parse_endpoint_request(
         const std::string & path, const json & body, ParsedRequest & req,
         bool & count_tokens_only) {
     count_tokens_only = false;
+    req.session = kvflash_resolve_session(req.headers, parse_session_id_from_body(body));   // who the conversation is: headers first, then the body
     if (path == "/v1/chat/completions") {
         req.format = ApiFormat::OPENAI_CHAT;
         req.response_id = generate_id("chatcmpl");
@@ -3591,6 +3617,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
+    req.headers = hr.headers;
     bool count_tokens_only = false;
     // "claude-cli/2.1.317 (external, cli)" -> "claude-cli".
     // The User-Agent's product token, kept to token characters (RFC 9110)
@@ -3606,6 +3633,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
+        req.session = kvflash_bound_identity(req.session);   // an id the engine could not hold or log is no identity
         if (hr.body.find("\"tools\"") != std::string::npos) {
             // json sorts object keys; the prompt shows tools as the client wrote them.
             const auto ordered = nlohmann::ordered_json::parse(hr.body, nullptr, false);
@@ -3852,12 +3880,23 @@ bool create_socket_pair(SocketHandle pair[2]) {
 
 }  // namespace
 
+ParsedRequest HttpServer::make_inner_request(const KvFlashHeaders * headers, const json & request) {
+    ParsedRequest inner;
+    if (headers) inner.headers = *headers;   // the session identity is resolved from them
+    bool count_only = false;
+    inner.raw_body = request;
+    inner.output_format = http_detail::request_output_format(request.dump());
+    parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+    return inner;
+}
+
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
                                        int & status, std::string & body,
                                        SocketHandle client_fd, bool * dropped_tool_call,
                                        bool note_pass,
                                        const nlohmann::ordered_json * ordered_tools,
-                                       const std::string & client) {
+                                       const std::string & client,
+                                       const KvFlashHeaders * headers) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -3890,11 +3929,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
     });
     RoutingAdmission outcome = RoutingAdmission::handled;
     try {
-        ParsedRequest inner;
-        bool count_only = false;
-        inner.raw_body = request;
-        inner.output_format = http_detail::request_output_format(request.dump());
-        parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        ParsedRequest inner = make_inner_request(headers, request);
         inner.client = client;
         auto dropped = std::make_shared<bool>(false);
         inner.dropped_tool_call_out = dropped;
@@ -3956,7 +3991,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true, &req.ordered_tools, req.client) ||
+                                   /*note_pass=*/true, &req.ordered_tools, req.client, &req.headers) ||
             status != 200) {
             return false;
         }
@@ -3969,7 +4004,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     std::string raw;
     bool dropped_call = false;
     if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call,
-                               /*note_pass=*/false, &req.ordered_tools, req.client)) {
+                               /*note_pass=*/false, &req.ordered_tools, req.client, &req.headers)) {
         return true;
     }
     json response = json::parse(raw, nullptr, false);
@@ -6941,7 +6976,7 @@ void HttpServer::prepare_generation_inputs(
     // A grammar masks one position at a time: backends that do not check
     // drafts against it decode autoregressively.
     inputs.request.force_ar_decode =
-        req.sampler.constraint != nullptr && !backend_.speculates_under_constraint();
+        (req.sampler.constraint != nullptr && !backend_.speculates_under_constraint()) || req.force_ar_decode;
     inputs.request.ignore_eos = request_ignores_eos(req);
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
@@ -7529,6 +7564,7 @@ void HttpServer::process_job(ServerJob * job) {
 // ─── Job queue ──────────────────────────────────────────────────────────
 
 void HttpServer::enqueue(ServerJob * job) {
+    job->arrived_at = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(queue_mu_);
     if (stopping_.load()) {
         // Return routed requests to the listener for a shutdown response.
@@ -7611,10 +7647,19 @@ ServerJob * HttpServer::dequeue_for(
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
-bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
+// 0 = request read; otherwise the status to answer with (400 bad request, 408 deadline).
+int HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
     sock_set_nonblock(fd);
-    auto receive = [&](char * data, size_t size) -> ssize_t {
+    using Clock = std::chrono::steady_clock;
+    const auto & lim = config_.http_read;
+    bool timed_out = false;
+    // Waits for bytes until `limit` (absolute) or `idle_ms` without any (< 0: no idle limit).
+    // stopping_ ends the wait at once.
+    auto receive = [&](char * data, size_t size, Clock::time_point limit, int idle_ms) -> ssize_t {
+        const auto idle_end = idle_ms < 0 ? Clock::time_point::max()
+                                          : Clock::now() + std::chrono::milliseconds(idle_ms);
         while (!stopping_.load()) {
+            if (Clock::now() >= std::min(limit, idle_end)) { timed_out = true; return -1; }
             struct pollfd pfd{fd, POLLIN, 0};
             const int ready = poll(&pfd, 1, 100);
             if (ready < 0 && sock_is_eintr(sock_errno())) continue;
@@ -7626,15 +7671,18 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         }
         return -1;
     };
+    auto fail = [&]() { return timed_out ? 408 : 400; };
     std::string buf;
     buf.reserve(8192);
     char tmp[4096];
 
     // Read until we find the header/body boundary (\r\n\r\n or \n\n).
     ssize_t hend = -1;
+    auto limit = Clock::now() + std::chrono::milliseconds(lim.first_byte_ms);
     while (hend < 0 && buf.size() < 65536) {
-        ssize_t n = receive(tmp, sizeof(tmp));
-        if (n <= 0) return false;
+        ssize_t n = receive(tmp, sizeof(tmp), limit, -1);
+        if (n <= 0) return fail();
+        if (buf.empty()) limit = Clock::now() + std::chrono::milliseconds(lim.header_ms);
         buf.append(tmp, n);
 
         // Look for end of headers.
@@ -7654,18 +7702,18 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
             }
         }
     }
-    if (hend < 0) return false;
+    if (hend < 0) return 400;
 
     // Parse request line.
     size_t line_end = buf.find('\n');
-    if (line_end == std::string::npos) return false;
+    if (line_end == std::string::npos) return 400;
     std::string line = buf.substr(0, line_end);
     if (!line.empty() && line.back() == '\r') line.pop_back();
 
     // "METHOD /path HTTP/1.1"
     size_t sp1 = line.find(' ');
     size_t sp2 = line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
+    if (sp1 == std::string::npos || sp2 == std::string::npos) return 400;
     out.method = line.substr(0, sp1);
     out.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
 
@@ -7677,6 +7725,7 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         out.path = out.path.substr(0, q);
     }
     out.query = std::move(query_string);
+    out.headers = kvflash_parse_headers(std::string_view(buf).substr(line_end + 1, (size_t)hend - line_end - 1));
 
     // Find Content-Length.
     long content_length = 0;
@@ -7701,17 +7750,18 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
         }
     }
 
-    if (content_length < 0 || content_length > 64 * 1024 * 1024) return false;
+    if (content_length < 0 || content_length > 64 * 1024 * 1024) return 400;
 
     // Read body.
+    const auto body_limit = Clock::now() + std::chrono::milliseconds(lim.body_total_ms);
     while ((ssize_t)buf.size() < hend + content_length) {
-        ssize_t n = receive(tmp, sizeof(tmp));
-        if (n <= 0) return false;
+        ssize_t n = receive(tmp, sizeof(tmp), body_limit, lim.body_idle_ms);
+        if (n <= 0) return fail();
         buf.append(tmp, n);
     }
 
     out.body = buf.substr(hend, content_length);
-    return true;
+    return 0;
 }
 
 bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
@@ -7830,6 +7880,7 @@ std::string HttpServer::format_http_response(
         case 400: reason = "Bad Request"; break;
         case 404: reason = "Not Found"; break;
         case 405: reason = "Method Not Allowed"; break;
+        case 408: reason = "Request Timeout"; break;
         case 413: reason = "Payload Too Large"; break;
         case 500: reason = "Internal Server Error"; break;
         case 503: reason = "Service Unavailable"; break;

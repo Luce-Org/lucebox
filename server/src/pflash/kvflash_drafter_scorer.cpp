@@ -134,14 +134,14 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
     const int64_t n_vocab = ctx_->state ? ctx_->state->weights.embedder.n_vocab : 0;
     if (!kvflash_pflash2_ids_fit(ids, n_vocab, err)) { std::fprintf(stderr, "[kvflash] pflash2: %s\n", err.c_str()); return false; }
 
-    // The release request: lookahead 128, the query ends at the last message's content,
+    // The release request: lookahead 128, the query ends at the latest human message's content,
     // keep 1.0, chunk 256, pool 1, suffix candidates, every message mapped.
     const PFlashRequestMessages msgs = kvflash_message_map(ids, roles_);
     if (!msgs.all_error.empty()) { std::fprintf(stderr, "[kvflash] pflash2: message map: %s\n", msgs.all_error.c_str()); return false; }
     // The request path's strict selection records every candidate with its density (the attention lift);
     // the selection itself is not used.
     const int query_end = kvflash_message_query_end(msgs);
-    if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: the last message is empty, no query\n"); return false; }
+    if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: no message with content to query\n"); return false; }
     const std::vector<int32_t> kept = drafter_score_and_compress(
         *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/128, /*pool_kernel=*/1,
         query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
