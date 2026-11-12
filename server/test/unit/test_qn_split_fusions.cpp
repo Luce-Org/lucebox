@@ -435,8 +435,10 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
     }
 
     // ── HC_COMBINE_NORM writing the HC down projection's q8_1 rows ─────────────────────────────────────────────────
-    void hc_cn_q8(ggml_backend_t be, int T) {
-        const std::string name = "hc_cn_q8 T=" + std::to_string(T);
+    // The rows are MMVQ's. A batch-invariant product runs on MMQ at every column count, so there the combine must
+    // not write them (0 runs) and the one graph still equals the segments.
+    void hc_cn_q8(ggml_backend_t be, int T, bool invariant) {
+        const std::string name = "hc_cn_q8 T=" + std::to_string(T) + (invariant ? "" : " (not batch-invariant)");
         const int n_embd = 2560, hc = 4, rank = 320;
         Pattern p;
         ggml_tensor * inject = p.input(GGML_TYPE_F32, hc, T);
@@ -455,16 +457,18 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         if (!p.alloc(be)) { fail(name + ": alloc"); return; }
         p.fill_rest();
         const Profile prof(true);
-        const Invariant inv(true);
-        check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_CN_Q8, 1);
+        const Invariant inv(invariant);
+        check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_CN_Q8, invariant ? 0 : 1);
     }
 
     // ── The layer output's ADD (split mode: cold plus hot expert sums) folded into the next HC_COMBINE_NORM ─────────
-    // Node by node is the reference. q8: an MMVQ product reads xn, so the fused launch writes its q8_1 rows too.
+    // Node by node is the reference. q8: a product reads xn; where it is MMVQ's (not batch-invariant) the fused launch
+    // writes its q8_1 rows too.
     // reuse: the ADD's sources are computed and the graph allocator places every tensor, as the scheduler does; it may
     // give the norm's output their memory, and then the fold must decline.
-    void hc_cn_add(ggml_backend_t be, int T, bool q8, bool reuse) {
-        const std::string name = "hc_cn_add T=" + std::to_string(T) + (q8 ? " q8" : "") + (reuse ? " reuse" : "");
+    void hc_cn_add(ggml_backend_t be, int T, bool q8, bool reuse, bool invariant = true) {
+        const std::string name = "hc_cn_add T=" + std::to_string(T) + (q8 ? " q8" : "") + (reuse ? " reuse" : "") +
+                                 (invariant ? "" : " (not batch-invariant)");
         const int n_embd = 2560, hc = 4, rank = 320;
         Pattern p;
         ggml_tensor * inject = p.input(GGML_TYPE_F32, hc, T);
@@ -499,9 +503,9 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
             for (size_t k = 0; k < p.inputs.size(); ++k) ggml_backend_tensor_set(p.inputs[k], saved[k].data(), 0, saved[k].size());
         };
         const Profile prof(true);
-        const Invariant inv(true);
+        const Invariant inv(invariant);
         Expect expect{{GGML_CUDA_QN_HC_CN_ADD, fold ? 1u : 0u}};
-        if (W) expect.push_back({GGML_CUDA_QN_HC_CN_Q8, 1u});
+        if (W) expect.push_back({GGML_CUDA_QN_HC_CN_Q8, invariant ? 0u : 1u});
         check(be, name, p, {}, expect, reset);
     }
 
@@ -1316,7 +1320,8 @@ TEST_CASE(QnSplitFusionsFixture, hc_cn_q8) {
     each_gpu([&](ggml_backend_t be) {
         if (!hc_supported(be)) return;
         ran = true;
-        for (int T : {1, 2, 8}) hc_cn_q8(be, T);
+        for (int T : {1, 2, 8}) hc_cn_q8(be, T, true);
+        for (int T : {1, 2, 3}) hc_cn_q8(be, T, false);   // MMVQ's default column limit is 3 (LUCE_MMVQ_MAX_NCOLS)
     });
     if (!ran) SKIP("HC_COMBINE_NORM is HIP-only");
 }
@@ -1328,9 +1333,11 @@ TEST_CASE(QnSplitFusionsFixture, hc_cn_add) {
         ran = true;
         for (int T : {1, 2, 3, 8}) hc_cn_add(be, T, false, false);
         for (int T : {1, 3}) {
-            hc_cn_add(be, T, true, false);
             hc_cn_add(be, T, false, true);
-            hc_cn_add(be, T, true, true);
+            for (bool invariant : {true, false}) {
+                hc_cn_add(be, T, true, false, invariant);
+                hc_cn_add(be, T, true, true, invariant);
+            }
         }
     });
     if (!ran) SKIP("HC_COMBINE_NORM is HIP-only");
