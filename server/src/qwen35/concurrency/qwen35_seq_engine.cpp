@@ -145,7 +145,7 @@ void Qwen35SeqEngine::init_slots_() {
         end_rung_min_ = rung && *rung ? std::atoi(rung) : -1;
         const char * hr = std::getenv("LUCE_KVFLASH_HEADER_RUNG");
         header_rung_ = hr && hr[0] == '1' && !hr[1];
-        if (header_rung_) std::fprintf(stderr, "[kvflash] slot first-pass header rung on recall turns (LUCE_KVFLASH_HEADER_RUNG)\n");
+        if (header_rung_) std::fprintf(stderr, "[kvflash] slot replay rung at the last cut before the header on recall turns (LUCE_KVFLASH_HEADER_RUNG)\n");
         const KvFlashParkCfg pc = kvflash_park_cfg(sticky_on_, std::getenv("LUCE_KVFLASH_PARK_SHORT"), std::getenv("LUCE_KVFLASH_PARK_TAIL"), std::getenv("LUCE_KVFLASH_PARK_DECODE"));
         park_short_on_ = pc.any() && slot_state_stash_alloc(b_.cache_, b_.target_backend_, stash_);   // the stash exists only when a mode uses it
         park_decode_on_ = park_short_on_ && pc.decode_on;
@@ -997,9 +997,7 @@ void Qwen35SeqEngine::place_ckpt_(int slot, SlotCkpt nu) {
     SlotCkpt & ck = ckpt_[(size_t)slot];
     SlotCkpt & tr = trunk_[(size_t)slot];
     SlotCkpt & ex = extra_[(size_t)slot];
-    const KvFlashLadder in = ladder_of_(ck, tr, ex);
-    // L4: the first pass already took the header rung above R: it stays the checkpoint and R goes below it
-    const KvFlashLadderMove m = header_rung_ && in.ckpt > nu.pos ? kvflash_ladder_ckpt_below(in, nu.pos) : kvflash_ladder_ckpt(in, nu.pos);
+    const KvFlashLadderMove m = kvflash_ladder_ckpt(ladder_of_(ck, tr, ex), nu.pos);
     apply_ladder_(m, ck, tr, ex, std::move(nu));
 }
 
@@ -1544,7 +1542,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
                                                                         luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
-                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn, capture_at, header_rung_);
+                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn, capture_at);
     if (rc.turn.capture_at > 0) rc.capture_ids.assign(prompt.begin(), prompt.begin() + rc.turn.capture_at);
     if (uq_queries_ > 0) {
         // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
@@ -1557,6 +1555,8 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         rc.uq_hash = kvflash_uq_hash(prompt, rc.uq.cut);
         if (!rc.uq.capture) rc.uq_miss = rc.uq.n == 0 ? "no-human-turn" : "window-not-in-prefill";   // unless the store holds it
     }
+    // L4: after the turn's last cut is in (the UQ cut above), with the replay's cut rule (the park tail of the step loop)
+    if (header_rung_) kvflash_slot_turn_header_rung(rc.turn, kKvFlashCutU, park_short_on_ ? park_tail_ : 0);
     if (rc.turn.apply_at >= 0) {
         // Mode 5: score the prompt ids with the drafter's session now; an unavailable drafter leaves an LRU turn.
         if (b_.kvflash_pflash2_scores(prompt, p.chunk_tokens(), rc.scores, rc.score_ms)) {
@@ -1570,7 +1570,8 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     } else if (rc.turn.first_pass()) {
         if (rc.turn.r == rc.turn.kv_offset) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts%s)\n",
-                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.end_rung ? ", header rung" : "");
+                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.end_rung ? ", header rung" : rc.turn.header_rung ? ", replay rung" : "");
+        if (rc.turn.header_rung) std::fprintf(stderr, "[kvflash] slot %d header rung: the replay checkpoints at %d\n", slot, rc.turn.ckpt);
     } else if (recall_on_) {
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: skip (%d tokens fit %d blocks or no turn)\n",
                      slot, rc.turn.end - rc.turn.kv_offset, p.n_pool_blocks());

@@ -29,7 +29,7 @@ struct KvFlashSlotTurn {
     int  reserve_chunks = 0;        // pool room kept for the replay (single-slot rule)
     int  ckpt = -1;                 // the prompt-end checkpoint: the last <|im_start|> (the assistant header)
     bool end_rung = false;          // C1.5 F7: a recall turn whose replay stops at ckpt and checkpoints there too
-    bool header_rung = false;       // L4: the first pass takes the header rung H (= ckpt) in a cut of its own and keeps R below it
+    bool header_rung = false;       // L4: a recall turn whose replay checkpoints at ckpt = H', its own last cut at or before the header (kvflash_slot_turn_header_rung)
     int  apply_at = -1;             // mode 5: the cut at which the drafter's picks are applied (one pass, no snapshot at R); -1: none
     int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
     int  capture_at = -1;           // the cut at which the head is captured (a multiple of k chunks); -1: none
@@ -37,8 +37,9 @@ struct KvFlashSlotTurn {
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
     bool first_pass() const { return phase == KvFlashTurnPhase::FirstPass; }
     bool snapshot_at_r() const { return recall() && r > kv_offset; }
-    // The pass that checkpoints at ckpt: an LRU turn's only pass, a recall turn's replay with the end rung, its first pass with the header rung.
-    bool ckpt_pass() const { return !recall() || (end_rung && phase == KvFlashTurnPhase::Replay) || (header_rung && phase == KvFlashTurnPhase::FirstPass); }
+    // The pass that checkpoints at ckpt: an LRU turn's only pass, a recall turn's replay with the end rung or the header rung
+    // (never its first pass: the replay rewrites the KV rows [R, end), so a first-pass state above R would sit on another pass's rows).
+    bool ckpt_pass() const { return !recall() || ((end_rung || header_rung) && phase == KvFlashTurnPhase::Replay); }
 };
 
 // First-pass cut ends over [kv_offset, end): r is a cut end (the state snapshot
@@ -59,8 +60,7 @@ inline std::vector<int> kvflash_slot_turn_cuts(int kv_offset, int r, int end, in
 // Blocks a live slot keeps resident: settle() holds it at the pool minus the step headroom.
 inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { return std::max(0, n_pool_blocks - headroom_blocks); }
 
-// L4 header rung position H': the last existing cut at or before the header H, above R. No cut is added, so the
-// step layout, q capture and scores equal the knob-off plan's. -1: no such cut (H' would be R or below).
+// L4 header rung position H': the last of a pass's cut ends at or before the header H, above R. -1: no such cut (H' would be R or below).
 inline int kvflash_header_rung_at(const std::vector<int> & cuts, int h, int r) {
     int best = -1;
     for (int c : cuts) if (c <= h && c > r) best = std::max(best, c);
@@ -72,8 +72,6 @@ inline int kvflash_header_rung_at(const std::vector<int> & cuts, int h, int r) {
 // pool (kvflash_pool_fits, the single-slot rule); otherwise the slot stays LRU.
 // end_rung_min (LUCE_KVFLASH_END_RUNG_MIN): a recall turn also checkpoints at the
 // header when end - r reaches it; < 0: never (the R rung alone, C1.4).
-// header_rung (LUCE_KVFLASH_HEADER_RUNG, L4): a recall turn's first pass also checkpoints at H' = the last existing cut <= the header H (no cut is added: bitwise
-// the knob-off pass), so the next turn resumes at H' (ckpt = H'), not R; R is kept (the quality reference). It replaces end_rung (the replay's rung).
 // pflash2 (mode 5): the picks come from the drafter's scores of the prompt ids, so the turn stays one
 // pass (the LRU turn's checkpoint rule) and only records where to apply them (apply_at = R).
 // capture_at: a cut the turn must stop at so the engine can capture the pinned head there; honoured inside (kv_offset, end)
@@ -82,7 +80,7 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
                                               int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0,
-                                              int capture_at = -1, bool header_rung = false) {
+                                              int capture_at = -1) {
     KvFlashSlotTurn t;
     t.kv_offset = std::clamp(kv_offset, 0, (int)prompt.size());
     t.end = (int)prompt.size();
@@ -104,11 +102,7 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     t.cuts = kvflash_slot_turn_cuts(t.kv_offset, t.r, t.end, cut_u, n_queries);
     if (t.capture_at > 0 && std::find(t.cuts.begin(), t.cuts.end(), t.capture_at) == t.cuts.end())
         t.cuts.insert(std::upper_bound(t.cuts.begin(), t.cuts.end(), t.capture_at), t.capture_at);
-    if (header_rung) {
-        const int h = kvflash_header_rung_at(t.cuts, t.ckpt, t.r);
-        if (h > 0) { t.header_rung = true; t.ckpt = h; }
-    }
-    t.end_rung = !t.header_rung && end_rung_min >= 0 && t.ckpt > t.r && t.end - t.r >= end_rung_min;
+    t.end_rung = end_rung_min >= 0 && t.ckpt > t.r && t.end - t.r >= end_rung_min;
     return t;
 }
 
@@ -129,6 +123,21 @@ inline int kvflash_slot_turn_next_cut(const KvFlashSlotTurn & t, int cur_pos, in
     if (t.ckpt_pass() && t.ckpt > cur_pos) n = std::min(n, t.ckpt - cur_pos);
     if (tail > 0 && n > tail && cur_pos + n == t.end) n -= tail;
     return n;
+}
+
+// LUCE_KVFLASH_HEADER_RUNG (L4): call once every cut of the turn is final (after kvflash_slot_turn_force_cut). A recall turn's
+// replay also checkpoints at H' = the last cut end of that replay at or before the header H and above R, so the next turn
+// resumes at H' (ckpt = H'), not R; R stays below it (Rule A). The rung's state and the resident KV rows [R, H') are both the
+// replay's. H' is a cut the knob-off replay already makes (cut_u, tail: the engine's), so no pass gains a cut and the first pass
+// is untouched. No such cut, or the end rung is on (the replay already checkpoints at H itself): the turn is left as planned.
+inline void kvflash_slot_turn_header_rung(KvFlashSlotTurn & t, int cut_u, int tail = 0) {
+    if (!t.first_pass() || t.end_rung || t.ckpt <= t.r) return;
+    KvFlashSlotTurn rp = t;
+    rp.phase = KvFlashTurnPhase::Replay;
+    std::vector<int> ends;
+    for (int pos = t.r, n; pos < t.ckpt && (n = kvflash_slot_turn_next_cut(rp, pos, cut_u, tail)) > 0;) ends.push_back(pos += n);
+    const int h = kvflash_header_rung_at(ends, t.ckpt, t.r);
+    if (h > 0) { t.header_rung = true; t.ckpt = h; }
 }
 
 // LUCE_KVFLASH_UQ_QUERIES: the question's end `cut` (kvflash_uq_cut, -1: none) becomes a cut end of every pass
@@ -329,21 +338,6 @@ inline KvFlashLadderMove kvflash_ladder_ckpt(const KvFlashLadder & in, int p) {
     KvFlashLadderMove m;
     m.to.ckpt = p; m.ckpt_from = kRungLive;
     if (!c.empty()) { m.to.trunk = c[0].pos; m.trunk_from = c[0].from; }
-    if (in.pinned) { m.to.extra = in.extra; m.extra_from = kRungExtra; m.to.pinned = true; }
-    else if (c.size() > 1) { m.to.extra = c[1].pos; m.extra_from = c[1].from; }
-    return m;
-}
-
-// L4: R placed under a header rung already in the ladder (H is the checkpoint, taken in the first pass; R is the live snapshot, p < in.ckpt).
-// H stays the checkpoint, R is the trunk, the highest rung below R the third (a pinned third stays), the rest goes.
-inline KvFlashLadderMove kvflash_ladder_ckpt_below(const KvFlashLadder & in, int p) {
-    std::vector<detail::LadderRung> c{{p, kRungLive}};
-    for (const detail::LadderRung r : {detail::LadderRung{in.trunk, kRungTrunk}, {in.extra, kRungExtra}})
-        if (r.pos > 0 && r.pos < in.ckpt && !(in.pinned && r.pos == in.extra)) c.push_back(r);
-    c = detail::ladder_sorted(c);
-    KvFlashLadderMove m;
-    m.to.ckpt = in.ckpt; m.ckpt_from = kRungCkpt;
-    m.to.trunk = c[0].pos; m.trunk_from = c[0].from;
     if (in.pinned) { m.to.extra = in.extra; m.extra_from = kRungExtra; m.to.pinned = true; }
     else if (c.size() > 1) { m.to.extra = c[1].pos; m.extra_from = c[1].from; }
     return m;

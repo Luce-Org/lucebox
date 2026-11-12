@@ -354,7 +354,7 @@ private:
     // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is copied.
     static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
     int end_rung_min_ = -1;                           // LUCE_KVFLASH_END_RUNG_MIN: a recall turn's header rung when end - R reaches it; -1 off
-    bool header_rung_ = false;                        // LUCE_KVFLASH_HEADER_RUNG=1 (L4): a recall turn's first pass takes the header rung and keeps R below it; 0 off
+    bool header_rung_ = false;                        // LUCE_KVFLASH_HEADER_RUNG=1 (L4): a recall turn's replay checkpoints at its last cut at or before the header; 0 off
     void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)
     void take_ckpt_(int slot, int pos);               // Rule A with the slot's state now (the header rung)
     // Sessions on disk (--kv-sessions, LUCE_KVFLASH_SESSIONS_DIR): each parked session is written under
