@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,27 @@ Outcome run(const SynthCfg & cfg, int scored) {
     CHECK(o_.max_rel < 2e-2);   /* the largest plane is the noisiest statistic: 1.3e-2 measured on the mixed-residency cases */ \
 } while (0)
 
+// Quantised keys: ggml_mul_mat quantises the queries to 8 bits, the AVX2 scorer keeps them F32, so the two scorers differ by
+// a rounding error that grows with the number of sealed chunks (measured on the ggml CPU backend: 2e-3 at 60, 1.7e-2 at 200,
+// 4e-2 at 400). Same quantity, not the same numbers: the bound below is the documented one (kvflash_gpu_mass.h).
+static constexpr double kQuantQueryBound = 5e-2;
+
+TEST_CASE(KvflashGpuMassFixture, q4_0_400_chunks_within_the_quantised_query_bound) {
+    const Outcome o = run(small_cfg(GGML_TYPE_Q4_0, 400, 8), 400);
+    REQUIRE(o.ok);
+    CHECK(o.sel_rel < kQuantQueryBound);
+    CHECK(o.mean_rel < kQuantQueryBound);
+    CHECK(o.top_rel < kQuantQueryBound);
+}
+TEST_CASE(KvflashGpuMassFixture, f32_keys_400_chunks_match_cpu_to_float_rounding) {
+    const Outcome o = run(small_cfg(GGML_TYPE_F32, 400, 8), 400);   // no query quantisation: the graph itself is exact
+    REQUIRE(o.ok);
+    CHECK(o.sel_rel < 1e-4);
+    CHECK(o.mean_rel < 1e-4);
+    CHECK(o.top_rel < 1e-4);
+    CHECK(o.picks_same);
+}
+
 TEST_CASE(KvflashGpuMassFixture, q4_0_mixed_residency_matches_cpu) { expect_parity(run(small_cfg(GGML_TYPE_Q4_0, 60, 8), 60)); }
 TEST_CASE(KvflashGpuMassFixture, q8_0_mixed_residency_matches_cpu) { expect_parity(run(small_cfg(GGML_TYPE_Q8_0, 60, 8), 60)); }
 TEST_CASE(KvflashGpuMassFixture, all_resident_matches_cpu) {
@@ -198,6 +220,16 @@ TEST_CASE(KvflashGpuMassFixture, bad_inputs_fail_without_crashing) {
     why.clear();
     CHECK(!gm.score(pool_k, ev, KvFlashKSegFn{}, c.CT, s.dims(), s.qptrs(), o, nullptr, nullptr, &why));   // evicted chunks, no host_seg
     CHECK(why.find("host") != std::string::npos);
+    // One NaN key (a Q4_0 block scale of fp16 NaN) in an evicted chunk fails the call instead of returning NaN scores.
+    std::vector<uint8_t> poisoned((size_t)c.CT * ggml_row_size(c.KT, c.D));
+    auto nan_host = [&](int ch, int l, int h) -> const uint8_t * {
+        std::memcpy(poisoned.data(), s.host_seg(ch, l, h), poisoned.size());
+        poisoned[0] = 0x00; poisoned[1] = 0x7e;
+        return poisoned.data();
+    };
+    why.clear();
+    CHECK(!gm.score(pool_k, ev, nan_host, c.CT, s.dims(), s.qptrs(), o, nullptr, nullptr, &why));
+    CHECK(why.find("non-finite") != std::string::npos);
     CHECK(gm.score(pool_k, s.blk, host, c.CT, s.dims(), {}, o, nullptr, nullptr, &why));                  // no queries
     CHECK(o.empty());
     // A working set far over free memory is refused before anything is allocated. Batching bounds the graph, so only the

@@ -14,10 +14,17 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <system_error>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <random>
 #include <vector>
+
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace luce::common;
 
@@ -52,7 +59,7 @@ std::vector<double> naive(const std::vector<float> & K, int C, int ct, const KvF
 }
 
 // Returns false on a setup failure (REQUIRE cannot be used in a helper).
-bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<double> & ref) {
+bool run_case(ggml_type type, std::vector<float> & out, std::vector<double> & ref) {
     KvFlashQkDims d; d.n_layers = 2; d.n_q_heads = 4; d.n_kv_heads = 2; d.head_dim = 32;
     const int C = 5, ct = 8;
     std::mt19937 rng(7);
@@ -77,7 +84,6 @@ bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<
     keys.seg = [&](int c, int l, int h) -> const uint8_t * {
         return buf.data() + ((((size_t)c * d.n_layers + l) * d.n_kv_heads + h) * ct * d.head_dim) * esz;
     };
-    (void)tol;
     if (!kvflash_exact_mass_scores(keys, d, q.data(), out, 3)) return false;
     ref = naive(K, C, ct, d, q);
     return true;
@@ -87,14 +93,14 @@ bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<
 
 TEST_CASE(KvflashExactMassFixture, matches_naive_reference_f32_gqa) {
     std::vector<float> out; std::vector<double> ref;
-    REQUIRE(run_case(GGML_TYPE_F32, 1e-5, out, ref));
+    REQUIRE(run_case(GGML_TYPE_F32, out, ref));
     double sum = 0;
     for (size_t c = 0; c < ref.size(); c++) { CHECK(std::fabs(out[c] - ref[c]) < 1e-5); sum += out[c]; }
     CHECK(std::fabs(sum - 1.0) < 1e-4);   // each head's masses sum to 1
 }
 TEST_CASE(KvflashExactMassFixture, matches_naive_reference_f16_gqa) {
     std::vector<float> out; std::vector<double> ref;
-    REQUIRE(run_case(GGML_TYPE_F16, 1e-5, out, ref));
+    REQUIRE(run_case(GGML_TYPE_F16, out, ref));
     double sum = 0;
     for (size_t c = 0; c < ref.size(); c++) { CHECK(std::fabs(out[c] - ref[c]) < 1e-5); sum += out[c]; }
     CHECK(std::fabs(sum - 1.0) < 1e-4);
@@ -299,7 +305,7 @@ TEST_CASE(KvflashExactMassFixture, fast_exact_ties_keep_newer_first_and_near_tie
     // gap between the two scorers on any block stays far below any realistic rank gap
     for (size_t i = 0; i < ba.size(); i++) CHECK(std::fabs(ba[i] - bb[i]) / ba[i] < 1e-4);
 }
-// ---- run_workers / bad inputs (review fixes) -----------------------------------
+// ---- run_workers / bad inputs -----------------------------------
 TEST_CASE(KvflashExactMassFixture, run_workers_zero_or_negative_workers_run_nothing) {
     std::atomic<int> calls{0};
     run_workers(0, [&](int) { calls++; });
@@ -461,3 +467,42 @@ TEST_CASE(KvflashExactMassFixture, fast_multi_absent_chunk_aggregates_zero) {
     CHECK(pl[0].max[0] > 0.0f);
 }
 
+
+// A pthread_create failure (pids cgroup, no stack memory) after some workers started must reach the caller as an
+// exception, not std::terminate from a joinable std::thread destructor. The forked child caps its address space just
+// above the current size, so the first one or two 8 MiB thread stacks fit and a later one does not.
+TEST_CASE(KvflashExactMassFixture, run_workers_thread_spawn_failure_throws_instead_of_terminating) {
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        long pages = 0;
+        FILE * f = std::fopen("/proc/self/statm", "r");
+        if (!f || std::fscanf(f, "%ld", &pages) != 1) _exit(77);
+        std::fclose(f);
+        const rlim_t cap = (rlim_t)pages * (rlim_t)sysconf(_SC_PAGESIZE) + (rlim_t)20 * 1024 * 1024;
+        rlimit rl{cap, cap};
+        if (setrlimit(RLIMIT_AS, &rl) != 0) _exit(77);
+        int code = 3;                                             // 3: all 8 workers started, the cap did not bite
+        try { run_workers(8, [](int) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }); }
+        catch (const std::system_error &) { code = 0; }
+        catch (...) { code = 4; }
+        _exit(code);
+    }
+    int st = 0;
+    REQUIRE(waitpid(pid, &st, 0) == pid);
+    REQUIRE(WIFEXITED(st));                                       // terminate() would be a SIGABRT
+    CHECK(WEXITSTATUS(st) == 0);
+}
+
+// One non-finite key value must fail the call, not return true with NaN scores for every chunk.
+TEST_CASE(KvflashExactMassFixture, non_finite_key_fails_the_call) {
+    KvFlashQkDims d; d.n_layers = 1; d.n_q_heads = 2; d.n_kv_heads = 1; d.head_dim = 4;
+    std::vector<float> k(2 * 4, 0.5f), bad(2 * 4, 0.5f), q(2 * 4, 1.0f);
+    bad[3] = std::numeric_limits<float>::quiet_NaN();
+    KvFlashExactKeys keys;
+    keys.n_chunks = 3; keys.chunk_tokens = 2; keys.type = GGML_TYPE_F32;
+    keys.seg = [&](int c, int, int) -> const uint8_t * { return (const uint8_t *)(c == 1 ? bad.data() : k.data()); };
+    std::vector<std::vector<float>> outs;
+    const float * qp = q.data();
+    CHECK(!kvflash_exact_mass_scores_fast_multi(keys, d, {qp}, outs, 0, nullptr, nullptr));
+}

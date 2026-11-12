@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -278,7 +279,10 @@ inline bool kvflash_exact_mass_scores_fast_multi(
         auto at = [&](int c, int x) { return lse[((size_t)c * nq + i) * LH + x]; };
         for (int x = 0; x < LH; x++) {
             double mx = NEG;
-            for (int c = 0; c < C; c++) mx = std::max(mx, at(c, x));
+            for (int c = 0; c < C; c++) {
+                if (!(at(c, x) < std::numeric_limits<double>::infinity())) return false;   // NaN or +Inf (-inf marks an absent chunk): the scores would be NaN for every chunk
+                mx = std::max(mx, at(c, x));
+            }
             if (mx == NEG) continue;
             double Z = 0.0;
             for (int c = 0; c < C; c++) Z += std::exp(at(c, x) - mx);
