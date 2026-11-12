@@ -1623,7 +1623,8 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
         }
     }
     const double score_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-    {   // L4 pre-condition: the bits the first pass's cuts produce (the captured queries, the scores); FNV-1a 64
+    static const bool first_pass_bits = std::getenv("LUCE_KVFLASH_FIRST_PASS_BITS") != nullptr;
+    if (first_pass_bits) {   // diagnostic (L4 pre-condition): the bits the first pass's cuts produce (the captured queries, the scores); FNV-1a 64
         auto fnv = [](const std::vector<float> & v) { uint64_t h = 1469598103934665603ull; const uint8_t * b = (const uint8_t *)v.data(); for (size_t i = 0; i < v.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull; return h; };
         std::fprintf(stderr, "[kvflash] slot %d mode4 first-pass bits: q_tail n_q=%d fnv=%016llx scores n=%zu fnv=%016llx\n",
                      slot, n_q, (unsigned long long)fnv(q_all), rc.scores.size(), (unsigned long long)fnv(rc.scores));
