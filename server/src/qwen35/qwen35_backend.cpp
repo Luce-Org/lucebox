@@ -3096,15 +3096,12 @@ static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlas
     if (!cache.q_cap_all) return 0;
     const int T = cache.q_cap_all_tokens;
     const int n_q = std::min(batch_tokens, T);
-    const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
-    std::vector<float> raw((size_t)ggml_nelements(cache.q_cap_all));
-    ggml_backend_tensor_get(cache.q_cap_all, raw.data(), 0, raw.size() * sizeof(float));
-    q_all.resize((size_t)n_q * qsize);
     const size_t planes = (size_t)d.n_layers * d.n_q_heads;
-    for (int t = 0; t < n_q; t++)
-        for (size_t p = 0; p < planes; p++)
-            std::memcpy(q_all.data() + (size_t)t * qsize + p * d.head_dim,
-                        raw.data() + (p * T + t) * d.head_dim, d.head_dim * sizeof(float));
+    // Only the n_q captured rows of each plane, not the whole 64-row tensor.
+    const auto rd = luce::common::kvflash_q_cap_all_read((size_t)T, d.head_dim, planes, (size_t)n_q);
+    std::vector<float> packed(planes * (size_t)n_q * d.head_dim);
+    ggml_backend_tensor_get_2d(cache.q_cap_all, packed.data(), 0, rd.size, rd.n_copies, rd.stride_tensor, rd.stride_data);
+    luce::common::kvflash_regroup_queries(packed, planes, (size_t)n_q, d.head_dim, q_all);
     return n_q;
 }
 

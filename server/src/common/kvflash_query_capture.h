@@ -28,6 +28,22 @@ inline bool kvflash_pool_process() {
 }
 inline int kvflash_q_cap_all_rows() { return kvflash_pool_process() ? kQueryCaptureTokens : 0; }
 
+// Strided read of the first n_q rows of every plane of q_cap_all ([fa][head][T][hd] f32, so rows of one plane are
+// contiguous and planes are T*hd floats apart): arguments of ggml_backend_tensor_get_2d(offset 0), reading
+// planes * n_q * hd floats instead of the whole tensor. The destination is packed [plane][n_q][hd].
+struct KvflashQCapRead { size_t size, n_copies, stride_tensor, stride_data; };
+inline KvflashQCapRead kvflash_q_cap_all_read(size_t T, size_t head_dim, size_t planes, size_t n_q) {
+    return {n_q * head_dim * sizeof(float), planes, T * head_dim * sizeof(float), n_q * head_dim * sizeof(float)};
+}
+// [plane][n_q][hd] -> the scorer's per-token [t][plane][hd].
+inline void kvflash_regroup_queries(const std::vector<float> & packed, size_t planes, size_t n_q, size_t head_dim,
+                                    std::vector<float> & out) {
+    out.resize(n_q * planes * head_dim);
+    for (size_t t = 0; t < n_q; t++)
+        for (size_t p = 0; p < planes; p++)
+            std::copy_n(packed.data() + (p * n_q + t) * head_dim, head_dim, out.data() + (t * planes + p) * head_dim);
+}
+
 // Whether a graph writes the per-token query capture q_cap_all. Only the prefill windows read it (recall mode 4
 // and the user-question queries); decode captures q_cap alone. q_cap_all has no tensor-parallel split, so TP never writes it.
 inline bool kvflash_capture_q_all(bool recall_on, bool uq_on, int tp_degree, bool capture_qk) {
