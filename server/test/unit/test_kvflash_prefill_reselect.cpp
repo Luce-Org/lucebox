@@ -77,6 +77,34 @@ TEST_CASE(KvflashPrefillReselectFixture, last_user_turn_finds_the_last_im_start_
     CHECK(kvflash_last_user_turn({1, 2}, -1, 2) == -1);            // unknown id
 }
 
+TEST_CASE(KvflashPrefillReselectFixture, max_turn_is_the_longest_turn_the_recall_gate_replays) {
+    // pool 256, 18 pinned, 60 recall chunks: 176 chunks of room, one of them the turn's partial chunk -> 175 * 64 tokens
+    const int cap = kvflash_max_turn_tokens(64, 256, 18, 60);
+    CHECK(cap == 175 * 64);
+    CHECK(kvflash_recall_gate(true, 81430 - cap, 81430, 64, 256, 18, 60).skip == KvFlashRecallSkip::None);
+    CHECK(kvflash_recall_gate(true, 81430 - cap - 1, 81430, 64, 256, 18, 60).skip == KvFlashRecallSkip::PoolTooSmall);
+    CHECK(kvflash_max_turn_tokens(64, 80, 18, 60) == 0);   // no room for a replay: uncapped, the gate refuses as before
+    CHECK(kvflash_max_turn_tokens(0, 256, 18, 60) == 0);
+}
+
+TEST_CASE(KvflashPrefillReselectFixture, mode4_plan_caps_a_long_turn_to_its_replayable_tail) {
+    // The needle: one cold 81,430-token turn whose user turn starts at token 17 (chunk 0). Uncapped, there is no sealed
+    // chunk before R, the gate skips and the turn runs LRU only: the pool keeps the preamble and the last ~15K tokens and
+    // a fact in between is gone at decode. Capped, R moves to the tail the pool can replay and the recall runs.
+    std::vector<int> toks(81430, 9);
+    toks[17] = 1; toks[18] = 2;
+    const int cap = kvflash_max_turn_tokens(64, 256, 18, 60);
+    KvFlashMode4Plan p = kvflash_mode4_plan(toks, 0, 1, 2);
+    CHECK(kvflash_recall_gate(p.run, p.r, 81430, 64, 256, 18, 60).skip == KvFlashRecallSkip::NoSealedChunk);
+    p = kvflash_mode4_plan(toks, 0, 1, 2, cap);
+    CHECK(p.run);
+    CHECK(p.r == 81430 - cap);
+    CHECK(kvflash_recall_gate(p.run, p.r, 81430, 64, 256, 18, 60).skip == KvFlashRecallSkip::None);
+    // A turn within the cap keeps its user-turn R; a resumed prefill caps from its absolute end.
+    CHECK(kvflash_mode4_plan(toks, 0, 1, 2, 81430).r == 17);
+    CHECK(kvflash_mode4_plan({9, 1, 2, 9, 9, 9, 9, 9}, 100, 1, 2, 4).r == 104);
+}
+
 TEST_CASE(KvflashPrefillReselectFixture, mode4_plan_uses_last_user_turn_clamped_to_prefill_start) {
     const std::vector<int> toks = {9, 1, 2, 9, 1, 3, 9, 1, 2, 9, 9};
     KvFlashMode4Plan p = kvflash_mode4_plan(toks, 100, 1, 2);

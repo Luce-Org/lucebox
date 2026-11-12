@@ -67,7 +67,7 @@ inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { retur
 inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & prompt, int kv_offset,
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
-                                              int end_rung_min = -1, bool pflash2 = false) {
+                                              int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0) {
     KvFlashSlotTurn t;
     t.kv_offset = std::clamp(kv_offset, 0, (int)prompt.size());
     t.end = (int)prompt.size();
@@ -76,7 +76,7 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     for (int i = t.end - 1; i > t.kv_offset; --i) if (prompt[(size_t)i] == im_start) { t.ckpt = i; break; }
     if (!profile_on || chunk_tokens <= 0 || t.end <= t.kv_offset) return t;
     const std::vector<int32_t> suffix(prompt.begin() + t.kv_offset, prompt.end());
-    const KvFlashMode4Plan p4 = kvflash_mode4_plan(suffix, t.kv_offset, im_start, user);
+    const KvFlashMode4Plan p4 = kvflash_mode4_plan(suffix, t.kv_offset, im_start, user, max_turn_tokens);
     if (!p4.run) return t;
     t.r = p4.r;
     t.reserve_chunks = (t.end - t.r + chunk_tokens - 1) / chunk_tokens + 1;

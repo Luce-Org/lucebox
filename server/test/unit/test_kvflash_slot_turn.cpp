@@ -66,6 +66,20 @@ TEST_CASE(KvflashSlotTurnFixture, plan_runs_mode4_only_with_the_profile_and_a_po
     CHECK(fits.r == -1);
 }
 
+TEST_CASE(KvflashSlotTurnFixture, plan_recalls_the_tail_of_a_cold_turn_too_long_to_replay) {
+    // The Modal needle smoke: one 81,430-token cold turn, its user turn at token 17. Uncapped it ran LRU only
+    // ("skip (81430 tokens fit 256 blocks or no turn)") and answered a code it had never kept.
+    const std::vector<int32_t> prompt = prompt_with_user(81430, 17);
+    const int cap = kvflash_max_turn_tokens(kCt, 256, 18, 60);
+    CHECK(!kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true).recall());
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, cap);
+    CHECK(t.first_pass());
+    CHECK(t.r == 81430 - cap);
+    CHECK(t.reserve_chunks == 256 - 18 - 60 - 2);
+    // a turn within the cap keeps its user-turn R
+    CHECK(kvflash_slot_turn_plan(prompt_with_user(20000, 15000), 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, cap).r == 15000);
+}
+
 TEST_CASE(KvflashSlotTurnFixture, plan_on_a_resumed_session_rewinds_to_the_new_user_turn_only) {
     auto prompt = prompt_with_user(6000, 5900);
     prompt[(size_t)100] = kImStart; prompt[(size_t)101] = kUser;   // an older user turn inside the session

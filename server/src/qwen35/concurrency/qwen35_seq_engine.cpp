@@ -892,9 +892,12 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         std::fprintf(stderr, "[kvflash] slot %d preamble pin end=%d pinned_chunks=%d reserve=%d\n",
                      slot, e, kvflash_pin_preamble(p, e, b_.kvflash_preamble_rows_), b_.kvflash_preamble_rows_);
     }
-    rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, p.chunk_tokens(),
-                                     luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom()), kKvFlashCutU, b_.kvflash_select_queries_, recall_on_, end_rung_min_,
-                                     b_.kvflash_prefill_reselect_ == 5);
+    // the recall budget kvflash_prefill_apply_on plans this turn with: a longer turn replays its tail only
+    const int ct = p.chunk_tokens(), usable = luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom());
+    const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
+                                                                        luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
+    rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
+                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn);
     if (uq_queries_ > 0) {
         // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
         // A prefill that covers the window captures them (whatever the slot's store holds: the same request
