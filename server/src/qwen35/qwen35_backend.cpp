@@ -2856,15 +2856,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         cache_.cur_pos = committed;
 
         // Every batch holding any of the last q_keep prompt tokens is captured;
-        // append its queries and keep the last q_keep, oldest first.
-        if (q_keep > 0 && !rw_done && committed + q_keep > kv_offset + prompt_len) {
+        // append its queries and keep the last q_keep, oldest first. A rewound turn captures in both
+        // passes: pass 1's tail is what the rewind scores with, and its rows at >= R are dropped below.
+        if (q_keep > 0 && committed + q_keep > kv_offset + prompt_len) {
             const KvFlashQkDims d = kvflash_exact_dims();
             std::vector<float> q_all;
             if (kvflash_read_captured_queries(cache_, d, n_tokens, q_all) > 0) {
-                auto & tail = kvflash_q_tail_;
-                tail.insert(tail.end(), q_all.begin(), q_all.end());
-                const size_t keep = (size_t)q_keep * d.n_layers * d.n_q_heads * d.head_dim;
-                if (tail.size() > keep) tail.erase(tail.begin(), tail.end() - keep);
+                luce::common::kvflash_q_tail_append(kvflash_q_tail_, q_all, (size_t)d.n_layers * d.n_q_heads * d.head_dim, q_keep);
             }
         }
 
@@ -2903,6 +2901,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             if (rc > 0) {
                 committed = rw.r;
                 start = rw.r - kv_offset;
+                {   // pass 1's rows at >= R came from the old pool; pass 2 re-captures them
+                    const KvFlashQkDims qd = kvflash_exact_dims();
+                    luce::common::kvflash_q_tail_trim(kvflash_q_tail_, (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim,
+                                                      kv_offset + prompt_len, rw.r);
+                }
                 // The rewind reaches back over the question window: its rows from the old pool are
                 // stale. They were used for the scoring just done; the second pass replaces them.
                 if (kvflash_uq_req_hi_ > 0 && luce::common::kvflash_uq_rewind_recaptures(uqp, rw.r)) {

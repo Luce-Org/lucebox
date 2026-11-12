@@ -216,3 +216,64 @@ TEST_CASE(KvflashUqFixture, uq_gate_requires_every_id) {
     CHECK(kvflash_uq_gate(S, -1, END, TR) == "user id missing");
     CHECK(kvflash_uq_gate(S, U, -1, TR) == "<|im_end|> id missing");
 }
+
+// ---- q_tail after a rewind (selector-v2 queries of the next turn) ---------------
+namespace {
+// One query row per position, every float of the row equal to the position.
+std::vector<float> q_rows(int lo, int hi, size_t qsize) {
+    std::vector<float> v;
+    for (int p = lo; p < hi; p++) v.insert(v.end(), qsize, (float)p);
+    return v;
+}
+std::vector<int> q_positions(const std::vector<float> & t, size_t qsize) {
+    std::vector<int> o;
+    for (size_t i = 0; i < t.size(); i += qsize) o.push_back((int)t[i]);
+    return o;
+}
+}  // namespace
+
+TEST_CASE(KvflashUqFixture, q_tail_trim_drops_rows_at_or_after_the_rewind_point) {
+    const size_t q = 3;
+    auto t = q_rows(92, 100, q);                                   // end=100, R=96
+    kvflash_q_tail_trim(t, q, 100, 96);
+    CHECK((q_positions(t, q) == std::vector<int>{92, 93, 94, 95}));
+    t = q_rows(92, 100, q); kvflash_q_tail_trim(t, q, 100, 90);    // every row is >= R
+    CHECK(t.empty());
+    t = q_rows(92, 100, q); kvflash_q_tail_trim(t, q, 100, 100);   // R == end: nothing to drop
+    CHECK(t.size() == 8 * q);
+    t = q_rows(92, 100, q); kvflash_q_tail_trim(t, q, 100, 0);
+    CHECK(t.empty());
+    t = q_rows(97, 100, q); kvflash_q_tail_trim(t, q, 100, 98);    // tail shorter than the window
+    CHECK((q_positions(t, q) == std::vector<int>{97}));
+}
+TEST_CASE(KvflashUqFixture, q_tail_trim_clears_a_ragged_tail) {
+    std::vector<float> t(7, 1.f);
+    kvflash_q_tail_trim(t, 3, 100, 96);
+    CHECK(t.empty());
+    t.assign(6, 1.f);
+    kvflash_q_tail_trim(t, 0, 100, 96);
+    CHECK(t.empty());
+}
+TEST_CASE(KvflashUqFixture, q_tail_after_rewind_is_pass1_below_r_then_pass2_rows) {
+    const size_t q = 3; const int keep = 8, end = 100;
+    // Pass 1 batches of 4 tokens, the last two hold the final 8 positions.
+    std::vector<float> tail;
+    for (int lo = 88; lo < end; lo += 4) kvflash_q_tail_append(tail, q_rows(lo, lo + 4, q), q, keep);
+    CHECK((q_positions(tail, q) == std::vector<int>{92, 93, 94, 95, 96, 97, 98, 99}));
+    // Rewind to R=96: pass 1 rows >= R are stale and dropped, pass 2 re-captures [96,100) under the new pool.
+    kvflash_q_tail_trim(tail, q, end, 96);
+    CHECK((q_positions(tail, q) == std::vector<int>{92, 93, 94, 95}));
+    std::vector<float> pass2 = q_rows(96, 100, q);
+    for (float & f : pass2) f += 1000.f;                           // marks "new pool"
+    kvflash_q_tail_append(tail, pass2, q, keep);
+    REQUIRE(tail.size() == 8 * q);
+    for (size_t r = 0; r < 8; r++) {
+        const float expect = r < 4 ? (float)(92 + r) : 1000.f + (float)(96 + r - 4);
+        CHECK(tail[r * q] == expect);
+    }
+    // Rewind further than the window: the whole tail goes and pass 2 refills it.
+    tail.clear();
+    for (int lo = 88; lo < end; lo += 4) kvflash_q_tail_append(tail, q_rows(lo, lo + 4, q), q, keep);
+    kvflash_q_tail_trim(tail, q, end, 40);
+    CHECK(tail.empty());
+}
