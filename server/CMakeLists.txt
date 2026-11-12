@@ -873,9 +873,13 @@ if(LUCE_GPU_BACKEND STREQUAL "hip")
     target_sources(luce_common PRIVATE src/common/specla_commit_cuda.cu)
     set_source_files_properties(src/common/specla_commit_cuda.cu
         PROPERTIES LANGUAGE HIP)
+    # Fused exact chunk-mass kernel for the KVFlash GPU scorer (Amendment 10); same shared-.cu pattern.
+    target_sources(luce_common PRIVATE src/common/kvflash_fused_mass_cuda.cu)
+    set_source_files_properties(src/common/kvflash_fused_mass_cuda.cu PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
     if(LUCE_HIP_SM80_EQUIV)
         find_path(LUCE_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_luce_rocm_root}/include" /opt/rocm/include
@@ -908,11 +912,13 @@ elseif(LUCE_GPU_BACKEND STREQUAL "cuda")
         src/flashprefill_select.cpp
         src/flashprefill.cpp
         src/common/geometric_draft_topk_cuda.cu
-        src/common/specla_commit_cuda.cu)
+        src/common/specla_commit_cuda.cu
+        src/common/kvflash_fused_mass_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
     # GPU port of the sample_logits chain. Compiled in by default; the path is
     # then opted into at runtime via the LUCE_GPU_SAMPLE env var. Turn the
     # whole thing off at configure time with -DLUCE_GPU_SAMPLER=OFF.
@@ -1119,6 +1125,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash/pflash_daemon.cpp")
     else()
         target_link_libraries(pflash_daemon PRIVATE hip::host)
     endif()
+    add_executable(pflash_resume_exact test/pflash/pflash_resume_exact.cpp)
+    target_include_directories(pflash_resume_exact PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(pflash_resume_exact PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(pflash_resume_exact PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(pflash_resume_exact PRIVATE hip::host)
+    endif()
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
@@ -1278,6 +1292,19 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         list(APPEND _raw_unit_test_targets test_paged_attn_lanes)
+    endif()
+
+    if(LUCE_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_kvflash_page.cpp")
+        add_executable(bench_kvflash_page test/bench/bench_kvflash_page.cpp)
+        target_compile_definitions(bench_kvflash_page PRIVATE LUCE_BACKEND_CUDA=1)
+        target_include_directories(bench_kvflash_page PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(bench_kvflash_page PRIVATE
+            ${LUCE_GGML_BACKEND_TARGET} ggml ggml-base CUDA::cudart)
     endif()
 
     if(LUCE_GPU_BACKEND STREQUAL "cuda"
@@ -2827,6 +2854,7 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_swap_snapshot_cache.cpp
             test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
+            test/unit/test_kvflash_q_stage.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
@@ -2845,14 +2873,33 @@ if(LUCE_TESTS)
             test/unit/test_kv_quant.cpp
             test/unit/test_kvflash_pager_serde.cpp
             test/unit/test_kvflash_pager_truncate.cpp
+            test/unit/test_kvflash_slot_pager.cpp
+            test/unit/test_kvflash_slot_plan.cpp
+            test/unit/test_kvflash_step_driver.cpp
+            test/unit/test_kvflash_arena.cpp
+            test/unit/test_kvflash_slot_kv.cpp
+            test/unit/test_kvflash_concurrent_gate.cpp
+            test/unit/test_kvflash_slot_turn.cpp
             test/unit/test_pooled_snapshot_blob.cpp
             test/unit/test_kvflash_placement.cpp
             test/unit/test_kvflash_pool_sizing.cpp
             test/unit/test_kvflash_qk.cpp
             test/unit/test_kvflash_pflash_map.cpp
             test/unit/test_kvflash_exact_mass.cpp
+            test/unit/test_kvflash_fused_mass.cpp
             test/unit/test_kvflash_gpu_mass.cpp
             test/unit/test_kvflash_uq.cpp
+            test/unit/test_kvflash_pager_recall.cpp
+            test/unit/test_kvflash_pager_reselect_fence.cpp
+            test/unit/test_kvflash_pager_victim_tier.cpp
+            test/unit/test_kvflash_pager_clean_evict.cpp
+            test/unit/test_kvflash_prefill_reselect.cpp
+            test/unit/test_kvflash_m5_rescore.cpp
+            test/unit/test_kvflash_m4_reuse.cpp
+            test/unit/test_pflash_probe_boundary.cpp
+            test/unit/test_kvflash_pin_preamble.cpp
+            test/unit/test_kvflash_spec_serial.cpp
+            test/unit/test_spec_rollback_policy.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
             test/unit/test_qwen35moe_swap_manager.cpp
@@ -2960,7 +3007,8 @@ if(LUCE_TESTS)
             test/smoke/smoke_load_target.cpp
             test/smoke/smoke_load_target_laguna.cpp
             test/unit/test_paged_attention.cpp
-            test/unit/test_decode_kv_offload_gpu.cpp)
+            test/unit/test_decode_kv_offload_gpu.cpp
+            test/unit/test_spec_rollback_storage_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include

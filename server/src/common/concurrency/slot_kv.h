@@ -16,6 +16,9 @@ public:
     virtual uint32_t physical_block_count() const = 0;
     virtual uint32_t max_sequences() const = 0;
     virtual uint32_t free_block_count() const = 0;
+    // Parking (detach/attach/evict_for_recompute) clears a slot's rows and rebuilds them; an arena
+    // whose rows are bounded residency cannot.
+    virtual bool parkable() const { return true; }
     virtual PagedKvStatus acquire_reserved(PagedKvRequestId request_id, uint32_t token_capacity,
                                            PagedKvSequenceHandle & out_handle) = 0;
     virtual PagedKvStatus reserve_capacity(PagedKvSequenceHandle handle, uint32_t token_capacity) = 0;
