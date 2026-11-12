@@ -142,6 +142,24 @@ inline int constrained_greedy_walk(int32_t * argmax, int width, const int32_t * 
     return accepted;
 }
 
+// The next root after a forward whose argmax is `tok`, with cfg.constraint at
+// the root's position. Greedy under a grammar keeps the argmax where the
+// grammar allows it and takes the sampler's pick from row() (the same
+// logits) where it does not, as constrained AR decoding does; a root the
+// grammar rejects would mark it dead at the next feed. Returns -1 when the row
+// cannot be read. Every place that seeds a root from an argmax calls this:
+// the chain step's replay seed and the AR hop's.
+template <typename Row>
+inline int32_t constrained_next_root(int32_t tok, const SamplerCfg & cfg,
+                                     std::vector<int32_t> & history,
+                                     std::mt19937_64 & rng, Row row) {
+    if (!cfg.greedy_under_constraint() || cfg.constraint->allows(tok)) return tok;
+    int vocab = 0;
+    const float * logits = row(vocab);
+    if (logits == nullptr) return -1;
+    return sample_logits(logits, vocab, cfg, history, rng);
+}
+
 // The token after the first `kept` committed tokens (root included), which
 // the next round feeds as its root. When the walk drew the row of the kept
 // tip, that draw is the sample there, and drawing again would spend a second

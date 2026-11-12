@@ -47,6 +47,10 @@
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventRecord hipEventRecord
+#define cudaStreamQuery hipStreamQuery
+#define cudaStreamWaitEvent hipStreamWaitEvent
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaFreeAsync hipFreeAsync
 #define cudaGetDevice hipGetDevice
@@ -57,6 +61,7 @@
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDefault hipMemcpyDefault
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaMemset2DAsync hipMemset2DAsync
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaStreamCreate hipStreamCreate

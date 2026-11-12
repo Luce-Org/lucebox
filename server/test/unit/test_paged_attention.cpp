@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <utility>
 #include <vector>
 
 using namespace CppUnitTestFramework;
@@ -28,6 +29,12 @@ struct TestCase {
     int max_blocks;
     std::vector<int32_t> kv_seq_lens;
     bool corrupt_blocks;
+    // Chain-over-holes cases (C-3). 0 none, 1 partial-null partitions, 2 whole-null partitions
+    // (128 tokens), 3 an all-null table, 4 modes 1, 2, 3 on slots 0, 1, 2 (then repeating).
+    // The last logical block of a slot stays mapped in modes 1 and 2: a KVFlash tail is resident.
+    int  gap_mode = 0;
+    bool poison_stale = false;    // pool rows no table entry names hold large K/V, as an evicted chunk's would
+    bool poison_tail = false;     // rows above the committed length inside the mapped tail block hold large K/V, as a rejected draft leaves them
 };
 
 struct TreeMetadata {
@@ -125,6 +132,21 @@ std::vector<int32_t> make_block_table(
         // exercises the partitioned long-context variant.
         result[4 * test_case.max_blocks + 1] = -1;
         result[9 * test_case.max_blocks + 7] = physical_blocks + 9;
+    }
+    if (test_case.gap_mode != 0) {
+        for (int seq = 0; seq < n_seq; ++seq) {
+            const int mode = test_case.gap_mode == 4 ? 1 + seq % 3 : test_case.gap_mode;
+            const int n_blocks = (clamped_seq_len(test_case, seq) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            for (int logical = 0; logical < n_blocks; ++logical) {
+                const bool is_tail = logical == n_blocks - 1;
+                const int partition_block = logical % 8;   // 8 blocks of 16 = one 128-token partition
+                const bool null_it =
+                    mode == 3 ||
+                    (!is_tail && mode == 1 && (partition_block == 1 || partition_block == 2 || partition_block == 5)) ||
+                    (!is_tail && mode == 2 && (logical / 8) % 2 == 1);
+                if (null_it) result[seq * test_case.max_blocks + logical] = -1;
+            }
+        }
     }
     return result;
 }
@@ -390,6 +412,41 @@ bool run_case(ggml_backend_t backend,
         v_source[i] = std::sin(static_cast<float>(i) * 0.011f + 0.3f) * 0.30f;
     }
 
+    if (test_case.poison_stale) {
+        std::vector<char> mapped(static_cast<size_t>(physical_blocks), 0);
+        for (int32_t entry : block_table) {
+            if (block_is_valid(entry, physical_blocks)) mapped[static_cast<size_t>(entry)] = 1;
+        }
+        for (int block = 0; block < physical_blocks; ++block) {
+            if (mapped[static_cast<size_t>(block)]) continue;
+            for (int head = 0; head < N_HEAD_KV; ++head) {
+                for (int row = block * BLOCK_SIZE; row < (block + 1) * BLOCK_SIZE; ++row) {
+                    for (int d = 0; d < D; ++d) {
+                        const size_t at = (static_cast<size_t>(head) * pool_tokens + row) * D + d;
+                        k_source[at] = 2.0f;
+                        v_source[at] = 50.0f;
+                    }
+                }
+            }
+        }
+    }
+    if (test_case.poison_tail) {
+        for (size_t seq = 0; seq < test_case.kv_seq_lens.size(); ++seq) {
+            const int len = clamped_seq_len(test_case, static_cast<int>(seq));
+            const int tail = (len - 1) / BLOCK_SIZE;
+            const int32_t entry = block_table[seq * test_case.max_blocks + tail];
+            if (!block_is_valid(entry, physical_blocks)) continue;
+            for (int head = 0; head < N_HEAD_KV; ++head) {
+                for (int row = entry * BLOCK_SIZE + (len - tail * BLOCK_SIZE); row < (entry + 1) * BLOCK_SIZE; ++row) {
+                    for (int d = 0; d < D; ++d) {
+                        const size_t at = (static_cast<size_t>(head) * pool_tokens + row) * D + d;
+                        k_source[at] = 2.0f;
+                        v_source[at] = 50.0f;
+                    }
+                }
+            }
+        }
+    }
     const int64_t cache_rows = static_cast<int64_t>(pool_tokens) * N_HEAD_KV;
     const std::vector<uint8_t> k_data =
         quantize_rows(k_type, k_source, cache_rows);
@@ -402,7 +459,6 @@ bool run_case(ggml_backend_t backend,
     bool ok = !k_data.empty() && !v_data.empty() &&
               !k_reference.empty() && !v_reference.empty();
 
-    size_t wmma_launches = 0;
     if (ok) {
         ggml_backend_tensor_set(q, q_data.data(), 0,
                                 q_data.size() * sizeof(q_data[0]));
@@ -437,16 +493,22 @@ bool run_case(ggml_backend_t backend,
         // up as a mismatch instead of whatever the allocator left there.
         const std::vector<float> poison(ggml_nelements(output), 1.0e30f);
         ggml_backend_tensor_set(output, poison.data(), 0, ggml_nbytes(output));
-        const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-        wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
     }
 
     float max_abs_error = INFINITY;
+    int drifted_runs = 0;   // the same graph on the same inputs must give the same bits every launch
     if (ok) {
         std::vector<float> actual(ggml_nelements(output));
         ggml_backend_tensor_get(output, actual.data(), 0,
                                 actual.size() * sizeof(actual[0]));
+        std::vector<float> again(actual.size());
+        for (int rep = 0; rep < 31 && ok; ++rep) {
+            ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(output, again.data(), 0, again.size() * sizeof(again[0]));
+            if (std::memcmp(again.data(), actual.data(), actual.size() * sizeof(actual[0])) != 0) ++drifted_runs;
+        }
+        if (drifted_runs) { std::printf("paged attention %s: %d of 31 relaunches differ bitwise\n", test_case.name, drifted_runs); ok = false; }
         const std::vector<float> expected =
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
@@ -461,14 +523,7 @@ bool run_case(ggml_backend_t backend,
             max_abs_error =
                 std::max(max_abs_error, std::fabs(actual[i] - expected[i]));
         }
-        // The WMMA route accumulates the VKQ output in f16 (design: mirrors
-        // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
-        // absolute noise against the f32 reference; the decode route
-        // accumulates in f32 (~1e-5). Keyed on the launch counter rather than
-        // the env, so cases that fall back to V_DOT2 (tree mode, ineligible
-        // shapes) keep the strict bound.
-        const float tol = wmma_launches > 0 ? 2.0e-3f : MAX_ABS_ERROR;
-        ok = ok && max_abs_error < tol;
+        ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
     std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
@@ -602,6 +657,30 @@ void run_cyclic_tree_case() {
     ggml_backend_free(backend);
 }
 
+// Stage C-3: chain verify (a tree with parent node-1) over KVFlash-style gapped block tables.
+// Every logical length stays the full logical length (as seq_lens_ does in a KVFlash arena); the
+// table carries null entries, the pool rows behind unmapped blocks hold poison (stale data of an
+// evicted chunk), and the chain's scratch rows sit beyond every mapped block.
+void run_gapped_chain_case(const TestCase & test_case, int width,
+                           std::vector<std::pair<ggml_type, ggml_type>> kv_types = {
+                               {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    TreeMetadata meta{width, 16, {}, std::vector<int32_t>(static_cast<size_t>(n_seq), width)};
+    std::vector<int32_t> slot_ids;
+    for (int s = 0; s < n_seq; ++s) {
+        for (int n = 0; n < width; ++n) {
+            meta.parent_ids.push_back(n - 1);   // a chain: node n's parent is n-1, the root's is -1
+            slot_ids.push_back(s);
+        }
+    }
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &slot_ids, nullptr, &meta));
+    }
+    ggml_backend_free(backend);
+}
+
 void run_active_slot_case(const TestCase & test_case,
                           const std::vector<int32_t> & active_slot_ids) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -613,11 +692,13 @@ void run_active_slot_case(const TestCase & test_case,
 
 void run_ragged_case(const TestCase & test_case,
                      const std::vector<int32_t> & active_slot_ids,
-                     const std::vector<int32_t> & query_positions) {
+                     const std::vector<int32_t> & query_positions,
+                     std::vector<std::pair<ggml_type, ggml_type>> kv_types = {{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}}) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
-    CHECK(run_case(backend, test_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
-                   &active_slot_ids, &query_positions));
+    for (const auto & kv : kv_types) {
+        CHECK(run_case(backend, test_case, kv.first, kv.second, &active_slot_ids, &query_positions));
+    }
     ggml_backend_free(backend);
 }
 
@@ -708,4 +789,42 @@ TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {
         {33, 1025},
         false,
     }, active_slot_ids, query_positions);
+}
+
+// A KVFlash slot's table has holes where chunks are paged out. Prefill and decode rows (no tree) attend around them
+// on every route: slot 0 has partial-null partitions, slot 1 whole-null ones, slot 2 an all-null table. A hole that
+// enters the softmax as a zero-score token dilutes the row: position 47 of slot 0 sees 16 mapped tokens and 32 holes.
+TEST_CASE(PagedAttention, RaggedRowsOverNullBlocksMatchReference) {
+    const std::vector<int32_t> active_slot_ids{0, 1, 2, 0, 1, 0, 0, -1};
+    const std::vector<int32_t> query_positions{1024, 516, 256, 300, 130, 47, INT32_MAX, -1};
+    run_ragged_case({"ragged-gap", 130, {1025, 517, 257}, false, 4, true, true}, active_slot_ids, query_positions,
+                    {{GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}});
+}
+
+// gap_mode: 1 partial-null partitions, 2 whole-null partitions, 3 an all-null table, 4 one mode per slot.
+// poison_stale: unmapped pool blocks hold large K/V, so a read through a null entry fails the case.
+TEST_CASE(PagedAttention, ChainVerifyWidth16OverPartialNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-partial16", 130, {1025, 517, 257}, false, 1, true, true}, 16);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth8OverPartialNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-partial8", 130, {1025, 517, 257}, false, 1, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth16OverWholeNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-whole16", 130, {1025, 517, 257}, false, 2, true, true}, 16);
+}
+TEST_CASE(PagedAttention, ChainVerifyWidth8OverWholeNullPartitionsMatchesReference) {
+    run_gapped_chain_case({"gap-whole8", 130, {1025, 517, 257}, false, 2, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyOverAnAllNullTableReadsOnlyItsScratchRows) {
+    run_gapped_chain_case({"gap-allnull16", 130, {1025, 517, 257}, false, 3, true, true}, 16);
+    run_gapped_chain_case({"gap-allnull8", 130, {1025, 517, 257}, false, 3, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyWithADifferentGapPatternPerSlotMatchesReference) {
+    // slot 0 partial-null, slot 1 whole-null partitions, slot 2 all-null, in one verify batch
+    run_gapped_chain_case({"gap-mixed16", 130, {1025, 517, 257}, false, 4, true, true}, 16);
+    run_gapped_chain_case({"gap-mixed8", 130, {1025, 517, 257}, false, 4, true, true}, 8);
+}
+TEST_CASE(PagedAttention, ChainVerifyOverGapsWithMixedKvTypesMatchesReference) {
+    run_gapped_chain_case({"gap-q8q4", 130, {1025, 517, 257}, false, 1, true, true}, 16,
+                          {{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}});
 }
