@@ -256,6 +256,11 @@ struct TargetWeights {
     int32_t im_start_id  = -1;
     int32_t assistant_id = -1;
     int32_t newline_id   = -1;
+    // Role-token ids for the KVFlash recall turn cuts and preamble pin; -1 when absent.
+    int32_t user_id      = -1;
+    int32_t system_id    = -1;
+    int32_t im_end_id    = -1;
+    int32_t tool_response_id = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
@@ -345,6 +350,9 @@ struct DraftLayer {
     DraftConvWeights attn_conv;         // optional DFlash 2 conv around attention
     DraftConvWeights mlp_conv;          // optional DFlash 2 conv around the MLP
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
+    // false only for upstream DFlash 2 GGUFs (dflash.attention.causal=false):
+    // noise columns fully visible + per-query sliding window over the ctx.
+    bool is_causal = true;
     bool attn_gate_per_head = false;
 };
 
@@ -586,6 +594,20 @@ struct TargetCache {
     // kv_k_rotated) query per full-attention layer, written by the graph
     // when QwenGraphInputs::q_capture is set. F32 [head_dim, n_head, n_fa].
     ggml_tensor * q_cap = nullptr;
+    // The last q_cap_all_tokens tokens' queries of a batch, F32 [head_dim, T, n_head, n_fa]
+    // (selector v2 and the user-question queries). Only a KVFlash process allocates it.
+    ggml_tensor * q_cap_all = nullptr;
+    int q_cap_all_tokens = 0;
+    // Spec verify query stage (KVFlash only): the query of each verify row,
+    // F32 [head_dim, n_head, q_stage_rows, n_fa]; row r of layer l is one
+    // contiguous q_cap plane (see kvflash_q_stage_view). After acceptance the backend copies the last
+    // accepted row into q_cap, so q_cap holds what AR holds. q_stage_base/n
+    // are the position and row count of the last staged pass.
+    ggml_tensor * q_stage = nullptr;
+    int q_stage_rows = 0;
+    int q_stage_base = -1;
+    int q_stage_n = 0;
+    bool q_stage_on = false;   // the backend wants verify passes to stage
 
     // Paged-attention metadata, resident next to the K/V pool (only when the
     // cache was created with paged_attention). Living here instead of as
@@ -1052,6 +1074,8 @@ struct QwenGraphInputs {
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
     bool q_capture = false;
+    // Stage every row's query into cache.q_stage (spec verify under KVFlash).
+    bool q_stage = false;
 
     // SpecLA topology masks for the fully factorized compatibility route.
     ggml_tensor * specla_m_strict = nullptr;

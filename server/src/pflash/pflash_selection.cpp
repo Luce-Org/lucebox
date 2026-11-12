@@ -834,4 +834,21 @@ const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept {
     return "unknown";
 }
 
+std::vector<float> pflash_probe_boundary_scores(const std::vector<float> & raw, const std::vector<float> & conv_w,
+                                                float conv_b) {
+    const int S = (int) raw.size();
+    const int taps = (int) conv_w.size();
+    const int radius = taps / 2;
+    std::vector<float> out((size_t) S, 0.0f);
+    for (int t = 0; t < S; ++t) {
+        float acc = raw[(size_t) t] + conv_b;
+        for (int k = 0; k < taps; ++k) {
+            const int u = t + k - radius;
+            if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
+        }
+        out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
+    }
+    return out;
+}
+
 } // namespace luce::pflash

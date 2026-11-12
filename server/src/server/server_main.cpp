@@ -274,7 +274,9 @@ static void print_usage(const char * prog) {
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
-        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on; with --kvflash\n"
+        "                      the default is exact rollback and this flag opts in; greedy\n"
+        "                      output then differs from AR on some prompts)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --specla            Enable speculative linear-attention verification\n"
         "                       when supported (Qwen3.6 uses DDTree automatically)\n"
@@ -911,6 +913,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
+            bargs.fast_rollback_explicit = true;
         } else if (std::strcmp(argv[i], "--specla") == 0) {
             bargs.specla_mode = true;
             bargs.fast_rollback = true;
@@ -1537,6 +1540,23 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default. Mode 4 unless
+    // LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter (flag or env)
+    // and its PFlash GGUFs are set.
+    if (!model.kvflash_pool.empty()) {
+        const std::string drafter_flag = model.sconfig.pflash_drafter_path;
+        const bool mode5 = luce::server::kvflash_mode5_requested([&](const char * k) {
+            if (drafter_flag.size() && std::string_view(k) == "LUCE_KVFLASH_DRAFTER") return drafter_flag;
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        });
+        std::fprintf(stderr, "[kvflash] recall profile: %s\n", mode5
+            ? "mode 5 (PFlash 2.0 drafter scorer)"
+            : "mode 4 (exact scorer; mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5, the drafter and PFLASH_SCORING_HEAD_GGUF, PFLASH_SEGMENT_PROBE_GGUF, PFLASH_REQUEST_PROBE_GGUF)");
+        apply_env_defaults("KVFlash recall",
+            luce::server::kvflash_recall_env(inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, mode5));
+    }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())

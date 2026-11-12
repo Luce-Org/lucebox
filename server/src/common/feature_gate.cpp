@@ -1,11 +1,13 @@
 // Cross-feature compatibility gate — see feature_gate.h for what belongs here.
 
 #include "feature_gate.h"
+#include "kvflash_refusals.h"
 
 #include "model_capabilities.h"
 #include "paged_attention_config.h"
 
 #include <climits>
+#include <cstdlib>
 
 namespace luce::common {
 
@@ -36,6 +38,22 @@ std::string check_feature_compatibility(
 
     if (arch == "qwen4exp" && (args.verify_width < 0 || args.verify_width > 8)) {
         return "qwen4exp --verify-width expects 0 (adaptive), 1 (off), or 2..8 (fixed k=1..7)";
+    }
+
+    // ── DDTree × KVFlash, on the args construction will consume. Every path
+    // that turns DDTree on (--ddtree, --specla planning onto it) is checked
+    // here, after normalization; the legacy daemon entry points keep theirs.
+    if (const std::string refusal =
+            kvflash_ddtree_refusal(args.ddtree_mode, admission.kvflash_requested());
+        !refusal.empty()) {
+        return refusal;
+    }
+    // ── LUCE_MIN_TOKENS (EOS floor) × speculative decode × KVFlash.
+    if (const std::string refusal = kvflash_min_tokens_refusal(
+            admission.kvflash_requested() && args.draft_path.has_value(),
+            std::getenv("LUCE_MIN_TOKENS"));
+        !refusal.empty()) {
+        return refusal;
     }
 
     // ── target placement × compiled backend

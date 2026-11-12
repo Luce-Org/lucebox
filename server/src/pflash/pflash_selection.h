@@ -202,6 +202,12 @@ struct PFlashSelectionConfig {
     double fallback_spread = 0.0;
 };
 
+// Segment probe boundary scores per token: tap-count Conv1d over the raw logits (torch Conv1d, symmetric zero
+// padding) plus the residual logit, then sigmoid. Pure in its inputs: the scorer computes it once per call and
+// segments under every pin set from the same scores.
+std::vector<float> pflash_probe_boundary_scores(const std::vector<float> & raw_logits,
+                                                const std::vector<float> & conv_w, float conv_b);
+
 // Segment probe: cut the context before every token whose boundary score is
 // above ``threshold``; ``forced_cuts`` (query start, instruction span edges)
 // are always cut; a cut closer than ``min_segment`` tokens to the previous

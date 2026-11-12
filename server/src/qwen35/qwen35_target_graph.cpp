@@ -41,6 +41,7 @@
 #include "glue_fusions.h"
 #include "common/chain_rollback_policy.h"
 #include "common/kv_rotation.h"
+#include "common/kvflash_query_capture.h"
 #include "common/specla_commit_cuda.h"
 
 #include "ggml-alloc.h"
@@ -295,6 +296,19 @@ bool create_target_cache_partial(const TargetWeights & w,
         out.q_cap = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
                                        head_dim, w.n_head, n_full_attn);
         ggml_set_name(out.q_cap, "q_cap");
+        if (const int T = luce::common::kvflash_q_cap_all_rows(); T > 0) {
+            out.q_cap_all_tokens = T;
+            out.q_cap_all = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                               head_dim, T, w.n_head, n_full_attn);
+            ggml_set_name(out.q_cap_all, "q_cap_all");
+        }
+        // Spec verify query stage: KVFlash processes only.
+        if (const int R = luce::common::kvflash_q_stage_rows(max_verify_tokens); R > 0) {
+            out.q_stage_rows = R;
+            out.q_stage = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                             head_dim, w.n_head, R, n_full_attn);
+            ggml_set_name(out.q_stage, "q_stage");
+        }
 
         // Paged-attention metadata is persistent like the K/V pool itself so
         // decode steps can update it append-only; a gallocr graph input would
@@ -507,6 +521,12 @@ void free_target_cache(TargetCache & c) {
     c.specla_pending_count = 0;
     c.target_feat = nullptr;
     c.q_cap = nullptr;
+    c.q_cap_all = nullptr;
+    c.q_cap_all_tokens = 0;
+    c.q_stage = nullptr;
+    c.q_stage_rows = 0;
+    c.q_stage_base = -1;
+    c.q_stage_n = 0;
     c.cur_pos = 0;
 }
 
@@ -2553,6 +2573,7 @@ QwenGraphOutputs build_qwen35_graph(
 
         if (is_attn) {
             const bool want_q_cap = in.q_capture && cache.q_cap;
+            const bool want_q_stage = in.q_stage && cache.q_stage && n_tokens <= cache.q_stage_rows;
             ggml_tensor * q_fa = nullptr;
             if (w.is_bailingmoe3) {
                 GGML_ASSERT(!in.kv_write_rows && !in.paged_block_table &&
@@ -2572,7 +2593,7 @@ QwenGraphOutputs build_qwen35_graph(
                                             /*q_tail_capture=*/nullptr,
                                             /*q_tail_start=*/0,
                                             in.kv_write_rows,
-                                            want_q_cap ? &q_fa : nullptr,
+                                            (want_q_cap || want_q_stage) ? &q_fa : nullptr,
                                             in.paged_block_table,
                                             in.paged_kv_seq_lens,
                                             in.paged_query_seq_ids,
@@ -2585,6 +2606,14 @@ QwenGraphOutputs build_qwen35_graph(
                                             in.tree_scratch_base,
                                             in.tree_scratch_stride,
                                             cache.max_ctx);
+            }
+            if (want_q_stage && q_fa) {
+                // Every row's query, [head_dim, n_tokens, n_head] permuted to
+                // [head_dim, n_head, n_tokens], into layer fa_idx's plane of the stage.
+                ggml_tensor * qp = ggml_permute(ctx, q_fa, 0, 2, 1, 3);
+                ggml_tensor * qd = luce::common::kvflash_q_stage_view(
+                    ctx, cache.q_stage, fa_idx, n_tokens);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, qp, qd));
             }
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
@@ -2600,6 +2629,19 @@ QwenGraphOutputs build_qwen35_graph(
                     cache.q_cap->nb[1], cache.q_cap->nb[1],
                     (size_t)fa_idx * cache.q_cap->nb[2]);
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+                if (cache.q_cap_all) {
+                    // The last T tokens' Q (T = min(n_tokens, capacity)),
+                    // [head_dim, T, n_head] into plane fa_idx of q_cap_all.
+                    const int T = std::min<int>(n_tokens, cache.q_cap_all_tokens);
+                    ggml_tensor * qs = ggml_cont(ctx, ggml_view_3d(ctx, q_fa,
+                        q_fa->ne[0], T, q_fa->ne[2], q_fa->nb[1], q_fa->nb[2],
+                        (size_t)(n_tokens - T) * q_fa->nb[1]));
+                    ggml_tensor * qd = ggml_view_3d(ctx, cache.q_cap_all,
+                        cache.q_cap_all->ne[0], T, cache.q_cap_all->ne[2],
+                        cache.q_cap_all->nb[1], cache.q_cap_all->nb[2],
+                        (size_t)fa_idx * cache.q_cap_all->nb[3]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, qs, qd));
+                }
             }
             fa_idx++;
         } else {
