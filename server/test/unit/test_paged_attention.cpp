@@ -1049,6 +1049,13 @@ struct InvariantScope {
     ~InvariantScope() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
 };
 
+// The chain-vs-AR cases compare routes by the WMMA launch counter. A replayed CUDA graph launches no kernel from the
+// launcher, so with graphs on (GGML_HIP_GRAPHS, the CI build) an AR call that replays counts 0 launches.
+struct GraphsOffScope {
+    bool prev = ggml_backend_cuda_set_graphs_disabled_override(true);
+    ~GraphsOffScope() { ggml_backend_cuda_set_graphs_disabled_override(prev); }
+};
+
 TEST_CASE(PagedAttention, RowOutputBitsIndependentOfBatch) {
     const InvariantScope invariant;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -1250,6 +1257,7 @@ int chain_vs_ar_mismatches(ggml_backend_t backend, ggml_type kv_type, int commit
 
 TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
     const InvariantScope invariant;
+    const GraphsOffScope graphs_off;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
     for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
@@ -1273,6 +1281,7 @@ TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBits) {
 // runs on gfx1151 and, with LUCE_PAGED_WMMA=0, on gfx1201.
 TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBitsAcrossTableWidths) {
     const InvariantScope invariant;
+    const GraphsOffScope graphs_off;
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
     int total = 0, bad = 0;
