@@ -46,7 +46,7 @@ class _FakeStream(io.BytesIO):
 
     status = 200
 
-    def __enter__(self) -> "_FakeStream":
+    def __enter__(self) -> _FakeStream:
         return self
 
     def __exit__(self, *_exc: object) -> bool:
