@@ -153,6 +153,7 @@ void Qwen35SeqEngine::init_slots_() {
             std::fprintf(stderr, "[kvflash] slot header rung on recall turns with end - R >= %d (LUCE_KVFLASH_END_RUNG_MIN)\n", end_rung_min_);
         init_bundles_();
         init_heads_();
+        rebind_restored_heads_();   // the start-up adopts ran before the binder and head_k_max_ existed: bind their heads now
     }
     if (kvf_)
         std::fprintf(stderr, "[kvflash] slot recall: %s (mode=%d queries=%d k=%d unit=%d uq=%d preamble=%d)\n",
@@ -1237,11 +1238,20 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     }
     if (rebind) {   // the session pinned a head when it parked: pin it again (its history must still start with that head)
         const KvFlashSessionEntry * me = book_.store().find_key(key);
-        if (me && !me->preamble.empty() && me->preamble_chunks > 0 &&
-            !kvflash_head_rebind(*kvf_kv_, head_binder_, slot, parked_[(size_t)slot].history, std::strtoull(me->preamble.c_str(), nullptr, 16), me->preamble_chunks))
+        if (me && !kvflash_rebind_restored(*kvf_kv_, head_binder_, head_k_max_, {{slot, &parked_[(size_t)slot].history, me->preamble, me->preamble_chunks}}) && !me->preamble.empty() && me->preamble_chunks > 0)
             std::fprintf(stderr, "[kvflash] slot %d session %s: its pinned head does not hold, the slot runs unpinned\n", slot, key.c_str());
     }
     return "";
+}
+
+void Qwen35SeqEngine::rebind_restored_heads_() {
+    std::vector<KvFlashRestoredSession> rs;
+    for (int slot = 0; slot < slots_.slot_count(); ++slot) {
+        const KvFlashSessionEntry * me = parked_[(size_t)slot].valid ? book_.store().find_key(book_[slot].key) : nullptr;
+        if (me) rs.push_back({slot, &parked_[(size_t)slot].history, me->preamble, me->preamble_chunks});
+    }
+    const int n = kvflash_rebind_restored(*kvf_kv_, head_binder_, head_k_max_, rs);
+    if (!rs.empty()) std::fprintf(stderr, "[kvflash] start-up: %d of %zu restored sessions re-bound their pinned head\n", n, rs.size());
 }
 
 void Qwen35SeqEngine::init_heads_() {

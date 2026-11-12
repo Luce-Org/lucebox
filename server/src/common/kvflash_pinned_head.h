@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <numeric>
 #include <string>
@@ -219,6 +220,29 @@ inline bool kvflash_head_rebind(Kv & kv, KvFlashHeadBinder & bd, int slot, const
     if ((int)path.size() < k || path.empty() || path.back() != hash || !bd.bind(slot, hash, k)) { kv.pager(slot).unpin_all(); return false; }
     bd.ensure(slot, kv.pager(slot));
     return bd.binding(slot).k == k;
+}
+
+// A session a start-up adopt put back into `slot`, with the binding its meta.json holds.
+struct KvFlashRestoredSession {
+    int slot = -1;
+    const std::vector<int32_t> * history = nullptr;
+    std::string preamble;   // hex16 of H_k, "" none
+    int k = 0;
+};
+
+// Start-up order: the adopts run in init_bundles_ before init_heads_ installs the binder and head_k_max, so no adopt can
+// rebind. This is the one pass after init_heads_: every restored session whose meta binds a head is re-bound; one whose
+// head does not hold is unbound and unpinned (cold-startable). Returns the slots left bound.
+template <class Kv>
+inline int kvflash_rebind_restored(Kv & kv, KvFlashHeadBinder & bd, int head_k_max, const std::vector<KvFlashRestoredSession> & sessions) {
+    if (head_k_max <= 0) return 0;
+    int bound = 0;
+    for (const KvFlashRestoredSession & r : sessions) {
+        if (r.preamble.empty() || r.k <= 0 || !r.history) continue;
+        if (kvflash_head_rebind(kv, bd, r.slot, *r.history, std::strtoull(r.preamble.c_str(), nullptr, 16), r.k)) ++bound;
+        else bd.unbind(r.slot);
+    }
+    return bound;
 }
 
 // The layout id a head file is saved under: the execution identity (model, KV types, geometry, backend, ggml build),

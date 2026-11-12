@@ -383,6 +383,7 @@ private:
     int head_k_max_ = 0;                                // chunks a head may pin; 0: heads off
     int head_pinned_files_ = 0;                         // head files pinned in the directory by this process
     void init_heads_();
+    void rebind_restored_heads_();   // one pass over the slots init_bundles_ adopted, after init_heads_
     const KvFlashHead * find_head_(const std::vector<int32_t> & prompt, int k);   // host copy, else the file; null when unknown
     const KvFlashHead * keep_head_(KvFlashHead h);
     void capture_head_(int slot);                       // the slot holds exactly its head: keep it, bind the slot, persist it
