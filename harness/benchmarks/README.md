@@ -104,6 +104,10 @@ Each run writes:
 - `compare.json`: machine-readable comparison
 - `report.md`: speed and expected-output summary
 
+Comparison requires the same non-empty set of unique case IDs in both reports.
+Missing or duplicate cases cause an error (exit code 2) before comparison outputs
+are written, so a partial run cannot silently pass by comparing only shared cases.
+
 Prompt files are JSONL. Each line needs `id` and either `prompt` or `messages`.
 Optional `expect_contains` and `expect_regex` fields define lightweight accuracy
 checks.
