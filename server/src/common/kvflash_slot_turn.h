@@ -11,6 +11,7 @@
 
 #include "kvflash_prefill_reselect.h"
 #include "kvflash_slot_ladder.h"
+#include "kvflash_uq.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -67,7 +68,8 @@ inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { retur
 inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & prompt, int kv_offset,
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
-                                              int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0) {
+                                              int end_rung_min = -1, bool pflash2 = false, int max_turn_tokens = 0,
+                                              const KvFlashUqPlan & uq = KvFlashUqPlan{}) {
     KvFlashSlotTurn t;
     t.kv_offset = std::clamp(kv_offset, 0, (int)prompt.size());
     t.end = (int)prompt.size();
@@ -78,7 +80,7 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     const std::vector<int32_t> suffix(prompt.begin() + t.kv_offset, prompt.end());
     const KvFlashMode4Plan p4 = kvflash_mode4_plan(suffix, t.kv_offset, im_start, user, max_turn_tokens);
     if (!p4.run) return t;
-    t.r = p4.r;
+    t.r = kvflash_uq_snap_rewind(uq, p4.r);   // a capped R never splits the question window
     t.reserve_chunks = (t.end - t.r + chunk_tokens - 1) / chunk_tokens + 1;
     // fits, or no sealed chunk before r to score: LRU turn
     if (kvflash_pool_fits(t.end, chunk_tokens, t.reserve_chunks, n_pool_blocks) || t.r / chunk_tokens == 0) { t.r = -1; t.reserve_chunks = 0; return t; }

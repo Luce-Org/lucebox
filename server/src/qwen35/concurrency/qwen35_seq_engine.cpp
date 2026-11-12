@@ -896,16 +896,23 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     const int ct = p.chunk_tokens(), usable = luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom());
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
                                                                         luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
-    rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
-                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn);
+    // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
+    // A prefill that covers the window captures them (whatever the slot's store holds: the same request
+    // runs the same cuts and scores with its own rows); a later turn of the session reads the store.
+    // Planned before the turn, so a capped R never lands inside its window.
+    KvFlashHumanTurn q;
+    KvFlashUqPlan uqp;
     if (uq_queries_ > 0) {
-        // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
-        // A prefill that covers the window captures them (whatever the slot's store holds: the same request
-        // runs the same cuts and scores with its own rows); a later turn of the session reads the store.
-        const KvFlashHumanTurn q = kvflash_last_human_turn(prompt, b_.w_.im_start_id, b_.w_.user_id, b_.w_.newline_id,
-                                                           b_.w_.im_end_id, b_.w_.tool_response_id);
+        q = kvflash_last_human_turn(prompt, b_.w_.im_start_id, b_.w_.user_id, b_.w_.newline_id, b_.w_.im_end_id,
+                                    b_.w_.tool_response_id);
+        uqp = kvflash_uq_plan(q, uq_queries_, std::clamp(kv_offset, 0, (int)prompt.size()), (int)prompt.size());
+    }
+    rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
+                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn,
+                                     uqp);
+    if (uq_queries_ > 0) {
         kvflash_slot_turn_force_cut(rc.turn, kvflash_uq_cut(q, uq_queries_, rc.turn.kv_offset, rc.turn.end));
-        rc.uq = kvflash_uq_plan(q, uq_queries_, rc.turn.kv_offset, rc.turn.end);
+        rc.uq = uqp;
         rc.uq_hash = kvflash_uq_hash(prompt, rc.uq.cut);
         if (!rc.uq.capture) rc.uq_miss = rc.uq.n == 0 ? "no-human-turn" : "window-not-in-prefill";   // unless the store holds it
     }

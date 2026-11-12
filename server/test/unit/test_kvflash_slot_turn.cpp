@@ -80,6 +80,21 @@ TEST_CASE(KvflashSlotTurnFixture, plan_recalls_the_tail_of_a_cold_turn_too_long_
     CHECK(kvflash_slot_turn_plan(prompt_with_user(20000, 15000), 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, cap).r == 15000);
 }
 
+TEST_CASE(KvflashSlotTurnFixture, a_capped_r_inside_the_question_window_moves_to_the_window_end) {
+    // The cap's R can land inside the latest question's window (LUCE_KVFLASH_UQ_QUERIES). The replay would recompute the
+    // window's tail without recapturing it and the store would keep the first pass's rows: R moves to the window's end.
+    const std::vector<int32_t> prompt = prompt_with_user(81430, 17);
+    const int cap = kvflash_max_turn_tokens(kCt, 256, 18, 60), r0 = 81430 - cap;
+    const KvFlashUqPlan inside = kvflash_uq_plan(KvFlashHumanTurn{r0 - 200, r0 + 30}, 64, 0, 81430);   // window [r0 - 34, r0 + 30)
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, cap, inside);
+    CHECK(t.first_pass());
+    CHECK(t.r == r0 + 30);
+    CHECK(t.reserve_chunks == (81430 - (r0 + 30) + kCt - 1) / kCt + 1);
+    // a window that R does not split leaves the cap's R
+    const KvFlashUqPlan after = kvflash_uq_plan(KvFlashHumanTurn{r0 + 100, r0 + 400}, 64, 0, 81430);
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, false, cap, after).r == r0);
+}
+
 TEST_CASE(KvflashSlotTurnFixture, plan_on_a_resumed_session_rewinds_to_the_new_user_turn_only) {
     auto prompt = prompt_with_user(6000, 5900);
     prompt[(size_t)100] = kImStart; prompt[(size_t)101] = kUser;   // an older user turn inside the session
