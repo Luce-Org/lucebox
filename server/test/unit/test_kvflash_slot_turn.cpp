@@ -887,3 +887,104 @@ TEST_CASE(KvflashSlotTurnFixture, a_busy_restore_with_no_victim_validates_nothin
     CHECK(p.loads == 0);
 }
 
+
+// ---- L4: LUCE_KVFLASH_HEADER_RUNG, the first-pass header rung H (the last <|im_start|>, the assistant header) beside R ----
+namespace {
+// 5000 tokens, the last user turn at R=4000, the assistant header at H=4990; the knob-off cuts after R: 4512, 5000, so H'=4512.
+std::vector<int> l4_tail(const std::vector<int> & c, size_t n) { return std::vector<int>(c.end() - (ptrdiff_t)std::min(n, c.size()), c.end()); }
+std::vector<int32_t> l4_prompt() { auto p = prompt_with_user(5000, 4000); p[4990] = kImStart; return p; }
+KvFlashSlotTurn l4_plan(bool header_rung, int end_rung_min = -1) {
+    return kvflash_slot_turn_plan(l4_prompt(), 0, kImStart, kUser, kCt, kQ, kU, kT, true, end_rung_min, false, 0, -1, header_rung);
+}
+}  // namespace
+
+// (a) the first pass takes H' (an existing cut) and adds no cut
+TEST_CASE(KvflashSlotTurnFixture, l4_a_the_rung_is_an_existing_cut_at_or_before_h_and_the_plan_is_otherwise_unchanged) {
+    CHECK(kvflash_header_rung_at({4000, 4512, 5000}, 4990, 4000) == 4512);
+    CHECK(kvflash_header_rung_at({4000, 4512, 5000}, 4512, 4000) == 4512);   // H on a cut: that cut
+    CHECK(kvflash_header_rung_at({4000, 4512, 5000}, 4511, 4000) == -1);     // only R below H: no rung above R
+    CHECK(kvflash_header_rung_at({4000, 5000}, 4990, 4000) == -1);
+    CHECK(kvflash_header_rung_at({}, 4990, 4000) == -1);
+    const KvFlashSlotTurn off = l4_plan(false), t = l4_plan(true);
+    CHECK(t.first_pass()); CHECK(t.r == 4000); CHECK(t.header_rung);
+    CHECK(t.ckpt == 4512);
+    CHECK(t.cuts == off.cuts);                                          // bitwise by construction: same steps, same q capture
+    CHECK((l4_tail(t.cuts, 2) == std::vector<int>{4512, 5000}));
+    CHECK(kvflash_slot_turn_step(t, 4000, 512, kT).ckpt);               // taken at the end of the step that holds H
+    CHECK(!kvflash_slot_turn_step(t, 4512, 488, kT).ckpt);
+    for (int pos : {0, 512, 4000, 4512}) {                              // every step but the checkpoint flag equals knob off
+        const int n = kvflash_slot_turn_next_cut(off, pos, kU);
+        const KvFlashTurnStep x = kvflash_slot_turn_step(off, pos, n, kT), y = kvflash_slot_turn_step(t, pos, n, kT);
+        CHECK(x.snapshot == y.snapshot); CHECK(x.capture == y.capture); CHECK(x.q_rows == y.q_rows);
+        CHECK(kvflash_slot_turn_next_cut(t, pos, kU) == n);
+    }
+    CHECK(!t.end_rung);
+    KvFlashSlotTurn rp = t; rp.phase = KvFlashTurnPhase::Replay;
+    CHECK(!kvflash_slot_turn_step(rp, 4000, 512).ckpt);                 // the replay does not take it again
+    // R is the only cut above H's step start: no rung, the plan is today's (ckpt stays H)
+    const KvFlashSlotTurn n = kvflash_slot_turn_plan(prompt_with_user(5000, 4800), 0, kImStart, kUser, kCt, kQ, kU, kT, true, -1, false, 0, -1, true);
+    CHECK(!n.header_rung); CHECK((l4_tail(n.cuts, 2) == std::vector<int>{4800, 5000}));
+}
+
+// (b) the ladder: H first (Rule A), then R below it; three slabs, every op valid
+TEST_CASE(KvflashSlotTurnFixture, l4_b_r_goes_below_h_and_the_ladder_never_exceeds_three_slabs) {
+    const KvFlashLadder states[] = {{4000, 3000, 2000, false}, {3842, 3671, 2047, false}, {3837, -1, 3671, true}, {3837, 3000, 3671, true},
+                                    {900, -1, 900, true}, {3671, 2047, -1, false}, {3671, -1, -1, false}, {-1, -1, -1, false}};
+    for (const KvFlashLadder & s : states) {
+        const KvFlashLadderMove h = kvflash_ladder_ckpt(s, 4990);       // take_ckpt_ at H
+        CHECK(kvflash_ladder_peak(held_mask(s, false), kvflash_ladder_ops(h), true) <= 3);
+        CHECK(h.to.ckpt == 4990);
+        const KvFlashLadderMove r = kvflash_ladder_ckpt_below(h.to, 4800);   // place_ckpt_ at R, the R snapshot is live
+        CHECK(r.to.ckpt == 4990); CHECK(r.ckpt_from == kRungCkpt);        // H stays the checkpoint, on its own slab
+        CHECK(r.to.trunk == 4800); CHECK(r.trunk_from == kRungLive);     // R is the fallback below it
+        const std::array<int, 3> got = run_ops(r);                       // every destination gets exactly its source
+        CHECK(got[0] == kRungCkpt); CHECK(got[1] == kRungLive);
+        CHECK(got[2] == (r.to.extra > 0 ? r.extra_from : -1));
+        CHECK(kvflash_ladder_peak(held_mask(h.to, true), kvflash_ladder_ops(r), false) <= 4);   // today's R placement holds the same 3 rungs + the live snapshot
+        int n = 0; for (int p : {r.to.ckpt, r.to.trunk, r.to.extra}) n += p > 0;
+        CHECK(n <= 3);
+        CHECK(r.to.ckpt > r.to.trunk); CHECK(r.to.trunk > r.to.extra);
+        if (h.to.pinned) { CHECK(r.to.pinned); CHECK(r.to.extra == h.to.extra); }   // a pinned branch point survives
+        else if (h.to.trunk > 0) CHECK(r.to.extra == h.to.trunk);        // the rung below R is the demoted third
+        // the live-slab accounting: ops never move the same source twice
+        std::array<int, 4> moved{}; for (const KvFlashSlabOp & op : kvflash_ladder_ops(r)) if (op.kind == KvFlashSlabOp::Move) CHECK(++moved[(size_t)op.from] == 1);
+    }
+    // a checkpoint at or above the ladder's top is Rule A as before: kvflash_ladder_ckpt_below is only for R under H
+    CHECK((kvflash_ladder_ckpt_below(L3{4990, 4000, 3000, false}, 4800).to == L3{4990, 4800, 4000, false}));
+    CHECK((kvflash_ladder_ckpt_below(L3{4990, 4000, 3000, true}, 4800).to == L3{4990, 4800, 3000, true}));
+}
+
+// (c) + (d): where the next turn resumes
+TEST_CASE(KvflashSlotTurnFixture, l4_c_d_a_returning_turn_resumes_at_h_prime_and_a_branch_before_it_falls_back_to_r) {
+    const int len = 5100, prompt_len = 6200;                            // the parked session: prompt 5000 + 100 output
+    const int hp = 4512;
+    const KvFlashLadder off{4000, 3500, 3000, false};                   // today: R only
+    KvFlashLadder on = kvflash_ladder_ckpt_below(kvflash_ladder_ckpt(off, hp).to, 4000).to;
+    CHECK((on == L3{hp, 4000, 3500, false}));
+    for (int lcp : {4990, 5000, 5050, 5099, hp}) {                      // the next prompt keeps the header and rewrites the reply
+        CHECK(kvflash_resume_point(lcp, len, off.ckpt, off.trunk, prompt_len, off.extra) == 4000);   // today: re-prefills 4000..lcp
+        CHECK(kvflash_resume_point(lcp, len, on.ckpt, on.trunk, prompt_len, on.extra) == hp);
+    }
+    CHECK(kvflash_resume_point(len, len, on.ckpt, on.trunk, prompt_len, on.extra) == len);   // exact extension: the whole history
+    for (int lcp : {4000, 4001, 4511})                                  // edited history before H'
+        CHECK(kvflash_resume_point(lcp, len, on.ckpt, on.trunk, prompt_len, on.extra) == 4000);
+    CHECK(kvflash_resume_point(3999, len, on.ckpt, on.trunk, prompt_len, on.extra) == 3500);   // before R: the old trunk, as today
+}
+
+// (e) knob off is today's plan
+TEST_CASE(KvflashSlotTurnFixture, l4_e_knob_off_is_todays_plan_bit_for_bit) {
+    const KvFlashSlotTurn a = l4_plan(false);
+    const KvFlashSlotTurn b = kvflash_slot_turn_plan(l4_prompt(), 0, kImStart, kUser, kCt, kQ, kU, kT, true);
+    CHECK(a.phase == b.phase); CHECK(a.kv_offset == b.kv_offset); CHECK(a.r == b.r); CHECK(a.end == b.end);
+    CHECK(a.reserve_chunks == b.reserve_chunks); CHECK(a.ckpt == b.ckpt); CHECK(a.end_rung == b.end_rung);
+    CHECK(a.apply_at == b.apply_at); CHECK(a.capture_at == b.capture_at); CHECK(a.cuts == b.cuts);
+    CHECK((l4_tail(a.cuts, 2) == std::vector<int>{4512, 5000}));                  // the hard-coded plan of today
+    CHECK(!a.header_rung); CHECK(a.ckpt == 4990);
+    CHECK(!kvflash_slot_turn_step(a, 4000, 512).ckpt);
+    // with the end rung control arm C the plan is today's; the header rung knob replaces it
+    const KvFlashSlotTurn c = l4_plan(false, 100);
+    CHECK(c.end_rung); CHECK((l4_tail(c.cuts, 2) == std::vector<int>{4512, 5000}));
+    CHECK(!l4_plan(true, 100).end_rung);
+    // ladder: kvflash_ladder_ckpt is untouched
+    CHECK((kvflash_ladder_ckpt(L3{3000, 2000, 1000, false}, 4000).to == L3{4000, 3000, 2000, false}));
+}

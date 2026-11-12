@@ -143,6 +143,9 @@ void Qwen35SeqEngine::init_slots_() {
         sticky_on_ = kvflash_slot_sticky_env();
         const char * rung = std::getenv("LUCE_KVFLASH_END_RUNG_MIN");
         end_rung_min_ = rung && *rung ? std::atoi(rung) : -1;
+        const char * hr = std::getenv("LUCE_KVFLASH_HEADER_RUNG");
+        header_rung_ = hr && hr[0] == '1' && !hr[1];
+        if (header_rung_) std::fprintf(stderr, "[kvflash] slot first-pass header rung on recall turns (LUCE_KVFLASH_HEADER_RUNG)\n");
         const KvFlashParkCfg pc = kvflash_park_cfg(sticky_on_, std::getenv("LUCE_KVFLASH_PARK_SHORT"), std::getenv("LUCE_KVFLASH_PARK_TAIL"), std::getenv("LUCE_KVFLASH_PARK_DECODE"));
         park_short_on_ = pc.any() && slot_state_stash_alloc(b_.cache_, b_.target_backend_, stash_);   // the stash exists only when a mode uses it
         park_decode_on_ = park_short_on_ && pc.decode_on;
@@ -994,7 +997,9 @@ void Qwen35SeqEngine::place_ckpt_(int slot, SlotCkpt nu) {
     SlotCkpt & ck = ckpt_[(size_t)slot];
     SlotCkpt & tr = trunk_[(size_t)slot];
     SlotCkpt & ex = extra_[(size_t)slot];
-    const KvFlashLadderMove m = kvflash_ladder_ckpt(ladder_of_(ck, tr, ex), nu.pos);
+    const KvFlashLadder in = ladder_of_(ck, tr, ex);
+    // L4: the first pass already took the header rung above R: it stays the checkpoint and R goes below it
+    const KvFlashLadderMove m = header_rung_ && in.ckpt > nu.pos ? kvflash_ladder_ckpt_below(in, nu.pos) : kvflash_ladder_ckpt(in, nu.pos);
     apply_ladder_(m, ck, tr, ex, std::move(nu));
 }
 
@@ -1539,7 +1544,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
                                                                         luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
-                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn, capture_at);
+                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, b_.kvflash_prefill_reselect_ == 5, max_turn, capture_at, header_rung_);
     if (rc.turn.capture_at > 0) rc.capture_ids.assign(prompt.begin(), prompt.begin() + rc.turn.capture_at);
     if (uq_queries_ > 0) {
         // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
@@ -1617,6 +1622,11 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
         }
     }
     const double score_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    {   // L4 pre-condition: the bits the first pass's cuts produce (the captured queries, the scores); FNV-1a 64
+        auto fnv = [](const std::vector<float> & v) { uint64_t h = 1469598103934665603ull; const uint8_t * b = (const uint8_t *)v.data(); for (size_t i = 0; i < v.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull; return h; };
+        std::fprintf(stderr, "[kvflash] slot %d mode4 first-pass bits: q_tail n_q=%d fnv=%016llx scores n=%zu fnv=%016llx\n",
+                     slot, n_q, (unsigned long long)fnv(q_all), rc.scores.size(), (unsigned long long)fnv(rc.scores));
+    }
     if (!scored)
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4 @%d: scoring failed (n_q=%d sealed=%d); LRU replay\n",
                      slot, r, n_q, sealed);
