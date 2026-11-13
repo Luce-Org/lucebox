@@ -321,7 +321,7 @@ static void print_usage(const char * prog) {
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
-        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: qk on qwen35 with --kvflash, else drafter)\n"
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -1537,6 +1537,24 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default. Mode 4 unless
+    // LUCE_KVFLASH_PREFILL_RESELECT=5 asks for mode 5 and the drafter (flag or env)
+    // and its PFlash GGUFs are set.
+    if (!model.kvflash_pool.empty()) {
+        const std::string drafter_flag = model.sconfig.pflash_drafter_path;
+        const bool mode5 = luce::server::kvflash_mode5_requested([&](const char * k) {
+            if (drafter_flag.size() && std::string_view(k) == "LUCE_KVFLASH_DRAFTER") return drafter_flag;
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        });
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        std::fprintf(stderr, "[kvflash] %s\n", luce::server::kvflash_recall_banner(arch, mode5, [](const char * k) {
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        }).c_str());
+        apply_env_defaults("KVFlash recall", luce::server::kvflash_recall_env(arch, mode5));
+    }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())

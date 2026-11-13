@@ -1119,6 +1119,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash/pflash_daemon.cpp")
     else()
         target_link_libraries(pflash_daemon PRIVATE hip::host)
     endif()
+    add_executable(pflash_resume_exact test/pflash/pflash_resume_exact.cpp)
+    target_include_directories(pflash_resume_exact PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(pflash_resume_exact PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(pflash_resume_exact PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(pflash_resume_exact PRIVATE hip::host)
+    endif()
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
@@ -1278,6 +1286,19 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
         list(APPEND _raw_unit_test_targets test_paged_attn_lanes)
+    endif()
+
+    if(LUCE_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_kvflash_page.cpp")
+        add_executable(bench_kvflash_page test/bench/bench_kvflash_page.cpp)
+        target_compile_definitions(bench_kvflash_page PRIVATE LUCE_BACKEND_CUDA=1)
+        target_include_directories(bench_kvflash_page PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(bench_kvflash_page PRIVATE
+            ${LUCE_GGML_BACKEND_TARGET} ggml ggml-base CUDA::cudart)
     endif()
 
     if(LUCE_GPU_BACKEND STREQUAL "cuda"
@@ -2853,6 +2874,15 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_exact_mass.cpp
             test/unit/test_kvflash_gpu_mass.cpp
             test/unit/test_kvflash_uq.cpp
+            test/unit/test_kvflash_pager_recall.cpp
+            test/unit/test_kvflash_pager_reselect_fence.cpp
+            test/unit/test_kvflash_pager_victim_tier.cpp
+            test/unit/test_kvflash_pager_clean_evict.cpp
+            test/unit/test_kvflash_prefill_reselect.cpp
+            test/unit/test_kvflash_m5_rescore.cpp
+            test/unit/test_kvflash_m4_reuse.cpp
+            test/unit/test_pflash_probe_boundary.cpp
+            test/unit/test_kvflash_pin_preamble.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
             test/unit/test_qwen35moe_swap_manager.cpp
