@@ -279,13 +279,13 @@ __global__ void chunk_aggregate_kernel(const float * __restrict__ part, const fl
     out[2 * (size_t)nq_total * C + o] = mxp;
 }
 
-// the WMMA kernel exists only in the gfx12 device pass; the host asks the device which one to launch
+// the WMMA kernel exists only in the gfx1200/gfx1201 device pass (LUCE_FUSED_WMMA); the host asks the device which one to launch
 bool device_has_wmma() {
 #if defined(__HIP_PLATFORM_AMD__)
     int dev = 0;
     hipDeviceProp_t pr;
     if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&pr, dev) != hipSuccess) return false;
-    return std::strncmp(pr.gcnArchName, "gfx12", 5) == 0;
+    return kvflash_fused_arch_has_wmma(pr.gcnArchName);
 #else
     return false;
 #endif

@@ -7,11 +7,21 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace luce::common {
+
+// The int8 WMMA kernel body is compiled only where the device pass defines __gfx1200__ / __gfx1201__ (see LUCE_FUSED_WMMA in the .cu).
+// The host cannot see those macros, so the runtime gate must name exactly the same archs; "gfx12-generic" and other gfx12xx parts run dp4a.
+// gcnArchName may carry a feature suffix ("gfx1201:sramecc-:xnack-"), so match the exact name up to ':'.
+inline bool kvflash_fused_arch_has_wmma(const char * gcn_arch_name) {
+    if (!gcn_arch_name) return false;
+    const size_t n = std::strcspn(gcn_arch_name, ":");
+    return n == 7 && (std::strncmp(gcn_arch_name, "gfx1200", 7) == 0 || std::strncmp(gcn_arch_name, "gfx1201", 7) == 0);
+}
 
 constexpr int kFusedMaxLayers = 64;
 
