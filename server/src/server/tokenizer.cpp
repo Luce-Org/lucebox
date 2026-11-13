@@ -254,23 +254,20 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
         }
 
-        // Pattern 5: \s*[\r\n]+
+        // Pattern 5: \s*[\r\n]+ — the greedy \s* backtracks to the last
+        // newline of the whitespace run, so "\n \n" is one piece.
         if (is_whitespace(cp)) {
-            size_t p = pos;
+            size_t p = pos, nl_end = pos;
             int cl = 0;
             uint32_t c = peek_cp(p, &cl);
-            // Consume leading whitespace
-            while (cl > 0 && is_whitespace(c) && !is_newline(c)) {
+            while (cl > 0 && is_whitespace(c)) {
                 p += cl;
+                if (is_newline(c)) nl_end = p;
                 c = peek_cp(p, &cl);
             }
-            if (cl > 0 && is_newline(c)) {
-                while (cl > 0 && is_newline(c)) {
-                    p += cl;
-                    c = peek_cp(p, &cl);
-                }
-                pieces.push_back(text.substr(pos, p - pos));
-                pos = p;
+            if (nl_end > pos) {
+                pieces.push_back(text.substr(pos, nl_end - pos));
+                pos = nl_end;
                 continue;
             }
             // Pattern 6: \s+(?!\S) — whitespace NOT followed by non-whitespace
