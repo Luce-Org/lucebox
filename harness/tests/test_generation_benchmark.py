@@ -1,8 +1,11 @@
-"""Regression tests for usage token counts in generation_benchmark.run_case."""
+"""Regression tests for generation benchmark metrics and report comparisons."""
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -89,6 +92,87 @@ class RunCaseUsageTests(unittest.TestCase):
                 self.assertEqual(run["completion_tokens"], 4)
                 self.assertIsNone(run["prompt_tokens"])
                 self.assertEqual(run["token_count_source"], "approx_words")
+
+
+class CompareReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.json_out = self.directory / "compare.json"
+        self.md_out = self.directory / "report.md"
+
+    def compare(self, baseline: list[dict], candidate: list[dict]) -> subprocess.CompletedProcess:
+        for name, cases in (("baseline", baseline), ("candidate", candidate)):
+            (self.directory / f"{name}.json").write_text(
+                json.dumps({"name": name, "cases": cases}), encoding="utf-8"
+            )
+        return subprocess.run(
+            [
+                sys.executable, str(Path(generation_benchmark.__file__)), "compare",
+                "--baseline", str(self.directory / "baseline.json"),
+                "--candidate", str(self.directory / "candidate.json"),
+                "--json-out", str(self.json_out), "--md-out", str(self.md_out),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+
+    @staticmethod
+    def case(case_id: str, passed: bool = True) -> dict:
+        return {"id": case_id, "mean_tok_s": 10.0, "expected_pass": passed, "text": "ok"}
+
+    def assert_invalid(self, result: subprocess.CompletedProcess, message: str) -> None:
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertFalse(self.json_out.exists())
+        self.assertFalse(self.md_out.exists())
+
+    def test_rejects_mismatched_case_sets(self) -> None:
+        for baseline, candidate in (
+            (["a", "b"], ["a"]),
+            (["a"], ["a", "b"]),
+            (["a"], ["b"]),
+        ):
+            with self.subTest(baseline=baseline, candidate=candidate):
+                result = self.compare(
+                    [self.case(key) for key in baseline],
+                    [self.case(key) for key in candidate],
+                )
+                self.assert_invalid(result, "case IDs differ")
+                self.assertIn(
+                    f"missing from candidate: {sorted(set(baseline) - set(candidate))}",
+                    result.stderr,
+                )
+                self.assertIn(
+                    f"missing from baseline: {sorted(set(candidate) - set(baseline))}",
+                    result.stderr,
+                )
+
+    def test_rejects_empty_reports(self) -> None:
+        self.assert_invalid(self.compare([], []), "at least one case")
+
+    def test_rejects_duplicate_ids_in_either_report(self) -> None:
+        case = self.case("a")
+        for baseline, candidate in (([case, case], [case]), ([case], [case, case])):
+            with self.subTest(baseline=baseline, candidate=candidate):
+                self.assert_invalid(self.compare(baseline, candidate), "duplicate case id: 'a'")
+
+    def test_compares_complete_reports_regardless_of_order(self) -> None:
+        result = self.compare(
+            [self.case("b"), self.case("a")], [self.case("a"), self.case("b")]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(self.json_out.read_text(encoding="utf-8"))
+        self.assertEqual([case["id"] for case in report["cases"]], ["a", "b"])
+        self.assertEqual(report["summary"]["candidate_expected_pass"], 2)
+        self.assertEqual(report["summary"]["mean_speedup"], 1.0)
+        self.assertIn("2/2", self.md_out.read_text(encoding="utf-8"))
+
+    def test_preserves_failed_expected_checks(self) -> None:
+        result = self.compare([self.case("a")], [self.case("a", passed=False)])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(self.json_out.read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["candidate_expected_pass"], 0)
 
 
 if __name__ == "__main__":
