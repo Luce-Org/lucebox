@@ -750,6 +750,20 @@ static std::string write_deepseek_marker_tokenizer_fixture() {
     return path;
 }
 
+// \s*[\r\n]+ backtracks to the last newline of a whitespace run, so HF splits
+// "a\n \nb" as a | \n \n | b. The engine used to split it as a | \n | " \n" | b.
+TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline) {
+    const std::string a = "a\n \nb", x = "x \t\n  \n y";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"\n \n", " \t\n  \n", " y"}, a + x);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    TEST_ASSERT(tok.encode(a).size() == 3);
+    TEST_ASSERT(tok.encode(x).size() == 3);
+    TEST_ASSERT(tok.decode(tok.encode(x)) == x);
+}
+
 TEST_CASE(ServerUnitFixture,
         test_pflash_decoded_span_covers_bpe_merged_first_token) {
     const std::string content =
