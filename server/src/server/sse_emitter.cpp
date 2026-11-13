@@ -81,6 +81,7 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         ? round1((double)completion_tokens / t.decode_s) : 0.0;
     json out{
         {"prefill_ms",            prefill_ms},
+        {"queue_ms",              round1(t.queue_s * 1000.0)},
         {"decode_ms",             decode_ms},
         {"decode_tokens_per_sec", tps},
         {"cache_hit",             t.cache_hit},

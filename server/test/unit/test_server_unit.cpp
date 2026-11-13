@@ -10,6 +10,7 @@
 #include "scoped_env.h"
 #include <fstream>
 
+#include "server/admit_timing.h"
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
 #include "server/tool_checks.h"
@@ -77,6 +78,8 @@
 #include <array>
 #include <mutex>
 #include <thread>
+#include <poll.h>
+#include <chrono>
 #include <tuple>
 #include <vector>
 #include <limits>
@@ -358,6 +361,25 @@ struct SchedulerTestHarness {
 
 struct HttpServerTestAccess {
     using PreparedPrompt = HttpServer::PreparedPrompt;
+    static void handle_client(HttpServer & server, int fd) { server.handle_client(fd); }
+    static void add_sse_subscriber(HttpServer & server, int fd) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        server.sse_fds_.push_back(fd);
+    }
+    static size_t sse_subscribers(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        return server.sse_fds_.size();
+    }
+    static void broadcast_token(HttpServer & server, const std::string & text) { server.broadcast_token(text); }
+    static bool parse_endpoint(HttpServer & server, const std::string & path, const json & body,
+                               const std::string & header_lines, ParsedRequest & req) {
+        req.headers = luce::common::kvflash_parse_headers(header_lines);
+        bool count_only = false;
+        return server.parse_endpoint_request(path, body, req, count_only);
+    }
+    static ParsedRequest inner_request(HttpServer & server, const ParsedRequest & outer, const json & body) {
+        return server.make_inner_request(&outer.headers, body);
+    }
     static std::string apply_pflash_compression(
             HttpServer & server, const ParsedRequest & req) {
         HttpServer::PreparedPrompt prepared;
@@ -5874,6 +5896,26 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
         boundaries, 100, 0, false, 110));
 }
 
+// An engine that does not chunk at plan.restore_points (it does not declare
+// prefill_cuts_at_restore_points) would not match a cold run after a restored
+// shared prefix: on the concurrent path `auto` resolves to `freeze` for it
+// unless the user typed it. One that declares it keeps `auto`.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_default_is_freeze_on_the_concurrent_path) {
+    using M = SharedPrefixMode;
+    for (const bool given : {false, true}) {
+        for (const bool cuts : {false, true}) {
+            for (const M mode : {M::off, M::freeze, M::learn}) {
+                TEST_ASSERT(effective_shared_prefix_mode(given, mode, /*concurrent=*/false, cuts) == mode);
+            }
+        }
+    }
+    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true, /*cuts=*/false) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(false, M::learn, true, /*cuts=*/true) == M::learn);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::learn, true, false) == M::learn);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::freeze, true, false) == M::freeze);
+    TEST_ASSERT(effective_shared_prefix_mode(true, M::off, true, false) == M::off);
+}
+
 TEST_CASE(ServerUnitFixture, test_shared_prefix_mode_and_head_preference) {
     SharedPrefixMode mode = SharedPrefixMode::off;
     TEST_ASSERT(parse_shared_prefix_mode("auto", mode) && mode == SharedPrefixMode::learn);
@@ -5930,6 +5972,26 @@ TEST_CASE(ServerUnitFixture, test_shared_prefix_cut_against_the_ring) {
     SharedPrefixes none(SharedPrefixMode::off, newline, 4, 2);
     none.set_ring({{1, 2, 3, 10, 4, 5, 6, 7}});
     TEST_ASSERT(none.cut(b, {8}) == 0);
+}
+
+// The head an engine that plans no prefix store captures: the ring's cut, else the first chat boundary
+// when it is far enough in (the first request has no ring yet); -1 when off, 0 when no head applies.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_head_cut_for_engines_without_a_prefix_store) {
+    std::vector<bool> newline(100, false);
+    newline[10] = true;
+    const std::vector<int32_t> a = {1, 2, 3, 10, 4, 5, 6, 7, 50, 51};
+    SharedPrefixes learn(SharedPrefixMode::learn, newline, 4, 2);
+    TEST_ASSERT(learn.head_cut(a, {8}, false) == 8);          // empty ring: the first boundary
+    TEST_ASSERT(learn.head_cut(a, {3}, false) == 0);          // too short, no tools: no head
+    TEST_ASSERT(learn.head_cut(a, {3}, true) == 0);           // tools, but no ring and no boundary far enough
+    learn.remember(a, {8});
+    const std::vector<int32_t> b = {1, 2, 3, 10, 4, 5, 6, 9, 60};
+    TEST_ASSERT(learn.head_cut(b, {8}, false) == learn.cut(b, {8}));  // the ring's cut wins
+    TEST_ASSERT(learn.head_cut(b, {8}, false) == 4);
+    SharedPrefixes frozen(SharedPrefixMode::freeze, newline, 4, 2);
+    TEST_ASSERT(frozen.head_cut(a, {8}, false) == 8);         // freeze still has the first boundary
+    SharedPrefixes none(SharedPrefixMode::off, newline, 4, 2);
+    TEST_ASSERT(none.head_cut(a, {8}, true) == -1);
 }
 
 TEST_CASE(ServerUnitFixture, test_agent_turn_cache_defaults_on_where_it_can_run) {
@@ -12803,6 +12865,226 @@ struct SpecRoundBackend : MockBackend {
 // A request the parallel scheduler decoded with drafted rounds reports, in
 // its response usage and its /status perf record, that it speculated and
 // the rounds' acceptance.
+// The scheduler hands the request's session identity to admit_bounded().
+class MetaRecordingEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 16, 32, 16}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override { return admitted_(); }
+    AdmitResult admit_bounded(uint64_t, const std::vector<int32_t> &, const SamplerCfg &, int,
+                              const AdmitMeta & m) override {
+        meta = m;
+        ++admits;
+        return admitted_();
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) result.decode.push_back({input.slot, 7, false, {}});
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = 7;
+            result.prefills.push_back(out);
+        }
+        return result;
+    }
+    void retire(int) override {}
+    AdmitMeta meta{"unset", "unset"};
+    int admits = 0;
+private:
+    static AdmitResult admitted_() {
+        AdmitResult result;
+        result.status = AdmitResult::Status::admitted;
+        result.slot = 0;
+        return result;
+    }
+};
+
+struct MetaRecordingBackend : MockBackend {
+    MetaRecordingEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// A request through the dialect's parse (headers + body) and the scheduler: the identity the engine admits with.
+static SeqEngine::AdmitMeta admitted_meta_for(const std::string & path, const json & body, const std::string & header_lines) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    auto backend_owner = std::make_unique<MetaRecordingBackend>();
+    MetaRecordingBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    TEST_ASSERT(HttpServerTestAccess::parse_endpoint(server, path, body, header_lines, job.req));
+    job.req.prompt_tokens.assign(8, 100);
+    job.req.max_output = 4;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "meta";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        TEST_ASSERT(job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; }));
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(tok_path.c_str());
+    return backend.engine.meta;
+}
+
+// B2 (CM5 screen): --tool-checks runs the request as inner passes; they dropped the header, so every session was anon/anon:N.
+TEST_CASE(ServerUnitFixture, test_tool_check_inner_pass_keeps_the_session_identity_of_the_outer_request) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    LuceEngine engine(std::make_unique<MockBackend>());
+    ServerConfig config;
+    config.tool_checks = true;
+    HttpServer server(engine, tokenizer, config);
+    const json body = {{"model", "m"}, {"max_tokens", 4},
+                       {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+                       {"tools", json::array({{{"type", "function"}, {"function", {{"name", "f"}, {"parameters", {{"type", "object"}}}}}}})}};
+    const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> cases = {
+        {"x-opencode-session-id: ses_test1\r\n", {"ses_test1", "opencode"}},
+        {"X-Claude-Code-Session-Id: cc\r\n", {"cc", "claude"}},
+        {"X-Session-Id: g\r\n", {"g", "header"}}};
+    for (const auto & c : cases) {
+        ParsedRequest outer;
+        TEST_ASSERT(HttpServerTestAccess::parse_endpoint(server, "/v1/chat/completions", body, c.first, outer));
+        TEST_ASSERT(outer.session.sid == c.second.first && outer.session.client == c.second.second);
+        const ParsedRequest inner = HttpServerTestAccess::inner_request(server, outer, body);
+        TEST_ASSERT(inner.session.sid == c.second.first);
+        TEST_ASSERT(inner.session.client == c.second.second);
+        // the replan / final-check passes are further inner requests of the same outer one: the identity holds for each
+        json again = body;
+        again["messages"].push_back({{"role", "assistant"}, {"content", "draft"}});
+        again["messages"].push_back({{"role", "user"}, {"content", "check again"}});
+        for (const json & next : {again, body}) {
+            const ParsedRequest pass = HttpServerTestAccess::inner_request(server, outer, next);
+            TEST_ASSERT(pass.session.sid == c.second.first && pass.session.client == c.second.second);
+        }
+    }
+    unlink(tok_path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_scheduler_admits_with_the_session_identity_of_both_dialects) {
+    const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+    for (const char * path : {"/v1/chat/completions", "/v1/messages"}) {
+        json body = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}};
+        auto m = admitted_meta_for(path, body, "Host: x\r\nX-OpenCode-Session-Id: ses_oc\r\n");
+        TEST_ASSERT(m.sid == "ses_oc" && m.client == "opencode");
+        m = admitted_meta_for(path, body, "x-session-affinity: aff\r\n");
+        TEST_ASSERT(m.sid == "aff" && m.client == "opencode");
+        m = admitted_meta_for(path, body, "X-Claude-Code-Session-Id: cc\r\nX-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "cc" && m.client == "claude");
+        m = admitted_meta_for(path, body, "X-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "g" && m.client == "header");
+        // the body: extra_body wins over the top-level field, a header over both
+        body["session_id"] = "top";
+        m = admitted_meta_for(path, body, "");
+        TEST_ASSERT(m.sid == "top" && m.client == "body");
+        body["extra_body"] = {{"session_id", "extra"}};
+        m = admitted_meta_for(path, body, "");
+        TEST_ASSERT(m.sid == "extra" && m.client == "body");
+        m = admitted_meta_for(path, body, "X-Session-Id: g\r\n");
+        TEST_ASSERT(m.sid == "g" && m.client == "header");
+        // nothing: no identity (the engine makes the request anonymous)
+        m = admitted_meta_for(path, {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}}, "x-parent-session-id: p\r\n");
+        TEST_ASSERT(m.sid.empty() && m.client.empty());
+    }
+}
+
+// A real HTTP request through the socket path (read_http_request -> HttpRequest -> route_request ->
+// ParsedRequest -> scheduler -> engine): what the engine admits with, how many admits, the response head.
+struct SocketAdmission { SeqEngine::AdmitMeta meta; int admits = 0; std::string response; };
+
+static SocketAdmission admitted_over_socket(const std::vector<std::string> & request_bodies_and_headers) {
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    auto backend_owner = std::make_unique<MetaRecordingBackend>();
+    MetaRecordingBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    SocketAdmission out;
+    // pairs of (extra header lines, JSON body); the last connection's identity is returned
+    for (size_t i = 0; i + 1 < request_bodies_and_headers.size(); i += 2) {
+        int fds[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        const std::string & body = request_bodies_and_headers[i + 1];
+        const std::string http = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" + request_bodies_and_headers[i] +
+            "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        TEST_ASSERT(write(fds[1], http.data(), http.size()) == (ssize_t)http.size());
+        HttpServerTestAccess::handle_client(server, fds[0]);   // closes fds[0]
+        out.response.clear();
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(fds[1], buf, sizeof buf)) > 0) out.response.append(buf, (size_t)n);
+        close(fds[1]);
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    unlink(tok_path.c_str());
+    out.meta = backend.engine.meta;
+    out.admits = backend.engine.admits;
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture, test_session_headers_travel_the_socket_path_into_the_engine_admission) {
+    const std::string body = json({{"model", "m"}, {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}, {"max_tokens", 4}}).dump();
+    // the harness headers, mixed case, among others, through read_http_request and the HttpRequest -> ParsedRequest copy
+    auto r = admitted_over_socket({"X-OpenCode-Session-Id: ses_sock\r\nUser-Agent: t\r\n", body});
+    TEST_ASSERT(r.admits == 1);
+    TEST_ASSERT(r.meta.sid == "ses_sock" && r.meta.client == "opencode");
+    r = admitted_over_socket({"x-claude-code-session-id: cc_sock\r\n", body});
+    TEST_ASSERT(r.meta.sid == "cc_sock" && r.meta.client == "claude");
+    r = admitted_over_socket({"", body});
+    TEST_ASSERT(r.admits == 1 && r.meta.sid.empty() && r.meta.client.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_an_unusable_session_id_is_no_identity_at_the_http_boundary_and_the_request_is_served) {
+    const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+    json too_long = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4},
+                     {"session_id", std::string(luce::common::kKvFlashSidMax + 1, 's')}};
+    json control = {{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}, {"session_id", std::string("a\x01" "b")}};
+    const std::string ok = json({{"model", "m"}, {"messages", msgs}, {"max_tokens", 4}}).dump();
+    // body identity over the bound: served without an identity, not refused
+    auto r = admitted_over_socket({"", too_long.dump()});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // header identity over the bound: the same
+    r = admitted_over_socket({"X-Session-Id: " + std::string(luce::common::kKvFlashSidMax + 100, 'h') + "\r\n", ok});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // a control character in the id: the same, it never reaches the log
+    r = admitted_over_socket({"", control.dump()});
+    TEST_ASSERT(r.admits == 1 && r.response.find(" 400 ") == std::string::npos);
+    TEST_ASSERT(r.meta.sid.empty());
+    // the next request, on the same server, keeps its own identity (both requests of the pair are admitted)
+    r = admitted_over_socket({"", too_long.dump(), "X-Session-Id: fine\r\n", ok});
+    TEST_ASSERT(r.admits == 2);
+    TEST_ASSERT(r.meta.sid == "fine" && r.meta.client == "header");
+}
+
 TEST_CASE(ServerUnitFixture, test_scheduler_perf_record_reports_speculative_rounds) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
@@ -14677,6 +14959,247 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
     rm_rf(dir);
 }
 
+namespace {
+
+// A DiskStore tenant over plain numbers: units of (last_used, bytes); the oldest unprotected one goes first.
+struct FakeTenant {
+    struct Unit { uint64_t last_used, bytes; bool prot; };
+    std::vector<Unit> units;
+    int evictions = 0;
+    uint64_t usage() const { uint64_t n = 0; for (const auto & u : units) n += u.bytes; return n; }
+    int oldest_index() const {
+        int at = -1;
+        for (size_t i = 0; i < units.size(); ++i)
+            if (!units[i].prot && (at < 0 || units[i].last_used < units[(size_t)at].last_used)) at = (int)i;
+        return at;
+    }
+    DiskStore::Tenant tenant() {
+        DiskStore::Tenant t;
+        t.usage = [this] { return usage(); };
+        t.oldest = [this](uint64_t & last_used) {
+            const int at = oldest_index();
+            if (at < 0) return false;
+            last_used = units[(size_t)at].last_used;
+            return true;
+        };
+        t.evict_oldest = [this]() -> uint64_t {
+            const int at = oldest_index();
+            if (at < 0) return 0;
+            const uint64_t n = units[(size_t)at].bytes;
+            units.erase(units.begin() + at);
+            ++evictions;
+            return n;
+        };
+        return t;
+    }
+};
+
+// The store a DiskPrefixCache over `cfg` already has open in this process.
+std::shared_ptr<DiskStore> shared_store(const DiskCacheConfig & cfg) {
+    bool failed = false;
+    return DiskStore::open(cfg, nullptr, nullptr, failed);
+}
+
+}  // namespace
+
+// A tenant's bytes count in the one budget: prefix files give way for them, oldest first.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_usage_counts_against_the_one_budget) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_usage").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    uint64_t clock = 1;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);   // one tenant unit and one file; a second file does not fit
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(store != nullptr);
+        FakeTenant fake;
+        fake.units.push_back({1000, one, true});      // protected: only the prefix files can give way
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        TEST_ASSERT(id != 0);
+        TEST_ASSERT(store->tenant_bytes() == one);
+        clock = 1; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        clock = 2; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 500)));
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(!cache.lookup(disk_test_key(40, 1), Checkpoint::of_cache_slot(1)));   // the older file went
+        TEST_ASSERT(cache.lookup(disk_test_key(40, 500), Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(fake.units.size() == 1 && fake.evictions == 0);
+        TEST_ASSERT(cache.total_bytes() + store->tenant_bytes() <= cfg.budget_bytes);
+        store->detach_tenant(id);
+        TEST_ASSERT(store->tenant_bytes() == 0);
+    }
+    rm_rf(dir);
+}
+
+// The one disk total and its parts: prefix files, pinned files and the tenant's sessions.
+TEST_CASE(ServerUnitFixture, test_disk_usage_splits_prefix_pins_and_sessions) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_usage_split").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(store != nullptr);
+        TEST_ASSERT(store->usage().total() == 0);
+        const auto loose = disk_test_key(40, 1), pinned = disk_test_key(40, 500);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), loose));
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), pinned));
+        TEST_ASSERT(!cache.pin(pinned, true).empty());
+        cache.drain();
+        FakeTenant fake;
+        fake.units.push_back({1000, 12345, true});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        const DiskUsage u = store->usage();
+        TEST_ASSERT(u.sessions == 12345);
+        TEST_ASSERT(u.prefix > 0 && u.pins > 0);
+        TEST_ASSERT(u.prefix == u.pins);                                    // two files of one size, one of them pinned
+        TEST_ASSERT(u.prefix + u.pins == store->total_bytes());             // the files, once each
+        TEST_ASSERT(u.total() == store->total_bytes() + store->tenant_bytes());
+        store->detach_tenant(id);
+        TEST_ASSERT(store->usage().sessions == 0);
+    }
+    rm_rf(dir);
+}
+
+// One LRU across both kinds: whichever of the prefix file and the tenant unit was used least recently is evicted.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_and_prefix_files_share_one_lru) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_lru").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    for (uint64_t unit_used : {5ull, 15ull}) {   // older than the first file, then newer
+        uint64_t clock = 10;
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+        cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+        rm_rf(dir);
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({unit_used, one, false});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        clock = 10; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        clock = 20; TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 500)));
+        if (unit_used < 10) {
+            TEST_ASSERT(fake.evictions == 1 && fake.units.empty());   // the tenant unit was the oldest
+            TEST_ASSERT(cache.entry_count() == 2);
+        } else {
+            TEST_ASSERT(fake.evictions == 0 && fake.units.size() == 1);   // the first file was
+            TEST_ASSERT(cache.entry_count() == 1);
+            TEST_ASSERT(!cache.lookup(disk_test_key(40, 1), Checkpoint::of_cache_slot(1)));
+        }
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// A tenant whose units are all protected is never evicted: the save that does not fit beside them is refused.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_protected_units_are_never_evicted_and_can_refuse_a_save) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_protected").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({1, one * 2, true});      // 2 of the 2.5 files of room, protected
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));   // 2 + 1 > 2.5 and nothing may give way
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(fake.units.size() == 1 && fake.evictions == 0);
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// reserve() makes room by the same LRU and holds the bytes until release().
+TEST_CASE(ServerUnitFixture, test_disk_tenant_reserve_evicts_by_lru_and_release_gives_the_bytes_back) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_reserve").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        TEST_ASSERT(store->reserve(one));                 // 2 of 2.5
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(store->reserve(one));                 // the file makes room
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(!store->reserve(one));                // nothing left to evict: refused, and nothing is held for it
+        store->release(one);
+        TEST_ASSERT(store->reserve(one));
+        store->release(one);
+        store->release(one);
+        TEST_ASSERT(!store->reserve(one * 3));            // more than the whole budget
+        TEST_ASSERT(store->reserve(one * 2));             // and the failed one held nothing
+    }
+    rm_rf(dir);
+}
+
+// The TTL reaches a tenant's unprotected units too, and protected ones stay.
+TEST_CASE(ServerUnitFixture, test_disk_tenant_ttl_expires_unprotected_units_only) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_ttl").string();
+    rm_rf(dir);
+    uint64_t clock = 1000;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 100;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&] { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        auto store = shared_store(cfg);
+        FakeTenant fake;
+        fake.units.push_back({1000, 10, false});
+        fake.units.push_back({1000, 20, true});
+        fake.units.push_back({1090, 40, false});
+        const uint64_t id = store->attach_tenant(fake.tenant());
+        clock = 1101;
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), disk_test_key(40, 1)));
+        TEST_ASSERT(fake.evictions == 1);                 // the 101 s old unprotected one
+        TEST_ASSERT(fake.usage() == 60);                  // the protected one and the 11 s old one stay
+        store->detach_tenant(id);
+    }
+    rm_rf(dir);
+}
+
+// The directories of tenants and of the pin catalog are not prefix layouts: opening the store leaves them alone.
+TEST_CASE(ServerUnitFixture, test_disk_store_scan_leaves_the_tenant_and_catalog_directories_alone) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tenant_scan").string();
+    rm_rf(dir);
+    fs::create_directories(dir + "/sessions/k1");
+    fs::create_directories(dir + "/pins");
+    { std::ofstream(dir + "/sessions/k1/head") << "x"; }
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(fs::exists(dir + "/sessions/k1/head"));
+        TEST_ASSERT(fs::exists(dir + "/pins"));
+        fs::remove_all(dir + "/sessions/k1");
+    }
+    { DiskPrefixCache again(cfg, backend); TEST_ASSERT(again.init()); }
+    TEST_ASSERT(fs::exists(dir + "/sessions"));           // an empty tenant directory is not a stray layout either
+    rm_rf(dir);
+}
+
 TEST_CASE(ServerUnitFixture, test_disk_cache_duplicate_save_refreshes_ttl_after_restart) {
     MockBackendWithAdopt backend;
     const std::string dir = test_tmp_path("luce_test_disk_duplicate_touch").string();
@@ -14931,6 +15454,7 @@ struct DiskPayloadBackend : MockBackend {
     std::vector<int> freed;
     std::vector<int> adopted;
     int live_position = 0;  // what snapshot_save() captures
+    bool pooled = false;    // report every payload as a KVFlash pager blob
 
     static Payload make(int pos) {
         ggml_init_params ip{};
@@ -14987,6 +15511,7 @@ struct DiskPayloadBackend : MockBackend {
         ref.buf = it->second.buf;
         ref.cur_pos = it->second.pos;
         ref.last_tok = 7;
+        ref.pooled = pooled;
         return ref;
     }
     bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf,
@@ -15227,6 +15752,42 @@ TEST_CASE(ServerUnitFixture, test_shared_prefix_pinned_on_restore_by_another_con
         TEST_ASSERT(SchedulerTestHarness::unpin(server, pin_id));
         TEST_ASSERT(!SchedulerTestHarness::unpin(server, pin_id));
         TEST_ASSERT(SchedulerTestHarness::pins(server).size() == 0);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// A pooled (KVFlash) payload cannot be written to disk, so another
+// conversation restoring it must not leave a pin: it would never get a file
+// and would be warmed again after every restart. A dense one still pins.
+TEST_CASE(ServerUnitFixture, test_shared_prefix_pooled_entry_is_not_pinned) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_shared_prefix_pooled").string();
+    const std::vector<int32_t> first = {1, 100, 3, 101};
+    PrefixCache markers_only(1, tokenizer, 0);
+    const int cut = find_all_boundaries({1, 100, 3, 101, 4, 102}, markers_only.chat_markers()).front();
+    for (const bool pooled : {true, false}) {
+        rm_rf(dir);
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        auto & backend = *backend_owner;
+        backend.pooled = pooled;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        backend.slots[0] = DiskPayloadBackend::make(cut);
+        cache.confirm_inline_snap(0, cut, first, /*protect=*/true, 64);
+        SchedulerTestHarness::set_slot_tokens(server, 0, std::vector<int32_t>(first.begin(), first.begin() + cut));
+        // Another conversation restores the shared prefix.
+        const auto other = SchedulerTestHarness::prepare_cache(server, {1, 100, 3, 201, 4, 202});
+        TEST_ASSERT(other.restore_slot == 0);
+        // Not even pending: a pooled entry is never written, so never pinned.
+        TEST_ASSERT(cache.pinned(0) == !pooled);
+        SchedulerTestHarness::flush_pins(server);
+        TEST_ASSERT(cache.pinned(0) == !pooled);
+        TEST_ASSERT(SchedulerTestHarness::pins(server).size() == (pooled ? 0u : 1u));
+        SchedulerTestHarness::flush_sessions(server);
     }
     rm_rf(dir);
     unlink(path.c_str());
@@ -16171,6 +16732,44 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_corrupt_tensor_metadata) {
             TEST_ASSERT(cache->entry_count() == 0);
             TEST_ASSERT(backend.adopted_.empty());
         }
+    }
+    rm_rf(dir);
+}
+
+// A caller that names the layout (the KVFlash pinned heads, whose payload is not the model's KV tensors)
+// writes, pins and reads back under that layout, across a restart, whatever tensors the snapshot holds.
+TEST_CASE(ServerUnitFixture, test_disk_cache_use_layout_names_the_layout_a_snapshot_is_saved_under) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_use_layout").string();
+    rm_rf(dir);
+    const auto key = disk_test_key(40, 7);
+    const auto ref = backend.snapshot_ref(0);
+    std::array<uint8_t, 16> id{};
+    for (size_t i = 0; i < id.size(); i++) id[i] = (uint8_t)(0xA0 + i);
+    std::string layout, pinned;
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.use_layout(id);
+        TEST_ASSERT(cache.layout_name() == "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+        TEST_ASSERT(cache.save_async(
+            OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok), key));
+        TEST_ASSERT(cache.layout_name() == "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");  // the snapshot did not re-learn it
+        pinned = cache.pin(key, true);
+        TEST_ASSERT(pinned.find("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf") != std::string::npos);
+        TEST_ASSERT(cache.drain().cancelled == 0);
+        TEST_ASSERT(cache.contains(key));
+    }
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.use_layout(id);
+        TEST_ASSERT(cache.contains(key));
+        const OwnedSnapshot back = cache.load(key);
+        TEST_ASSERT(!back.empty() && back.cur_pos() == ref.cur_pos);
+        TEST_ASSERT(cache.pinned_files() == std::vector<std::string>{pinned});
     }
     rm_rf(dir);
 }
@@ -17865,6 +18464,25 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
 }
 
+// /props reports one disk total and its parts, not the prefix files alone.
+TEST_CASE(ServerUnitFixture, test_props_reports_one_disk_total_with_prefix_pins_and_sessions) {
+    ServerConfig cfg = make_props_config_with_sidecar(json());
+    cfg.disk_cache_dir = "/somewhere";
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    const json none = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(!none["full_cache"].contains("disk"));                      // no disk store behind it: as before
+    DiskUsage u; u.prefix = 700; u.pins = 200; u.sessions = 100;
+    const json body = build_props_body(cfg, pc, tm, &u);
+    const json & d = body["full_cache"]["disk"];
+    TEST_ASSERT(d["total"].get<uint64_t>() == 1000);
+    TEST_ASSERT(d["prefix"].get<uint64_t>() == 700);
+    TEST_ASSERT(d["pins"].get<uint64_t>() == 200);
+    TEST_ASSERT(d["sessions"].get<uint64_t>() == 100);
+    TEST_ASSERT(body["full_cache"]["disk_bytes"].get<uint64_t>() == 1000);  // the one total
+}
+
 TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
     ServerConfig cfg;
     cfg.arch = "deepseek4";
@@ -18113,6 +18731,54 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
     // No NaN / Inf serialization leak.
     TEST_ASSERT(finish_str.find("inf") == std::string::npos);
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
+}
+
+// A request that waited for admission: the wait is queue_s, the prefill starts at the successful admit.
+// Before: prefill_s ran from the first attempt (265 s reported for a real 131 s prefill that waited 134 s).
+TEST_CASE(ServerUnitFixture, test_admit_timing_prefill_excludes_the_deferred_wait) {
+    using clk = std::chrono::steady_clock;
+    const clk::time_point t0{}, admitted = t0 + std::chrono::seconds(134), end = admitted + std::chrono::seconds(131);
+    const auto t = luce::common::admit_timing(t0, admitted, end);
+    TEST_ASSERT(t.queue_s == 134.0);
+    TEST_ASSERT(t.prefill_s == 131.0);
+    // admitted at the first attempt: no queue, prefill is the whole
+    const auto n = luce::common::admit_timing(t0, t0, t0 + std::chrono::seconds(7));
+    TEST_ASSERT(n.queue_s == 0.0 && n.prefill_s == 7.0);
+}
+
+// The wait a request reports starts when it arrives. With every slot decoding the scheduler does not dequeue, and a request
+// that then waited 30 s in the queue reported queue_ms 0: the clock used to start at the scheduler's first look at the job.
+TEST_CASE(ServerUnitFixture, test_enqueue_stamps_the_request_arrival) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    LuceEngine engine(std::make_unique<ShortInlineSnapshotBackend>());
+    ServerJob job;   // outlives the server, whose queue holds it
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    const auto before = std::chrono::steady_clock::now();
+    SchedulerTestHarness::enqueue(server, &job);
+    TEST_ASSERT(job.arrived_at >= before);
+    TEST_ASSERT(job.arrived_at <= std::chrono::steady_clock::now());
+}
+
+// A sticky resume at L prefills only the tokens past L: the usage timings, the perf record and the step planner count them as cached.
+TEST_CASE(ServerUnitFixture, test_admit_cached_tokens_counts_a_sticky_resume) {
+    using luce::common::admit_cached_tokens;
+    TEST_ASSERT(admit_cached_tokens(0, 49700) == 49700);   // a 50000-token session resumed at 49700: 300 prefilled
+    TEST_ASSERT(admit_cached_tokens(8192, 0) == 8192);     // a prefix-cache restore, no resume
+    TEST_ASSERT(admit_cached_tokens(0, 0) == 0);           // cold
+    TEST_ASSERT(admit_cached_tokens(4096, 1024) == 4096);  // never less than either source
+}
+
+TEST_CASE(ServerUnitFixture, test_usage_timings_carry_queue_ms_apart_from_prefill_ms) {
+    GenTimings t;
+    t.prefill_s = 131.0;
+    t.queue_s = 134.25;
+    json j = build_timings_json(t, /*completion_tokens=*/1);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 131000.0);
+    TEST_ASSERT(j.contains("queue_ms") && j["queue_ms"].get<double>() == 134250.0);
+    TEST_ASSERT(build_timings_json(GenTimings{}, 0)["queue_ms"].get<double>() == 0.0);
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
@@ -22055,4 +22721,51 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
+}
+
+// ─── HTTP edge bounds: status-event fan-out ─────────────────────────────
+
+namespace {
+struct SseRig {
+    std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    std::unique_ptr<LuceEngine> engine;
+    std::unique_ptr<HttpServer> server;
+    SseRig() {
+        TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+        engine = std::make_unique<LuceEngine>(std::make_unique<MetaRecordingBackend>());
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 4096;
+        config.prefix_cache_cap = 0;
+        server = std::make_unique<HttpServer>(*engine, tokenizer, config);
+    }
+    ~SseRig() { server.reset(); unlink(tok_path.c_str()); }
+};
+}
+
+TEST_CASE(ServerUnitFixture, test_a_stuck_status_subscriber_does_not_block_a_broadcast_to_another) {
+    SseRig rig;
+    int stuck[2], live[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, stuck) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, live) == 0);
+    // Fill the stuck subscriber's send buffer: its peer (stuck[1]) never reads.
+    const std::string chunk(4096, 'x');
+    while (send(stuck[0], chunk.data(), chunk.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, stuck[0]);   // first in the list
+    HttpServerTestAccess::add_sse_subscriber(*rig.server, live[0]);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread broadcaster([&] { HttpServerTestAccess::broadcast_token(*rig.server, "hello"); });
+    pollfd pfd{live[1], POLLIN, 0};
+    const int ready = poll(&pfd, 1, 400);
+    const auto reached = std::chrono::steady_clock::now() - t0;
+    broadcaster.join();
+    const auto returned = std::chrono::steady_clock::now() - t0;
+    TEST_ASSERT(ready == 1);                                                   // the live subscriber got it within 400 ms
+    TEST_ASSERT(reached < std::chrono::milliseconds(400));
+    TEST_ASSERT(returned < std::chrono::milliseconds(400));                    // and the caller was not stalled
+    TEST_ASSERT(HttpServerTestAccess::sse_subscribers(*rig.server) == 1);      // the stuck one was dropped
+    close(stuck[1]);
+    close(live[1]);
 }

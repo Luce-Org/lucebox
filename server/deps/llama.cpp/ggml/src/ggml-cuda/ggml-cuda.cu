@@ -216,7 +216,7 @@ extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
 
 int ggml_cuda_mmvq_invariant_max_ncols() {
     return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
-                                                        : MMVQ_MAX_BATCH_SIZE;
+                                                        : MMVQ_INVARIANT_MAX_NCOLS;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3244,7 +3244,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP8 && !bad_padding_clear &&
                              src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
-                             ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE);
+                             ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE
+                                           : ggml_cuda_mmvq_batch_invariant_enabled ? ggml_cuda_mmvq_invariant_max_ncols()
+                                                                                    : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
     // Keep the conservative dequantize fallback unless explicitly enabled.
@@ -3268,7 +3270,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
             return false;
         }
     }
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // Batch-invariant mode runs MUL_MAT on MMQ at every width (ggml_cuda_mul_mat_prefers_mmq); the fused kernel is MMVQ.
+    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] != 1 || ggml_cuda_mmvq_batch_invariant_enabled)) {
         return false;
     }
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
@@ -3430,7 +3433,8 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 
     // RDNA4 Q8_0 gate/up pairs at several columns (the cluster shared expert in
     // a verify, qwen4exp's shared expert): one launch reads both matrices and writes the SwiGLU.
-    if (!ids && direct_vector_layout && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
+    // Not in batch-invariant mode: it is an MMVQ kernel, and that mode runs MUL_MAT on MMQ at every width.
+    if (!ids && direct_vector_layout && !ggml_cuda_mmvq_batch_invariant_enabled && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         !ggml_backend_buft_is_cuda_split(gate->src[0]->buffer->buft) &&
         ggml_cuda_mmvq_rdna4_glu_pair(gate, up, glu)) {
@@ -3586,8 +3590,12 @@ static bool ggml_cuda_mul_mat_vec_q_eligible(const ggml_tensor * src0, const ggm
 
 // Whether a product that both MMVQ and MMQ can run takes MMQ on device cc.
 static bool ggml_cuda_mul_mat_prefers_mmq(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
-    return src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
-           src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS;
+    // Batch-invariant mode: MMQ at every column count. MMVQ and MMQ give different bits, and the engine packs decode
+    // rows into one product with prefill cuts, so a width threshold between the two kernels would make a token's bits
+    // depend on what the scheduler packed into its step (test_mul_mat_invariant_wide_batch).
+    return ggml_cuda_mmvq_batch_invariant_enabled ||
+           (src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
+            src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS);
 }
 
 // Row stacking, the Qwen3.5 gate|up stack (qwen35/glue_fusions.h): whether a
@@ -7893,6 +7901,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const enum ggml_op ops3[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
                             const int outs[1] = { k };
                             if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops3, outs, 1) &&
+                                !ggml_cuda_mmvq_batch_invariant_enabled &&
                                 up_n->src[1]->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
                                 !ggml_backend_buft_is_cuda_split(up_n->src[0]->buffer->buft) &&
                                 !ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft) &&

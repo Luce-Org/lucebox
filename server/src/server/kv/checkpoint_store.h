@@ -19,6 +19,10 @@
 
 namespace luce::common {
 
+// How a payload holds its KV: dense tensors a disk file can carry, or a
+// KVFlash pager blob (ModelBackend::SnapshotRef::pooled), which no file can.
+enum class CheckpointKind { dense, pooled };
+
 // Payload, geometry and the disk boundary: what both serving paths share.
 class CheckpointStore {
 public:
@@ -43,6 +47,8 @@ public:
     virtual bool used(Checkpoint checkpoint) const = 0;
     // The positions (KV rows) the checkpoint holds; 0 when unused.
     virtual int position(Checkpoint checkpoint) const = 0;
+    // The payload kind; dense when unused.
+    virtual CheckpointKind kind(Checkpoint checkpoint) const = 0;
     virtual void free(Checkpoint checkpoint) = 0;
     // The checkpoint a disk read is adopted into before it is restored.
     // No prefix-index entry ever lives there.
@@ -71,6 +77,7 @@ public:
     bool state_only(Checkpoint checkpoint) const override;
     bool used(Checkpoint checkpoint) const override;
     int position(Checkpoint checkpoint) const override;
+    CheckpointKind kind(Checkpoint checkpoint) const override;
     void free(Checkpoint checkpoint) override;
     Checkpoint staging() const override;
     ModelBackend::SnapshotRef ref(Checkpoint checkpoint) const override;
