@@ -154,3 +154,17 @@ TEST_CASE(KvflashPagerRecallFixture, chunk_version_changes_only_when_its_rows_ar
     CHECK(p.chunk_version(2) != 0u);
     CHECK(p.chunk_version(2) != v2);
 }
+
+// The slot engine's pagers share one exact scorer and its device archive, keyed by (chunk, version): two sessions that
+// seal their chunks in the same order must still get different versions, or one slot scores the other's keys.
+TEST_CASE(KvflashPagerRecallFixture, chunk_versions_never_repeat_across_pagers) {
+    Harness ha, hb;
+    KvFlashPager a, b;
+    a.set_pinned_host_backing(false);
+    b.set_pinned_host_backing(false);
+    REQUIRE(a.attach(cfg(), ha.k, ha.v));
+    REQUIRE(b.attach(cfg(), hb.k, hb.v));
+    must(a.alloc_span(0, 14 * kChunk));
+    must(b.alloc_span(0, 14 * kChunk));
+    for (int c = 0; c < 14; c++) CHECK(a.chunk_version(c) != b.chunk_version(c));
+}

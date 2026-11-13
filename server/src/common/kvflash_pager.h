@@ -56,6 +56,7 @@
 #include "kvflash_config.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1509,7 +1510,9 @@ private:
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
     uint64_t clock_ = 0;
-    uint64_t ver_seq_ = 0;   // last chunk_version() handed out
+    // Last chunk_version() handed out, by any pager: the slot pagers share one exact scorer whose device archive is keyed
+    // by (chunk, version), so a version must never repeat across pagers.
+    static inline std::atomic<uint64_t> ver_seq_{0};
     uint64_t epoch_ = 0;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
