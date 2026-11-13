@@ -8,8 +8,8 @@
 #include "kvflash_exact_mass.h"
 #include "kvflash_fused_mass.h"
 #include "kvflash_mass_synth.h"   // the reference scorer
-#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
 #include "kvflash_fused_mass_cuda.h"
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #endif
@@ -237,6 +237,20 @@ TEST_CASE(KvflashFusedMassFixture, device_kernel_tiles_the_queries_without_chang
     CHECK(a <= 1e-5); CHECK(b <= 1e-5);
     CHECK(t1 == 1);
     CHECK(t2 > 1);
+}
+
+TEST_CASE(KvflashFusedMassFixture, wmma_arch_gate_matches_the_compiled_kernel_archs) {
+    CHECK(kvflash_fused_arch_has_wmma("gfx1200"));
+    CHECK(kvflash_fused_arch_has_wmma("gfx1201"));
+    CHECK(kvflash_fused_arch_has_wmma("gfx1201:sramecc-:xnack-"));
+    CHECK(!kvflash_fused_arch_has_wmma("gfx12-generic"));
+    CHECK(!kvflash_fused_arch_has_wmma("gfx12-generic:xnack-"));
+    CHECK(!kvflash_fused_arch_has_wmma("gfx1250"));
+    CHECK(!kvflash_fused_arch_has_wmma("gfx12"));
+    CHECK(!kvflash_fused_arch_has_wmma("gfx1151"));
+    CHECK(!kvflash_fused_arch_has_wmma("sm_86"));
+    CHECK(!kvflash_fused_arch_has_wmma(""));
+    CHECK(!kvflash_fused_arch_has_wmma(nullptr));
 }
 
 TEST_CASE(KvflashFusedMassFixture, dp4a_impl_matches_and_wmma_impl_is_refused_off_gfx12) {
