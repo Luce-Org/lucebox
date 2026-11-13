@@ -289,3 +289,18 @@ TEST_CASE(KvflashUqFixture, q_tail_after_rewind_is_pass1_below_r_then_pass2_rows
     kvflash_q_tail_trim(tail, q, end, 40);
     CHECK(tail.empty());
 }
+
+// The fused scorer's device workspace stays allocated between calls and is not the archive: when a call is refused,
+// releasing it must be tried before the CPU scorer answers.
+TEST_CASE(KvflashUqFixture, gpu_mass_release_ws_helps_only_when_it_turns_a_refusal_into_a_fit) {
+    const size_t MiB = (size_t)1 << 20, margin = 512 * MiB, total = 24000 * MiB;
+    // a refusal like the M0 log lines (needs 2275 +512, 2600 free): a 256 MiB workspace held turns it into a fit
+    CHECK(kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2600 * MiB, total, margin, 256 * MiB));
+    CHECK(!kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2600 * MiB, total, margin, 0));          // nothing held
+    CHECK(!kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2800 * MiB, total, margin, 256 * MiB)); // already fits
+    CHECK(!kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2000 * MiB, total, margin, 256 * MiB)); // still short
+    CHECK(kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2531 * MiB, total, margin, 256 * MiB));  // exact boundary: 2275+512 == 2787 == 2531+256
+    CHECK(!kvflash_gpu_mass_release_ws_helps(2275 * MiB, 2530 * MiB, total, margin, 256 * MiB)); // one MiB short
+    CHECK(!kvflash_gpu_mass_release_ws_helps(9999 * MiB, 0, 0, margin, 256 * MiB));              // unknown total: no guard, never refused
+}
+

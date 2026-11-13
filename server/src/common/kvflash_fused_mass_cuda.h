@@ -49,6 +49,7 @@ struct KvFlashFusedTiming {
 class KvFlashFusedWs;
 KvFlashFusedWs * kvflash_fused_ws_new();
 void kvflash_fused_ws_free(KvFlashFusedWs *);
+size_t kvflash_fused_ws_bytes(const KvFlashFusedWs *);   // device bytes the workspace holds between calls
 
 // q8 (host): [nq][L*Hq][D] int8 and qd: [nq][L*Hq][D/32] float scales. Outputs (host) [nq][C] each.
 bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const float * qd,

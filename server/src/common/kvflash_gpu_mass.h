@@ -144,6 +144,13 @@ inline bool kvflash_gpu_mass_fits(size_t need, size_t free_bytes, size_t total_b
     return !(total_bytes > 0 && need + margin > free_bytes);
 }
 
+// Pure: the call is refused now but would fit once the fused scorer's device workspace (`ws_bytes`, held between
+// calls, neither the archive nor counted in the device's free memory) is released.
+inline bool kvflash_gpu_mass_release_ws_helps(size_t need, size_t free_bytes, size_t total_bytes, size_t margin, size_t ws_bytes) {
+    return ws_bytes > 0 && !kvflash_gpu_mass_fits(need, free_bytes, total_bytes, margin) &&
+           kvflash_gpu_mass_fits(need, free_bytes + ws_bytes, total_bytes, margin);
+}
+
 class KvFlashGpuMass {
 public:
     static constexpr size_t kMarginBytes = (size_t)512 << 20;   // VRAM kept free beside the scorer
@@ -252,7 +259,18 @@ public:
         if (over) {
             if (!aslots_.empty() && !plan.reset) plan = kvflash_gpu_archive_plan({}, ev, kNoVersions);
             aslots_.clear();
-            const int cap = fits(room(E), false) ? room(E) : E;
+            int cap = fits(room(E), false) ? room(E) : E;
+            if (!fits(cap, false)) {
+                // The fused workspace (up to ~256 MiB of partials, grown to the largest call so far) is device memory this
+                // scorer holds but the free-memory test never counted. Give it back before refusing; the fused run regrows it.
+                const size_t need = kvflash_gpu_mass_bytes(d, kt, ct, NB, E, N, batch_bytes_);
+                const size_t ws_b = ws_bytes();
+                if (kvflash_gpu_mass_release_ws_helps(need, fr + arch_bytes(), tot, kMarginBytes, ws_b)) {
+                    ws_release();
+                    fr += ws_b;
+                    cap = fits(room(E), false) ? room(E) : E;
+                }
+            }
             if (!fits(cap, false)) {
                 const size_t need = kvflash_gpu_mass_bytes(d, kt, ct, NB, E, N, batch_bytes_);
                 return fail("needs " + std::to_string(need >> 20) + " MiB (+" + std::to_string(kMarginBytes >> 20) + " MiB margin) but " +
@@ -452,6 +470,18 @@ private:
         return buf && ggml_backend_buffer_get_base(buf);
     }
 
+    size_t ws_bytes() const {
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+        return fws_ ? luce::common::kvflash_fused_ws_bytes(fws_) : 0;
+#else
+        return 0;
+#endif
+    }
+    void ws_release() {
+#ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
+        if (fws_) { luce::common::kvflash_fused_ws_free(fws_); fws_ = nullptr; }
+#endif
+    }
     size_t arch_bytes() const { return abuf_ ? ggml_backend_buffer_get_size(abuf_) : 0; }
     void arch_free() {
         if (abuf_) ggml_backend_buffer_free(abuf_);
