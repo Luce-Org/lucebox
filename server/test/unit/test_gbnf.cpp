@@ -296,3 +296,20 @@ TEST_CASE(GbnfUtf8Fixture, gbnf_utf8_schema_pattern_without_surrogates_admits_ed
     constraint.accept(QUOTE);
     CHECK(constraint.complete());
 }
+
+TEST_CASE(GbnfUtf8Fixture, gbnf_repetition_counts_are_bounded) {
+    // Within the bound, a count means what it says.
+    CHECK(fed("root ::= \"a\"{2,3}\n", { "aa" })->can_end());
+    CHECK(fed("root ::= \"a\"{2,3}\n", { "aaaa" })->dead());
+    // A maximum above the bound is "no maximum": the grammar stays small.
+    auto open = fed("root ::= \"a\"{1,2000000000}\n", { std::string(5000, 'a') });
+    CHECK(!open->dead() && open->can_end());
+    CHECK(open->rules().size() < 16);
+    // A minimum above the bound is refused, not expanded.
+    std::string error;
+    CHECK(!gbnf::Matcher::compile("root ::= \"a\"{2000000000}\n", "root", error));
+    CHECK(error.find("repetition count") != std::string::npos);
+    // A schema's own limits go the same way.
+    const auto schema = nlohmann::ordered_json::parse(R"({"type": "string", "maxLength": 2000000000})");
+    CHECK(compile(json_schema_to_grammar(schema))->rules().size() < 64);
+}

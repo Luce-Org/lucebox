@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <system_error>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -113,6 +114,13 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 #endif
 
 namespace luce::common {
+
+// JSON for the wire. A string cut mid-character, or bytes a client sent that
+// are not UTF-8, become U+FFFD instead of an exception: valid text is unchanged.
+template <class Json>
+static std::string wire_json(const Json & value) {
+    return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
 
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
@@ -1089,7 +1097,7 @@ static bool curl_forward(const std::string & url,
     CURL * curl = curl_easy_init();
     if (!curl) return false;
 
-    std::string body_str = body.dump();
+    std::string body_str = wire_json(body);
 
     struct curl_slist * headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -2540,13 +2548,32 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
-        std::thread([this, client_fd]() {
-            handle_client(client_fd);
+        const auto client_done = [this]() {
             // Publish completion under the same lock used by run()'s wait.
             // Once it observes zero, no detached handler may touch this object.
             std::lock_guard<std::mutex> lk(clients_mu_);
             if (active_clients_.fetch_sub(1) == 1) clients_cv_.notify_all();
-        }).detach();
+        };
+        try {
+            std::thread([this, client_fd, client_done]() {
+                // One request must never end the server: what its handler
+                // throws stops that request only. The socket is left as it
+                // is, since the handler may have closed it already.
+                try {
+                    handle_client(client_fd);
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "[server] request failed: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[server] request failed: unknown error\n");
+                }
+                client_done();
+            }).detach();
+        } catch (const std::system_error & e) {
+            // No thread for this connection (too many open): drop it, keep serving.
+            std::fprintf(stderr, "[server] could not start a request thread: %s\n", e.what());
+            socket_close(client_fd);
+            client_done();
+        }
     }
 
     auto stop_worker = [](HttpServer * server) {
@@ -2622,7 +2649,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 }
             }
             body.update(model_routing_status());
-            send_response(fd, 200, "application/json", body.dump() + "\n");
+            send_response(fd, 200, "application/json", wire_json(body) + "\n");
             socket_close(fd);
             return;
         }
@@ -2646,7 +2673,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 body["pflash"]["unified"] = std::move(unified);
             }
         }
-        send_response(fd, 200, "application/json", body.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(body) + "\n");
         socket_close(fd);
         return;
     }
@@ -2719,7 +2746,7 @@ void HttpServer::handle_client(SocketHandle fd) {
             }
         }
         send_response(fd, 200, "application/json",
-                      json{{"object", "list"}, {"data", data}}.dump() + "\n");
+                      wire_json(json{{"object", "list"}, {"data", data}}) + "\n");
         socket_close(fd);
         return;
     }
@@ -2731,7 +2758,7 @@ void HttpServer::handle_client(SocketHandle fd) {
         }
         if (removed) {
             send_response(fd, 200, "application/json",
-                          json{{"id", id}, {"object", "shared_prefix"}, {"deleted", true}}.dump() + "\n");
+                          wire_json(json{{"id", id}, {"object", "shared_prefix"}, {"deleted", true}}) + "\n");
         } else {
             send_error(fd, 404, "no shared prefix " + id);
         }
@@ -2749,7 +2776,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 if (i != 0) response[key].push_back(model_list(cfg, codex_schema)[key][0]);
             }
         }
-        send_response(fd, 200, "application/json", response.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(response) + "\n");
         socket_close(fd);
         return;
     }
@@ -3771,7 +3798,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             const json response = {
                 {"input_tokens", (int) req.prompt_tokens.size()},
             };
-            send_response(fd, 200, "application/json", response.dump() + "\n");
+            send_response(fd, 200, "application/json", wire_json(response) + "\n");
             return true;
         }
         if (!attach_output_constraint(fd, req)) return true;
@@ -4121,7 +4148,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         const std::string events = tc::as_sse(response);
         send_all(fd, events.data(), events.size());
     } else {
-        send_response(fd, 200, "application/json", response.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(response) + "\n");
     }
     return true;
 }
@@ -7169,7 +7196,7 @@ void HttpServer::send_nonstream_response(
         *req.dropped_tool_call_out = true;
     }
 
-    const std::string body = response.dump() + "\n";
+    const std::string body = wire_json(response) + "\n";
     if (send_buffer) {
         send_buffer->append(
             format_http_response(200, "application/json", body));
@@ -7223,7 +7250,7 @@ void HttpServer::process_job(ServerJob * job) {
     }
     // Store messages JSON for request inspection (truncate to avoid huge payloads).
     if (!req.messages.is_null()) {
-        std::string msg_str = req.messages.dump();
+        std::string msg_str = wire_json(req.messages);
         if (msg_str.size() > 4096) msg_str.resize(4096);
         status_.set_messages(msg_str);
     }
@@ -7302,7 +7329,7 @@ void HttpServer::process_job(ServerJob * job) {
             const json body = build_error_response(
                 req.format, error, req.response_id);
             send_response(fd, response_error_http_status(error),
-                          "application/json", body.dump() + "\n");
+                          "application/json", wire_json(body) + "\n");
         }
         finish_job();
     };
@@ -7463,7 +7490,7 @@ void HttpServer::process_job(ServerJob * job) {
                     req.format, error, req.response_id);
                 sock_set_block(fd);
                 send_response(fd, response_error_http_status(error),
-                              "application/json", body.dump() + "\n");
+                              "application/json", wire_json(body) + "\n");
             }
         }
         log_done();
@@ -7550,7 +7577,7 @@ void HttpServer::process_job(ServerJob * job) {
         // writing a complete JSON response on this shared socket path.
         sock_set_block(fd);
         send_response(fd, 200, "application/json",
-                      response.dump() + "\n");
+                      wire_json(response) + "\n");
     }
 
     remember_agent_turn(
@@ -7660,13 +7687,21 @@ ServerJob * HttpServer::dequeue_for(
 
 bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
     sock_set_nonblock(fd);
+    // A client that opens a connection and then sends nothing more for this
+    // long is dropped, so idle connections cannot pile up.
+    constexpr int kIdleReadLimitMs = 60 * 1000;
     auto receive = [&](char * data, size_t size) -> ssize_t {
+        int idle_ms = 0;
         while (!stopping_.load()) {
             struct pollfd pfd{fd, POLLIN, 0};
             const int ready = poll(&pfd, 1, 100);
             if (ready < 0 && sock_is_eintr(sock_errno())) continue;
             if (ready < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return -1;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                idle_ms += 100;
+                if (idle_ms >= kIdleReadLimitMs) return -1;
+                continue;
+            }
             const ssize_t n = recv(fd, data, size, 0);
             if (n < 0 && (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno()))) continue;
             return n;
@@ -7916,7 +7951,7 @@ bool HttpServer::send_response(
 bool HttpServer::send_error(
         SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
-    return send_response(fd, status, "application/json", err.dump() + "\n");
+    return send_response(fd, status, "application/json", wire_json(err) + "\n");
 }
 
 bool HttpServer::send_sse_headers(ServerJob * job) {
