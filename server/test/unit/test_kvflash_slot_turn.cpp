@@ -66,6 +66,11 @@ TEST_CASE(KvflashSlotTurnFixture, plan_runs_mode4_only_with_the_profile_and_a_po
     const KvFlashSlotTurn fits = kvflash_slot_turn_plan(prompt_with_user(1280, 1100), 0, kImStart, kUser, kCt, kQ, kU, kT, true);
     CHECK(!fits.recall());
     CHECK(fits.r == -1);
+    // m4 marks a mode-4 turn whatever the gates decide (the slot engine tracks its tail queries for the next same-question turn)
+    CHECK(t.m4);
+    CHECK(fits.m4);
+    CHECK(early.m4);
+    CHECK(!off.m4);
 }
 
 TEST_CASE(KvflashSlotTurnFixture, plan_recalls_the_tail_of_a_cold_turn_too_long_to_replay) {

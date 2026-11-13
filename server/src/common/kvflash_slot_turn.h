@@ -30,7 +30,10 @@ struct KvFlashSlotTurn {
     int  ckpt = -1;                 // the prompt-end checkpoint: the last <|im_start|> (the assistant header)
     bool end_rung = false;          // C1.5 F7: a recall turn whose replay stops at ckpt and checkpoints there too
     bool header_rung = false;       // L4: a recall turn whose replay checkpoints at ckpt = H', its own last cut at or before the header (kvflash_slot_turn_header_rung)
+    int  apply_at = -1;             // mode 4 once: the resume point, where the picks scored before the pass are applied; -1: none
     int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
+    bool m4 = false;                // a mode-4 turn was found (before the fits / sealed gates): its tail queries are the next turn's
+    bool track_tail = false;        // a turn that is not a first pass still captures its last prompt queries (kvflash_slot_m4.h)
     int  capture_at = -1;           // the cut at which the head is captured (a multiple of k chunks); -1: none
     std::vector<int> cuts;          // first-pass cut ends, ascending
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
@@ -89,6 +92,7 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     const std::vector<int32_t> suffix(prompt.begin() + t.kv_offset, prompt.end());
     const KvFlashMode4Plan p4 = kvflash_mode4_plan(suffix, t.kv_offset, im_start, user, max_turn_tokens);
     if (!p4.run) return t;
+    t.m4 = true;
     t.r = kvflash_uq_snap_rewind(uq, p4.r);   // a capped R never splits the question window
     t.reserve_chunks = (t.end - t.r + chunk_tokens - 1) / chunk_tokens + 1;
     // fits, or no sealed chunk before r to score: LRU turn
@@ -156,8 +160,8 @@ inline KvFlashTurnStep kvflash_slot_turn_step(const KvFlashSlotTurn & t, int cur
     if (n <= 0) return s;
     s.ckpt = t.ckpt_pass() && t.ckpt > 0 && cur_pos + n == t.ckpt;
     s.preamble = t.capture_at > 0 && cur_pos + n == t.capture_at;
-    if (!t.first_pass()) return s;
-    s.snapshot = t.snapshot_at_r() && cur_pos + n == t.r;
+    if (!t.first_pass() && !t.track_tail) return s;
+    s.snapshot = t.first_pass() && t.snapshot_at_r() && cur_pos + n == t.r;
     s.capture = cur_pos + n == t.end;
     s.q_rows = n_queries > 0 ? std::clamp(cur_pos + n - (t.end - n_queries), 0, n) : 0;
     return s;

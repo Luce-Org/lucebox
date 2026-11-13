@@ -117,6 +117,7 @@ void Qwen35SeqEngine::init_slots_() {
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
     recall_.assign(static_cast<size_t>(n_slots), SlotRecall{});
     uq_store_.assign(static_cast<size_t>(n_slots), {});
+    m4_last_.assign(static_cast<size_t>(n_slots), KvFlashM4Last{});
     parked_.assign(static_cast<size_t>(n_slots), ParkedSession{});
     stage_pending_.assign(static_cast<size_t>(n_slots), 0);
     ckpt_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
@@ -643,6 +644,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded_(
         reset_recurrent_slot(b_.cache_, result.slot);
         reset_slot_draft_kv(result.slot);
         set_feat_from_(result.slot, 0);
+        if (kvf_) m4_last_[(size_t)result.slot] = KvFlashM4Last{};   // a new session
         if (kvf_) plan_slot_turn_(result.slot, prompt, 0);
     }
     return result;
@@ -881,6 +883,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         book_.begin_session(result.slot, who.client, who.sid, (int64_t)std::time(nullptr), archive_of);
         bundle_failed_[(size_t)result.slot] = false;
         book_[result.slot].resume_L = 0;
+        m4_last_[(size_t)result.slot] = KvFlashM4Last{};   // a new session (or a head attach): not the last occupant's
         clear_slot_images(result.slot);
         if (attached_at) {   // KV and state are the head's; the feature ring holds the last occupant's below L, as on a resume
             reset_slot_draft_kv(result.slot);
@@ -908,6 +911,7 @@ void Qwen35SeqEngine::release_host_(int slot, const char * why) {
         std::fprintf(stderr, "[kvflash] slot %d session released from host memory, its last committed bundle %s stays on disk: its newer park cannot be written (%s)\n", slot, key.c_str(), why);
         parked_[(size_t)slot] = ParkedSession{};
         uq_clear_(slot);   // the rows go with the session: the next occupant must not save them
+        m4_last_[(size_t)slot] = KvFlashM4Last{};
         kvf_kv_->drop_parked(slot);
         bundle_failed_[(size_t)slot] = false;
         return;
@@ -923,6 +927,7 @@ void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
                      slot, parked_[(size_t)slot].history.size(), why);
     parked_[(size_t)slot] = ParkedSession{};
     uq_clear_(slot);
+    m4_last_[(size_t)slot] = KvFlashM4Last{};
     kvf_kv_->drop_parked(slot);
     if (!bundle_dir_.empty()) {
         bundle_writer_->wait(slot);   // a queued park of this slot would recreate the directory after the removal
@@ -961,6 +966,7 @@ bool Qwen35SeqEngine::evict_session_(int slot, const char * why) {
     if (!book_.evict(slot, bundle_failed_[(size_t)slot].load())) std::fprintf(stderr, "[kvflash] slot %d session %s: no committed head or meta and index not written\n", slot, evicted_key.c_str());
     parked_[(size_t)slot] = ParkedSession{};
     uq_clear_(slot);
+    m4_last_[(size_t)slot] = KvFlashM4Last{};
     kvf_kv_->drop_parked(slot);
     bundle_failed_[(size_t)slot] = false;
     return true;
@@ -1261,6 +1267,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     if (const int skipped = kvflash_uq_slot_restore_held(uq_store_, slot, std::move(l.uq), [&](int64_t d) { return uq_hold_(d); }))
         std::fprintf(stderr, "[kvflash] slot %d bundle uq rows not restored: host budget (%d stores)\n", slot, skipped);
     for (const KvFlashUqStore & u : uq_store_[(size_t)slot]) std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, u.lo, u.hi, u.n);
+    m4_last_[(size_t)slot] = KvFlashM4Last{};   // a restored session starts without the last request's scores
     const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind: the hard pins came back with the pager's layout, the rebind only adds the head's again
     if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the rebind and any reselect
         ParkedSession & q = parked_[(size_t)slot];
@@ -1603,9 +1610,76 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         rc.uq_hash = kvflash_uq_hash(prompt, rc.uq.cut);
         if (!rc.uq.capture) rc.uq_miss = rc.uq.n == 0 ? "no-human-turn" : "window-not-in-prefill";   // unless the store holds it
     }
+    // Mode 4 once per question: the last request this slot served for the session decides the path. Whatever happens, it
+    // stops being "the last one": the record is rebuilt by this request and stored when its prefill completes.
+    KvFlashM4Last m4_prev = std::move(m4_last_[(size_t)slot]);
+    m4_last_[(size_t)slot] = KvFlashM4Last{};
+    rc.m4_track = b_.kvflash_m4_single_ && uq_queries_ > 0 && rc.turn.m4 && rc.uq.n > 0 && rc.uq.cut > 0;
+    if (rc.m4_track) rc.m4_ids = prompt;
+    const char * m4_path = "";
+    if (rc.m4_track && rc.turn.first_pass()) {
+        const int unit_chunks = luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_;
+        const KvFlashUqStore * const st = kvflash_uq_slot_get(uq_store_, slot, rc.uq.cut, rc.uq_hash);   // this question's rows, when the slot holds them
+        KvFlashRecallIn in;   // the input the apply at kv_offset plans with (kvflash_prefill_apply_on, slot form)
+        in.n_pool_blocks = usable;
+        in.cur_chunk = p.cur_chunk();
+        in.recall_chunks = unit_chunks;
+        in.unit = b_.kvflash_select_unit_;
+        in.reserve = (rc.turn.end - kv_offset + ct - 1) / ct + 1;
+        in.pin_reserve_chunks = std::max(b_.kvflash_preamble_reserve_ / ct, head_binder_.pins(slot));
+        in.pinned_chunks = kvflash_pinned_prefix(p);
+        KvFlashM4Ask a;
+        a.uq_hi = rc.uq.cut; a.uq_hash = rc.uq_hash; a.uq_stored = st != nullptr;
+        a.kv_offset = kv_offset; a.chunk_tokens = ct; a.first_window = kvflash_recall_first_window(in);
+        const auto gate = kvflash_recall_gate(true, kv_offset, rc.turn.end, ct, usable, b_.kvflash_preamble_reserve_ / ct, unit_chunks).skip;
+        KvFlashM4Path path = kvflash_slot_m4_path(true, b_.kvflash_recall_blocks_, true, gate, m4_prev, a, prompt);
+        if (path == KvFlashM4Path::Prescore) {
+            // the exact scorer before the pass: the stored question rows + the previous request's tail queries (whole queries only)
+            p.synchronize_paging();
+            kvf_->complete_all();
+            const KvFlashQkDims d = b_.kvflash_exact_dims();
+            const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
+            std::vector<const float *> qs;
+            bool scored = false;
+            if (qsize > 0 && !m4_prev.q_tail.empty() && m4_prev.q_tail.size() % qsize == 0) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (size_t o = 0; o < m4_prev.q_tail.size(); o += qsize) qs.push_back(m4_prev.q_tail.data() + o);
+                kvflash_uq_join(qs, st, rc.uq_miss, qsize, qs.size());
+                std::vector<std::vector<float>> o;
+                std::vector<KvFlashMassPlanes> planes;
+                const int sealed = kv_offset / ct;
+                if (b_.kvflash_exact_scores_gpu_on(p, sealed, qs, o, planes) || b_.kvflash_exact_scores_on(p, sealed, qs, o, &planes)) {
+                    rc.scores = kvflash_select_scores(planes);
+                    scored = true;
+                }
+                rc.score_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
+            if (!scored) path = KvFlashM4Path::Full;
+        } else if (path == KvFlashM4Path::Reuse) {
+            rc.scores = m4_prev.scores;
+        }
+        if (path == KvFlashM4Path::Full) {
+            m4_path = "full";
+        } else {
+            m4_path = path == KvFlashM4Path::Reuse ? "reuse" : "prescore";
+            rc.m4_scores = rc.scores;   // as scored: the pick marks its ledger copy
+            rc.uq.capture = false;      // the question's rows are in the store (uq_stored)
+            kvflash_slot_turn_single(rc.turn, ct);
+            std::fprintf(stderr, "[kvflash] slot %d m4 path=%s @%d (end %d, prefill %d tokens once; %zu chunks scored, window from chunk %d)\n",
+                         slot, m4_path, kv_offset, rc.turn.end, rc.turn.end - kv_offset, rc.scores.size(), a.first_window);
+        }
+        rc.m4_path = m4_path;
+    } else if (rc.m4_track) {
+        rc.turn.track_tail = true;   // not a recall turn (the prompt fits): its tail queries are still the next turn's prescore input
+    }
     // L4: after the turn's last cut is in (the UQ cut above), with the replay's cut rule (the park tail of the step loop)
     if (header_rung_) kvflash_slot_turn_header_rung(rc.turn, kKvFlashCutU, park_short_on_ ? park_tail_ : 0);
-    if (rc.turn.first_pass()) {
+    if (rc.turn.apply_at >= 0 && m4_path[0]) {
+        // Mode 4 once: the picks come from the exact scores above, applied at the resume point; no snapshot, no rewind.
+        apply_once_(slot, m4_path[0] == 'r' ? "; reused" : "; prescore");
+    } else if (rc.turn.first_pass()) {
+        std::fprintf(stderr, "[kvflash] slot %d m4 path=full @%d (end %d, %s, re-prefill %d tokens)\n", slot, kv_offset, rc.turn.end,
+                     rc.m4_track ? "no reusable record" : "single pass off", rc.turn.end - rc.turn.r);
         if (rc.turn.r == rc.turn.kv_offset) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts%s)\n",
                      slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.end_rung ? ", header rung" : rc.turn.header_rung ? ", replay rung" : "");
@@ -1614,6 +1688,19 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: skip (%d tokens fit %d blocks or no turn)\n",
                      slot, rc.turn.end - rc.turn.kv_offset, p.n_pool_blocks());
     }
+}
+
+void Qwen35SeqEngine::apply_once_(int slot, const char * note) {
+    SlotRecall & rc = recall_[(size_t)slot];
+    KvFlashSlotPager & p = kvf_kv_->pager(slot);
+    // Pending frees must drain first and the apply's page-outs free at once, as in the mode-4 rewind.
+    p.synchronize_paging();
+    kvf_->complete_all();
+    p.set_deferred_free(false);
+    b_.kvflash_prefill_apply_on(p, rc.scores, rc.turn.apply_at, rc.turn.end, rc.turn.reserve_chunks,
+                                rc.turn.apply_at - 1, rc.score_ms, note, slot, head_binder_.pins(slot));
+    p.set_deferred_free(true);
+    rc.turn.apply_at = -1;
 }
 
 // C1.4: the first pass of a slot ended this step: score its chunks before R with
@@ -1629,6 +1716,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
     const std::vector<float> q_all = std::move(rc.q_tail);   // accumulated over the first pass's cuts; consumed here
     rc.q_tail.clear();
+    if (rc.m4_track) rc.m4_q_tail = q_all;   // the next same-question turn scores with these before its pass
     const int n_q = qsize ? (int)(q_all.size() / qsize) : 0;
     std::vector<const float *> qs;
     for (int t = 0; t < n_q; t++) qs.push_back(q_all.data() + (size_t)t * qsize);
@@ -1644,6 +1732,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
         if (b_.kvflash_exact_scores_gpu_on(p, sealed, qs, o, planes) || b_.kvflash_exact_scores_on(p, sealed, qs, o, &planes)) {
             rc.scores = kvflash_select_scores(planes);
             scored = true;
+            if (rc.m4_track) rc.m4_scores = rc.scores;   // as scored: the pick below marks its ledger copy
         }
     }
     const double score_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
@@ -3681,8 +3770,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 kvflash_q_tail_push(rc.q_tail, rows.data(), got, (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim, b_.kvflash_select_queries_);
             }
             if (slot == capture_slot) take_uq_rows_(slot, prefills[i].kv_pos, prefills[i].chunk);
+            if (prefills[i].commit && rc.m4_track)   // the request's prefill is complete: it is the slot's last mode-4 request
+                m4_last_[(size_t)slot] = kvflash_slot_m4_record(rc.m4_ids, rc.uq.cut, rc.uq_hash, std::move(rc.m4_scores),
+                                                                 rc.m4_q_tail.empty() ? std::move(rc.q_tail) : std::move(rc.m4_q_tail));
             if (ts.snapshot) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
-            if (ts.capture && slot == capture_slot) pending_rewind_.push_back(slot);
+            if (ts.capture && slot == capture_slot && rc.turn.first_pass()) pending_rewind_.push_back(slot);
             if (ts.ckpt && sticky_on_) take_ckpt_(slot, prefills[i].kv_pos + prefills[i].chunk);   // the header rung (Rule A)
             if (ts.preamble && !rc.capture_ids.empty()) capture_head_(slot);                       // the pinned head
         }

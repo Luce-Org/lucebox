@@ -2878,6 +2878,7 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_pager_clean_evict.cpp
             test/unit/test_kvflash_prefill_reselect.cpp
             test/unit/test_kvflash_m4_reuse.cpp
+            test/unit/test_kvflash_slot_m4.cpp
             test/unit/test_kvflash_pin_preamble.cpp
             test/unit/test_kvflash_pinned_head.cpp
             test/unit/test_kvflash_pinned_head_paths.cpp

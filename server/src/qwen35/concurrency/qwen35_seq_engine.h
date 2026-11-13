@@ -38,6 +38,7 @@
 #include "server/kv/disk_prefix_cache.h"
 #include "server/kv/disk_store.h"
 #include "common/kvflash_slot_turn.h"
+#include "common/kvflash_slot_m4.h"
 #include "common/kvflash_step_driver.h"
 #include "common/kvflash_uq.h"
 #include "common/dflash_draft_kv.h"
@@ -316,12 +317,22 @@ private:
         uint64_t uq_hash = 0;
         std::vector<float> uq_rows;
         const char * uq_miss = "";   // why the scorer gets no question rows this turn
+        double score_ms = 0.0;       // mode 4 once: the scorer's time for `scores`
         SlotStateSnapshot snap;
         bool snap_ok = false;
         bool tainted = false;        // in a failed step cohort: never parked
         std::vector<int32_t> capture_ids;   // the head's tokens while its capture cut is ahead (empty: none)
+        // Mode 4 once per question (LUCE_KVFLASH_M4_SINGLE): this request's record for the slot's next one, built as it runs.
+        bool m4_track = false;
+        const char * m4_path = "";         // "full" | "reuse" | "prescore" once decided; "" for a turn with no mode-4 pass decision
+        std::vector<int32_t> m4_ids;
+        std::vector<float> m4_scores;      // the exact scores as the scorer returned them (before the pick marks its copy)
+        std::vector<float> m4_q_tail;      // a rewound turn's first-pass tail queries (rewind consumes q_tail)
     };
     std::vector<SlotRecall> recall_;
+    // The last mode-4 request each slot served for its session (kvflash_m4_reuse.h). Dropped wherever the slot's session
+    // changes; a request that does not finish leaves none. Outlives recall_[slot], which retire() resets.
+    std::vector<luce::common::KvFlashM4Last> m4_last_;
     bool recall_on_ = false;                          // the recall profile is on for the slot engine
     int uq_queries_ = 0;                              // LUCE_KVFLASH_UQ_QUERIES with mode-4 recall, else 0
     // The question rows of each slot's session: an LRU per slot (kvflash_uq_slot_put), never shared between
@@ -425,6 +436,8 @@ private:
     std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
     int capture_rows_ = 0;                            // query rows the graph captured this step
     void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset, int capture_at = -1);
+    // Mode 4 once: the picks scored before the pass, applied at the resume point (no first pass, no rewind).
+    void apply_once_(int slot, const char * note);
     // The first pass of a slot ended this step: score, restore the R state, rewind, apply the picks; the replay follows.
     bool rewind_slot_turn_(int slot);
     void take_uq_rows_(int slot, int kv_pos, int n);
