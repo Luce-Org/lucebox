@@ -1580,7 +1580,8 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     // the recall budget kvflash_prefill_apply_on plans this turn with: a longer turn replays its tail only
     const int ct = p.chunk_tokens(), usable = luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom());
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
-                                                                        luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
+                                                                        luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_,
+                                                                        b_.kvflash_replay_max_) : 0;
     // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
     // A prefill that covers the window captures them (whatever the slot's store holds: the same request
     // runs the same cuts and scores with its own rows); a later turn of the session reads the store.

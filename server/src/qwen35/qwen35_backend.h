@@ -336,6 +336,7 @@ protected:
         ~ReselectRequestScope() { scores.clear(); }
     };
     int                     kvflash_recall_blocks_ = 0;      // LUCE_KVFLASH_RECALL_BLOCKS (R-LRU)
+    int                     kvflash_replay_max_ = 0;         // LUCE_KVFLASH_REPLAY_MAX: mode-4 replay cap, test switch
     int                     kvflash_select_queries_ = 0;     // queries kept per prefill (kQueryCaptureTokens in mode 4, else 0): selector v2, 0 = v1
     int                     kvflash_select_unit_ = luce::common::kKvFlashRecallUnit;   // LUCE_KVFLASH_SELECT_UNIT: chunks per recall unit; budget stays 10 * k chunks
     std::vector<float>      kvflash_q_tail_;                 // this prefill's last prompt queries, oldest first (selector v2)
