@@ -2557,14 +2557,18 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         try {
             std::thread([this, client_fd, client_done]() {
                 // One request must never end the server: what its handler
-                // throws stops that request only. The socket is left as it
-                // is, since the handler may have closed it already.
+                // throws stops that request only. The handler closes the
+                // socket, or hands it to the status stream, as the last thing
+                // before it returns, so one that threw left it open: it is
+                // closed here, or each such request would leak a descriptor.
                 try {
                     handle_client(client_fd);
                 } catch (const std::exception & e) {
                     std::fprintf(stderr, "[server] request failed: %s\n", e.what());
+                    socket_close(client_fd);
                 } catch (...) {
                     std::fprintf(stderr, "[server] request failed: unknown error\n");
+                    socket_close(client_fd);
                 }
                 client_done();
             }).detach();
