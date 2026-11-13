@@ -173,6 +173,7 @@ public:
         int slot = -1;
         std::string error;
         PrefixStoreAdmission prefix_store;
+        int resumed_tokens = 0;   // the admit starts the prompt here (a parked session resumed, a pinned head attached): the prompt before it is not prefilled again
     };
 
     // Admit one request into a free slot and queue its prompt for chunked
@@ -195,7 +196,8 @@ public:
     // capacity for the whole request. `meta` carries the request's session
     // identity (empty when the client sent none). The default ignores both.
     // Image and prefix-store admissions carry neither.
-    struct AdmitMeta { std::string sid, client; };
+    // head_cut (0 when not given): the shared system/tools head the server found (tokens); 0 none, -1 sharing is off.
+    struct AdmitMeta { std::string sid, client; int head_cut; };
     virtual AdmitResult admit_bounded(uint64_t request_id,
                                       const std::vector<int32_t> & prompt,
                                       const SamplerCfg & sampler,
@@ -398,6 +400,17 @@ public:
     // final token); 0 when the engine does not say.
     virtual int max_decode_tokens() const { return 0; }
 };
+
+// Fails `slot`'s prefill of this step with `error`: its output is replaced (no token, no prefix capture), or added
+// when the step has none for it. The other slots' outputs stay.
+inline void fail_prefill_output(std::vector<SeqEngine::PrefillOutput> & outputs, int slot, std::string error) {
+    auto it = std::find_if(outputs.begin(), outputs.end(), [slot](const SeqEngine::PrefillOutput & o) { return o.slot == slot; });
+    if (it == outputs.end()) it = outputs.emplace(outputs.end());
+    *it = SeqEngine::PrefillOutput{};
+    it->slot = slot;
+    it->status = SeqEngine::PrefillOutput::Status::failed;
+    it->error = std::move(error);
+}
 
 template <typename Advance>
 inline bool consume_decode_output_tokens(

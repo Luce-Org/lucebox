@@ -6138,6 +6138,30 @@ struct ggml_tensor * ggml_paged_attn_ext_tree(
         tree_scratch_base, tree_scratch_stride);
 }
 
+struct ggml_tensor * ggml_paged_attn_ext_chain(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
+    struct ggml_tensor * result = ggml_paged_attn_ext_tree(
+        ctx, q, k, v, block_table, kv_seq_lens, active_slot_ids,
+        query_positions, scale, block_size, max_kv_seq_len, parent_ids,
+        tree_sizes, tree_scratch_base, tree_scratch_stride);
+    ggml_set_op_params_i32(result, 6, 1);
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

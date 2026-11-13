@@ -6,6 +6,7 @@
 namespace luce::common {
 
 int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
+    if (const int rc = qwen35_daemon_kvflash_gate(args)) return rc;
     Qwen35Config cfg;
     cfg.target_path        = args.target_path ? args.target_path : "";
     if (args.draft_path) cfg.draft_path = args.draft_path;

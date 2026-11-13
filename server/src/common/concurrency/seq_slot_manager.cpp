@@ -151,6 +151,37 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
         r.error = "all decode slots are busy";
         return r;
     }
+    return admit_in_(slot, request_id, prompt, sampler, 0);
+}
+
+SeqEngine::AdmitResult SeqSlotManager::admit_at(
+        int slot, uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, int resume_pos) {
+    using AdmitStatus = SeqEngine::AdmitResult::Status;
+    SeqEngine::AdmitResult r;
+    if (slot < 0 || slot >= (int)slots_.size() || slots_[(size_t)slot].active()) {
+        r.status = AdmitStatus::busy;
+        r.error = "slot is not free";
+        return r;
+    }
+    if (prompt.size() > static_cast<size_t>(max_ctx_)) {
+        r.status = AdmitStatus::capacity_exceeded;
+        r.error = "prompt exceeds max_ctx";
+        return r;
+    }
+    if (resume_pos < 0 || (size_t)resume_pos >= prompt.size()) {
+        r.error = "resume position is not inside the prompt";
+        return r;
+    }
+    return admit_in_(slot, request_id, prompt, sampler, resume_pos);
+}
+
+SeqEngine::AdmitResult SeqSlotManager::admit_in_(
+        int slot, uint64_t request_id, const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler, int resume_pos) {
+    using AdmitStatus = SeqEngine::AdmitResult::Status;
+    SeqEngine::AdmitResult r;
+    const int prompt_len = static_cast<int>(prompt.size());
 
     // A newly freed block belongs to any older decoder missing its rolling
     // next-page reserve before it can belong to this admission.
@@ -178,7 +209,8 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     if (status != PagedKvStatus::Ok) {
         r.status = status == PagedKvStatus::SequenceSlotsExhausted ||
                            status == PagedKvStatus::BlocksExhausted
-            ? AdmitStatus::busy : AdmitStatus::failed;
+            ? AdmitStatus::busy
+            : status == PagedKvStatus::CapacityExceeded ? AdmitStatus::capacity_exceeded : AdmitStatus::failed;
         r.error = status == PagedKvStatus::BlocksExhausted
             ? "not enough unreserved KV blocks for the prompt and decode headroom"
             : paged_kv_status_string(status);
@@ -188,7 +220,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     SeqSlot & s = slots_[(size_t)slot];
     s.phase = SeqSlotPhase::prefill;
     s.handle = handle;
-    s.cur_pos = 0;
+    s.cur_pos = resume_pos;
     s.original_prompt_len = prompt_len;
     s.prompt_len = prompt_len;
     s.sampler = sampler;
@@ -204,6 +236,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
 
     r.status = AdmitStatus::admitted;
     r.slot = slot;
+    r.resumed_tokens = resume_pos;   // the prompt before it is the slot's already: a parked resume, an attached head
     return r;
 }
 
@@ -262,6 +295,22 @@ void SeqSlotManager::commit_prefill(int slot) {
     SeqSlot & s = slots_[(size_t)slot];
     if (s.cur_pos != s.prompt_len) return;
     s.phase = SeqSlotPhase::decode;
+}
+
+bool SeqSlotManager::rewind_prefill(int slot, int pos) {
+    if (!is_prefilling(slot)) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (pos < 0 || pos > s.cur_pos || !s.staged_tokens.empty()) return false;
+    if (pos == s.cur_pos) return true;
+    const PagedKvStatus status = kv_.rollback_append(
+        s.handle, static_cast<uint32_t>(s.cur_pos - pos));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr, "[parallel] slot %d prefill rewind to %d failed: %s\n",
+                     slot, pos, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos = pos;
+    return true;
 }
 
 SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
@@ -382,7 +431,7 @@ bool SeqSlotManager::reserve_decode(const std::vector<int> & growth) {
 }
 
 bool SeqSlotManager::detach_kv(int slot) {
-    if (!is_active(slot)) return false;
+    if (!kv_.parkable() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.parked() || !s.staged_tokens.empty()) return false;
     if (kv_.clear(s.handle) != PagedKvStatus::Ok) return false;
@@ -427,7 +476,7 @@ bool SeqSlotManager::attach_kv(int slot) {
 }
 
 bool SeqSlotManager::evict_for_recompute(int slot, int32_t pending_token) {
-    if (!is_active(slot)) return false;
+    if (!kv_.parkable() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.recomputing() || !s.staged_tokens.empty()) return false;
     // A request that cannot fit the pool even alone can never resume;
@@ -479,6 +528,21 @@ bool SeqSlotManager::kv_restore_feasible(int slot) const {
         margin += o.active() && !o.parked() ? 1 : 0;
     }
     return needed + margin <= kv_.free_block_count();
+}
+
+bool SeqSlotManager::park(int slot, std::vector<int32_t> & history) {
+    if (slot < 0 || slot >= (int)slots_.size()) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (!s.decoding() || !s.staged_tokens.empty() || s.cur_pos <= 0 ||
+        s.sample_history.size() != (size_t)s.cur_pos) return false;
+    const PagedKvStatus status = kv_.park(s.handle);
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr, "[parallel] slot %d park failed: %s\n", slot, paged_kv_status_string(status));
+        return false;
+    }
+    history = std::move(s.sample_history);
+    s = SeqSlot{};
+    return true;
 }
 
 void SeqSlotManager::retire(int slot) {

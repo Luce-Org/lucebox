@@ -2688,6 +2688,29 @@ extern "C" {
             int                   tree_scratch_base,
             int                   tree_scratch_stride);
 
+    // A chain verify: the tree op for a tree whose node n has parent n-1 (the
+    // caller guarantees it; parent_ids stays an input for the kernels that walk
+    // it). Node n then attends the committed prefix plus scratch nodes 0..n,
+    // which is the causal block of one decode step per node, so a backend may
+    // run it through its decode route. Same arguments and layout as
+    // ggml_paged_attn_ext_tree.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_chain(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
+
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
     // Used for KV cache rotation in TurboQuant quantization types (TQ3_0).

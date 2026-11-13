@@ -20,6 +20,11 @@ bool parse_shared_prefix_mode(const std::string & value, SharedPrefixMode & out)
     return true;
 }
 
+SharedPrefixMode effective_shared_prefix_mode(bool given, SharedPrefixMode mode, bool concurrent,
+                                              bool cuts_at_restore_points) {
+    return !given && concurrent && !cuts_at_restore_points && mode == SharedPrefixMode::learn ? SharedPrefixMode::freeze : mode;
+}
+
 const char * shared_prefix_mode_name(SharedPrefixMode mode) {
     switch (mode) {
         case SharedPrefixMode::off: return "off";
@@ -65,6 +70,14 @@ int SharedPrefixes::cut(const std::vector<int32_t> & prompt,
     }
     if (boundary >= min_tokens_) return boundary;
     return back_off_to_line_end(prompt, common);
+}
+
+int SharedPrefixes::head_cut(const std::vector<int32_t> & prompt,
+                             const std::vector<int> & boundaries, bool has_tools) const {
+    if (!on()) return -1;
+    if (!prefers_head(boundaries, has_tools)) return 0;
+    if (const int c = cut(prompt, boundaries)) return c;
+    return !boundaries.empty() && boundaries.front() >= min_tokens_ ? boundaries.front() : 0;
 }
 
 void SharedPrefixes::remember(const std::vector<int32_t> & prompt,

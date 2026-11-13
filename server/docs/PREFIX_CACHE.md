@@ -255,7 +255,10 @@ tool schemas and system prompt, up to the first user turn, or up to where its
 projects differ. `--shared-prefix auto` (the default) keeps them across
 conversations, and with the disk cache on across restarts and model swaps
 (`server/kv/shared_prefixes`, `server/kv/prefix_pins`); with
-`--kv-cache-dir off` the pins and the ring live in memory only.
+`--kv-cache-dir off` the pins and the ring live in memory only. On the
+concurrent path the default is `freeze` for an engine that does not chunk at
+the restore points (`prefill_cuts_at_restore_points`); an explicit `auto`
+still learns.
 
 **The cut.** A request with tools, or whose prefix before the first user turn
 is at least 512 tokens, captures that head first, until it is restored. When
@@ -595,6 +598,35 @@ one-time log line.
 snapshot only when it leaves RAM. `take_prefix_snapshot` frees a pooled
 snapshot instead of handing it over, because an `OwnedSnapshot` cannot carry
 the pager blob. A file on disk therefore never lacks the KV it claims to hold.
+
+**KVFlash sessions on disk.** The pooled snapshot above is the prefix cache's;
+the KVFlash slot engine keeps its own sessions on disk in the same cache
+directory, under `<kv-cache-dir>/sessions/<key>/` (an append-only chunk log, slab
+files and a head). A park writes it, a restart adopts it, and a request whose
+session id names a stored session restores it into a slot. It is on by default
+whenever `--kvflash` and a disk cache directory are on (`--kv-sessions off` keeps
+sessions in memory only). The sessions count in the one `--kv-cache-budget`, go by
+the same LRU as the prefix files and expire by the same TTL; `/props` reports one
+disk total with its parts (`full_cache.disk`: prefix, pins, sessions).
+`LUCE_KVFLASH_SLOT_BUNDLE_DIR` still works for one release as an override, with a
+warning.
+
+**Pinned shared head (concurrent slots).** The KVFlash slot engine plans no prefix
+store, so the shared-prefix cut (see Shared Prefixes) reaches it with the request
+(`AdmitMeta::head_cut`: the cut, 0 for none, -1 when `--shared-prefix off`, where the
+system block's end stands in). The engine rounds the cut down to its 512-token prefill
+grid and the head is that many chunks, at most a quarter of a slot's pool. The first
+slot to prefill it stops at the cut, keeps the head once (the chunks, the pager header and
+the recurrent state at the cut), and pins those chunks in its pool: eviction and recall
+never take them, and they come off the slot's history budget. Every later slot with the
+same head attaches the stored copy and prefills only what follows. Because the cut is a
+multiple of the prefill grid, a hit runs the same chunks a cold run would. Up to 16 heads
+stay in host memory. With the cache directory open (sessions on), each head is also one
+pooled file there under a layout of its own (the execution identity: model, KV types,
+geometry, backend), pinned like a shared-prefix pin (the first 16), so a restart finds it.
+A session that parked with a pinned head records it in its `meta.json` and pins it again
+when it is restored. There is no flag: heads are on with sticky slot sessions, and
+`LUCE_KVFLASH_PREAMBLE_STORE` is not read.
 
 **Suffix-only restore.** With `LUCE_KVFLASH_RESTORE_CONSUME=1`, a pooled
 snapshot rebuilds the pager and KV pool, and the request prefills only the

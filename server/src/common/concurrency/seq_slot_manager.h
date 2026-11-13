@@ -108,6 +108,18 @@ public:
     SeqEngine::AdmitResult admit(uint64_t request_id,
                                  const std::vector<int32_t> & prompt,
                                  const SamplerCfg & sampler);
+    // Sticky sessions (KVFlash): admit into this inactive slot with the
+    // first resume_pos prompt tokens already in its KV (the pool resumes the
+    // slot; it must have been parked at that length). resume_pos 0 is a cold
+    // admission into a chosen slot.
+    SeqEngine::AdmitResult admit_at(int slot, uint64_t request_id,
+                                    const std::vector<int32_t> & prompt,
+                                    const SamplerCfg & sampler, int resume_pos);
+    // Park a decoded slot: its KV stays with the pool (SlotKv::park), its fed
+    // tokens come back as the session's history, the slot becomes inactive.
+    // False (nothing changes) unless the slot is decoding with no staged
+    // tokens and a history that matches its position.
+    bool park(int slot, std::vector<int32_t> & history);
 
     struct PrefillChunk {
         bool ok = false;
@@ -131,6 +143,10 @@ public:
     PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
 
     void commit_prefill(int slot);
+    // KVFlash mode 4: drop the rows of [pos, cur_pos) and continue the prefill
+    // from pos (the pager truncates). False when the slot is not prefilling or
+    // pos is past cur_pos; true and a no-op at pos == cur_pos.
+    bool rewind_prefill(int slot, int pos);
 
     struct StepAppend {
         bool ok = false;
@@ -186,6 +202,7 @@ public:
     void retire(int slot);
 
     int slot_count() const { return (int)slots_.size(); }
+    bool parkable() const { return kv_.parkable(); }
     int max_context() const { return max_ctx_; }
     int decoding_count() const;
     bool is_active(int slot) const;
@@ -195,6 +212,9 @@ public:
     const SeqSlot & slot(int i) const { return slots_[(size_t)i]; }
 
 private:
+    SeqEngine::AdmitResult admit_in_(int slot, uint64_t request_id,
+                                     const std::vector<int32_t> & prompt,
+                                     const SamplerCfg & sampler, int resume_pos);
     // Logical extent whose block count includes the sequence's current pages
     // plus one future page, capped at max_ctx.
     uint32_t decode_headroom_capacity(int logical_tokens) const;

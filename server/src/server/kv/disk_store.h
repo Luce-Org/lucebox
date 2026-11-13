@@ -25,7 +25,9 @@
 //   <cache_dir>/<layout_fingerprint_hex>/<token_hash_hex>.dkv
 //
 // Every layout directory is indexed for the disk budget and the TTL; only
-// the live layout's files are ever restored.
+// the live layout's files are ever restored. <cache_dir>/sessions/ belongs to
+// a tenant (attach_tenant) and <cache_dir>/pins/ to the pin catalog: neither
+// is a layout.
 
 #pragma once
 
@@ -39,6 +41,7 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -148,6 +151,11 @@ struct DiskDrainResult {
 // budget evicts files of every layout, which is why one process owns the
 // directory. Everything below open() is the DiskPrefixCache's to use, under
 // mu_.
+struct DiskUsage {
+    uint64_t prefix = 0, pins = 0, sessions = 0;
+    uint64_t total() const { return prefix + pins + sessions; }
+};
+
 class DiskStore {
 public:
     // The store of `config.cache_dir`: the one this process already has
@@ -176,6 +184,32 @@ public:
     DiskDrainResult drain(double max_seconds = -1.0, const Owner * only = nullptr);
     uint64_t budget_bytes() const;
     size_t total_bytes() const;
+
+    // What the one budget holds, by kind: prefix files, pinned prefix files, and the tenants' (sessions).
+    DiskUsage usage() const;
+    // The store already open over `dir` in this process; null when none.
+    static std::shared_ptr<DiskStore> find(const std::string & dir);
+
+    // A tenant keeps its own files under <dir>/<its subdirectory> (sessions/):
+    // the store counts them in the one budget and evicts and expires them with
+    // its own files, by one LRU. The store calls these with its lock held, so
+    // they must not call back into the store; a tenant calls reserve() and
+    // release() with none of its own locks held.
+    struct Tenant {
+        std::function<uint64_t()> usage;                    // bytes it holds on disk now
+        std::function<bool(uint64_t & last_used)> oldest;   // its least recently used unit that may go (unix s); false: none may
+        std::function<uint64_t()> evict_oldest;             // delete that unit; the bytes freed
+    };
+    // Returns an id for detach_tenant().
+    uint64_t attach_tenant(Tenant tenant);
+    void detach_tenant(uint64_t id);
+    uint64_t tenant_bytes() const;
+    // Hold `bytes` for a tenant's coming write: evicts by the LRU until they
+    // fit; false when nothing that may go gives enough room (nothing is held).
+    // The hold lasts until release(): the tenant's usage() counts the bytes
+    // once they are written.
+    bool reserve(uint64_t bytes);
+    void release(uint64_t bytes);
     size_t entry_count() const;
     DiskCacheStats stats() const;
 
@@ -223,6 +257,9 @@ public:
     std::atomic<bool> abort_write_{false};  // drain() time limit hit
     bool     stop_writer_ = false;
     uint64_t pending_bytes_ = 0;
+    std::map<uint64_t, Tenant> tenants_;
+    uint64_t next_tenant_id_ = 1;
+    uint64_t reserved_bytes_ = 0;   // reserve() holds
     std::condition_variable writer_cv_;   // work for the writer
     std::condition_variable done_cv_;     // a write finished
     DiskCacheStats stats_;
@@ -236,6 +273,11 @@ public:
     void remove_entry(size_t idx, const char * why);
     void expire_locked();
     uint64_t budget_locked();
+    uint64_t tenant_bytes_locked() const;
+    // Everything counted against the budget: files, tenants, holds.
+    uint64_t used_locked() const { return total_bytes_ + tenant_bytes_locked() + reserved_bytes_; }
+    // The tenant whose oldest unit is the least recently used, 0 for none.
+    uint64_t oldest_tenant_locked(uint64_t & last_used) const;
     // Evict least-recently-used files until `incoming` more bytes fit.
     // Pinned files are never evicted: false when they leave no room.
     bool make_room_locked(uint64_t incoming);

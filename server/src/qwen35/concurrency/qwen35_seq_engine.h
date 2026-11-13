@@ -23,7 +23,23 @@
 
 #include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/chain_spec_shapes.h"
+#include "common/concurrency/kvflash_slot_kv.h"
 #include "common/concurrency/paged_kv_offload.h"
+#include "common/kvflash_admit_plan.h"
+#include "common/kvflash_engine_step.h"
+#include "common/kvflash_chain_plan.h"
+#include "common/kvflash_bundle_digest.h"
+#include "common/kvflash_session_store.h"
+#include "common/kvflash_slot_bundle.h"
+#include "common/kvflash_head_snapshot.h"
+#include "common/kvflash_pinned_head.h"
+#include "server/kv/checkpoint_store.h"
+#include "server/kv/disk_prefix_cache.h"
+#include "server/kv/disk_store.h"
+#include "common/kvflash_slot_turn.h"
+#include "common/kvflash_step_driver.h"
+#include "common/kvflash_uq.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
 #include "common/pinned_stage.h"
@@ -32,10 +48,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace luce::common {
@@ -66,6 +85,18 @@ public:
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
                     int prefill_quantum = 512);
+    // KVFlash slots (Track C): the slots allocate through `kv` (one arena, one
+    // slice per slot) and `driver` runs the pager work of every step (LRU only,
+    // D1 cuts of kKvFlashCutU). `fixed_chain` (Stage C) is default-disabled: AR only. No pool, no offload, no prefix store, no images.
+    // `kv` and `driver` must outlive the engine.
+    Qwen35SeqEngine(Qwen35Backend & backend, KvFlashSlotKv & kv, KvFlashStepDriver & driver,
+                    int max_ctx, int64_t scratch_row,
+                    FixedChainConfig fixed_chain,
+                    int max_prefills = 8,
+                    int mixed_prefill_tokens = 2048,
+                    int long_mixed_prefill_tokens = 4096,
+                    int long_prefill_threshold = 768,
+                    int idle_prefill_tokens = 4096);
     ~Qwen35SeqEngine() override;
 
     // Destroy every graph that captures draft-weight tensors. Qwen35Backend
@@ -75,8 +106,9 @@ public:
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
-    bool supports_prefix_store() const override { return true; }
-    bool prefix_store_in_backend_snapshots() const override { return true; }
+    // KVFlash slots take no prefix store yet: resident-only capture (D5) needs the arena table behind it.
+    bool supports_prefix_store() const override { return !kvf_; }
+    bool prefix_store_in_backend_snapshots() const override { return !kvf_; }
     size_t estimate_prefix_store_bytes(int tokens) const override;
 
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
@@ -86,6 +118,13 @@ public:
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
+    AdmitResult admit_bounded(uint64_t request_id,
+                              const std::vector<int32_t> & prompt,
+                              const SamplerCfg & sampler,
+                              int max_new_tokens,
+                              const AdmitMeta & meta) override;
+    AdmitResult admit_bounded_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
+                               int max_new_tokens, const AdmitMeta & meta);   // the admission itself; admit_bounded records the bound
 
     AdmitResult admit_with_prefix(
         uint64_t request_id,
@@ -109,7 +148,7 @@ public:
                 total_cap = std::max(total_cap, long_mixed_prefill_tokens_);
             }
         }
-        return {
+        const StepPlanLimits limits{
             max_prefills_,
             per_sequence,
             std::min(max_prefills_ * per_sequence, total_cap),
@@ -117,13 +156,15 @@ public:
             /*prefill_time_share=*/mixed ? 0.5 : 1.0,
             /*time_share_prompt_tokens=*/8192,
         };
+        return kvf_ ? kvflash_step_limits(limits) : limits;
     }
 
     bool reserve_decode(const StepPlan & plan) override;
-    size_t kv_offload_capacity() const override { return offload_.capacity(); }
-    KvOffloadState kv_offload_state(int slot) const override { return offload_.state(slot); }
+    size_t kv_offload_capacity() const override { return offload_ ? offload_->capacity() : 0; }
+    KvOffloadState kv_offload_state(int slot) const override { return offload_ ? offload_->state(slot) : KvOffloadState{}; }
     bool offload_kv(int slot, size_t bytes, std::string & error) override {
-        return offload_.suspend(slot, bytes, error);
+        if (!offload_) { error = "KVFlash slots cannot be parked"; return false; }
+        return offload_->suspend(slot, bytes, error);
     }
     bool restore_kv(int slot, std::string & error) override;
     bool evict_kv(int slot, int32_t pending_token, std::string & error) override;
@@ -210,6 +251,15 @@ private:
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
     void reset_slot_draft_kv(int slot);
+    // Codex P1-1: the generation bound each slot was admitted with; a chain round never commits past it.
+    std::vector<int> gen_cap_;
+    void set_gen_cap_(int slot, int cap) { if (slot >= 0) { if ((size_t)slot >= gen_cap_.size()) gen_cap_.resize((size_t)slot + 1, 1 << 30); gen_cap_[(size_t)slot] = cap; } }
+    // Codex P2-3: the first position whose feature row in the slot's ring belongs to its current session. A resumed or
+    // restored session has KV and recurrent state but no features below its resume point; the drafter never reads there.
+    std::vector<int> feat_from_;
+    void set_feat_from_(int slot, int v) { if (slot >= 0) { if ((size_t)slot >= feat_from_.size()) feat_from_.resize((size_t)slot + 1, 0); feat_from_[(size_t)slot] = v; } }
+    int feat_from_of_(int slot) const { return slot_value_or(feat_from_, slot, 0); }
+    void trim_unaccepted_chunks_();   // Codex P1-2: every live slot's pager back to ceil(len/64) chunks
     // The longest block a round with these selected lanes drafts.
     int chain_draft_width(const std::vector<uint8_t> & selected) const;
     std::optional<PreparedChainRound> prepare_chain_drafts(
@@ -217,7 +267,11 @@ private:
         const std::vector<uint8_t> & selected);
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
-        PreparedChainRound && prepared);
+        PreparedChainRound && prepared, const ChainTablePlan * kvf_plan);
+    // KVFlash chain rounds: one rate-limited line per 64 rounds (rounds, accepted tokens, per slot).
+    void log_kvflash_chain_round_(const StepResult & result, const std::vector<uint8_t> & selected);
+    std::vector<std::pair<uint64_t, uint64_t>> kvf_chain_stats_;   // per slot: {spec rounds, tokens committed by them}
+    uint64_t kvf_chain_rounds_ = 0;
     // Verify width for one batched chain round. Each verify graph bucket
     // keeps its own AdaptiveSpecWidth: a round's cost depends on the graph's
     // rows (bucket lanes x width), while the width that maximizes committed
@@ -237,10 +291,137 @@ private:
         int slot, PrefixCaptureTicket ticket, int restored_tokens);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
 
-    PagedKvPool & pool_;
+    PagedKvPool * pool_ = nullptr;                    // null with KVFlash slots
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
-    PagedKvOffload offload_;
+    std::unique_ptr<PagedKvOffload> offload_;         // null with KVFlash slots
+    KvFlashSlotKv *     kvf_kv_ = nullptr;
+    KvFlashStepDriver * kvf_ = nullptr;
+    void init_slots_();
+    bool upload_kvflash_column(int slot, int kv_len);
+    bool settle_kvflash_(std::vector<PrefillOutput> & prefill_outputs);
+    // C1.4: per-slot mode 4. The turn plan, the scores the pager's hook reads
+    // (stable: recall_ is sized once), the state at R and the step bookkeeping.
+    struct SlotRecall {
+        KvFlashSlotTurn turn;
+        std::vector<float> scores;
+        std::vector<float> q_tail;   // the first pass's last select_queries prompt queries across its cuts, oldest first (the serial engine's kvflash_q_tail_)
+        // LUCE_KVFLASH_UQ_QUERIES: the latest human question. uq.capture while its window rows are still to
+        // be captured; complete, they are the slot's store (uq_store_) under the key {uq.cut, uq_hash}.
+        KvFlashUqPlan uq;
+        uint64_t uq_hash = 0;
+        std::vector<float> uq_rows;
+        const char * uq_miss = "";   // why the scorer gets no question rows this turn
+        double score_ms = 0.0;       // mode 5: the drafter's time for `scores`
+        SlotStateSnapshot snap;
+        bool snap_ok = false;
+        bool tainted = false;        // in a failed step cohort: never parked
+        std::vector<int32_t> capture_ids;   // the head's tokens while its capture cut is ahead (empty: none)
+    };
+    std::vector<SlotRecall> recall_;
+    bool recall_on_ = false;                          // the recall profile is on for the slot engine
+    int uq_queries_ = 0;                              // LUCE_KVFLASH_UQ_QUERIES with mode-4 recall, else 0
+    // The question rows of each slot's session. One per slot and never shared: a scorer that read another
+    // slot's rows would depend on how far that slot's request had run.
+    std::vector<KvFlashUqStore> uq_store_;
+    // Sticky sessions (LUCE_KVFLASH_SLOT_STICKY, on by default with KVFlash slots). A retired slot keeps its KV and
+    // recurrent state parked in place; a prompt that extends its history resumes it where it parked.
+    // The recurrent state cannot be sliced back, so a prompt that diverges inside the history (the client re-renders
+    // the reply from text) resumes at a rung: a recurrent state saved at an earlier position (kvflash_slot_turn.h
+    // Rules A and B). Three rungs per session: `ckpt`, the prompt-end checkpoint (the state before the reply),
+    // `trunk` below it (the checkpoint before that: where a branch forked) and `extra` (rule v5: a pinned branch
+    // point, or the rung the ladder demoted).
+    struct SlotCkpt {
+        int pos = -1;
+        SlotStateSnapshot slab;
+        uint32_t file = 0;               // its slab file id in the slot's session directory (slab.<file>), 0: not on disk
+        bool pinned = false;             // the third rung only: a branch point, kept until a deeper branch
+    };
+    struct ParkedSession {
+        std::vector<int32_t> history;    // the tokens its KV holds (== its cur_pos at park)
+        uint64_t tick = 0;
+        bool valid = false;
+        SlotCkpt ckpt;
+        SlotCkpt trunk;
+        SlotCkpt extra;
+        KvFlashResumeWait wait;          // a resume rewound it to L and was refused busy: the retry resumes it there
+    };
+    std::vector<ParkedSession> parked_;
+    std::vector<SlotCkpt> ckpt_;                      // the live slot's prompt-end checkpoint, taken at commit
+    std::vector<SlotCkpt> trunk_;                     // the rung below it
+    std::vector<SlotCkpt> extra_;                     // the third rung
+    static KvFlashLadder ladder_of_(const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex) { return {ck.pos, tr.pos, ex.pos, ex.pos > 0 && ex.pinned}; }
+    // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is copied.
+    static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
+    int end_rung_min_ = -1;                           // LUCE_KVFLASH_END_RUNG_MIN: a recall turn's header rung when end - R reaches it; -1 off
+    void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)
+    void take_ckpt_(int slot, int pos);               // Rule A with the slot's state now (the header rung)
+    // Sessions on disk (--kv-sessions, LUCE_KVFLASH_SESSIONS_DIR): each parked session is written under
+    // <kv-cache-dir>/sessions/<key>/ (an append-only chunk log, slab files and a head), so a restart resumes it where it
+    // parked. The session store is a tenant of the cache directory's DiskStore: one budget, one LRU, one TTL. A slot is a
+    // cache over the store: a session leaving its slot is evicted to disk (its directory stays) and a request whose sid
+    // names it restores it; only a session that never reached disk is dropped. A park appends only the chunks from the
+    // one holding the turn's resume point on; the rest keep their records.
+    KvFlashSessionBook book_;                         // per slot: the session in it, its directory and what the directory holds
+    std::vector<std::atomic<bool>> bundle_failed_;    // set by the writer thread: the next park rewrites the slot whole
+    std::string bundle_dir_;                          // the cache directory; "" with sessions off
+    uint64_t bundle_identity_ = 0;
+    KvFlashBundleLimits bundle_lim_;
+    std::shared_ptr<DiskStore> disk_;                 // the directory's store; the session store is attached to it
+    uint64_t tenant_id_ = 0;
+    std::unique_ptr<KvFlashBundleWriter> bundle_writer_;   // the park saves, off the step thread (after bundle_failed_: it uses it)
+    void init_bundles_();
+    // Pinned heads (kvflash_pinned_head.h): the shared system/tools prefix #941's cut found, rounded to the chunk grid. A
+    // slot that prefilled it pins its chunks and keeps one copy here (host memory, at most kHeadsHost); a later slot with
+    // the same head attaches that copy instead of prefilling it. With the cache directory open, each head is also a
+    // pooled file in it under a layout of its own (the execution identity), so it survives a restart.
+    KvFlashHeadBinder head_binder_{0};
+    std::unordered_map<uint64_t, KvFlashHead> heads_;   // by hash of the head's chunks
+    std::deque<uint64_t> head_order_;                   // insertion order, oldest first
+    std::unique_ptr<CheckpointStore> head_nostore_;     // the disk view's checkpoint side: heads are never backend checkpoints
+    std::unique_ptr<DiskPrefixCache> head_disk_;        // null: heads stay in host memory (sessions off or the directory not open)
+    int head_k_max_ = 0;                                // chunks a head may pin; 0: heads off
+    int head_pinned_files_ = 0;                         // head files pinned in the directory by this process
+    void init_heads_();
+    void rebind_restored_heads_();   // one pass over the slots init_bundles_ adopted, after init_heads_
+    const KvFlashHead * find_head_(const std::vector<int32_t> & prompt, int k);   // host copy, else the file; null when unknown
+    const KvFlashHead * keep_head_(KvFlashHead h);
+    void capture_head_(int slot);                       // the slot holds exactly its head: keep it, bind the slot, persist it
+    std::string adopt_bundle_(int slot, const std::string & key, bool * refused, bool evict_for_room = false, bool * busy = nullptr);   // load sessions/<key>/ into the slot's pager; "" or why not (refused: the bundle itself is unusable here)
+    KvFlashRestore restore_from_disk_(const AdmitMeta & who, const std::vector<int32_t> & prompt, int e_role);   // a disk session of this request into a slot
+    void save_bundle_(int slot, ParkedSession & ps);   // ps is unchanged on return but for the rungs' file ids
+    std::string identity_key_() const;                // model, KV types, pager geometry, context, attention route: the bundle identity's text
+    size_t slab_bytes_() const;                       // one slot's recurrent slab
+    void log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
+                            const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const KvFlashUqStore * uq, std::chrono::steady_clock::time_point t0);
+    uint64_t park_tick_ = 0;
+    bool sticky_on_ = false;
+    // G-D: park one token short (kvflash_park_point). The decode step stashes each live slot's recurrent
+    // state before it feeds the slot's token; stash_pos_[slot] is the token count that state covers (-1: none).
+    SlotStateStash stash_;
+    bool park_short_on_ = false;                      // LUCE_KVFLASH_PARK_SHORT=0 turns it off
+    bool park_decode_on_ = false;                     // LUCE_KVFLASH_PARK_DECODE=1: stash before every decode step too
+    int park_tail_ = 4;                               // LUCE_KVFLASH_PARK_TAIL: a prefill-only turn parks this many tokens short (R's replay window is 4)
+    std::vector<int> stash_pos_;
+    AdmitResult admit_sticky_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
+                              int64_t total, const AdmitMeta & meta);
+    void drop_session_(int slot, const char * why);   // forget the session, and its directory: only for one that never reached disk
+    void release_host_(int slot, const char * why);   // a refused park: host memory goes, the last committed bundle stays (else dropped)
+    bool evict_session_(int slot, const char * why);  // the session leaves the slot, its bundle stays on disk; false: its latest park is not on disk, it stays
+    bool any_slot_live_() const;
+    int evict_oldest_(const char * why, int keep = -1);   // the oldest parked session (but `keep`) that can be evicted: its slot, -1 when none
+    std::vector<bool> active_slots_() const;          // which slots decode a request now
+    std::vector<KvFlashOwnedSession> parked_list_() const;   // every parked session with its owner
+    void begin_resume_(int slot);                     // residency to the recent state before the turn's first pass
+    std::vector<int> pending_rewind_;                 // slots whose first pass ended this step
+    int capture_rows_ = 0;                            // query rows the graph captured this step
+    void plan_slot_turn_(int slot, const std::vector<int32_t> & prompt, int kv_offset, int capture_at = -1);
+    // Mode 5: the drafter's picks of the slot's turn, applied when its prefill reaches R (no first pass, no rewind).
+    void apply_recall5_(int slot);
+    // The first pass of a slot ended this step: score, restore the R state, rewind, apply the picks; the replay follows.
+    bool rewind_slot_turn_(int slot);
+    void take_uq_rows_(int slot, int kv_pos, int n);
+    std::vector<int32_t> column_buf_;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;
     bool            fixed_chain_ready_ = false;

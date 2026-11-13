@@ -87,6 +87,11 @@ struct DFlashTarget {
     // When true, verify_batch captures intermediates and rollback_to() works.
     virtual bool supports_fast_rollback() const { return false; }
 
+    // True when the last verify_batch() failed only because the KV pool had no
+    // slot left for the block (KVFlash). The step has not touched any state, so
+    // the caller can finish the request with plain decode instead of failing it.
+    virtual bool verify_pool_exhausted() const { return false; }
+
     // Whether fast rollback is an exact, low-overhead device-side commit for
     // which the replay breakeven threshold does not apply.
     virtual bool exact_fast_rollback() const { return false; }

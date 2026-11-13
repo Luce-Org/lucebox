@@ -17,6 +17,7 @@
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -452,6 +453,43 @@ void test_feature_gate_paged_attention_requires_monolithic_backend() {
         CHECK(gate_result(
             *relaxed, "qwen35", PlacementBackend::Cuda).empty());
     }
+}
+
+void test_feature_gate_kvflash_draft_needs_the_chain_spec_switch() {
+    BackendArgs chain;
+    chain.model_path = "/nonexistent/model.gguf";
+    chain.paged_attention = true;
+    chain.max_concurrency = 2;
+    chain.draft_path = "/nonexistent/draft.gguf";
+    BackendAdmissionContext kvflash;
+    kvflash.kvflash = KvFlashRequest::Fixed;
+
+    const char * t = std::getenv("LUCE_KVFLASH_CONCURRENT_TEST");
+    const char * c = std::getenv("LUCE_KVFLASH_CHAIN_SPEC");
+    const std::string saved_t = t ? t : "", saved_c = c ? c : "";
+    setenv("LUCE_KVFLASH_CONCURRENT_TEST", "1", 1);
+    unsetenv("LUCE_KVFLASH_CHAIN_SPEC");
+    {   // the test switch alone still refuses a draft beside KVFlash, and says which switch is missing
+        const std::string why = gate_result(chain, "qwen35", PlacementBackend::Cuda, kvflash);
+        CHECK(why.find("LUCE_KVFLASH_CHAIN_SPEC") != std::string::npos);
+    }
+    setenv("LUCE_KVFLASH_CHAIN_SPEC", "1", 1);
+    CHECK(gate_result(chain, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+    BackendArgs tree = chain;
+    tree.ddtree_mode = true;
+    CHECK(!gate_result(tree, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+    BackendArgs windowed = chain;
+    windowed.fa_window = 4096;
+    CHECK(!gate_result(windowed, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+    BackendArgs n1 = chain;      // the slice is N>1: a single slot is not a concurrent chain
+    n1.max_concurrency = 1;
+    CHECK(!gate_result(n1, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+    // no draft: the chain switch changes nothing
+    BackendArgs ar = chain;
+    ar.draft_path.reset();
+    CHECK(gate_result(ar, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+    if (t) setenv("LUCE_KVFLASH_CONCURRENT_TEST", saved_t.c_str(), 1); else unsetenv("LUCE_KVFLASH_CONCURRENT_TEST");
+    if (c) setenv("LUCE_KVFLASH_CHAIN_SPEC", saved_c.c_str(), 1); else unsetenv("LUCE_KVFLASH_CHAIN_SPEC");
 }
 
 void test_feature_gate_paged_attention_allows_fixed_local_chains() {
@@ -970,6 +1008,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_layer_split_requires_supported_arch();
     test_feature_gate_paged_attention_requires_monolithic_backend();
     test_feature_gate_paged_attention_allows_fixed_local_chains();
+    test_feature_gate_kvflash_draft_needs_the_chain_spec_switch();
     test_feature_gate_parallel_and_kv_pool_rules();
     test_feature_warnings_silent_when_supported();
     test_feature_warnings_report_inert_draft();

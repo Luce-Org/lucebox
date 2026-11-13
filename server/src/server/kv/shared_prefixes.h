@@ -27,6 +27,13 @@ enum class SharedPrefixMode { off, freeze, learn };
 bool parse_shared_prefix_mode(const std::string & value, SharedPrefixMode & out);
 const char * shared_prefix_mode_name(SharedPrefixMode mode);
 
+// The mode a server runs: `auto` that was not typed becomes `freeze` on the
+// concurrent path for an engine that does not cut prefill at the restore
+// points (ModelBackend::prefill_cuts_at_restore_points), so a restored prefix
+// would not match a cold run.
+SharedPrefixMode effective_shared_prefix_mode(bool given, SharedPrefixMode mode, bool concurrent,
+                                              bool cuts_at_restore_points);
+
 class SharedPrefixes {
 public:
     // A prefix shorter than this is not worth a snapshot: on hybrid Qwen a
@@ -58,6 +65,13 @@ public:
     // is at least min_tokens in, else mid-message, backed off to the end of
     // its last line. 0 when it shares less than min_tokens.
     int cut(const std::vector<int32_t> & prompt, const std::vector<int> & boundaries) const;
+
+    // The head an engine that plans no prefix store captures: the ring's cut,
+    // else the first chat boundary when it is min_tokens in (the first request
+    // has no ring yet). -1 when off (the engine uses its own role end), 0 when
+    // no head applies.
+    int head_cut(const std::vector<int32_t> & prompt, const std::vector<int> & boundaries,
+                 bool has_tools) const;
 
     // Remember a request's prefix region: `prompt` up to its first chat
     // boundary (`boundaries`), the whole prompt without one. Only while it

@@ -15,6 +15,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -35,9 +36,12 @@ float next_float() {
     return ((int32_t)(g_rng >> 8) - 8388608) / 8388608.0f; // [-1, 1)
 }
 
-bool run_shape(ggml_backend_t gpu, int nq, int kv_len, int iters, ggml_type kv_type) {
+bool run_shape(ggml_backend_t gpu, int nq, int kv_len, int iters, ggml_type kv_type, int table_tokens) {
     const int pool_tokens = (kv_len + BLOCK_SIZE - 1 + 64) / BLOCK_SIZE * BLOCK_SIZE;
-    const int max_blocks  = pool_tokens / BLOCK_SIZE;
+    // The WMMA route cuts the table into fixed partitions sized from the table
+    // width, so a server-sized table (argv[3], e.g. 135168) measures the
+    // production split; the default is the pool itself.
+    const int max_blocks  = std::max(pool_tokens, table_tokens) / BLOCK_SIZE;
 
     ggml_init_params params = { 4u << 20, nullptr, true };
     ggml_context * ctx = ggml_init(params);
@@ -168,16 +172,17 @@ int main(int argc, char ** argv) {
     const char * tname = argc > 2 ? argv[2] : "q8_0";
     if (std::strcmp(tname, "f16") != 0 && std::strcmp(tname, "q8_0") != 0 &&
         std::strcmp(tname, "q4_0") != 0) {
-        std::printf("usage: bench_paged_attn_wmma [nq] [f16|q8_0|q4_0]\n");
+        std::printf("usage: bench_paged_attn_wmma [nq] [f16|q8_0|q4_0] [table_tokens]\n");
         ggml_backend_free(gpu);
         return 2;
     }
     const ggml_type kv_type = std::strcmp(tname, "f16") == 0   ? GGML_TYPE_F16  :
                               std::strcmp(tname, "q4_0") == 0  ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
-    std::printf("[bench-paged-wmma] kv_type=%s\n", ggml_type_name(kv_type));
+    const int table_tokens = argc > 3 ? atoi(argv[3]) : 0;
+    std::printf("[bench-paged-wmma] kv_type=%s table_tokens=%d\n", ggml_type_name(kv_type), table_tokens);
     bool ok = true;
-    for (int kv : { 8192, 16384, 32768, 65536 }) {
-        ok = run_shape(gpu, nq, kv, 5, kv_type) && ok;
+    for (int kv : { 8192, 16384, 32768, 65536, 98304 }) {
+        ok = run_shape(gpu, nq, kv, 5, kv_type, table_tokens) && ok;
     }
     ggml_backend_free(gpu);
     return ok ? 0 : 1;
