@@ -2934,6 +2934,17 @@ bool output_format_schema(const nlohmann::ordered_json & format,
     }
     const std::string type = string_member(format, "type");
     if (type.empty() || type == "text") return true;
+    if (type == "grammar") {
+        if (format.contains("schema") || format.contains("json_schema")) {
+            error = "cannot specify schema with type grammar in response_format";
+            return false;
+        }
+        if (!format.contains("grammar") || !format["grammar"].is_string()) {
+            error = "response_format grammar must be a string";
+            return false;
+        }
+        return true;
+    }
     if (type == "json_object") {
         // A schema beside json_object narrows it, as in llama-server.
         schema = format.contains("schema") ? format["schema"]
@@ -2945,7 +2956,7 @@ bool output_format_schema(const nlohmann::ordered_json & format,
         schema = holder.is_object() && holder.contains("schema")
             ? holder["schema"] : nlohmann::ordered_json::object();
     } else {
-        error = "response_format type must be text, json_object or json_schema, not '" +
+        error = "response_format type must be text, json_object, json_schema or grammar, not '" +
                 type + "'";
         return false;
     }
@@ -3027,26 +3038,56 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         send_error(fd, 400, error);
         return false;
     }
+
+    bool has_custom = req.has_custom_grammar;
+    std::string custom_grammar = req.custom_grammar;
+    if (!has_custom && !req.output_format.is_null() && req.output_format.is_object()) {
+        const std::string type = http_detail::string_member(req.output_format, "type");
+        if (type == "grammar" && req.output_format.contains("grammar") &&
+            req.output_format["grammar"].is_string()) {
+            custom_grammar = req.output_format["grammar"].get<std::string>();
+            has_custom = true;
+        }
+    }
+
+    if (has_custom && !schema.is_null()) {
+        send_error(fd, 400, "cannot specify both grammar and response_format schema");
+        return false;
+    }
+
     const bool tools_off = tool_checks::tool_choice_is_none(req.tool_choice);
     const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
     const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
-    if (schema.is_null() && !must_call) return true;
+
+    if (has_custom && must_call) {
+        send_error(fd, 400, "cannot specify custom grammar with required tool_choice");
+        return false;
+    }
+
+    if (!has_custom && schema.is_null() && !must_call) return true;
 
     // With tools the reply may call one first; a forced call must. A codec
     // allows only its template's call format.
     std::vector<std::string> openers;
     if (has_tools) openers = chat_codec_ ? chat_codec_->tool_call_openers() : tool_call_openers(req.tools);
+
+    const bool is_custom = has_custom && !must_call;
     std::string grammar;
-    try {
-        grammar = http_detail::output_constraint_grammar(
-            must_call ? nlohmann::ordered_json() : schema, openers);
-    } catch (const std::exception & e) {
-        send_error(fd, 400, std::string("response_format: ") + e.what());
-        return false;
+    if (is_custom) {
+        grammar = std::move(custom_grammar);
+    } else {
+        try {
+            grammar = http_detail::output_constraint_grammar(
+                must_call ? nlohmann::ordered_json() : schema, openers);
+        } catch (const std::exception & e) {
+            send_error(fd, 400, std::string("response_format: ") + e.what());
+            return false;
+        }
     }
+
     auto matcher = gbnf::Matcher::compile(grammar, "root", error);
     if (!matcher) {
-        send_error(fd, 400, "response_format: " + error);
+        send_error(fd, 400, (is_custom ? "grammar: " : "response_format: ") + error);
         return false;
     }
     OutputConstraint::Options options;
@@ -3071,6 +3112,12 @@ bool HttpServer::parse_common_request_fields(
     req.stream = body.value("stream", false);
     req.model = config_.model_name;
     req.disk_cache_policy = config_.disk_cache_policy;
+
+    std::string grammar_error;
+    if (!parse_grammar_from_body(body, req.custom_grammar, req.has_custom_grammar, grammar_error)) {
+        send_error(fd, 400, grammar_error);
+        return false;
+    }
 
     // Accept the output-token names used by each supported API dialect.
     // Default when the client omits all three: --default-max-tokens, so
