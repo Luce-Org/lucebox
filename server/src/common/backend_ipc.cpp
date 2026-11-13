@@ -186,6 +186,13 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         argv_storage.emplace_back("--stream-fd=" +
                                   std::to_string(stream_pipe[1]));
 
+        // Apply any per-daemon environment overrides (e.g. GPU visibility
+        // pinning) in the child before exec, so the parent's own environment is
+        // untouched.
+        for (const auto & kv : cfg.child_env) {
+            ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
+        }
+
         std::vector<char *> argv;
         argv.reserve(argv_storage.size() + 1);
         for (std::string & arg : argv_storage) argv.push_back(arg.data());
