@@ -1844,6 +1844,26 @@ void Qwen35Backend::release_scratch() {
                  trimmed / (1024.0 * 1024.0));
 }
 
+void Qwen35Backend::trim_pools_at_ar_handoff(const char * reason) {
+    // Nothing trims the legacy pool while a reply decodes, and the tile FA
+    // kernel's f16 K/V copies grow with the context, so a long reply leaves
+    // 1-2 GiB of smaller blocks cached. The handoff's differently shaped graphs
+    // (prefix replay, then single-token decode) then need a block none of them
+    // can serve, and the driver has no VRAM left for it.
+    size_t trimmed = 0;
+    if (ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+        trimmed += ggml_backend_cuda_trim_pool(target_backend_);
+    }
+    if (draft_backend_ && draft_backend_ != target_backend_ &&
+        ggml_backend_cuda_has_legacy_pool(draft_backend_)) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+    if (trimmed > 0) {
+        std::fprintf(stderr, "[vram] %s: spec->AR handoff trimmed %.1f MiB from device pools\n",
+                     reason, trimmed / (1024.0 * 1024.0));
+    }
+}
+
 // ── Generate (speculative decode) ───────────────────────────────────────
 
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
@@ -3776,6 +3796,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 "switching to AR\n",
                 last_tok, (int)out_tokens.size());
             step_graph_destroy(draft_sg);
+            trim_pools_at_ar_handoff("invalid-seed");
             cache_.last_tok = out_tokens.back();
             if (!finish_speculative_state()) return false;
             bool ok = do_ar_decode(committed, budget, out_tokens, io,
@@ -4817,6 +4838,9 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
         int injected = 0;
+        if (floor_to_ar || budget_close_fired) {
+            trim_pools_at_ar_handoff(floor_to_ar ? "floor" : "budget-close");
+        }
         if (floor_to_ar) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);

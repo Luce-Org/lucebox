@@ -466,6 +466,10 @@ private:
                    const std::vector<int> & restore_points = {},
                    const std::vector<int32_t> * full_prompt = nullptr);
 
+    // Returns the legacy (non-VMM) device pools' cached blocks to the driver
+    // when spec decode hands over to plain decode.
+    void trim_pools_at_ar_handoff(const char * reason);
+
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // The generation's controller observes every emitted token, including the
     // first seed. A forced close cuts the verified block, restores/replays the
