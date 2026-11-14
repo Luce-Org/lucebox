@@ -530,6 +530,9 @@ private:
                                    int committed_cut, size_t resident_bytes,
                                    bool protect);
     void abort_inline_reservation(InlineReservation & reservation);
+    // Drops the further entries the reservation's resident-budget plan
+    // evicts. Their payloads left RAM in KvCache::clear_for_capture.
+    void erase_extra_victims(const InlineReservation & reservation);
     void replace_inline_entry(int slot, int target_cut,
                               const std::vector<int32_t> & prompt_ids,
                               bool protect, size_t resident_bytes);

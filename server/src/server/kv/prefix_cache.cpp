@@ -930,23 +930,7 @@ bool PrefixCache::commit_inline_reservation(
     // The further entries its plan evicts, before the slot's own victim:
     // an edit backup leaves while its deeper snapshot is still resident, so
     // it is not written to disk (persist_on_evict).
-    if (const ActiveReservation * active = find_active_reservation(reservation.id_)) {
-        size_t evicted = 0, freed = 0;
-        for (size_t i = 0; i < active->extra_victims.size(); ++i) {
-            const int idx = find_entry(active->extra_victims[i]);
-            if (idx < 0 || entries_[(size_t)idx].slot != active->extra_slots[i]) continue;
-            ++evicted;
-            freed += entries_[(size_t)idx].resident_bytes;
-            record_eviction(idx);
-            erase_inline_entry(idx);
-        }
-        if (evicted > 0) {
-            std::fprintf(stderr,
-                "[pc] resident budget evicted %zu snapshot(s), %zu MiB, for "
-                "capture slot=%d\n",
-                evicted, freed / (1024 * 1024), reservation.slot_);
-        }
-    }
+    erase_extra_victims(reservation);
     if (reservation.has_victim_) {
         const int victim = find_entry(reservation.victim_);
         if (victim >= 0) {
@@ -968,6 +952,7 @@ void PrefixCache::abort_inline_reservation(
         reservation.clear();
         return;
     }
+    erase_extra_victims(reservation);
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
         if (entries_[(size_t)i].slot == reservation.slot_) {
             erase_inline_entry(i);
@@ -975,6 +960,26 @@ void PrefixCache::abort_inline_reservation(
     }
     release_inline_reservation(reservation.id_);
     reservation.clear();
+}
+
+void PrefixCache::erase_extra_victims(const InlineReservation & reservation) {
+    const ActiveReservation * active = find_active_reservation(reservation.id_);
+    if (!active) return;
+    size_t evicted = 0, freed = 0;
+    for (size_t i = 0; i < active->extra_victims.size(); ++i) {
+        const int idx = find_entry(active->extra_victims[i]);
+        if (idx < 0 || entries_[(size_t)idx].slot != active->extra_slots[i]) continue;
+        ++evicted;
+        freed += entries_[(size_t)idx].resident_bytes;
+        record_eviction(idx);
+        erase_inline_entry(idx);
+    }
+    if (evicted > 0) {
+        std::fprintf(stderr,
+            "[pc] resident budget evicted %zu snapshot(s), %zu MiB, for "
+            "capture slot=%d\n",
+            evicted, freed / (1024 * 1024), reservation.slot_);
+    }
 }
 
 void PrefixCache::confirm_inline_snap(

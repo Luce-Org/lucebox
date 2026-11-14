@@ -253,6 +253,11 @@ struct SchedulerTestHarness {
 
     // What prepare_generation_cache does with a reservation's slot before
     // the new snapshot overwrites it.
+    static void clear_for_capture(HttpServer & server,
+                                  const PrefixCache::InlineReservation & reservation) {
+        server.kv_cache_.clear_for_capture(reservation);
+    }
+
     static void evict_inline_slot(HttpServer & server, int slot) {
         server.kv_cache_.evict(slot, "ram eviction");
         server.backend_.snapshot_free(slot);
@@ -5263,7 +5268,9 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_evicts_several_for_large_c
         TEST_ASSERT(cache.lookup_candidate(next, (int)next.size()).second == (int)big.size());
     }
     {
-        // A capture that fails or is cancelled evicts none of them.
+        // A cancelled capture evicts none of them. A capture is aborted only
+        // after KvCache::clear_for_capture freed its planned victims, so the
+        // abort drops them from the index too.
         PrefixCache cache(8, tokenizer, 1000);
         cache.set_record_evictions(true);
         std::vector<int> slots;
@@ -5272,11 +5279,12 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_evicts_several_for_large_c
         TEST_ASSERT(r.active() && r.extra_victim_slots().size() == 3);
         r.cancel();
         TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        TEST_ASSERT(cache.take_evicted().empty());
         r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(700));
         TEST_ASSERT(r.active());
         r.abort();
-        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
-        TEST_ASSERT(cache.take_evicted().empty());
+        TEST_ASSERT(cache.stats().in_use == 1 && cache.stats().resident_bytes == 200);
+        TEST_ASSERT(cache.take_evicted().size() == 3);
     }
     {
         // Larger than the whole budget: skipped, nothing evicted.
@@ -15029,7 +15037,7 @@ int commit_turn(HttpServer & server, DiskPayloadBackend & backend,
         restore_slot, [&](int tokens) { return backend.snapshot_bytes_estimate(tokens); });
     if (!reservation.active()) return -1;
     const int slot = reservation.slot();
-    SchedulerTestHarness::evict_inline_slot(server, slot);
+    SchedulerTestHarness::clear_for_capture(server, reservation);
     backend.put(slot, (int)prompt.size());
     SchedulerTestHarness::finalize_inline_snapshot(
         server, prompt, std::move(reservation), slot, (int)prompt.size(),
@@ -15783,7 +15791,9 @@ TEST_CASE(ServerUnitFixture, test_disk_session_ram_eviction_writes_and_restores)
         TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
         TEST_ASSERT(prepared.prefix_len == (int)a.size());
         disk.drain();
-        TEST_ASSERT(disk.stats().writes == 1 && disk.stats().pending_files == 0);
+        // a, then b and c: this turn's 7-token capture needs both out of RAM
+        // before it is saved.
+        TEST_ASSERT(disk.stats().writes == 3 && disk.stats().pending_files == 0);
     }
     rm_rf(dir);
     unlink(path.c_str());
@@ -15842,6 +15852,110 @@ TEST_CASE(ServerUnitFixture, test_disk_session_large_capture_evicts_several_to_d
         TEST_ASSERT(prepared.prefix_len == 4);
     }
     rm_rf(dir);
+    unlink(path.c_str());
+}
+
+namespace {
+
+// Refuses a save that would take its resident snapshots past a byte
+// allowance, as Qwen4ExpBackend::snapshot_fits does.
+struct SaveAllowanceBackend : DiskPayloadBackend {
+    size_t allowance = 0;
+    size_t resident_bytes(int except = -1) const {
+        size_t total = 0;
+        for (const auto & [slot, p] : slots) {
+            if (slot != except) total += snapshot_bytes_estimate(p.pos);
+        }
+        return total;
+    }
+    bool snapshot_save(int slot) override {
+        return resident_bytes(slot) + snapshot_bytes_estimate(live_position) <= allowance &&
+               DiskPayloadBackend::snapshot_save(slot);
+    }
+};
+
+// Four 4-token turns resident (1400 bytes each), then an agent turn saved at
+// 43 tokens (5300 bytes): a 7000-byte budget evicts the three oldest for it.
+struct SeveralVictims {
+    std::vector<std::vector<int32_t>> small = {
+        {1, 100, 3, 101}, {1, 200, 3, 201}, {1, 300, 3, 301}, {1, 400, 3, 401}};
+    std::vector<int32_t> prompt, generated, canonical;
+    std::vector<int> slots;
+    SeveralVictims() {
+        prompt = {1, 900, 3};
+        prompt.insert(prompt.end(), 30, 901);
+        generated.assign(10, 902);
+        canonical = prompt;
+        canonical.insert(canonical.end(), generated.begin(), generated.end());
+        canonical.push_back(7);
+    }
+    bool save_big_turn(HttpServer & server, SaveAllowanceBackend & backend) {
+        for (const auto & ids : small) slots.push_back(commit_turn(server, backend, ids));
+        backend.live_position = (int) canonical.size() - 1;
+        return SchedulerTestHarness::save_generated_turn(server, prompt, generated, canonical);
+    }
+};
+
+ServerConfig several_victims_config() {
+    ServerConfig config;
+    config.prefix_cache_cap = 8;
+    config.prefix_cache_max_bytes = 7000;
+    return config;
+}
+
+}  // namespace
+
+// The backend checks its allowance when it saves, so every victim the plan
+// counted on must be gone by then (qwen4exp on 2026-11-13: once 8k turns were
+// resident, no 32k turn was ever saved).
+TEST_CASE(ServerUnitFixture, test_capture_evicting_several_fits_backend_allowance) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    {
+        auto backend_owner = std::make_unique<SaveAllowanceBackend>();
+        SaveAllowanceBackend & backend = *backend_owner;
+        backend.allowance = 7000;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, several_victims_config());
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        SeveralVictims s;
+        TEST_ASSERT(s.save_big_turn(server, backend));
+        TEST_ASSERT(cache.stats().resident_bytes == 1400 + 5300);
+        TEST_ASSERT(backend.resident_bytes() == 1400 + 5300);
+        for (int i = 0; i < 3; ++i) {
+            TEST_ASSERT(!backend.snapshot_used(s.slots[i]));
+            TEST_ASSERT(cache.lookup_candidate(s.small[i], 4).first < 0);
+        }
+        TEST_ASSERT(cache.lookup_candidate(s.small[3], 4).first == s.slots[3]);
+        std::vector<int32_t> next = s.canonical;
+        next.insert(next.end(), {8, 9});
+        TEST_ASSERT(cache.lookup(next).second == (int) s.canonical.size() - 1);
+    }
+    unlink(path.c_str());
+}
+
+// A capture that fails anyway leaves no index entry pointing at a victim
+// whose payload already left RAM.
+TEST_CASE(ServerUnitFixture, test_failed_capture_keeps_index_and_payloads_in_step) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    {
+        auto backend_owner = std::make_unique<SaveAllowanceBackend>();
+        SaveAllowanceBackend & backend = *backend_owner;
+        backend.allowance = 5000;  // under 1400 + 5300: the save fails after the evictions
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, several_victims_config());
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        SeveralVictims s;
+        TEST_ASSERT(!s.save_big_turn(server, backend));
+        for (size_t i = 0; i < s.small.size(); ++i) {
+            const bool listed = cache.lookup_candidate(s.small[i], 4).first >= 0;
+            TEST_ASSERT(listed == backend.snapshot_used(s.slots[i]));
+        }
+        TEST_ASSERT(cache.stats().resident_bytes == backend.resident_bytes());
+    }
     unlink(path.c_str());
 }
 

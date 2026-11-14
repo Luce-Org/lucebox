@@ -1055,6 +1055,9 @@ Checkpoint KvCache::clear_for_capture(const PrefixCache::InlineReservation & res
     const Checkpoint checkpoint = Checkpoint::of_cache_slot(reservation.slot());
     evict(reservation.slot(), "ram eviction");
     checkpoints_.free(checkpoint);
+    // A backend can check its own allowance when it saves (qwen4exp's
+    // snapshot_fits), so every victim the plan counted on goes now.
+    evict_extra_victims(reservation);
     return checkpoint;
 }
 
@@ -1062,7 +1065,6 @@ void KvCache::commit_capture(PrefixCache::InlineReservation & reservation,
                              const std::vector<int32_t> & ids, int saved_pos,
                              bool key_at_saved, bool prune) {
     const int slot = reservation.slot();
-    evict_extra_victims(reservation);
     const size_t bytes = checkpoints_.estimate_bytes(saved_pos);
     if (key_at_saved) {
         reservation.commit_at(ids, saved_pos, bytes);
