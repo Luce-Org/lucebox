@@ -41,7 +41,10 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       slots_(pool_, max_ctx),
       prefill_granule_(std::max(prefill_granule, 1)),
       prefix_allowance_(prefix_allowance),
-      checkpoints_((size_t)kPrefixCheckpoints),
+      own_checkpoints_((size_t)kPrefixCheckpoints),
+      own_displaced_((size_t)kPrefixCheckpoints),
+      checkpoints_(own_checkpoints_.data()),
+      displaced_(own_displaced_.data()),
       prefill_cuts_(caches_.size()),
       mtp_slot_(verify_width != 1 && !caches_.empty() && caches_[0] &&
                 qwen4exp_verify_supported(*caches_[0]) ? 0 : -1),
@@ -56,10 +59,20 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     next_inputs_.clear();   // waits for any lookahead gather still running
     ggml_backend_synchronize(backend_);
-    for (Qwen4ExpSnapshot & checkpoint : checkpoints_) free_qwen4exp_snapshot(checkpoint);
+    for (Qwen4ExpSnapshot & checkpoint : own_checkpoints_) free_qwen4exp_snapshot(checkpoint);
+    for (Qwen4ExpSnapshot & checkpoint : own_displaced_) free_qwen4exp_snapshot(checkpoint);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
     clear_qwen4exp_batched_decode_workspace(verify_workspace_);
     for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
+}
+
+void Qwen4ExpSeqEngine::use_backend_snapshots(Qwen4ExpSnapshot * checkpoints, Qwen4ExpSnapshot * displaced) {
+    for (int i = 0; i < kPrefixCheckpoints; ++i) {
+        free_qwen4exp_snapshot(own_checkpoints_[(size_t)i]);
+        free_qwen4exp_snapshot(own_displaced_[(size_t)i]);
+    }
+    checkpoints_ = checkpoints;
+    displaced_ = displaced;
 }
 
 bool Qwen4ExpSeqEngine::mtp_capable(int slot) const {
@@ -612,11 +625,15 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
         return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - started).count();
     };
-    // The capture replaces checkpoint `index`; every other resident one counts against the allowance.
+    // The capture replaces checkpoint `index`; every other resident one counts against the allowance, and so do the
+    // replaced ones the scheduler has not claimed yet. The one `index` replaced before is freed now.
+    free_qwen4exp_snapshot(displaced_[index]);
     size_t resident = 0;
-    for (size_t i = 0; i < checkpoints_.size(); ++i)
+    for (size_t i = 0; i < (size_t)kPrefixCheckpoints; ++i) {
         if (i != (size_t)index && checkpoints_[i].buf)
             resident += ggml_backend_buffer_get_size(checkpoints_[i].buf);
+        if (displaced_[i].buf) resident += ggml_backend_buffer_get_size(displaced_[i].buf);
+    }
     const size_t need = estimate_prefix_store_bytes(ticket.checkpoint.tokens);
     if (!need || resident > prefix_allowance_ || need > prefix_allowance_ - resident) {
         event.elapsed_us = elapsed_us();
@@ -624,8 +641,12 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
         return event;
     }
     Qwen4ExpSnapshot & s = checkpoints_[(size_t)index];
+    // The checkpoint this capture replaces waits for the scheduler, which writes it to disk when it is worth keeping.
+    if (s.buf) std::swap(s, displaced_[index]);
     if (!save_qwen4exp_snapshot(backend_, store_, *caches_[(size_t)slot], s)) {
+        // A failed capture leaves the checkpoint it would have replaced, as the scheduler's index does.
         free_qwen4exp_snapshot(s);
+        std::swap(s, displaced_[index]);
         event.elapsed_us = elapsed_us();
         event.error = "qwen4exp prefix capture failed";
         return event;
@@ -755,6 +776,8 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     if (!backend_ ||
         (int)plan.decode.size() != slots_.decoding_count())
         return fail("qwen4exp decode plan does not cover live slots");
+    // A replaced checkpoint the scheduler did not claim after the last step (a capture it could not match) goes now.
+    for (int i = 0; i < kPrefixCheckpoints; ++i) free_qwen4exp_snapshot(displaced_[i]);
 
     std::vector<uint8_t> seen((size_t)n, 0);
     for (const StepInput & input : plan.decode) {

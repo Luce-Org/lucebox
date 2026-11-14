@@ -200,11 +200,14 @@ its earlier tool calls (ToolMemory, which a new process does not have). Each
 file stores that replay text and startup loads it back into ToolMemory.
 
 **Budget.** Every layout directory under the cache directory is indexed, also
-files of another model or KV type, so the cap covers the whole directory. The
-budget never exceeds the cache's bytes plus the free space minus a reserve
-(the larger of 1 GiB and 5% of the disk, at most 16 GiB). Before a write the
-least recently used files are deleted until the new file fits. A hit rewrites
-the file's `last_used` field in place, so LRU order survives restarts.
+files of another model, KV type or server, so the cap covers the whole
+directory. The budget never exceeds the cache's bytes plus the free space
+minus a reserve (the larger of 1 GiB and 5% of the disk, at most 16 GiB).
+When a write is queued, this server's least recently used files are deleted
+until it fits; before it is renamed into place, the writer merges the
+directory (see *Several servers*) and deletes the least recently used files
+of any model until the directory fits. A hit rewrites the file's `last_used`
+field in place, so LRU order survives restarts and other servers see it.
 
 **TTL.** A file unused for longer than `--kv-cache-ttl` hours is deleted at
 startup, before each write, and when a lookup meets it.
@@ -214,7 +217,8 @@ startup, before each write, and when a lookup meets it.
 - Format v5 ends with an XXH64 checksum of the whole file (the header with
   `last_used` zeroed). A hit verifies it while reading: a corrupt or partial
   file is a logged miss, it is deleted and the prompt is prefilled. Startup
-  deletes leftover `.tmp` files, files of older formats and truncated files.
+  deletes leftover `.tmp` files nobody writes, files of older formats and
+  truncated files.
 - A file is restored only when its identity matches: model path, size, mtime
   and a content fingerprint (SHA-1 of the first and last MiB), KV cache types,
   K rotation, `--max-ctx`, chat template and draft model, plus the snapshot's
@@ -222,11 +226,36 @@ startup, before each write, and when a lookup meets it.
   live cache (the paged restore against the page table too).
 - Each file stores the exact key token ids; a hit compares them with the
   prompt.
-- One process per directory: startup takes an exclusive lock on
-  `<dir>/.lock`. The models of one process share the directory's store
-  (`DiskStore`: one index, one writer, one budget and TTL), each restoring
-  only the files its own identity wrote; a second process on the same
-  directory runs without a disk cache and logs it.
+- The models of one process share the directory's store (`DiskStore`: one
+  index, one writer, one budget and TTL), each restoring only the files its
+  own identity wrote. Other servers can share the directory too (below).
+
+**Several servers.** Servers on one machine share one cache directory, one
+budget and one TTL (POSIX; on Windows the first server keeps the directory
+and the others run without a disk cache):
+
+- Each holds a shared lock on `<dir>/.lock` for its lifetime. An older
+  server, which takes it exclusively, keeps newer ones off, and is kept off
+  by them (both log it).
+- Each model identity is served by one server at a time
+  (`<dir>/.identity-<salt>.lock`): its files, pins file and views are its
+  alone, so no two servers write the same file. A second server of the same
+  model and settings runs without a disk cache and logs it.
+- Before a write is renamed into place, the writer thread takes
+  `<dir>/.index.lock` and merges the directory into its index: the files
+  other servers wrote, the ones they deleted, and their `last_used` times.
+  The TTL and the budget then apply to the whole directory, and the file is
+  renamed. Only the writer thread deletes other servers' files, right after
+  that merge; a request never waits on another server.
+- A file another server deletes while it is being read stays readable to
+  the end; one deleted earlier is a miss (`is gone`) and leaves the index.
+- A temporary file is locked while it is written, so a server starting up
+  removes only temporaries nobody writes.
+- Each server keeps the whole directory within its own `--kv-cache-budget`
+  and `--kv-cache-ttl`: with different values, the smaller one wins once
+  that server writes. Queued writes count for the server that queued them
+  only, so the directory exceeds the budget by at most the files being
+  written at that moment.
 
 **Without RAM slots.** With `--prefix-cache-slots 0` nothing leaves RAM, so
 nothing new is written; the entries already on disk are still served. Only
@@ -235,8 +264,18 @@ The `auto` scope and the cold-head and continued checkpoints this mode used
 to write are retired; `auto` and `auto:N` read as `full`, and
 `--kv-cache-interval` is accepted and ignored.
 
+**Engines.** Concurrent engines keep their checkpoints in the backend's
+snapshot slots (Qwen paged, `qwen4exp`), where the disk cache writes and
+reads them. A capture keeps the checkpoint it replaces aside until the
+scheduler claims it: written when worth keeping, freed otherwise. A backend
+whose snapshots are not plain ggml tensors packs them itself
+(`ModelBackend::snapshot_exports`): `qwen4exp` stores its snapshot buffer as
+one tensor and its host fields (positions, tokens, draft state, logits, each
+strip's place) as another, hands a snapshot in system memory to the writer
+without a copy, and keeps a disk read in place.
+
 **Not covered.** Single-sequence `--paged-attention` keeps no snapshots, and
-the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
+the concurrent DeepSeek4 engine keeps its checkpoints outside the backend's
 snapshot slots: both run without a disk cache (logged at startup).
 
 **Cache-aware admission.** PFlash's admission counts the deeper of the RAM

@@ -29,6 +29,7 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -379,6 +380,10 @@ DiskStore::~DiskStore() {
 #if defined(_WIN32)
     if (lock_handle_) CloseHandle(lock_handle_);
 #else
+    for (auto & held : identities_) {
+        if (held.second.fd >= 0) ::close(held.second.fd);
+    }
+    if (index_fd_ >= 0) ::close(index_fd_);
     if (lock_fd_ >= 0) ::close(lock_fd_);
 #endif
 }
@@ -392,6 +397,66 @@ static bool has_suffix(const std::string & s, const char * suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
+// The size of an open file.
+static bool open_file_size(FILE * f, uint64_t & size) {
+#if defined(_WIN32)
+    const __int64 n = _filelengthi64(_fileno(f));
+    if (n < 0) return false;
+    size = (uint64_t)n;
+    return true;
+#else
+    struct stat st{};
+    if (::fstat(fileno(f), &st) != 0) return false;
+    size = (uint64_t)st.st_size;
+    return true;
+#endif
+}
+
+// Open a temporary file for writing, locked for as long as it stays open
+// (POSIX): another server's start-up leaves it alone.
+static FILE * open_locked_temp(const std::string & path) {
+#if defined(_WIN32)
+    return std::fopen(path.c_str(), "wb");
+#else
+    int fd = -1;
+    // Another server's start-up may remove the file between the open and the
+    // lock: then lock the one created after it.
+    for (int attempt = 0; attempt < 3 && fd < 0; ++attempt) {
+        fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return nullptr;
+        struct stat opened{}, named{};
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            ::close(fd);
+            return nullptr;
+        }
+        if (::fstat(fd, &opened) != 0 || ::stat(path.c_str(), &named) != 0 ||
+            opened.st_ino != named.st_ino || opened.st_dev != named.st_dev) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+    if (fd < 0) return nullptr;
+    FILE * f = ::fdopen(fd, "wb");
+    if (!f) ::close(fd);
+    return f;
+#endif
+}
+
+// Remove a leftover temporary file unless a writer holds it.
+static bool remove_stale_temp(const std::string & path) {
+#if defined(_WIN32)
+    std::error_code ec;
+    return fs::remove(path, ec);
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool removed = false;
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) removed = ::unlink(path.c_str()) == 0;
+    ::close(fd);
+    return removed;
+#endif
+}
+
 // Validate a snapshot file without reading tensor data: header, version,
 // tensor table, payload sum and exact file size. A file cut short by a crash
 // or a full disk, or written by an older format, fails here. Bit corruption
@@ -400,11 +465,15 @@ static bool validate_snapshot_file(const std::string & path,
                                    DiskCacheHeader & hdr,
                                    uint64_t & file_size,
                                    const char *& why) {
-    std::error_code ec;
-    file_size = (uint64_t) fs::file_size(path, ec);
-    if (ec) { why = "unreadable size"; return false; }
     FILE * f = std::fopen(path.c_str(), "rb");
     if (!f) { why = "unreadable"; return false; }
+    // The size of the file opened, which another server may unlink or
+    // replace meanwhile; the open file stays readable.
+    if (!open_file_size(f, file_size)) {
+        std::fclose(f);
+        why = "unreadable size";
+        return false;
+    }
     bool ok = false;
     do {
         uint8_t raw[DISK_CACHE_HEADER_SIZE];
@@ -489,17 +558,26 @@ std::shared_ptr<DiskStore> DiskStore::open(const DiskCacheConfig & config,
     store->free_space_ = std::move(free_space);
     if (!store->lock_dir()) {
         std::fprintf(stderr,
-                     "[disk-cache] disabled: cannot lock %s (in use or not writable) "
-                     "(pass --kv-cache-dir <other dir> to give this one its own)\n",
+                     "[disk-cache] disabled: cannot lock %s (held by an older server, "
+                     "or not writable) (pass --kv-cache-dir <other dir> to give this one "
+                     "its own)\n",
                      config.cache_dir.c_str());
         return {};
     }
     {
+        const bool index_locked = store->lock_index();
         std::lock_guard<std::mutex> lock(store->mu_);
         store->scan_all();
-        // Budget and TTL hold from the first moment, before any request.
-        store->expire_locked();
-        (void)store->make_room_locked(0);  // over it with pins alone: they stay
+        if (index_locked) {
+            // Budget and TTL hold from the first moment, before any request.
+            store->expire_locked();
+            (void)store->make_room_locked(0);  // over it with pins alone: they stay
+            store->unlock_index();
+        } else {
+            std::fprintf(stderr, "[disk-cache] %s/.index.lock is held by another server: "
+                         "the TTL and the budget apply at this server's first write\n",
+                         config.cache_dir.c_str());
+        }
     }
     store->writer_ = std::thread([raw = store.get()] { raw->writer_loop(); });
     registry[key] = store;
@@ -516,14 +594,79 @@ bool DiskStore::lock_dir() {
     const bool locked = lock_handle_ != INVALID_HANDLE_VALUE;
     if (!locked) lock_handle_ = nullptr;
 #else
+    // Shared: every server of this format uses the directory together. An
+    // older server takes it exclusively, which keeps both sides apart.
     lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    const bool locked = lock_fd_ >= 0 && ::flock(lock_fd_, LOCK_EX | LOCK_NB) == 0;
+    bool locked = lock_fd_ >= 0 && ::flock(lock_fd_, LOCK_SH | LOCK_NB) == 0;
+    if (locked) {
+        const std::string index_path = config_.cache_dir + "/.index.lock";
+        index_fd_ = ::open(index_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        locked = index_fd_ >= 0;
+    }
     if (!locked && lock_fd_ >= 0) {
         ::close(lock_fd_);
         lock_fd_ = -1;
     }
 #endif
     return locked;
+}
+
+bool DiskStore::lock_index() {
+#if !defined(_WIN32)
+    if (index_fd_ < 0) return true;
+    // A peer holds it for a scan and a rename; a stopped or stuck peer would
+    // hold it for good, so give up after a while, or when drain() aborts.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kIndexLockSeconds);
+    while (::flock(index_fd_, LOCK_EX | LOCK_NB) != 0) {
+        if ((errno != EWOULDBLOCK && errno != EINTR) || abort_write_.load() ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+#endif
+    return true;
+}
+
+void DiskStore::unlock_index() {
+#if !defined(_WIN32)
+    if (index_fd_ >= 0) (void)::flock(index_fd_, LOCK_UN);
+#endif
+}
+
+bool DiskStore::hold_identity(const std::array<uint8_t, 16> & salt) {
+    std::lock_guard<std::mutex> lock(mu_);
+    HeldIdentity & held = identities_[salt];
+    if (held.models > 0) {
+        ++held.models;
+        return true;
+    }
+#if !defined(_WIN32)
+    const std::string path = config_.cache_dir + "/.identity-" + hex_string(salt.data(), 16) + ".lock";
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) ::close(fd);
+        identities_.erase(salt);
+        return false;
+    }
+    held.fd = fd;
+#endif
+    held.models = 1;
+    return true;
+}
+
+void DiskStore::release_identity(const std::array<uint8_t, 16> & salt) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = identities_.find(salt);
+    if (it == identities_.end() || --it->second.models > 0) return;
+#if !defined(_WIN32)
+    if (it->second.fd >= 0) ::close(it->second.fd);
+#endif
+    identities_.erase(it);
+}
+
+bool DiskStore::local_locked(const DiskEntry & e) const {
+    return identities_.count(e.salt) != 0;
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────
@@ -544,9 +687,10 @@ void DiskStore::scan_all() {
             const std::string path = se.path().string();
             std::error_code rec;
             if (has_suffix(name, ".dkv.tmp")) {
-                // A write the previous process never renamed into place.
-                fs::remove(path, rec);
-                ++removed;
+                // A write a server never renamed into place (one still being
+                // written holds its lock).
+                if (remove_stale_temp(path)) ++removed;
+                else kept_any = true;
                 continue;
             }
             if (!has_suffix(name, ".dkv")) continue;
@@ -588,6 +732,85 @@ void DiskStore::scan_all() {
                  entries_.size(), mib(total_bytes_), removed);
 }
 
+// ─── Other servers' files ───────────────────────────────────────────────
+
+std::vector<DiskStore::ScannedFile> DiskStore::scan_files() const {
+    std::vector<ScannedFile> out;
+    std::error_code ec;
+    for (const auto & de : fs::directory_iterator(config_.cache_dir, ec)) {
+        const std::string base = de.path().filename().string();
+        std::error_code dec;
+        if (base.empty() || base[0] == '.' || !de.is_directory(dec)) continue;
+        std::error_code sec;
+        for (const auto & se : fs::directory_iterator(de.path(), sec)) {
+            const std::string name = se.path().filename().string();
+            if (!has_suffix(name, ".dkv")) continue;
+            ScannedFile file;
+            file.path = se.path().string();
+            FILE * f = std::fopen(file.path.c_str(), "rb");
+            if (!f) continue;  // deleted meanwhile
+            const bool ok = open_file_size(f, file.size) && read_header(f, file.hdr) &&
+                std::memcmp(file.hdr.magic, "DKVC", 4) == 0 &&
+                file.hdr.version == DISK_CACHE_VERSION;
+            std::fclose(f);
+            if (ok) out.push_back(std::move(file));
+        }
+    }
+    return out;
+}
+
+void DiskStore::merge_locked(const std::vector<ScannedFile> & files) {
+    std::map<std::string, size_t> by_path;
+    for (size_t i = 0; i < entries_.size(); ++i) by_path.emplace(entries_[i].path, i);
+    std::vector<bool> seen(entries_.size(), false);
+    size_t added = 0, gone = 0;
+    for (const ScannedFile & file : files) {
+        const auto it = by_path.find(file.path);
+        if (it != by_path.end()) {
+            seen[it->second] = true;
+            DiskEntry & e = entries_[it->second];
+            // This process's own files keep its in-memory times (it touches
+            // them); another server's file reads as it stored them.
+            if (e.pending || local_locked(e)) continue;
+            e.last_used = file.hdr.last_used & ~DISK_CACHE_PINNED_BIT;
+            e.pinned = (file.hdr.last_used & DISK_CACHE_PINNED_BIT) != 0;
+            if (e.file_size != file.size) {
+                total_bytes_ = total_bytes_ - std::min<size_t>(total_bytes_, e.file_size) + file.size;
+                e.file_size = file.size;
+            }
+            continue;
+        }
+        DiskEntry entry;
+        std::memcpy(entry.salt.data(), file.hdr.identity_salt, 16);
+        // Only another server's files are new to the index: one of this
+        // process's that it lacks was deleted after the scan.
+        if (local_locked(entry)) continue;
+        entry.id          = next_entry_id_++;
+        entry.path        = file.path;
+        std::memcpy(entry.token_hash.data(), file.hdr.token_hash, 16);
+        std::memcpy(entry.layout_id.data(), file.hdr.layout_id, 16);
+        entry.token_count = file.hdr.token_count;
+        entry.cur_pos     = file.hdr.cur_pos;
+        entry.last_used   = file.hdr.last_used & ~DISK_CACHE_PINNED_BIT;
+        entry.pinned      = (file.hdr.last_used & DISK_CACHE_PINNED_BIT) != 0;
+        entry.file_size   = file.size;
+        total_bytes_ += entry.file_size;
+        entries_.push_back(std::move(entry));
+        ++added;
+    }
+    // Files another server deleted (queued writes are not on disk yet).
+    for (size_t i = seen.size(); i-- > 0;) {
+        if (seen[i] || entries_[i].pending) continue;
+        forget_entry_locked(i);
+        ++gone;
+    }
+    if (added || gone) {
+        std::fprintf(stderr, "[disk-cache] directory merged: %zu files of other servers added, "
+                     "%zu gone, %zu files %.1f MB in all\n",
+                     added, gone, entries_.size(), mib(total_bytes_));
+    }
+}
+
 // ─── Index maintenance ──────────────────────────────────────────────────
 
 bool DiskStore::expired(const DiskEntry & e, uint64_t t) const {
@@ -606,24 +829,25 @@ static uint64_t stored_last_used(const DiskStore::DiskEntry & e) {
     return e.last_used | (e.pinned ? DISK_CACHE_PINNED_BIT : 0);
 }
 
-static void rewrite_last_used(const DiskStore::DiskEntry & e) {
+// False when the file is gone (another server evicted it).
+static bool rewrite_last_used(const DiskStore::DiskEntry & e) {
     // Not fsynced: a crash may age an entry, but clean restarts retain uses.
-    if (FILE * f = std::fopen(e.path.c_str(), "r+b")) {
-        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) write_u64(f, stored_last_used(e));
-        std::fclose(f);
-    }
+    FILE * f = std::fopen(e.path.c_str(), "r+b");
+    if (!f) return errno != ENOENT;
+    if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) write_u64(f, stored_last_used(e));
+    std::fclose(f);
+    return true;
 }
 
-void DiskStore::touch_locked(DiskEntry & e) {
+bool DiskStore::touch_locked(DiskEntry & e) {
     e.last_used = now();
-    if (e.pending) return;  // the writer publishes the latest timestamp
-    rewrite_last_used(e);
+    return e.pending || rewrite_last_used(e);  // a queued write publishes the latest timestamp
 }
 
 void DiskStore::set_pinned_locked(DiskEntry & e, bool on) {
     if (e.pinned == on) return;
     e.pinned = on;
-    if (!e.pending) rewrite_last_used(e);
+    if (!e.pending) (void)rewrite_last_used(e);
 }
 
 void DiskStore::remove_entry(size_t idx, const char * why) {
@@ -647,9 +871,15 @@ void DiskStore::remove_entry(size_t idx, const char * why) {
     done_cv_.notify_all();
 }
 
-void DiskStore::expire_locked() {
+void DiskStore::forget_entry_locked(size_t idx) {
+    total_bytes_ -= std::min<size_t>(total_bytes_, entries_[idx].file_size);
+    entries_.erase(entries_.begin() + (long)idx);
+}
+
+void DiskStore::expire_locked(bool local_only) {
     const uint64_t t = now();
     for (size_t i = entries_.size(); i-- > 0;) {
+        if (local_only && !local_locked(entries_[i])) continue;
         if (!pinned_locked(entries_[i]) && expired(entries_[i], t)) {
             remove_entry(i, "ttl expired");
         }
@@ -725,12 +955,13 @@ DiskCacheStats DiskStore::stats() const {
     return out;
 }
 
-bool DiskStore::make_room_locked(uint64_t incoming) {
+bool DiskStore::make_room_locked(uint64_t incoming, bool local_only, uint64_t keep) {
     const uint64_t budget = budget_locked();
     while ((uint64_t)total_bytes_ + incoming > budget) {
         size_t lru = entries_.size();
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (pinned_locked(entries_[i])) continue;
+            if (pinned_locked(entries_[i]) || (keep && entries_[i].id == keep)) continue;
+            if (local_only && !local_locked(entries_[i])) continue;
             if (lru == entries_.size() || entries_[i].last_used < entries_[lru].last_used) {
                 lru = i;
             }
@@ -761,18 +992,50 @@ void DiskStore::writer_loop() {
 
         const std::string tmp_path = job->path + ".tmp";
         const std::string dir = fs::path(job->path).parent_path().string();
-        mkdir_p(dir);
         const auto t0 = std::chrono::steady_clock::now();
-        bool ok = write_file(tmp_path, *job);
-        const int err = ok ? 0 : errno;
+        // Held (and locked) until the rename: another server's start-up
+        // removes only temporaries nobody writes. A directory another
+        // server's start-up removed as empty is made again.
+        mkdir_p(dir);
+        FILE * f = open_locked_temp(tmp_path);
+        if (!f && errno == ENOENT && mkdir_p(dir)) f = open_locked_temp(tmp_path);
+        bool ok = f && write_file(f, *job);
+        int err = ok ? 0 : errno;
 
+        // Publish under the directory's index lock: the files of the other
+        // servers merged in, then the TTL and the budget over the whole
+        // directory (never this file), then the rename.
+        bool publish = ok && !abort_write_.load();
+        std::vector<ScannedFile> files;
+        if (publish && !lock_index()) {
+            publish = ok = false;
+            err = EWOULDBLOCK;   // another server holds the directory
+        }
+        if (publish) files = scan_files();
         lock.lock();
+        bool fits = true;
+        if (publish) {
+            merge_locked(files);
+            expire_locked();
+            if (find_entry_id(id) >= 0) fits = make_room_locked(0, false, id);
+        }
         const int at = find_entry_id(id);
+        if (ok && !fits) {
+            ok = false;
+            err = ENOSPC;
+        }
+#if defined(_WIN32)
+        // Windows renames and removes only closed files.
+        if (f) std::fclose(f);
+        f = nullptr;
+#endif
         if (ok && at >= 0 && !abort_write_.load()) {
             ok = std::rename(tmp_path.c_str(), job->path.c_str()) == 0;
-            if (ok) sync_directory(dir);
+            if (!ok) err = errno;
         }
         if (!ok || at < 0 || abort_write_.load()) std::remove(tmp_path.c_str());
+        if (f) std::fclose(f);
+        if (ok && at >= 0 && !abort_write_.load()) sync_directory(dir);
         if (at >= 0) {
             DiskEntry & e = entries_[(size_t)at];
             if (ok && !abort_write_.load()) {
@@ -792,11 +1055,17 @@ void DiskStore::writer_loop() {
             } else {
                 ++stats_.write_failures;
                 std::fprintf(stderr, "[disk-cache] write failed (%s): %s\n",
-                             abort_write_.load() ? "time limit" : std::strerror(err),
+                             abort_write_.load() ? "time limit"
+                             : !fits ? "no room beside the pinned files"
+                             : err == EWOULDBLOCK ? "another server holds .index.lock"
+                             : std::strerror(err),
                              e.path.c_str());
                 remove_entry((size_t)at, "write failed");
             }
         }
+        // After the header holds a pin set while writing: another server
+        // evicts only what it sees unpinned.
+        unlock_index();
         job.reset();  // frees the payload unless a lookup still copies it
         writing_id_ = 0;
         done_cv_.notify_all();
@@ -859,9 +1128,7 @@ int DiskStore::find_entry_id(uint64_t id) const {
 
 // ─── File I/O: Write ────────────────────────────────────────────────────
 
-bool DiskStore::write_file(const std::string & path, const PendingWrite & job) {
-    FILE * f = std::fopen(path.c_str(), "wb");
-    if (!f) return false;
+bool DiskStore::write_file(FILE * f, const PendingWrite & job) {
     ggml_context * ctx = job.snap.ctx();
 
     uint32_t n_tensors = 0;
@@ -922,7 +1189,6 @@ bool DiskStore::write_file(const std::string & path, const PendingWrite & job) {
     bool ok = w.ok && std::fwrite(&digest, 1, 8, f) == 8;
     // Durable before the rename publishes it.
     ok = ok && std::fflush(f) == 0 && sync_file(f);
-    ok = (std::fclose(f) == 0) && ok;
     return ok;
 }
 
@@ -933,16 +1199,23 @@ OwnedSnapshot DiskStore::read_file(const std::string & path,
                                    const std::array<uint8_t, 16> & layout_id,
                                    const std::array<uint8_t, 16> & salt) {
     FILE * f = std::fopen(path.c_str(), "rb");
-    if (!f) return {};
+    if (!f) {
+        if (errno == ENOENT) {
+            std::fprintf(stderr, "[disk-cache] %s is gone (another server evicted it)\n",
+                         path.c_str());
+        }
+        return {};
+    }
     const auto fail = [&](const char * why) {
         if (why) std::fprintf(stderr, "[disk-cache] rejecting %s: %s\n", path.c_str(), why);
         std::fclose(f);
         return OwnedSnapshot{};
     };
     HashedReader r{f, {}};
-    std::error_code ec;
-    const uint64_t file_size = fs::file_size(path, ec);
-    if (ec) return fail("unreadable size");
+    // The file opened: another server may unlink it meanwhile, and it stays
+    // readable to the end.
+    uint64_t file_size = 0;
+    if (!open_file_size(f, file_size)) return fail("unreadable size");
     uint8_t raw[DISK_CACHE_HEADER_SIZE];
     if (std::fread(raw, 1, sizeof(raw), f) != sizeof(raw)) return fail("short header");
     hash_header(r.sum, raw);

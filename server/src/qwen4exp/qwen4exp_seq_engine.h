@@ -32,7 +32,10 @@ struct Qwen4ExpRow;
 // snapshots, the same payload the single-slot path keeps) on `snapshot_store`,
 // the device or system memory, restorable into any slot of the same layout.
 // The scheduler owns their identities (1..kPrefixCheckpoints) and LRU policy;
-// the engine enforces the backend's byte allowance on capture. A checkpoint a
+// the engine enforces the backend's byte allowance on capture. Served by a
+// backend, they live in its snapshot slots (use_backend_snapshots), where the
+// disk session cache writes and reads them; a capture keeps the checkpoint it
+// replaces there until the scheduler claims it. A checkpoint a
 // deeper one supersedes can keep its point state alone (drop_prefix_kv) and
 // restores with the deeper one's rows (PrefixStorePlan::restore_kv).
 //
@@ -69,6 +72,10 @@ public:
     AdmitResult admit(uint64_t request_id, const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
     bool supports_prefix_store() const override { return prefix_allowance_ > 0; }
+    bool prefix_store_in_backend_snapshots() const override { return checkpoints_ != own_checkpoints_.data(); }
+    // Keep the checkpoints in the backend's snapshot slots and the ones captures replace beside them
+    // (kPrefixCheckpoints of each), from before the first admission on.
+    void use_backend_snapshots(Qwen4ExpSnapshot * checkpoints, Qwen4ExpSnapshot * displaced);
     size_t estimate_prefix_store_bytes(int tokens) const override;
     AdmitResult admit_with_prefix(uint64_t request_id, const std::vector<int32_t> & prompt,
                                   const SamplerCfg & sampler, const PrefixStorePlan & plan) override;
@@ -145,7 +152,12 @@ private:
     Qwen4ExpBatchedDecodeWorkspace decode_workspace_;
     int prefill_granule_;
     size_t prefix_allowance_;
-    std::vector<Qwen4ExpSnapshot> checkpoints_;
+    // kPrefixCheckpoints each: the checkpoints, and per checkpoint the one its last capture replaced, until the
+    // scheduler claims it (ModelBackend::snapshot_take_displaced) or the next step frees it. The engine's own, or
+    // the backend's (use_backend_snapshots).
+    std::vector<Qwen4ExpSnapshot> own_checkpoints_, own_displaced_;
+    Qwen4ExpSnapshot * checkpoints_ = nullptr;
+    Qwen4ExpSnapshot * displaced_ = nullptr;
     std::vector<std::vector<int>> prefill_cuts_;   // per slot: restore points, ascending
     int mtp_slot_ = -1;
     int verify_width_ = 1;
