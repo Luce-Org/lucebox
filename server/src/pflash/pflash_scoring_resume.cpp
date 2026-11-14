@@ -4,12 +4,20 @@
 
 namespace luce::pflash {
 
-static_assert(kScoringResumeGrid % kScoringUbatch == 0, "the resume grid must hold whole ubatches");
+static_assert(kScoringResumeGrid % kScoringUbatch == 0 && kScoringProjChunk % kScoringResumeGrid == 0,
+              "the resume grid holds whole ubatches and the projection chunk holds whole grid steps");
 
 int pflash_scoring_checkpoint(int S) {
     const int cut = S - kScoringCutBack;
     if (cut < kScoringResumeGrid) return 0;
     return cut / kScoringResumeGrid * kScoringResumeGrid;
+}
+
+int pflash_scoring_proj_begin(int resume) { return resume / kScoringProjChunk * kScoringProjChunk; }
+
+bool pflash_scoring_proj_rows_cover(int resume, int rows_begin, int rows) {
+    const int begin = pflash_scoring_proj_begin(resume);
+    return resume == begin || (rows_begin == begin && rows_begin + rows >= resume);
 }
 
 int pflash_scoring_exact_rows_end(int S) {
@@ -22,6 +30,28 @@ int pflash_scoring_resume(int checkpoint, int shared, int S, int cap) {
     if (checkpoint <= 0 || checkpoint % kScoringResumeGrid != 0) return 0;
     if (checkpoint > shared || checkpoint > S - kScoringCutBack || checkpoint > cap) return 0;
     return checkpoint;
+}
+
+PFlashResumePick pflash_pick_resume(const std::vector<PFlashResumeCandidate> & sessions,
+                                    const std::vector<int32_t> & ids, int cap) {
+    const int S = (int) ids.size();
+    const int S_padded = (S + 255) / 256 * 256;
+    PFlashResumePick best;
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        const PFlashResumeCandidate & c = sessions[i];
+        if (!c.usable || !c.ids || c.ids->empty()) continue;
+        const size_t n = std::min(c.ids->size(), ids.size());
+        const int shared = (int) (std::mismatch(c.ids->begin(), c.ids->begin() + (long) n, ids.begin()).first -
+                                  c.ids->begin());
+        int r = pflash_scoring_resume(c.checkpoint, shared, S, cap);
+        if (r > 0 && c.rows_cover) r = c.rows_cover(r, shared);
+        if (r <= 0) continue;
+        const bool grow = c.capacity < S_padded;
+        if (r > best.resume || (r == best.resume && best.needs_grow && !grow)) {
+            best = {(int) i, r, shared, grow};
+        }
+    }
+    return best;
 }
 
 std::vector<int> pflash_span_tokens(int begin, int end) {

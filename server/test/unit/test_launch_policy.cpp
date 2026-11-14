@@ -7,6 +7,7 @@
 #include "placement/device_select.h"
 #include "common/feature_gate.h"
 #include "server/launch_profiles.h"
+#include "common/kvflash_prefill_reselect.h"
 
 #include <algorithm>
 #include <cstring>
@@ -705,11 +706,145 @@ struct LaunchPolicyFixture : CommonFixture {
             CHECK(!error.empty());
         }
     }
+
+    void test_kvflash_recall_defaults_need_a_qwen35_target() {
+        // On another architecture nothing is installed (the caller only asks when --kvflash was given).
+        CHECK(kvflash_recall_env("deepseek41", true).empty());
+        CHECK(kvflash_recall_env("qwen35moe", true).empty());
+        CHECK(kvflash_recall_env("", true).empty());
+    }
+
+    void test_kvflash_recall_preamble_reserve_is_18_chunks() {
+        // The reserve grows the resident pool and every decode step attends the whole pool: 6144 rows (+37.5%) cost
+        // 4.7% decode, so the default is the 18 chunks of 64 that hold the measured 1064-token preamble pin.
+        CHECK(KvflashRecallProfile::preamble_rows == 18 * 64);
+    }
+
+    void test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size() {
+        // --kvflash N sets the decode cost (every step attends the whole pool), so the profile's reserve comes out of N
+        // and leaves N - reserve history rows; it never grows the pool.
+        const int ct = 64, pool = 16384;
+        const int reserve = kvflash_preamble_reserve_in_pool(pool, KvflashRecallProfile::preamble_rows, ct);
+        CHECK(reserve == KvflashRecallProfile::preamble_rows);
+        CHECK(pool - reserve == 15232);
+    }
+
+    void test_kvflash_preamble_reserve_that_leaves_no_history_is_off() {
+        // Like a missing <|im_start|> id, a reserve the pool cannot hold turns the pin off (the backend logs why).
+        const int ct = 64;
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 0, ct) == 0);
+        CHECK(kvflash_preamble_reserve_in_pool(0, 1152, ct) == 0);              // KVFlash off stays off
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 1100, ct) == 1152);       // rounded up to a chunk
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 16320, ct) == 16320);     // one chunk of history left
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 16384, ct) == 0);         // reserve == pool
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 20000, ct) == 0);         // reserve > pool
+        CHECK(kvflash_preamble_reserve_in_pool(16384, 1152, 0) == 0);           // unusable chunk size
+    }
+
+    void check_env(const std::vector<LaunchProfileEnv> & env,
+                   const std::vector<std::pair<std::string, std::string>> & expected) {
+        CHECK(env.size() == expected.size());
+        std::set<std::string> names;
+        for (const LaunchProfileEnv & entry : env) {
+            CHECK(names.insert(entry.name).second);
+            const auto hit = std::find_if(expected.begin(), expected.end(),
+                [&](const auto & e) { return e.first == entry.name; });
+            CHECK(hit != expected.end());
+            if (hit != expected.end()) CHECK(hit->second == entry.value);
+        }
+    }
+
+    void test_kvflash_recall_defaults_are_the_shipped_profile() {
+        // Mode 5 asked for (LUCE_KVFLASH_PREFILL_RESELECT=5) with a drafter and its three PFlash GGUFs: the PFlash 2.0
+        // scorer, exactly the settings the K2/K3 LiveCode nights measured (P1 27/40, P2 29/40 on 14 sessions).
+        check_env(kvflash_recall_env("qwen35", true), {
+            {"LUCE_KVFLASH_POLICY", "qk"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "5"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "pflash2"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
+            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_UQ_QUERIES", "0"},
+            {"PFLASH_SELECT_MODE", "budget_only"},
+            {"PFLASH_SELECT_SCORE", "density"},
+            {"PFLASH_SELECT_SEGMENTS", "probe"},
+            {"PFLASH_SELECT_CHUNK_SIZE", "256"},
+            {"PFLASH_SELECT_QUERY_TOKENS", "128"},
+            {"PFLASH_SELECT_QUERY_HEAD", "1"},
+            {"PFLASH_SELECT_QUERY_PROBE", "1"},
+            {"PFLASH_QUERY_CANDIDATES", "1"},
+            {"PFLASH_QUERY_PIN", "512"},
+            {"PFLASH_DRAFTER_SESSIONS", "2"},
+        });
+        // Otherwise, drafter or not: mode 4, the exact scorer, the values the profile installed before it became named constants.
+        check_env(kvflash_recall_env("qwen35", false), {
+            {"LUCE_KVFLASH_POLICY", "qk"},
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
+            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
+            {"LUCE_KVFLASH_SELECT_UNIT", "2"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_UQ_QUERIES", "64"},
+        });
+        CHECK(kvflash_recall_env("qwen3", true).empty());
+        // Nothing here changes what PFlash prefill compression selects on: the parser stays the release
+        // default, and the retired paragraph join and the hard-coded selector-query count are not exported.
+        for (const auto & e : kvflash_recall_env("qwen35", true)) {
+            CHECK(e.name != "PFLASH_SELECT_QUERY_PARSER");
+            CHECK(e.name != "PFLASH_SELECT_PARAGRAPH_JOIN");
+            CHECK(e.name != "LUCE_KVFLASH_SELECT_QUERIES");
+        }
+    }
+
+    void test_kvflash_mode5_needs_the_opt_in_the_drafter_and_its_three_ggufs() {
+        // Mode 4 is the default even with a drafter (ruling 2026-11-10: mode 4 kept the needle in 10/10 replayed
+        // agent sessions, mode 5 in 0/10); mode 5 needs LUCE_KVFLASH_PREFILL_RESELECT=5 and everything its scorer loads.
+        std::map<std::string, std::string> env = {
+            {"LUCE_KVFLASH_PREFILL_RESELECT", "5"}, {"LUCE_KVFLASH_DRAFTER", "d.gguf"}, {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"},
+            {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"}, {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"}};
+        const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        CHECK(kvflash_mode5_requested(get));
+        for (const char * k : {"LUCE_KVFLASH_PREFILL_RESELECT", "LUCE_KVFLASH_DRAFTER", "PFLASH_SCORING_HEAD_GGUF",
+                               "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"}) {
+            const std::string keep = env[k];
+            env[k] = "";
+            CHECK(!kvflash_mode5_requested(get));
+            env[k] = keep;
+        }
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "4";
+        CHECK(!kvflash_mode5_requested(get));
+    }
+
+    void test_kvflash_banner_prints_the_resolved_reselect_mode() {
+        std::map<std::string, std::string> env;
+        const auto get = [&](const char * k) { const auto it = env.find(k); return it == env.end() ? std::string() : it->second; };
+        const auto has = [](const std::string & s, const char * t) { return s.find(t) != std::string::npos; };
+        std::string b = kvflash_recall_banner("qwen35", false, get);                 // nothing preset: the profile's default
+        CHECK(has(b, "mode 4"));
+        CHECK(has(b, "LUCE_KVFLASH_PREFILL_RESELECT=5"));                              // how to get mode 5
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "0";                                    // preset value wins over the profile
+        b = kvflash_recall_banner("qwen35", false, get);
+        CHECK(has(b, "mode 0"));
+        CHECK(!has(b, "mode 4"));
+        CHECK(has(b, "set by the environment"));
+        env["LUCE_KVFLASH_PREFILL_RESELECT"] = "5";                                    // 5 without its GGUFs: still 5, not 4
+        b = kvflash_recall_banner("qwen35", false, get);
+        CHECK(has(b, "mode 5"));
+        CHECK(!has(b, "mode 4"));
+        env.clear();
+        CHECK(has(kvflash_recall_banner("qwen35", true, get), "mode 5"));
+        b = kvflash_recall_banner("llama", false, get);                                // profile is qwen35 only
+        CHECK(has(b, "not applied"));
+        CHECK(!has(b, "mode"));
+    }
 };
 
 }  // namespace
 
 TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
+    test_kvflash_banner_prints_the_resolved_reselect_mode();
     test_auto_device_prefers_discrete_gpu_that_fits();
     test_auto_device_moves_large_model_to_device_that_fits();
     test_auto_device_falls_back_to_largest();
@@ -737,6 +872,12 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_r9700_gorgon_profile_is_the_measured_recipe();
     test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
+    test_kvflash_recall_defaults_need_a_qwen35_target();
+    test_kvflash_recall_preamble_reserve_is_18_chunks();
+    test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
+    test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
+    test_kvflash_recall_defaults_are_the_shipped_profile();
+    test_kvflash_mode5_needs_the_opt_in_the_drafter_and_its_three_ggufs();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
 }

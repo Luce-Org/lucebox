@@ -31,6 +31,11 @@
 #include "pflash/pflash_compress.h"
 #include "pflash/pflash_window.h"
 #include "pflash/kvflash_drafter_scorer.h"
+#include "common/kvflash_prefill_reselect.h"
+#include "common/kvflash_m5_rescore.h"
+#include "common/kvflash_exact_mass.h"
+#include "common/kvflash_exact_fast.h"
+#include "common/kvflash_gpu_mass.h"
 
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
@@ -210,7 +215,7 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
-        (int64_t)sizeof(float);
+        (int64_t)sizeof(float) * (1 + luce::common::kvflash_q_cap_all_rows());
     const int64_t paged_metadata =
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
@@ -280,7 +285,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
     // Single source of truth with the qwen35moe placement path — see kv_quant.h.
     b.bytes_per_token = (int64_t)luce::kv_reservation_bytes_per_token(
         w.n_layer, w.full_attention_interval, w.n_head_kv,
-        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v) *
+        luce::common::kvflash_pool_density_factor(kvflash_prefill_reselect_);   // the victim tier is device memory too
     b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
         (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
     return b;
@@ -427,7 +433,20 @@ bool Qwen35Backend::init() {
     // model (Spark's pattern). LRU is the fallback when nothing is found
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
-    if (std::getenv("LUCE_KVFLASH") && !kvflash_qk_policy_) {
+    {
+        const char * sc = std::getenv("LUCE_KVFLASH_RESELECT_SCORER");
+        std::string why;
+        kvflash_prefill_reselect_ = luce::common::kvflash_reselect_mode(
+            env_int_or_default("LUCE_KVFLASH_PREFILL_RESELECT", 0), kvflash_qk_policy_, sc, &why);
+        if (!why.empty()) std::fprintf(stderr, "[kvflash] %s; reselect off\n", why.c_str());
+        kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
+        kvflash_m4_single_ = env_int_or_default("LUCE_KVFLASH_M4_SINGLE", 1) != 0;
+        kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
+        kvflash_m5_rescore_tokens_ = std::max(0, env_int_or_default("LUCE_KVFLASH_M5_RESCORE_TOKENS", luce::common::kKvFlashM5RescoreTokens));
+        kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
+        kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
+    }
+    if (std::getenv("LUCE_KVFLASH") && (!kvflash_qk_policy_ || kvflash_prefill_reselect_ == 5)) {
         kvflash_drafter_path_ = kvflash_find_drafter(
             cfg_.target_path.c_str());
     }
@@ -445,6 +464,51 @@ bool Qwen35Backend::init() {
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
+    }
+    // LUCE_KVFLASH_PREAMBLE_ROWS=R: R rounded up to a chunk is reserved inside the pool for the pinned preamble,
+    // so the history budget is the pool minus the reserve and the pool (the decode cost) stays what --kvflash asked.
+    kvflash_preamble_reserve_ = kvflash_preamble_rows_ = 0;
+    if (kvflash_tokens_ > 0) {
+        int rows = luce::common::kvflash_preamble_rows_from_env();
+        if (rows > 0) {
+            const std::string why = luce::common::kvflash_preamble_gate(w_.im_start_id, w_.system_id);
+            if (!why.empty()) {
+                std::fprintf(stderr, "[kvflash] preamble pin disabled: %s\n", why.c_str());
+                rows = 0;
+            }
+        }
+        const int reserve = luce::common::kvflash_preamble_reserve_in_pool(kvflash_tokens_, rows, KvFlashConfig{}.chunk_tokens);
+        if (rows > 0 && reserve == 0)
+            std::fprintf(stderr, "[kvflash] preamble pin disabled: reserve of %d rows leaves no history in the %d-token pool\n",
+                         rows, kvflash_tokens_);
+        if (reserve > 0) {
+            std::fprintf(stderr, "[kvflash] preamble reserve: rows=%d reserve=%d of pool %d tokens, history %d\n",
+                         rows, reserve, kvflash_tokens_, kvflash_tokens_ - reserve);
+            kvflash_preamble_reserve_ = reserve;
+            kvflash_preamble_rows_ = std::min(rows, reserve);
+        }
+    }
+    kvflash_uq_queries_ = luce::common::kvflash_uq_queries();
+    {
+        const int tp_degree = kvflash_tp_degree();
+        const luce::common::KvflashFeaturePlan plan = luce::common::kvflash_recall_features(
+            tp_degree, {kvflash_prefill_reselect_, kvflash_uq_queries_});
+        if (!plan.why.empty()) std::fprintf(stderr, "[kvflash] recall disabled: %s\n", plan.why.c_str());
+        kvflash_prefill_reselect_ = plan.reselect_mode;
+        kvflash_uq_queries_ = plan.uq_queries;
+        if (plan.reselect_mode == 0) kvflash_select_queries_ = 0;
+    }
+    if (kvflash_uq_queries_ > 0) {
+        const std::string why = luce::common::kvflash_uq_gate(w_.im_start_id, w_.user_id, w_.im_end_id, w_.tool_response_id);
+        if (!why.empty()) {
+            std::fprintf(stderr, "[kvflash] uq disabled: %s\n", why.c_str());
+            kvflash_uq_queries_ = 0;
+        }
+    }
+    if (kvflash_prefill_reselect_ == 5) {   // mode 5 needs the drafter's release profile; a missing setting is a refusal, not a silent no-recall run
+        const std::string why = luce::common::kvflash_pflash2_config_error(
+            [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); }, concurrent_slots());
+        if (!why.empty()) { set_last_error("LUCE_KVFLASH_PREFILL_RESELECT=5: " + why); return false; }
     }
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
@@ -658,10 +722,15 @@ bool Qwen35Backend::init() {
     if (kvflash_active()) {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
+        // LUCE_KVFLASH_VICTIM_BLOCKS: paged-out chunks keep their bytes on the device, so the turn-by-turn churn between
+        // the recency pool and the drafter's picks recalls D2D instead of over the host link. Default: twice the pool in mode 5, off otherwise.
+        pc.victim_blocks = std::max(0, env_int_or_default("LUCE_KVFLASH_VICTIM_BLOCKS", luce::common::kvflash_victim_blocks_default(kvflash_prefill_reselect_, kvflash_tokens_ / pc.chunk_tokens)));
         if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
             std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n", kvflash_tokens_);
             return false;
         }
+        std::printf("[kvflash] victim tier: %d blocks (%.0f MiB device; asked %d)\n", kvflash_pager_.victim_blocks(),
+                    (double)kvflash_pager_.victim_blocks() * (double)kvflash_pager_.chunk_bytes() / 1048576.0, pc.victim_blocks);
         // Page-out and recall run on the pager's own stream; make the compute
         // stream wait for them on the device before it touches a reused slot
         // (without this, slot_for() waits on the host instead).
@@ -1102,6 +1171,21 @@ int Qwen35Backend::kvflash_live_cut_peek(const std::vector<int32_t> & prompt) co
     return kvflash_live_restore_decide(prompt, kvflash_history_, cache_.cur_pos, rungs).C;
 }
 
+// LUCE_KVFLASH_PREAMBLE_ROWS: pin the system+tools preamble. Pins live in the pager and are cleared
+// by reset() / deserialize() and clipped by truncate(), so every path that does one of those calls this.
+int Qwen35Backend::kvflash_apply_preamble_pin(const std::vector<int32_t> * ids, bool log) {
+    if (kvflash_preamble_rows_ <= 0 || !kvflash_active()) return 0;
+    if (ids) kvflash_preamble_end_ = luce::common::kvflash_preamble_end(*ids, w_.im_start_id, w_.system_id);
+    const int E = kvflash_preamble_end_;
+    if (log && kvflash_preamble_rows_ > 0 && E > kvflash_preamble_rows_)
+        std::fprintf(stderr, "[kvflash] preamble %d tok exceeds reserve %d\n", E, kvflash_preamble_rows_);
+    const int pinned = luce::common::kvflash_pin_preamble(kvflash_pager_, E, kvflash_preamble_rows_);
+    if (log)
+        std::fprintf(stderr, "[kvflash] preamble pin end=%d pinned_chunks=%d reserve=%d\n",
+                     E, pinned, kvflash_preamble_rows_);
+    return pinned;
+}
+
 int Qwen35Backend::kvflash_live_restore(const std::vector<int32_t> & prompt) {
     std::vector<int> rungs;
     for (const auto & kv : state_ladder_) rungs.push_back(kv.first);
@@ -1139,6 +1223,7 @@ int Qwen35Backend::kvflash_live_restore(const std::vector<int32_t> & prompt) {
 
     // No clear-then-restore here: the pool rows below C are the session.
     kvflash_pager_.truncate(C);
+    kvflash_apply_preamble_pin(&prompt, false);
     if (!restore_target_cache(state_ladder_[C].snap, cache_, /*skip_kv=*/true)) {
         std::fprintf(stderr, "[kvflash] live restore: state restore @%d failed; cold prefill\n", C);
         return -1;   // the cold prefill resets pager, ladder and history
@@ -1718,6 +1803,7 @@ void Qwen35Backend::free_drafter() {
         // The kvflash DRAFTER scorer borrows drafter_ctx_; drop it first.
         // The target-QK scorer is drafter-independent and survives.
         if (!kvflash_qk_scorer_) kvflash_scorer_.reset();
+        kvflash_pflash2_.reset();
         // Drafter has its own backend — do a full free (weights + backend)
         luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
@@ -1793,6 +1879,8 @@ void Qwen35Backend::shutdown() {
     vision_.reset();  // its buffers belong to target_backend_, freed below
     if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
+    kvflash_gpu_mass_.reset();   // its buffers belong to target_backend_, freed below
+    if (kvflash_exact_pin_) { ggml_backend_buffer_free(kvflash_exact_pin_); kvflash_exact_pin_ = nullptr; }
     if (split_gpus_ && draft_backend_) {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
@@ -1880,6 +1968,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     // position-addressed and will be overwritten during prefill.
     // S8a: resume from the live session when a ladder rung covers the common
     // prefix; the state checkpoint replaces the zeroing.
+    ReselectRequestScope reselect_scope(kvflash_pager_, kvflash_scores_);
     int live_cut = -1;
     if (kvflash_session_enabled() && kvflash_active() && !cfg_.paged_attention &&
         !req.images) {
@@ -2063,6 +2152,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
               cache_.cur_pos == prefix_snapshots_[slot].cur_pos);
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    ReselectRequestScope reselect_scope(kvflash_pager_, kvflash_scores_);
     if (cfg_.paged_attention) {
         result.fail(GenerateErrorCode::BackendSpecific,
                     "paged-attention snapshots are not yet supported");
@@ -2364,6 +2454,9 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 // error so the build succeeds and the interface is validated.
 // ═══════════════════════════════════════════════════════════════════════════
 
+static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlashQkDims & d,
+                                        int batch_tokens, std::vector<float> & q_all);
+
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
@@ -2454,10 +2547,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         set_last_error("kvflash: restore + pooled prefill unsupported");
         return -1;
     }
+    // Full prompt ids [0, kv_offset + prompt_len) for the gated preamble pin / user-question capture
+    // (empty when the restored prefix is not known, or both features are off).
+    std::vector<int32_t> kvf_ids;
+    if (kvflash_active() && (kvflash_preamble_rows_ > 0 || kvflash_uq_queries_ > 0 || kvflash_prefill_reselect_ == 5) &&
+        (kv_offset == 0 || (full_prompt && (int)full_prompt->size() >= kv_offset)))
+        kvf_ids = kvflash_restore_history(tokens, kv_offset, full_prompt);
     if (kvf_paged) {
         // Chunk-aligned but not one-chunk ubatches; see kvflash_pooled_ubatch.
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
-        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_);
+        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_, kvflash_preamble_reserve_);
         if (!kvf_consume) {   // a consuming restore keeps the restored pager
             kvflash_pager_.reset();
             if (kvflash_qk_policy_) {
@@ -2465,6 +2564,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                 kvflash_qk_pooled_upto_ = 0;
             }
         }
+        // reset() cleared the pins and a restore may have clipped them: pin on every pooled request.
+        kvflash_apply_preamble_pin(&kvf_ids, true);
         std::printf("[kvflash] pooled prefill: %d tokens through a %d-token pool "
                     "(%d-token chunks, ubatch=%d, evicting)\n",
                     prompt_len, kvflash_tokens_, kvf_chunk, prefill_ubatch);
@@ -2533,13 +2634,47 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         ladder = kvflash_state_ladder_positions(snap_pos, kv_offset + prompt_len,
                                                 kQwen35PrefillUbatch, 8192, turn_cut);
     }
+
+    // LUCE_KVFLASH_PREFILL_RESELECT: R becomes a batch boundary (local cut
+    // copy; turn_cuts itself still drives the ladder rung and restore).
+    const bool kvf_reselect = kvf_paged && kvflash_active() && kvflash_qk_policy_ &&
+                              kvflash_prefill_reselect_ != 0 && !images;
+    const KvflashRecallSetup recall = kvflash_recall_setup(tokens, kvf_ids, kv_offset, prompt_len, kvf_reselect, images, kvf_paged);
+    const auto & rw = recall.rw;
+    const auto & uqp = recall.uqp;
+    const int m5_r = recall.m5_r, uq_cut = recall.uq_cut;
+    const double m5_ms = recall.m5_ms;
+    bool uq_capturing = recall.uq_capturing, uq_done = false;
+    int uq_got = 0;
+    std::vector<float> uq_rows;
+    const int reselect_r = rw.run ? rw.r : m5_r;
+    std::vector<int> batch_cuts = reselect_r >= 0
+        ? luce::common::kvflash_cuts_with(turn_cuts, reselect_r) : turn_cuts;
+    // The cut follows the question, not the store: identical requests get identical batch schedules.
+    if (uq_cut >= 0) batch_cuts = luce::common::kvflash_cuts_with(batch_cuts, uq_cut);
+    // The dense (non-pooled) path chunks on restore points; the question end is one more.
+    const std::vector<int> uq_dense_points = uq_cut >= 0 && !kvf_paged
+        ? luce::common::kvflash_cuts_with(restore_points, uq_cut) : std::vector<int>();
+    const std::vector<int> & chunk_points = uq_dense_points.empty() ? restore_points : uq_dense_points;
+    // The last q_keep prompt queries, oldest first, in kvflash_q_tail_: selector v2's
+    // (SELECT_QUERIES). Every mode-4 prefill keeps them: the next request may score with them before its pass.
+    const int q_keep = rw.run || recall.m4_track ? kvflash_select_queries_ : 0;
+    kvflash_q_tail_.clear();
+    // Scratch state snapshot at R (not a ladder rung), freed on every exit by the guard.
+    struct M3Scratch {
+        PrefixSnapshot snap;
+        ~M3Scratch() { free_prefix_snapshot(snap); }
+    } m3_scratch;
+    bool rw_snapped = false, rw_done = false, rw_failed = false;
+    const bool rw_zero_state = rw.run && rw.r == 0;   // R4 = 0: the state to restore is the zero state
+
     // Pooled boundary snapshot: the last chunk-aligned batch start <= snap_pos
     // (a turn cut can start the batch that holds snap_pos off the chunk grid,
     // and a pooled snapshot there could never be consumed).
     const int pooled_snap_at =
         kvf_paged && snap_slot >= 0
             ? kvflash_pooled_snapshot_pos(kv_offset, kv_offset + prompt_len, kQwen35PrefillUbatch,
-                                          prefill_ubatch, turn_cuts, snap_pos,
+                                          prefill_ubatch, batch_cuts, snap_pos,
                                           kvflash_pager_.chunk_tokens())
             : -1;
 
@@ -2560,9 +2695,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // kvflash_prefill_batch_end) and never snapshots mid-batch.
         const int n_tokens = kvf_paged
             ? kvflash_prefill_batch_end(kv_pos, kv_offset + prompt_len,
-                                        kQwen35PrefillUbatch, prefill_ubatch, turn_cuts) - kv_pos
+                                        kQwen35PrefillUbatch, prefill_ubatch, batch_cuts) - kv_pos
             : qwen35_prefill_chunk_tokens(
-                  kv_pos, prompt_len - start, prefill_ubatch, restore_points,
+                  kv_pos, prompt_len - start, prefill_ubatch, chunk_points,
                   start == 0 && restored_off_grid ? kQwen35OffGridLeadTokens
                                                   : kQwen35MinChunkTokens);
         // When snap_pos falls inside this chunk (a cut that is not a restore
@@ -2611,6 +2746,30 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool with_mask = kvf_paged ||
             (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
+        // Mode 5: refill the pool from the drafter's scores before this batch's
+        // slots and mask are computed from the pager state.
+        if (m5_r >= 0 && kv_pos == m5_r)
+            kvflash_prefill_apply(kv_pos, kv_offset + prompt_len, kv_pos - 1, m5_ms, recall.apply_note);
+
+        // Mode 4: the state at R is about to run [R, end) under the old pool;
+        // keep a scratch copy so the pass can be rewound.
+        const bool is_final_batch = start + n_tokens >= prompt_len;
+        if (rw.run && !rw_done && !rw_failed && !rw_snapped && kv_pos == rw.r) {
+            if (cache_.cur_pos != kv_pos ||
+                (!rw_zero_state &&
+                 !snapshot_target_cache(w_, cache_, snap_backend_, m3_scratch.snap,
+                                        /*skip_kv=*/true, /*kvflash_blob=*/nullptr,
+                                        /*skip_target_feat=*/!cfg_.draft_path))) {
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=%d: scratch snapshot @%d failed; "
+                                     "no reselect for this request\n", kvflash_prefill_reselect_, kv_pos);
+                rw_failed = true;
+            } else {
+                rw_snapped = true;
+            }
+        }
+        const bool rw_pass1 = rw.run && !rw_done && !rw_failed && rw_snapped;   // first pass over [R, end)
+        const bool rw_capture = rw_pass1 && is_final_batch;                      // its final batch: q(end-1)
+
         // kvflash pooled prefill: allocate this chunk's slots up front
         // (evicting the lowest-priority resident chunk once the pool fills).
         std::vector<int> kvf_slots;
@@ -2632,6 +2791,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
+        // this batch reaches the turn's tail window (recall) or the UQ capture window
+        const bool q_window = (q_keep > 0 && kv_pos + n_tokens + q_keep > kv_offset + prompt_len) ||
+                              (uq_capturing && !uq_done && kv_pos < uqp.cut && kv_pos + n_tokens > uqp.win_lo);
         static const bool prefill_timing = std::getenv("LUCE_PREFILL_TIMING") != nullptr;
         const auto t_build0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
@@ -2643,7 +2805,14 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                    (start + n_tokens < prompt_len ? 1 : 0),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
-                               /*kvflash_mask=*/kvf_paged)) {
+                               /*kvflash_mask=*/kvf_paged,
+                               /*capture_qk=*/rw_capture || q_window,
+                               /*paged_attention=*/false, /*n_seqs=*/1, /*seq_slot=*/0, /*paged_max_kv_len=*/0,
+                               /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr, /*n_prefill_segments=*/0,
+                               /*n_logits_rows=*/0, /*compact_slots=*/false, /*top_n=*/0,
+                               /*keep_base_ssm_state=*/false, /*single_replay_slot_ids=*/nullptr,
+                               /*capture_q_all=*/luce::common::kvflash_capture_q_all(
+                                   kvflash_prefill_reselect_ != 0, kvflash_uq_queries_ > 0, kvflash_tp_degree(), q_window))) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -2730,8 +2899,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
         }
-        after_target_compute(sg_, kv_pos, n_tokens);
-
+        // The discarded first pass of mode 4 must not count in the MoE routing stats.
+        if (!rw_pass1) after_target_compute(sg_, kv_pos, n_tokens);
         int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
         const size_t argmax_off =
@@ -2745,6 +2914,68 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         committed = kv_pos + n_tokens;
         cache_.cur_pos = committed;
+
+        // Every batch holding any of the last q_keep prompt tokens is captured;
+        // append its queries and keep the last q_keep, oldest first. A rewound turn captures in both
+        // passes: pass 1's tail is what the rewind scores with, and its rows at >= R are dropped below.
+        if (q_keep > 0 && committed + q_keep > kv_offset + prompt_len) {
+            const KvFlashQkDims d = kvflash_exact_dims();
+            std::vector<float> q_all;
+            if (kvflash_read_captured_queries(cache_, d, n_tokens, q_all) > 0) {
+                luce::common::kvflash_q_tail_append(kvflash_q_tail_, q_all, (size_t)d.n_layers * d.n_q_heads * d.head_dim, q_keep);
+            }
+        }
+
+        // LUCE_KVFLASH_UQ_QUERIES: this batch holds part of the question's window; keep those rows.
+        if (uq_capturing && !uq_done && kv_pos < uqp.cut && committed > uqp.win_lo) {
+            std::vector<float> q_all;
+            const KvFlashQkDims d = kvflash_exact_dims();
+            const int n_q = kvflash_read_captured_queries(cache_, d, n_tokens, q_all);
+            const size_t qsz = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
+            const auto tk = luce::common::kvflash_uq_batch_take(kv_pos, n_tokens, n_q, uqp.win_lo, uqp.cut);
+            if (tk.count > 0 && qsz > 0) {
+                uq_rows.insert(uq_rows.end(), q_all.begin() + (long)((size_t)tk.first_row * qsz),
+                               q_all.begin() + (long)((size_t)(tk.first_row + tk.count) * qsz));
+                uq_got += tk.count;
+            }
+            if (committed >= uqp.cut) {
+                uq_done = true;
+                if (uq_got == uqp.n && uq_rows.size() == (size_t)uqp.n * qsz) {
+                    luce::common::KvFlashUqStore st;
+                    st.lo = uqp.win_lo; st.hi = uqp.cut; st.n = uqp.n; st.hash = kvflash_uq_req_hash_; st.rows = std::move(uq_rows);
+                    for (int ev : luce::common::kvflash_uq_put(kvflash_uq_stores_, std::move(st), luce::common::kKvFlashUqMaxStores))
+                        std::fprintf(stderr, "[kvflash] uq store evicted hi=%d (%zu kept)\n", ev, kvflash_uq_stores_.size());
+                } else {
+                    kvflash_uq_miss_ = "capture-incomplete";
+                }
+            }
+        }
+
+        // Mode 4: q_cap = q(end-1) under the old pool. Reselect, rewind to R and
+        // run [R, end) again under the new pool (its result replaces this one).
+        if (rw_capture) {
+            const int rc = kvflash_rewind_turn(m3_scratch.snap, rw_zero_state, rw.r,
+                                               kv_offset + prompt_len);
+            rw_done = true;
+            if (rc < 0) return -1;
+            if (rc > 0) {
+                committed = rw.r;
+                start = rw.r - kv_offset;
+                {   // pass 1's rows at >= R came from the old pool; pass 2 re-captures them
+                    const KvFlashQkDims qd = kvflash_exact_dims();
+                    luce::common::kvflash_q_tail_trim(kvflash_q_tail_, (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim,
+                                                      kv_offset + prompt_len, rw.r);
+                }
+                // The rewind reaches back over the question window: its rows from the old pool are
+                // stale. They were used for the scoring just done; the second pass replaces them.
+                if (kvflash_uq_req_hi_ > 0 && luce::common::kvflash_uq_rewind_recaptures(uqp, rw.r)) {
+                    luce::common::kvflash_uq_erase(kvflash_uq_stores_, kvflash_uq_req_hi_, kvflash_uq_req_hash_);
+                    uq_rows.clear(); uq_got = 0; uq_done = false; uq_capturing = true;
+                    kvflash_uq_miss_.clear();
+                }
+                continue;
+            }
+        }
 
         // S7: batch ends are grid points, so ladder rungs coincide with them.
         if (!ladder.empty() && std::binary_search(ladder.begin(), ladder.end(), committed) &&
@@ -2782,6 +3013,14 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
     }
 
+    // Mode 4: this request is what the next one may continue (never after a cancelled prefill).
+    if (recall.m4_track && committed == kv_offset + prompt_len && kvflash_uq_req_hi_ > 0) {
+        kvflash_m4_last_.uq_hi = kvflash_uq_req_hi_;
+        kvflash_m4_last_.uq_hash = kvflash_uq_req_hash_;
+        kvflash_m4_last_.ids = kvf_ids;
+        kvflash_m4_last_.q_tail = std::move(kvflash_q_tail_);
+        kvflash_m4_last_.valid = true;
+    }
     if (kvflash_active()) {
         if (kvf_paged) {
             // The pager mapping was built live during the pooled prefill;
@@ -2838,6 +3077,7 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
     // Restored-prefix ids are real when the caller knows the full prompt,
     // zeros otherwise.
     kvflash_history_ = kvflash_restore_history(tokens, kv_offset, full_prompt);
+    kvflash_apply_preamble_pin(&kvflash_history_, false);   // reset() above dropped the pins
     // Slots past the prompt still hold the previous request's rows; the
     // maskless qwen35moe pipelined decode reads the whole padded pool span.
     kvflash_pager_.zero_free_blocks();
@@ -2871,6 +3111,7 @@ bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
     kvflash_mask_epoch_ = (uint64_t)-1;
     kvflash_scores_.clear();
     kvflash_history_ = kvflash_restore_history({}, snap.cur_pos, &prompt);
+    kvflash_apply_preamble_pin(&prompt, false);
     if (kvflash_qk_policy_) {
         kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
         const int sealed = snap.cur_pos / ct;
@@ -2900,14 +3141,35 @@ void Qwen35Backend::kvflash_qk_pool_to(int committed) {
     kvflash_qk_pooled_upto_ = std::max(kvflash_qk_pooled_upto_, sealed);
 }
 
-void Qwen35Backend::kvflash_upload_mask() {
+// Regroup the last n_tok tokens' queries of the batch just computed from
+// q_cap_all's [fa][head][T_alloc][hd] layout to the scorer's per-token
+// [fa][head][hd]. Returns the token count (0 when not captured).
+static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlashQkDims & d,
+                                        int batch_tokens, std::vector<float> & q_all) {
+    if (!cache.q_cap_all) return 0;
+    const int T = cache.q_cap_all_tokens;
+    const int n_q = std::min(batch_tokens, T);
+    const size_t planes = (size_t)d.n_layers * d.n_q_heads;
+    // Only the n_q captured rows of each plane, not the whole 64-row tensor.
+    const auto rd = luce::common::kvflash_q_cap_all_read((size_t)T, d.head_dim, planes, (size_t)n_q);
+    std::vector<float> packed(planes * (size_t)n_q * d.head_dim);
+    ggml_backend_tensor_get_2d(cache.q_cap_all, packed.data(), 0, rd.size, rd.n_copies, rd.stride_tensor, rd.stride_data);
+    luce::common::kvflash_regroup_queries(packed, planes, (size_t)n_q, d.head_dim, q_all);
+    return n_q;
+}
+
+void Qwen35Backend::kvflash_upload_mask(int cur_pos) {
     if (!sg_.attn_mask) return;
     kvflash_require_base_zero(kvflash_pager_, "kvflash_upload_mask");
     const size_t need = (size_t)sg_.attn_mask->ne[0] * sg_.attn_mask->ne[1];
-    if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_) {
+    // The decode step at cur_pos attends rows <= cur_pos only: rows above it hold
+    // rejected drafts or an earlier turn's tokens and must stay hidden.
+    if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_ ||
+        cur_pos != kvflash_mask_pos_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);
-        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data());   // q row 0
+        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data(), (int64_t)cur_pos + 1);   // q row 0
         kvflash_mask_epoch_ = kvflash_pager_.epoch();
+        kvflash_mask_pos_ = cur_pos;
     }
     // Upload before EVERY compute: the input tensor's buffer region is
     // reused by graph execution, so a stale upload reads back as garbage.
@@ -2921,25 +3183,489 @@ void Qwen35Backend::kvflash_upload_mask() {
 // recency-only LRU. Loads lazily on the first reselect that needs it (and
 // re-attaches after a draft-residency release frees the drafter).
 void Qwen35Backend::kvflash_ensure_scorer() {
-    if (kvflash_scorer_ || kvflash_drafter_path_.empty() || kvflash_drafter_failed_) {
+    if (kvflash_scorer_ || kvflash_drafter_path_.empty() || kvflash_drafter_failed_ || !kvflash_load_drafter()) {
         return;
-    }
-    if (!drafter_loaded_) {
-        ggml_backend_synchronize(target_backend_);
-        if (draft_backend_) ggml_backend_synchronize(draft_backend_);
-        std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
-                     kvflash_drafter_path_.c_str());
-        if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
-                          cfg_.device.gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
-                                 "LRU residency\n", luce_last_error());
-            kvflash_drafter_failed_ = true;
-            return;
-        }
-        drafter_loaded_ = true;
     }
     kvflash_scorer_ = std::make_unique<KvFlashDrafterScorer>(&drafter_ctx_);
     std::fprintf(stderr, "[kvflash] drafter scorer attached (tau=%d)\n", kvflash_tau_);
+}
+
+// The residency drafter, loaded beside the target on first use; false after a failed load (not retried).
+bool Qwen35Backend::kvflash_load_drafter() {
+    if (drafter_loaded_) return true;
+    if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return false;
+    ggml_backend_synchronize(target_backend_);
+    if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+    std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                 kvflash_drafter_path_.c_str());
+    if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                      cfg_.device.gpu, drafter_ctx_)) {
+        std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                             "LRU residency\n", luce_last_error());
+        kvflash_drafter_failed_ = true;
+        return false;
+    }
+    drafter_loaded_ = true;
+    drafter_ctx_.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
+    return true;
+}
+
+bool Qwen35Backend::kvflash_pflash2_scores(const std::vector<int32_t> & ids, int chunk_tokens,
+                                           std::vector<float> & out, double & ms) {
+    if (!kvflash_load_drafter()) return false;
+    if (!kvflash_pflash2_) {
+        kvflash_pflash2_ = std::make_unique<KvFlashPFlash2Scorer>(
+            &drafter_ctx_, KvFlashPFlash2Scorer::Roles{w_.im_start_id, w_.user_id, w_.newline_id, w_.im_end_id, w_.tool_response_id, w_.assistant_id, w_.system_id});
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = kvflash_pflash2_->score_chunks(ids, chunk_tokens, out);
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const PFlashScoringStats & st = kvflash_pflash2_->last_stats();
+    std::fprintf(stderr, "[kvflash] pflash2 scorer: %s, %d tokens, %d segments, session resume %d, ran %d tokens, %.1f ms\n",
+                 ok ? "ok" : "failed", (int)ids.size(), kvflash_pflash2_->last_segments(), st.resume, st.new_tokens, ms);
+    return ok;
+}
+
+// What do_prefill decides before its batch loop: mode 4 (rewind the turn) or mode 5 (the drafter's pick at R), and the
+// user-question capture. Mode 4 runs the pass over [R, end) twice, the second time under the reselected pool; R = start
+// of the last user turn. Recall is a strict no-op while the pool holds the whole prompt plus the room reserved for the
+// rest of the prefill. Mode 5 scores the prompt ids now, before the 27B runs, and the turn then runs once.
+Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std::vector<int32_t> & tokens,
+                                                                      const std::vector<int32_t> & kvf_ids,
+                                                                      int kv_offset, int prompt_len,
+                                                                      bool kvf_reselect, bool images, bool kvf_paged) {
+    KvflashRecallSetup s;
+    const int end_abs = kv_offset + prompt_len, ctk = kvflash_pager_.chunk_tokens();
+    // Whatever happens below, the last mode-4 request stops being "the last one": kvflash_m4_last_ is rebuilt by
+    // this request and marked valid only when its prefill completes.
+    luce::common::KvFlashM4Last m4_prev = std::move(kvflash_m4_last_);
+    kvflash_m4_last_ = {};
+    bool uq_stored = false, m4_single = false;
+    // LUCE_KVFLASH_UQ_QUERIES: the last N queries of the latest human question. A stored copy of this
+    // session's prompt prefix is reused; otherwise the prefill cuts at the question's end and captures.
+    kvflash_uq_req_hi_ = -1;
+    kvflash_uq_miss_.clear();
+    if (kvflash_uq_queries_ > 0) {
+        if (!kvflash_active() || images || !kvflash_qk_policy_) kvflash_uq_miss_ = "uq-inactive";
+        else if (kvf_ids.empty()) kvflash_uq_miss_ = "no-prompt-ids";
+        else {
+            const auto t = luce::common::kvflash_last_human_turn(kvf_ids, w_.im_start_id, w_.user_id, w_.newline_id,
+                                                                 w_.im_end_id, w_.tool_response_id);
+            if (!t.valid()) {
+                kvflash_uq_miss_ = "no-human-turn";
+            } else {
+                kvflash_uq_req_hi_ = t.hi;
+                kvflash_uq_req_hash_ = luce::common::kvflash_uq_hash(kvf_ids, t.hi);
+                s.uqp = luce::common::kvflash_uq_plan(t, kvflash_uq_queries_, kv_offset, end_abs);
+                s.uq_cut = luce::common::kvflash_uq_cut(t, kvflash_uq_queries_, kv_offset, end_abs);
+                const int hit = luce::common::kvflash_uq_find(kvflash_uq_stores_, t.hi, kvflash_uq_req_hash_);
+                uq_stored = hit >= 0;
+                if (hit >= 0) luce::common::kvflash_uq_touch(kvflash_uq_stores_, hit);
+                else if (s.uqp.capture) s.uq_capturing = true;
+                else kvflash_uq_miss_ = "window-not-in-prefill";
+            }
+        }
+    }
+    if (kvf_reselect) {
+        auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id,
+            luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+                                                  luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_));
+        p4.r = luce::common::kvflash_uq_snap_rewind(s.uqp, p4.r);
+        const auto gate = luce::common::kvflash_recall_gate(
+            p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+            luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
+        using Skip = luce::common::KvFlashRecallSkip;
+        if (kvflash_prefill_reselect_ == 4 && p4.run) {
+            s.m4_track = kvflash_m4_single_ && (int)kvf_ids.size() == end_abs;
+            if (gate.skip == Skip::Fits) {
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=%d: skip, fits (%d chunks + %d reserve <= %d blocks)\n",
+                             kvflash_prefill_reselect_, (p4.r + ctk - 1) / ctk, gate.reserve, kvflash_pager_.n_pool_blocks());
+            } else if (gate.skip != Skip::None) {
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=4: skip, %s (LRU)\n",
+                             gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R" : "pool too small for the recall plan");
+            } else {
+                // A turn under the same human question runs once: from the last exact scores when they cover every
+                // recall candidate, else after a scoring with the queries the last request left (kvflash_m4_reuse.h).
+                using Path = luce::common::KvFlashM4Path;
+                Path path = Path::Full;
+                int first_window = 0;
+                if (s.m4_track && kvflash_recall_blocks_ > 0 &&
+                    luce::common::kvflash_recall_gate(true, kv_offset, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+                                                      luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_).skip == Skip::None) {
+                    luce::common::KvFlashM4Ask a;
+                    a.uq_hi = kvflash_uq_req_hi_; a.uq_hash = kvflash_uq_req_hash_; a.uq_stored = uq_stored;
+                    a.kv_offset = kv_offset; a.chunk_tokens = ctk;
+                    a.first_window = first_window = luce::common::kvflash_recall_first_window(kvflash_recall_in(kv_offset, end_abs));
+                    path = luce::common::kvflash_m4_path(m4_prev, a, kvf_ids);
+                }
+                if (path == Path::Prescore) {
+                    const KvFlashQkDims & qd = kvflash_qk_pool_.dims();
+                    const size_t qsize = (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim;
+                    kvflash_q_tail_ = std::move(m4_prev.q_tail);
+                    // whole queries only: the scorer would otherwise fall back to the single query in q_cap, which is not this turn's
+                    if (qsize > 0 && kvflash_q_tail_.size() % qsize == 0 && kvflash_prefill_score(kv_offset, s.m5_ms))
+                        kvflash_m4_last_.scores = kvflash_scores_;
+                    else path = Path::Full;
+                } else if (path == Path::Reuse) {
+                    kvflash_scores_ = m4_prev.scores;
+                    kvflash_m4_last_.scores = std::move(m4_prev.scores);
+                }
+                if (path == Path::Full) {
+                    s.rw = p4;
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens)\n",
+                                 p4.r, end_abs, end_abs - p4.r);
+                } else {
+                    m4_single = true;
+                    s.m5_r = kv_offset;
+                    s.apply_note = path == Path::Reuse ? "; reused" : "; prescore";
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=4: same question, %s @%d (end %d, prefill %d tokens once; "
+                                         "%zu chunks scored, window from chunk %d)\n",
+                                 path == Path::Reuse ? "scores reused" : "scored before the pass", kv_offset, end_abs,
+                                 end_abs - kv_offset, kvflash_m4_last_.scores.size(), first_window);
+                }
+            }
+        } else if (kvflash_prefill_reselect_ == 5) {
+            const char * skip = gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R"
+                : gate.skip == Skip::Fits ? "fits"
+                : gate.skip == Skip::PoolTooSmall ? "pool too small for the recall plan"
+                : (int)kvf_ids.size() != end_abs ? "prompt ids unknown" : nullptr;
+            // LUCE_KVFLASH_M5_RESCORE_TOKENS: the same latest user question over a prompt that extends the last scored
+            // one needs no new drafter pass; the turn reselects at R from the last drafter scores.
+            if (!skip) {
+                const auto t = luce::common::kvflash_last_human_turn(kvf_ids, w_.im_start_id, w_.user_id, w_.newline_id,
+                                                                     w_.im_end_id, w_.tool_response_id);
+                const uint64_t qkey = t.valid() ? luce::common::kvflash_m5_query_key(kvf_ids, t.lo, t.hi) : 0;
+                if (t.valid() && !luce::common::kvflash_m5_should_score(kvflash_m5_last_, qkey, kvf_ids, kvflash_m5_rescore_tokens_)) {
+                    kvflash_scores_ = luce::common::kvflash_m5_reuse_scores(kvflash_m5_scores_, (end_abs + ctk - 1) / ctk);
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=5: drafter skipped (same query, %d tokens since last score), last scores reused\n",
+                                 end_abs - (int)kvflash_m5_last_.ids.size());
+                } else if (!kvflash_pflash2_scores(kvf_ids, ctk, kvflash_scores_, s.m5_ms)) {
+                    skip = "drafter scoring failed";
+                } else if (t.valid()) {
+                    kvflash_m5_last_ = {true, qkey, kvf_ids};
+                    kvflash_m5_scores_ = kvflash_scores_;
+                } else {
+                    kvflash_m5_last_ = {};
+                }
+            }
+            if (skip) kvflash_m5_last_ = {};
+            if (skip) {
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=5: skip, %s (LRU)\n", skip);
+            } else {
+                s.m5_r = p4.r;
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=5: R=%d (end %d, prefill %d tokens once)\n", s.m5_r, end_abs, end_abs - s.m5_r);
+            }
+        }
+    }
+    // The first (scoring) pass must see OFF's plain-LRU pool, not the previous request's recalled blocks:
+    // recency-reselect on every pooled request, after every restore path. A mode-4 turn that runs once has no
+    // scoring pass: it picks from the pool the last request left, so only the chunks that changed are paged.
+    if (kvf_paged && kvflash_score_pool_recent_ && !m4_single) {
+        const int64_t ins0 = kvflash_pager_.stats().page_ins, hits0 = kvflash_pager_.stats().victim_hits;
+        const auto t_rr = std::chrono::steady_clock::now();
+        const int events = kvflash_pager_.reselect_recent();
+        const double rr_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rr).count();
+        const int64_t ins = kvflash_pager_.stats().page_ins - ins0, hits = kvflash_pager_.stats().victim_hits - hits0;
+        std::fprintf(stderr, "[kvflash] prefill reselect recent-pool @%d: %d page events; "
+                     "%d in (%.1f MiB H2D) %.1f ms (%lld tier hits)\n", kv_offset, events, (int)ins,
+                     (double)(ins - hits) * (double)kvflash_pager_.chunk_bytes() / 1048576.0, rr_ms, (long long)hits);
+    }
+    return s;
+}
+
+// The pool block holding each of the first `sealed` chunks (-1: evicted to the host copy), and how many are resident.
+struct KvFlashResidency { std::vector<int> block; int n_resident = 0; };
+static KvFlashResidency kvflash_residency(const KvFlashPager & p, int sealed) {
+    KvFlashResidency r;
+    r.block.resize((size_t)sealed);
+    for (int c = 0; c < sealed; c++) { r.block[(size_t)c] = p.block_of(c); r.n_resident += r.block[(size_t)c] >= 0; }
+    return r;
+}
+
+KvFlashQkDims Qwen35Backend::kvflash_exact_dims() const {
+    KvFlashQkDims d;
+    d.n_layers   = (int)cache_.attn_k.size();
+    d.n_q_heads  = w_.n_head;
+    d.n_kv_heads = w_.n_head_kv;
+    d.head_dim   = w_.n_embd_head_k;
+    return d;
+}
+
+// Fast path: one bulk device-to-host copy per layer (the whole pool tensor), the fused
+// AVX2 scorer (kvflash_exact_fast.h) over it. Host-backed chunks are read in place.
+bool Qwen35Backend::kvflash_exact_scores(int sealed, const std::vector<const float *> & qs,
+                                         std::vector<std::vector<float>> & outs,
+                                         std::vector<luce::common::KvFlashMassPlanes> * planes) {
+    KvFlashPager & p = kvflash_pager_;
+    const int ct = p.chunk_tokens();
+    p.synchronize_paging();
+    const KvFlashQkDims d = kvflash_exact_dims();
+    if (ct <= 0 || sealed <= 0 || d.n_layers <= 0 || cache_.attn_k.empty()) return false;
+    const ggml_tensor * k0 = cache_.attn_k[0];
+    const auto tc0 = std::chrono::steady_clock::now();
+    const KvFlashResidency res = kvflash_residency(p, sealed);
+    const int n_res = res.n_resident;
+    // Resident K: layer l -> buf[l * layer_bytes ...]. One async D2H per layer into a persistent pinned
+    // buffer (no page faults, full PCIe rate); falls back to a pageable vector if the device has no host buffer type.
+    const size_t layer_bytes = n_res ? ggml_nbytes(k0) : 0;
+    const size_t need = layer_bytes * d.n_layers;
+    uint8_t * buf = nullptr;
+    bool pinned = false;
+    if (need) {
+        if (kvflash_exact_pin_ && ggml_backend_buffer_get_size(kvflash_exact_pin_) < need) {
+            ggml_backend_buffer_free(kvflash_exact_pin_); kvflash_exact_pin_ = nullptr;
+        }
+        if (!kvflash_exact_pin_ && !kvflash_exact_pin_failed_) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_);
+            ggml_backend_buffer_type_t bt = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            kvflash_exact_pin_ = bt ? ggml_backend_buft_alloc_buffer(bt, need) : nullptr;
+            kvflash_exact_pin_failed_ = !kvflash_exact_pin_;
+        }
+        if (kvflash_exact_pin_) { buf = (uint8_t *)ggml_backend_buffer_get_base(kvflash_exact_pin_); pinned = true; }
+        else {
+            if (kvflash_exact_buf_.size() < need) kvflash_exact_buf_.resize(need);
+            buf = kvflash_exact_buf_.data();
+        }
+        for (int l = 0; l < d.n_layers; l++) {
+            if (pinned) ggml_backend_tensor_get_async(target_backend_, cache_.attn_k[(size_t)l], buf + (size_t)l * layer_bytes, 0, layer_bytes);
+            else        ggml_backend_tensor_get(cache_.attn_k[(size_t)l], buf + (size_t)l * layer_bytes, 0, layer_bytes);
+        }
+        if (pinned) ggml_backend_synchronize(target_backend_);
+    }
+    const auto tc1 = std::chrono::steady_clock::now();
+    const std::vector<int> & blk = res.block;
+    luce::common::KvFlashExactKeys keys;
+    keys.n_chunks = sealed;
+    keys.chunk_tokens = ct;
+    keys.type = k0->type;
+    keys.seg = [&](int c, int l, int h) -> const uint8_t * {
+        const int b = blk[(size_t)c];
+        if (b < 0) return p.host_k_seg(c, l, h);
+        const ggml_tensor * t = cache_.attn_k[(size_t)l];
+        return buf + (size_t)l * layer_bytes + (size_t)b * ct * t->nb[1] + (size_t)h * t->nb[2];
+    };
+    luce::common::KvFlashExactTiming tm;
+    const bool ok = luce::common::kvflash_exact_mass_scores_fast_multi(keys, d, qs, outs, 0, &tm, planes);
+    const auto tc2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[kvflash] exact-scorer fast split: n_q=%d sealed=%d resident=%d copy %.1f ms (%d bulk copies, %.0f MB), math %.1f ms "
+                 "[cpu-ms summed over threads: dequant %.1f dot %.1f exp %.1f]\n", (int)qs.size(), sealed, n_res,
+                 std::chrono::duration<double, std::milli>(tc1 - tc0).count(), n_res ? d.n_layers : 0,
+                 (double)layer_bytes * (n_res ? d.n_layers : 0) / 1e6,
+                 std::chrono::duration<double, std::milli>(tc2 - tc1).count(),
+                 tm.dequant_ns.load() / 1e6, tm.dot_ns.load() / 1e6, tm.exp_ns.load() / 1e6);
+    return ok;
+}
+
+// Selector v2 on the target backend (kvflash_gpu_mass.h): the pool K tensors are graph leaves, evicted chunks are
+// staged from the pager's pinned host copies. Pool blocks no sealed chunk maps to (free, or a chunk >= sealed: this
+// turn's first pass) are masked in the graph. The first failure (alloc, free-VRAM guard, compute) is logged once and
+// sends this and every later call to the CPU scorer.
+bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const float *> & qs,
+                                             std::vector<std::vector<float>> & outs,
+                                             std::vector<luce::common::KvFlashMassPlanes> & planes) {
+    if (kvflash_gpu_failed_) return false;
+    KvFlashPager & p = kvflash_pager_;
+    const int ct = p.chunk_tokens();
+    p.synchronize_paging();   // queued D2H page-outs and H2D page-ins must land before any host/pool read
+    const KvFlashQkDims d = kvflash_exact_dims();
+    std::string why;
+    if (sealed <= 0) return false;   // nothing sealed yet: the CPU scorer answers this call, the GPU scorer stays available
+    if (ct <= 0 || d.n_layers <= 0 || cache_.attn_k.empty() || !target_backend_) why = "no pooled K";
+    else {
+        if (!kvflash_gpu_mass_) kvflash_gpu_mass_ = std::make_unique<luce::common::KvFlashGpuMass>(target_backend_);
+        const KvFlashResidency res = kvflash_residency(p, sealed);
+        const std::vector<int> & blk = res.block;
+        const int n_res = res.n_resident;
+        luce::common::KvFlashGpuMassTiming tm;
+        const std::vector<ggml_tensor *> pool_k(cache_.attn_k.begin(), cache_.attn_k.end());
+        // Default: the fused kernel, with the evicted K it reads kept on the device between calls (the chunk versions say which
+        // slots are still current). Where the kernel cannot score this K, or with LUCE_KVFLASH_GPU_SCORE_FUSED=0: the logits graph,
+        // call-scoped. The graph spans every slot held, so it never gets the archive.
+        const bool fused = env_int_or_default("LUCE_KVFLASH_GPU_SCORE_FUSED", 1) != 0 &&
+                           luce::common::KvFlashGpuMass::fused_available(pool_k[0]->type, d.head_dim, d.n_layers);
+        std::vector<uint64_t> ver;
+        for (int c = 0; fused && c < sealed; c++) ver.push_back(p.chunk_version(c));
+        kvflash_gpu_mass_->set_fused(fused);
+        if (kvflash_gpu_mass_->score(pool_k, blk, [&](int c, int l, int h) { return p.host_k_seg(c, l, h); },
+                                     ct, d, qs, outs, &planes, &tm, &why, fused ? &ver : nullptr)) {
+            std::fprintf(stderr, "[kvflash] gpu scorer: n_q=%d sealed=%d resident=%d gather %.1f h2d %.1f graph %.1f d2h %.1f agg %.1f total %.1f ms batches=%d peak=%.0f MiB "
+                                 "uploaded=%d of %d evicted (%d held) fused=%d\n",
+                         (int)qs.size(), sealed, n_res, tm.gather, tm.h2d, tm.graph, tm.d2h, tm.agg, tm.total, tm.batches, tm.peak_bytes / 1048576.0,
+                         tm.uploaded, sealed - n_res, tm.archived, (int)tm.fused);
+            return true;
+        }
+    }
+    if (luce::common::kvflash_gpu_failure_latches(why)) kvflash_gpu_failed_ = true;
+    std::fprintf(stderr, "[kvflash] gpu scorer unavailable: %s; using the CPU scorer%s\n", why.c_str(),
+                 kvflash_gpu_failed_ ? "" : " for this call");
+    return false;
+}
+
+// LUCE_KVFLASH_UQ_QUERIES: append the stored rows of the latest human question to the selector's queries
+// when the store's key matches this prompt (and, on the GPU scorer, the call still fits in VRAM).
+// Logs one hit or miss line per reselect.
+void Qwen35Backend::kvflash_uq_append(std::vector<const float *> & qs, int sealed, size_t qsize, size_t n_v2) {
+    const int found = luce::common::kvflash_uq_find(kvflash_uq_stores_, kvflash_uq_req_hi_, kvflash_uq_req_hash_);
+    static const luce::common::KvFlashUqStore kNone;
+    const auto & st = found >= 0 ? kvflash_uq_stores_[(size_t)found] : kNone;
+    const char * why = nullptr;
+    std::string reason;
+    if (n_v2 == 0) why = "no-v2-selector";
+    else if (kvflash_uq_req_hi_ <= 0 || st.empty() || st.rows.size() != (size_t)st.n * qsize)
+        why = kvflash_uq_miss_.empty() ? "no-store" : kvflash_uq_miss_.c_str();
+    else if (!kvflash_gpu_failed_ && target_backend_ && !cache_.attn_k.empty()) {
+        if (!kvflash_gpu_mass_) kvflash_gpu_mass_ = std::make_unique<luce::common::KvFlashGpuMass>(target_backend_);
+        const int ct = kvflash_pager_.chunk_tokens();
+        const ggml_tensor * k0 = cache_.attn_k[0];
+        const int n_ev = sealed - kvflash_residency(kvflash_pager_, sealed).n_resident;
+        size_t need = 0;
+        if (!kvflash_gpu_mass_->fits_now(kvflash_exact_dims(), k0->type, ct, (int)(k0->ne[1] / ct), n_ev,
+                                         (int)qs.size() + st.n, &need)) {
+            reason = "gpu-vram need " + std::to_string(need >> 20) + " MiB";
+            why = reason.c_str();
+        }
+    }
+    if (why) {
+        std::fprintf(stderr, "[kvflash] uq miss reason=%s\n", why);
+        return;
+    }
+    luce::common::kvflash_uq_append_queries(qs, st, qsize);
+    std::fprintf(stderr, "[kvflash] uq hit lo=%d hi=%d n=%d\n", st.lo, st.hi, st.n);
+}
+
+// LUCE_KVFLASH_PREFILL_RESELECT: score the chunks sealed before `sealed_tokens`
+// with the query held in cache_.q_cap.
+bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) {
+    const int ct = kvflash_pager_.chunk_tokens();
+    const KvFlashQkDims & d = kvflash_qk_pool_.dims();
+    if (ct <= 0 || d.n_layers <= 0 || !cache_.q_cap) return false;
+    const size_t qsize = (size_t)d.n_layers * d.n_q_heads * d.head_dim;
+    if ((size_t)ggml_nelements(cache_.q_cap) != qsize) return false;
+    std::vector<float> q(qsize);
+    ggml_backend_tensor_get(cache_.q_cap, q.data(), 0, qsize * sizeof(float));
+    const int sealed = sealed_tokens / ct;
+    const auto t0 = std::chrono::steady_clock::now();
+    // Selector v2: the last kvflash_select_queries_ prompt queries of the first pass
+    // (q_cap's is the newest), max over queries of the top-plane mass.
+    const size_t n_v2 = kvflash_q_tail_.size() % qsize ? 0
+        : std::min(kvflash_q_tail_.size() / qsize, (size_t)kvflash_select_queries_);
+    bool gpu_scored = false;
+    std::vector<const float *> qs = {q.data()};
+    if (n_v2 > 0) {
+        qs.clear();
+        for (size_t o = kvflash_q_tail_.size() - n_v2 * qsize; o < kvflash_q_tail_.size(); o += qsize)
+            qs.push_back(kvflash_q_tail_.data() + o);
+    }
+    if (kvflash_uq_queries_ > 0) kvflash_uq_append(qs, sealed, qsize, n_v2);
+    std::vector<std::vector<float>> o;
+    std::vector<luce::common::KvFlashMassPlanes> planes;
+    gpu_scored = n_v2 > 0 && kvflash_exact_scores_gpu(sealed, qs, o, planes);
+    if (!gpu_scored && !kvflash_exact_scores(sealed, qs, o, n_v2 > 0 ? &planes : nullptr)) {
+        std::fprintf(stderr, "[kvflash] exact scorer failed @%d; keeping the pool\n", sealed_tokens);
+        return false;
+    }
+    kvflash_scores_ = n_v2 > 0 ? luce::common::kvflash_select_scores(planes) : std::move(o[0]);
+    if (kvflash_select_queries_ > 0)
+        std::fprintf(stderr, "[kvflash] selector v2: %zu of %d queries (max over queries, top-%d planes)\n",
+                     n_v2, kvflash_select_queries_, luce::common::kExactTopPlanes);
+    score_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+luce::common::KvFlashRecallIn Qwen35Backend::kvflash_recall_in(int committed, int end) const {
+    const KvFlashPager & p = kvflash_pager_;
+    const int ct = p.chunk_tokens();
+    luce::common::KvFlashRecallIn in;
+    in.n_pool_blocks = p.n_pool_blocks();
+    in.cur_chunk = p.cur_chunk();
+    in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
+    in.unit = kvflash_select_unit_;
+    in.reserve = (end - committed + ct - 1) / ct + 1;
+    in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
+    in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
+    return in;
+}
+
+// With LUCE_KVFLASH_RECALL_BLOCKS=k the pool becomes an exact LRU window plus
+// k recalled 10-chunk blocks (R-LRU). The pool room kept for the rest of the
+// prefill is derived from `end`.
+void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
+                                          double score_ms, const char * note) {
+    KvFlashPager & p = kvflash_pager_;
+    std::vector<float> & scores = kvflash_scores_;
+    const int ct = p.chunk_tokens();
+    int tail = -1;   // the pager's configured tail unless recall derives one
+    std::vector<int> picked;
+    if (kvflash_recall_blocks_ > 0) {
+        // budget: kKvFlashRecallUnit * k chunks, picked in units of `unit` chunks
+        const int unit = kvflash_select_unit_;
+        // The pins sit in the rows LUCE_KVFLASH_PREAMBLE_ROWS reserves in the pool (0 when off): the history budget
+        // (tail + recall + reserve) is the pool minus them, and the pinned chunks are not recall candidates.
+        luce::common::KvFlashRecallPlan plan = luce::common::kvflash_recall_plan(scores, kvflash_recall_in(committed, end));
+        tail = plan.tail;
+        picked = std::move(plan.picked);
+        for (int b : picked)
+            for (int c = b * unit; c < (b + 1) * unit; c++) scores[(size_t)c] = 1e30f;
+        // The window is kept exactly: it must also survive evictions in the
+        // rest of the prefill, so pin it in the ledger the hook reads.
+        for (int c = std::max(0, plan.first_window); c < (int)scores.size(); c++)
+            scores[(size_t)c] = 1e30f;
+    }
+    // Chunks at or past `committed` are the batch being allocated: never victims, whatever the ledger holds.
+    p.score_hook = [&scores, committed_chunks = committed / ct](int c) {
+        return luce::common::kvflash_hook_score(scores, committed_chunks, c);
+    };
+    const int64_t ins0 = p.stats().page_ins, hits0 = p.stats().victim_hits;
+    const auto t_rs = std::chrono::steady_clock::now();
+    const int events = p.reselect(tail);
+    const double paging_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_rs).count();
+    const int64_t ins = p.stats().page_ins - ins0;
+    std::string ids;
+    for (int b : picked) ids += (ids.empty() ? "" : ",") + std::to_string(b);
+    std::fprintf(stderr, "[kvflash] prefill reselect mode=%d scorer=%s k=%d tail=%d @%d (q tok %d) "
+                 "picked=[%s]: %d page events; %d in (%.1f MiB H2D) (resident %d/%d blocks) scorer %.1f ms%s\n",
+                 kvflash_prefill_reselect_, kvflash_prefill_reselect_ == 5 ? "pflash2" : "exact",
+                 kvflash_recall_blocks_, tail, committed, q_tok, ids.c_str(), events,
+                 (int)ins, (double)ins * (double)p.chunk_bytes() / 1048576.0,
+                 p.resident_blocks(), p.n_pool_blocks(), score_ms, note);
+    if (kvflash_select_unit_ != luce::common::kKvFlashRecallUnit)
+        std::fprintf(stderr, "[kvflash] prefill reselect picked units of %d chunks\n", kvflash_select_unit_);
+    // Its own line: the pick line above is diffed across builds with only "N ms" masked.
+    std::fprintf(stderr, "[kvflash] prefill reselect paging @%d: %d page events in %.1f ms (%lld tier hits)\n", committed, events,
+                 paging_ms, (long long)(p.stats().victim_hits - hits0));
+}
+
+// Rewind of the pass over [r, end) (mode 4). Everything that can fail
+// without touching state (scoring) runs first. Then the state restore, which is
+// the same call live restore uses with skip_kv (or the zero state when r == 0);
+// if it fails the request errors out rather than continuing on a half-restored
+// cache.
+int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_state, int r, int end) {
+    const int ct = kvflash_pager_.chunk_tokens();
+    double ms = 0.0;
+    if (!kvflash_prefill_score(r, ms)) {
+        std::fprintf(stderr, "[kvflash] prefill reselect mode=%d @%d: scoring failed; "
+                             "keeping the pre-rewind result\n", kvflash_prefill_reselect_, r);
+        return 0;
+    }
+    kvflash_m4_last_.scores = kvflash_scores_;   // as scored: the pick below marks its ledger copy
+    if (zero_state) {
+        reset_recurrent_state(cache_);
+    } else if (!restore_target_cache(snap, cache_, /*skip_kv=*/true)) {
+        std::fprintf(stderr, "[kvflash] prefill reselect mode=%d @%d: state restore failed\n",
+                     kvflash_prefill_reselect_, r);
+        set_last_error("kvflash: rewind state restore failed");
+        return -1;
+    }
+    // Rows >= r are dropped; the chunk holding r keeps rows < r. kvflash_scores_
+    // is NOT cleared: the pick must survive until the re-run allocates.
+    kvflash_pager_.truncate(r);
+    kvflash_apply_preamble_pin(nullptr, false);   // truncate() below the preamble clips the pins
+    kvflash_prefill_apply(r, end, end - 1, ms, "; rewind");
+    cache_.cur_pos = r;
+    kvflash_mask_epoch_ = (uint64_t)-1;
+    if (kvflash_qk_policy_) kvflash_qk_pooled_upto_ = std::min(kvflash_qk_pooled_upto_, r / ct);
+    return 1;
 }
 
 void Qwen35Backend::kvflash_maybe_reselect(int generated) {
@@ -3095,7 +3821,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                     sizeof(int64_t) * n_head_kv);
         }
         if (pool) {
-            kvflash_upload_mask();
+            kvflash_upload_mask(committed);
         } else if (w_.is_bailingmoe3) {
             upload_qwen35_causal_mask(
                 sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);

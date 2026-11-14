@@ -6,6 +6,7 @@
 #include "kvflash_exact_mass.h"
 #include "kvflash_exact_fast.h"
 #include "kvflash_mass_synth.h"
+#include "kvflash_prefill_reselect.h"
 #include "kvflash_query_capture.h"
 #include "scoped_env.h"
 
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <system_error>
@@ -188,6 +190,80 @@ TEST_CASE(KvflashExactMassFixture, stage_rows_exist_only_in_a_kvflash_process) {
     }
     luce_test::ScopedEnvVar zero("LUCE_KVFLASH", "0");
     CHECK(kvflash_q_stage_rows(16) == 0);
+}
+
+TEST_CASE(KvflashExactMassFixture, per_token_query_capture_exists_only_in_a_kvflash_process) {
+    luce_test::ScopedEnvVar off("LUCE_KVFLASH", nullptr);
+    CHECK(kvflash_q_cap_all_rows() == 0);              // KVFlash off: the cache is the one main builds
+    {
+        luce_test::ScopedEnvVar on("LUCE_KVFLASH", "auto");
+        CHECK(kvflash_q_cap_all_rows() == kQueryCaptureTokens);
+    }
+    {
+        luce_test::ScopedEnvVar pool("LUCE_KVFLASH", "16384");
+        CHECK(kvflash_q_cap_all_rows() == kQueryCaptureTokens);
+    }
+    luce_test::ScopedEnvVar zero("LUCE_KVFLASH", "0");
+    CHECK(kvflash_q_cap_all_rows() == 0);
+}
+TEST_CASE(KvflashExactMassFixture, q_cap_all_is_written_only_for_recall_or_uq_prefill) {
+    // Decode under the qk policy captures q_cap but must not copy into q_cap_all.
+    CHECK(!kvflash_capture_q_all(false, false, 1, true));
+    CHECK(kvflash_capture_q_all(true, false, 1, true));            // recall (mode 4)
+    CHECK(kvflash_capture_q_all(false, true, 1, true));            // user-question queries
+    CHECK(!kvflash_capture_q_all(true, true, 1, false));           // this batch captures no queries
+    // Tensor parallel: q_cap_all has no split, so it is never written.
+    const auto plan = kvflash_recall_features(2, {4, 3});
+    CHECK(!kvflash_capture_q_all(plan.reselect_mode != 0, plan.uq_queries > 0, 2, true));
+    CHECK(!kvflash_capture_q_all(true, true, 2, true));
+    const auto one = kvflash_recall_features(1, {4, 3});
+    CHECK(kvflash_capture_q_all(one.reselect_mode != 0, one.uq_queries > 0, 1, true));
+}
+TEST_CASE(KvflashExactMassFixture, captured_queries_are_read_as_n_q_rows_per_plane_and_regrouped) {
+    // q_cap_all is [fa][head][T][hd]; element (plane, t, d) holds a value that names it.
+    const size_t T = kQueryCaptureTokens, hd = 4, planes = 6;
+    std::vector<float> tensor(planes * T * hd);
+    for (size_t p = 0; p < planes; p++)
+        for (size_t t = 0; t < T; t++)
+            for (size_t d = 0; d < hd; d++) tensor[(p * T + t) * hd + d] = (float)(p * 100000 + t * 100 + d);
+    for (const size_t n_q : {(size_t)1, (size_t)5, T}) {
+        // ggml_backend_tensor_get_2d(offset 0, size, n_copies, stride_tensor, stride_data) on host memory.
+        const auto rd = kvflash_q_cap_all_read(T, hd, planes, n_q);
+        std::vector<float> packed(rd.n_copies * rd.size / sizeof(float));
+        for (size_t c = 0; c < rd.n_copies; c++)
+            std::memcpy((char *)packed.data() + c * rd.stride_data, (const char *)tensor.data() + c * rd.stride_tensor, rd.size);
+        CHECK(packed.size() * sizeof(float) == planes * n_q * hd * sizeof(float));      // only the captured rows
+        if (n_q < T) CHECK(packed.size() < tensor.size());
+        std::vector<float> got;
+        kvflash_regroup_queries(packed, planes, n_q, hd, got);
+        REQUIRE(got.size() == n_q * planes * hd);
+        for (size_t t = 0; t < n_q; t++)
+            for (size_t p = 0; p < planes; p++)
+                for (size_t d = 0; d < hd; d++)
+                    CHECK(got[t * planes * hd + p * hd + d] == tensor[(p * T + t) * hd + d]);
+    }
+}
+TEST_CASE(KvflashExactMassFixture, uq_queries_env_is_off_by_default_and_capped_at_the_capture_window) {
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", nullptr);
+        CHECK(kvflash_uq_queries() == 0);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "16");
+        CHECK(kvflash_uq_queries() == 16);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "64");
+        CHECK(kvflash_uq_queries() == 64);
+    }
+    {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", "512");
+        CHECK(kvflash_uq_queries() == kQueryCaptureTokens);   // the graph keeps 64 rows per batch
+    }
+    for (const char * bad : {"0", "-3", "junk", ""}) {
+        luce_test::ScopedEnvVar e("LUCE_KVFLASH_UQ_QUERIES", bad);
+        CHECK(kvflash_uq_queries() == 0);
+    }
 }
 
 // ---- fast scorer vs the double-precision reference -------------------------
