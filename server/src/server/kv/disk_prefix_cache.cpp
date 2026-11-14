@@ -143,6 +143,7 @@ DiskPrefixCache::~DiskPrefixCache() {
     // The store outlives this model while another one uses it; this
     // model's queued writes finish either way.
     drain();
+    if (disk_ && holds_identity_) disk_->release_identity(identity_salt_);
 }
 
 bool DiskPrefixCache::init() {
@@ -155,6 +156,18 @@ bool DiskPrefixCache::init() {
         config_.cache_dir.clear();
         return !failed;
     }
+    // One server per model identity on a directory: its files, pins and
+    // views are its alone.
+    if (!disk_->hold_identity(identity_salt_)) {
+        std::fprintf(stderr,
+                     "[disk-cache] disabled: another server on %s serves this model "
+                     "with the same settings (pass --kv-cache-dir <other dir> to give "
+                     "this one its own)\n", config_.cache_dir.c_str());
+        disk_.reset();
+        config_.cache_dir.clear();
+        return true;
+    }
+    holds_identity_ = true;
     std::lock_guard<std::mutex> lock(disk_->mu_);
     // Restore into the layout this identity used most recently; learn_layout
     // confirms it against the live model before anything is written.
@@ -278,7 +291,7 @@ void DiskPrefixCache::learn_layout(Checkpoint checkpoint) {
     // A memory-only backend is detected even before init().
     auto ref = store_.ref(checkpoint);
     if (!ref.ctx) {
-        if (store_.used(checkpoint)) {
+        if (store_.used(checkpoint) && !store_.exports()) {
             backend_snapshot_unsupported_ = true;
             std::fprintf(stderr,
                          "[disk-cache] disabled: backend snapshots are "
@@ -333,11 +346,17 @@ OwnedSnapshot DiskPrefixCache::load(const std::vector<int32_t> & prompt_ids) {
     std::lock_guard<std::mutex> lock(disk_->mu_);
     const int idx = disk_->find_entry_id(id);
     if (out.empty()) {
-        ++disk_->stats_.load_failures;
-        // A corrupt, partial or mismatched file is never retried.
         if (idx >= 0 && !disk_->entries_[(size_t)idx].pending) {
+            std::error_code ec;
+            if (!pending && !fs::exists(path, ec)) {
+                // Another server evicted it: only the index entry goes.
+                disk_->forget_entry_locked((size_t)idx);
+                return {};
+            }
+            // A corrupt, partial or mismatched file is never retried.
             disk_->remove_entry((size_t)idx, "lookup failed");
         }
+        ++disk_->stats_.load_failures;
         return {};
     }
     std::fprintf(stderr, "[disk-cache] read %s (%u pos, %.1f MB, %.2fs)\n",
@@ -578,20 +597,28 @@ bool DiskPrefixCache::save_async(OwnedSnapshot snap,
                          std::chrono::steady_clock::now() - t0).count(),
                      mib(disk_->config_.max_pending_bytes));
     }
-    disk_->expire_locked();
-    // Already on disk (or queued): count it as a use.
+    // This process's files only: the writer thread expires and evicts the
+    // other servers' ones, after merging the directory, before it publishes.
+    disk_->expire_locked(/*local_only=*/true);
+    // Already on disk (or queued): count it as a use. A file another server
+    // evicted is written again.
     const int existing = find_entry(hash);
     if (existing >= 0) {
-        disk_->touch_locked(disk_->entries_[(size_t)existing]);
-        return true;
+        if (disk_->touch_locked(disk_->entries_[(size_t)existing])) return true;
+        disk_->forget_entry_locked((size_t)existing);
     }
-    // Make room first, so the budget holds while the file is being written.
+    // Make room first among this process's files, so the budget holds while
+    // the file is being written; the publish makes the rest of the room
+    // (other servers' files), or drops the file when pins fill it.
     if (est_size > disk_->budget_locked()) {
         std::fprintf(stderr, "[disk-cache] skip save: %.1f MB exceeds budget\n",
                      mib(est_size));
         return false;
     }
-    if (!disk_->make_room_locked(est_size)) {
+    uint64_t pinned_bytes = 0;
+    for (const auto & e : disk_->entries_) pinned_bytes += disk_->pinned_locked(e) ? e.file_size : 0;
+    if (!disk_->make_room_locked(est_size, /*local_only=*/true) &&
+        pinned_bytes + est_size > disk_->budget_locked()) {
         std::fprintf(stderr, "[disk-cache] skip save: %.1f MB does not fit beside "
                      "the pinned files\n", mib(est_size));
         return false;
@@ -632,18 +659,22 @@ bool DiskPrefixCache::save(Checkpoint checkpoint, const std::vector<int32_t> & p
     learn_layout(checkpoint);
     if (off()) return false;
     if ((int)prompt_ids.size() < config_.min_tokens) return false;
-    const auto ref = store_.ref(checkpoint);
-    if (!ref.ctx) return false;
-    // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
-    // ref.ctx; a file written from ref.ctx would restore with no KV.
-    if (ref.pooled) {
-        std::fprintf(stderr, "[disk-cache] skip save: pooled (KVFlash) snapshot not persistable\n");
-        return false;
+    if (!store_.exports()) {
+        const auto ref = store_.ref(checkpoint);
+        if (!ref.ctx) return false;
+        // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
+        // ref.ctx; a file written from ref.ctx would restore with no KV.
+        if (ref.pooled) {
+            std::fprintf(stderr, "[disk-cache] skip save: pooled (KVFlash) snapshot not persistable\n");
+            return false;
+        }
     }
-    if (ref.cur_pos > (int)prompt_ids.size()) {
+    const int position = store_.position(checkpoint);
+    if (position <= 0) return false;
+    if (position > (int)prompt_ids.size()) {
         std::fprintf(stderr,
                      "[disk-cache] skip save: snapshot pos=%d exceeds key of "
-                     "%zu tokens\n", ref.cur_pos, prompt_ids.size());
+                     "%zu tokens\n", position, prompt_ids.size());
         return false;
     }
     {
@@ -651,13 +682,9 @@ bool DiskPrefixCache::save(Checkpoint checkpoint, const std::vector<int32_t> & p
         const PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
         std::lock_guard<std::mutex> lock(disk_->mu_);
         const int existing = find_entry(hash);
-        if (existing >= 0) {
-            disk_->touch_locked(disk_->entries_[(size_t)existing]);
-            return true;
-        }
+        if (existing >= 0 && disk_->touch_locked(disk_->entries_[(size_t)existing])) return true;
     }
-    return save_async(OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok),
-                      prompt_ids, aux);
+    return save_async(store_.copy(checkpoint), prompt_ids, aux);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
