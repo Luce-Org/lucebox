@@ -8,6 +8,7 @@
 
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
+#include <cstdint>
 #include <fstream>
 
 #include "server/sse_emitter.h"
@@ -7170,6 +7171,45 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
     TEST_ASSERT(
         resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
     TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+
+    // Explicit null fields represent unset optional fields (the OpenAI API
+    // default) and must fall back to the default or lower-priority aliases.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", nullptr}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", nullptr}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", nullptr}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", nullptr},
+                                   {"max_output_tokens", nullptr},
+                                   {"max_completion_tokens", nullptr}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", nullptr},
+                                   {"max_completion_tokens", 256}}, 400) == 256);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", nullptr},
+                                   {"max_output_tokens", 250},
+                                   {"max_completion_tokens", 500}}, 400) == 250);
+
+    // Unshadowed invalid types on selected aliases must throw json::type_error.
+    bool threw = false;
+    try {
+        resolve_max_output_tokens({{"max_tokens", "invalid"}}, 400);
+    } catch (const json::type_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
+
+    threw = false;
+    try {
+        resolve_max_output_tokens({{"max_tokens", nullptr},
+                                   {"max_completion_tokens", "invalid"}}, 400);
+    } catch (const json::type_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
+
     // "Unlimited" sentinels from clients such as PocketPal must fall back
     // to the default rather than yielding a zero-token budget.
     TEST_ASSERT(
@@ -7182,6 +7222,52 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_output_tokens", -1}}, 400) == 400);
     TEST_ASSERT(
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
+
+    // Boundary checks: INT_MAX, signed and unsigned values exceeding INT_MAX clamp safely.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", std::numeric_limits<int>::max()}}, 400) ==
+        std::numeric_limits<int>::max());
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", 3000000000LL}}, 400) ==
+        std::numeric_limits<int>::max());
+    TEST_ASSERT(
+        resolve_max_output_tokens(
+            {{"max_tokens", static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1ULL}}, 400) ==
+        std::numeric_limits<int>::max());
+
+    // Floating-point inputs: integral values within range convert safely,
+    // values exceeding INT_MAX clamp without overflow, non-positive values fall back
+    // to default, and positive fractional or non-finite values throw json::type_error.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", 1e100}}, 400) ==
+        std::numeric_limits<int>::max());
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", 3000000000.0}}, 400) ==
+        std::numeric_limits<int>::max());
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", 2048.0}}, 400) == 2048);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", 0.0}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", -1.0}}, 400) == 400);
+
+    threw = false;
+    try {
+        resolve_max_output_tokens({{"max_tokens", 1.5}}, 400);
+    } catch (const json::type_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
+
+    threw = false;
+    try {
+        json j;
+        j["max_tokens"] = std::numeric_limits<double>::infinity();
+        resolve_max_output_tokens(j, 400);
+    } catch (const json::type_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
 }
 
 
