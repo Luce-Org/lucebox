@@ -68,6 +68,7 @@ public:
         std::optional<std::string> draft_path;
         int draft_block_size = 0;
         bool fast_rollback = true;
+        bool fast_rollback_explicit = false;
         bool seq_verify = false;
         bool specla_mode = false;
         int specla_top_k = 4;
