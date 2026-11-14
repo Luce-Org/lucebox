@@ -161,6 +161,8 @@ public:
         max_resident_bytes_ = bytes;
         max_resident_bytes_published_.store(bytes, std::memory_order_relaxed);
     }
+    size_t max_resident_bytes() const { return max_resident_bytes_; }
+    size_t resident_bytes() const { return resident_bytes_; }
 
     // Select a boundary, destination, and optional budget victim as one owned
     // operation. Each prefilling request can hold one; a live reservation's

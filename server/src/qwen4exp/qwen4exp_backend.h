@@ -65,6 +65,10 @@ public:
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
 
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
 
@@ -116,6 +120,24 @@ private:
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
+    bool create_seq_caches();
+    // Residency: what the model holds on its GPUs. `experts` is the split mode's release of the target device only,
+    // which keeps the routed expert stacks on the expert device.
+    enum class Held { all, experts, none };   // in decreasing order of what is held
+    Held held_ = Held::all;
+    void release_device_state(bool keep_experts);
+    // A release of the target device keeps each cache's expert-device K/V buffer (0: the main cache, then the
+    // concurrency slots); the reinstate places the rows back in them.
+    std::vector<ggml_backend_buffer_t> kept_remote_bufs_;
+    ggml_backend_buffer_t take_kept_remote(size_t i) {
+        if (i >= kept_remote_bufs_.size()) return nullptr;
+        ggml_backend_buffer_t b = kept_remote_bufs_[i];
+        kept_remote_bufs_[i] = nullptr;
+        return b;
+    }
+    void free_kept_remote_bufs();
+    int target_gpu() const { return cfg_.device.gpu; }
+    int expert_gpu() const { return cfg_.expert_device ? cfg_.expert_device->gpu : -1; }
     // ctx < 0: the cache's context (none before the cache exists).
     size_t pflash_reserve(ggml_backend_t device, int ctx = -1) const;
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and

@@ -62,6 +62,17 @@ Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
 }
 
+void Qwen4ExpSeqEngine::release_device_state() {
+    for (InputGather & gather : next_inputs_) {
+        if (gather.inputs.valid()) gather.inputs.wait();   // a lookahead gather may still read the PLE table
+        gather = InputGather{};
+    }
+    ggml_backend_synchronize(backend_);
+    clear_qwen4exp_batched_decode_workspace(decode_workspace_);
+    clear_qwen4exp_batched_decode_workspace(verify_workspace_);
+    for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
+}
+
 bool Qwen4ExpSeqEngine::mtp_capable(int slot) const {
     return verify_width_ != 1 && slot >= 0 && slot < (int)caches_.size() && caches_[(size_t)slot] &&
         qwen4exp_verify_supported(*caches_[(size_t)slot]);

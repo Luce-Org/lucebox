@@ -248,7 +248,10 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp = false,
                            int mtp_draft = 1, // allocate the explicit draft cap once
                            const Qwen4ExpSlotStates * slot_states = nullptr, int state_slot = -1,
-                           int remote_layers = 0, int kvflash_pool = 0);
+                           int remote_layers = 0, int kvflash_pool = 0,
+                           // A reinstate after a release of the target device: the expert device's K/V
+                           // buffer this cache had, kept there; the remote rows are placed back in it.
+                           ggml_backend_buffer_t reuse_remote_buf = nullptr);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 

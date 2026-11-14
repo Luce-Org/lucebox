@@ -39,6 +39,7 @@
 #include "pflash_unified.h"
 #include "pflash/pflash_selection.h"
 #include <nlohmann/json.hpp>
+#include "swap_group.h"
 #include <memory>
 
 #include <atomic>
@@ -113,6 +114,13 @@ struct ServerConfig {
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "luce";
+    // --swap-group <dir>: servers that share GPUs take turns on them (docs/specs/model-swap.md).
+    std::string swap_group_dir;
+    // --swap-start released: after loading, release the GPUs a peer may need (keeping what never conflicts).
+    bool        swap_start_released = false;
+    // The RAM prefix budget was sized automatically (resolve_prefix_cache_budget), so a swap-group member may
+    // resize it as the memory available changes.
+    bool        prefix_cache_budget_auto = false;
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     // Resident system-memory budget for single-sequence prefix snapshots.
     // kPrefixCacheBudgetAuto sizes it from the backend's snapshot size at
@@ -804,6 +812,11 @@ public:
         stopping_.store(true, std::memory_order_relaxed);
     }
 
+    // Swap group membership (residency.cpp). The caller holds the group's lock
+    // across the model load; this publishes the member, applies
+    // --swap-start released, and unlocks.
+    void attach_swap_group(std::unique_ptr<luce::server::SwapGroup> group);
+
 private:
     friend struct SchedulerTestHarness;
     friend struct HttpServerTestAccess;
@@ -985,6 +998,11 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    // The head of the queue whatever residency says. Only for the shutdown
+    // drain, which answers the job without running it.
+    ServerJob * take_queued_job();
+    // Takes the head of the queue, or null when it is empty. queue_mu_ held.
+    ServerJob * pop_job_locked();
     // The longest prefix `prompt` shares with a job still in the queue.
     int queued_shared_prefix(const std::vector<int32_t> & prompt);
     // Bounded wait: an idle-to-busy admission window, the grace before a
@@ -1196,6 +1214,50 @@ private:
     std::map<std::string, uint64_t> pflash_unified_counts_;
     nlohmann::json pflash_failure_counters_json() const;
     nlohmann::json pflash_unified_json() const;
+
+    // ── Residency: releasing and reinstating the model's GPUs (residency.cpp) ──
+    // An operation queued by a client thread and run by the serving thread
+    // while no request runs: admission stops while one is queued.
+    struct ResidencyOp {
+        bool release = false;           // false: reinstate
+        std::vector<int> gpus;          // release: the GPUs (empty: every one)
+        bool done = false, ok = false;
+        bool running = false;           // taken off the queue by the serving thread
+        std::string error;
+        double seconds = 0.0;
+        ResidencyOp * next = nullptr;
+    };
+    ResidencyOp * residency_head_ = nullptr;   // guarded by queue_mu_
+    ResidencyOp * residency_tail_ = nullptr;
+    std::condition_variable residency_cv_;     // with queue_mu_: an operation finished
+    std::atomic<bool> residency_released_{false};   // the model holds nothing on some GPU
+    std::unique_ptr<luce::server::SwapGroup> swap_group_;
+    std::unique_ptr<ResidencyOp> startup_release_;   // --swap-start released, nobody waits on it
+    mutable std::mutex residency_info_mu_;
+    nlohmann::json residency_info_;            // GET /v1/residency, refreshed by the serving thread
+    void handle_residency_request(SocketHandle fd, const std::string & method, const std::string & body);
+    bool run_residency_op(ResidencyOp & op);          // client thread: queue it and wait
+    void unlink_residency_op_locked(ResidencyOp ** link);   // queue_mu_ held: takes *link out of the queue
+    // Once stopping_ is set and the serving thread has stopped: the clients of
+    // queued operations give up.
+    void cancel_queued_residency_ops();
+    // Serving thread, idle. releases_only: while waiting for the swap group's
+    // lock, answer peers' release requests and leave reinstates queued.
+    void service_residency_ops(bool releases_only = false);
+    bool ensure_resident(std::string & error);        // serving thread
+    bool residency_release(const std::vector<int> & gpus, std::string & error);  // serving thread
+    void refresh_residency(const char * last_event = nullptr, double seconds = 0.0,
+                           const std::string & error = std::string());
+    bool residency_blocks_admission_locked() const {  // queue_mu_ held
+        return residency_head_ != nullptr || residency_released_.load(std::memory_order_acquire);
+    }
+    void fail_unstarted_job(ServerJob * job, const std::string & message);
+    // In a swap group, the automatic RAM prefix budget follows the memory
+    // available now (peers on an integrated GPU take system memory after this
+    // server sized its budget at start-up); never above its start-up size.
+    void rebudget_prefix_cache();
+    size_t prefix_budget_cap_ = 0;       // the budget as sized without the group (start-up, or the scheduler's)
+    size_t prefix_budget_applied_ = 0;   // the last budget rebudget_prefix_cache() set
 
     // Active client thread tracking.
     std::atomic<int>                active_clients_{0};

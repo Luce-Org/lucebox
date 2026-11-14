@@ -41,6 +41,7 @@
 #include "placement/kfd_topology.h"
 #include "kvflash_pager.h"
 #include "kv_quant.h"
+#include "swap_group.h"
 #ifdef LUCE_MOSS_IMAGE
 #include "moss_image/image_server.h"
 #include "moss_image/pipeline.h"
@@ -151,6 +152,12 @@ static void print_usage(const char * prog) {
         "                       wait in host memory and the server gives its GPU memory\n"
         "                       back on request (POST /memory/release, /memory/load)\n"
         "  --port <N>           Listen port (default: 8080)\n"
+        "  --swap-group <dir>   Take turns on shared GPUs with the other servers started\n"
+        "                       with this directory: a request to this model asks the\n"
+        "                       servers holding its GPUs to release them, then loads it\n"
+        "                       back (GET/POST /v1/residency; docs/specs/model-swap.md)\n"
+        "  --swap-start <released|resident>  With --swap-group: release the GPUs a peer\n"
+        "                       may need once loaded (default: resident)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
         "                       trained context, lowered to what the devices hold\n"
@@ -584,6 +591,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.mmproj_device = vision_device;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--swap-group") == 0 && i + 1 < argc) {
+            sconfig.swap_group_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--swap-start") == 0 && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value != "released" && value != "resident") {
+                std::fprintf(stderr, "[server] --swap-start must be released or resident\n");
+                return 2;
+            }
+            sconfig.swap_start_released = value == "released";
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             sconfig.host = argv[++i];
         } else if (std::strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
@@ -2420,6 +2436,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             "[server] --prefix-cache-max-mib has no effect with concurrent "
             "serving; use --concurrent-prefix-cache-max-mib\n");
     }
+    sconfig.prefix_cache_budget_auto = prefix_ram.automatic;
     // Store the resolved value: auto depends on the memory available now,
     // and the budget printed here must be the one the server enforces.
     if (!sconfig.concurrent_prefix_cache) {
@@ -3048,6 +3065,49 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // --swap-group: join before loading, so the GPUs this model loads onto are
+    // free; the group's lock is held until the server is ready.
+    std::unique_ptr<luce::server::SwapGroup> swap_group;
+    if (!options.front().sconfig.swap_group_dir.empty()) {
+        const ModelOptions & option = options.front();
+        if (load_balancing || options.size() > 1) {
+            std::fprintf(stderr, "[server] --swap-group serves one model per server\n");
+            return 2;
+        }
+        if (option.target_device_auto) {
+            std::fprintf(stderr, "[server] --swap-group needs an explicit --target-device\n");
+            return 2;
+        }
+        std::string error;
+        swap_group = luce::server::SwapGroup::open(option.sconfig.swap_group_dir, option.sconfig.port, error);
+        if (!swap_group || !swap_group->lock(nullptr, luce::server::kSwapLockTimeoutS, error)) {
+            std::fprintf(stderr, "[server] swap group: %s\n", error.c_str());
+            return 1;
+        }
+        std::vector<int> gpus;
+        auto add = [&gpus](const DevicePlacement & d) {
+            const std::vector<int> ids = d.is_multi_device() ? d.layer_split_gpus : std::vector<int>{d.gpu};
+            for (int g : ids) {
+                if (std::find(gpus.begin(), gpus.end(), g) == gpus.end()) gpus.push_back(g);
+            }
+        };
+        add(option.bargs.device);
+        if (option.draft_device_set) add(option.bargs.draft_device);
+        if (option.bargs.expert_device) add(*option.bargs.expert_device);
+        if (option.bargs.mmproj_device) add(*option.bargs.mmproj_device);
+        if (option.pflash_drafter_device) add(*option.pflash_drafter_device);
+        for (const luce::server::SwapMember & peer : swap_group->peers()) {
+            const std::vector<int> overlap = luce::server::gpu_overlap(peer.held(), gpus);
+            if (overlap.empty()) continue;
+            std::fprintf(stderr, "[swap] asking %s (port %d) to release its GPUs before loading\n",
+                         peer.model.c_str(), peer.port);
+            if (!luce::server::SwapGroup::ask_release(peer, overlap, luce::server::kSwapReleaseTimeoutS, error)) {
+                std::fprintf(stderr, "[server] swap group: %s\n", error.c_str());
+                return 1;
+            }
+        }
+    }
+
     std::vector<std::unique_ptr<LoadedModel>> loaded;
     std::vector<HttpServer *> servers;
     // All initialization (including backend environment defaults) finishes
@@ -3063,6 +3123,7 @@ int main(int argc, char ** argv) {
         loaded.push_back(std::move(model));
     }
     g_server = servers.front();
+    if (swap_group) g_server->attach_swap_group(std::move(swap_group));
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
     const int ret = load_balancing ? g_server->run(servers) : g_server->run();

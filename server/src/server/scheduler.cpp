@@ -978,11 +978,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // time, once the server has been idle for a moment. A
                     // request arriving during a warm waits for its current
                     // engine step (KvCache::warm_next_on_engine).
-                    if (kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
+                    // A released model has no caches to warm (residency.cpp).
+                    const bool can_warm = !residency_released_.load(std::memory_order_acquire);
+                    if (can_warm && kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
                         job = dequeue_for(
                             std::chrono::milliseconds(config_.shared_prefix_warm_grace_ms));
                     }
-                    while (!job && !stopping_.load() && kv_cache_.warm_pending() &&
+                    while (can_warm && !job && !stopping_.load() && kv_cache_.warm_pending() &&
                            !has_pending_jobs() &&
                            kv_cache_.warm_next_on_engine([this] {
                                return has_pending_jobs() || stopping_.load();
@@ -1516,7 +1518,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // threads too. Drain the raw queue before returning so run() does not hit
     // its client-shutdown timeout and the destructor never has to wake threads
     // after the server/backend teardown has already started.
-    while (ServerJob * queued = try_dequeue()) {
+    // A queued residency operation or a released model stops admission, not
+    // this drain.
+    while (ServerJob * queued = take_queued_job()) {
         const ParsedRequest & req = queued->req;
         const ResponseError error = ResponseError::unavailable(
             "server_shutting_down", "server shutting down");
