@@ -26,3 +26,12 @@ TEST_CASE(KvflashUbatchFixture, clamped_to_pool) {
     // the documented precedence.
     CHECK(kvflash_pooled_ubatch(1024, 64, 32) == 64);
 }
+
+TEST_CASE(KvflashUbatchFixture, clamped_to_the_unpinned_capacity_when_the_preamble_pins_rows) {
+    // 2048-token pool with 1152 rows pinned: a 1024 batch (16 chunks) cannot fit the 14 unpinned blocks beside the
+    // one the pager keeps free, so each batch would evict its own chunks. 13 chunks fit.
+    CHECK(kvflash_pooled_ubatch(1024, 64, 2048, 1152) == 832);
+    CHECK(kvflash_pooled_ubatch(512, 64, 2048, 1152) == 512);    // the default ubatch is untouched
+    CHECK(kvflash_pooled_ubatch(1024, 64, 2048, 0) == 1024);     // no pins: the old clamp
+    CHECK(kvflash_pooled_ubatch(1024, 64, 1280, 1152) == 64);    // the one-chunk floor still wins
+}

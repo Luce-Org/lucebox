@@ -7,6 +7,48 @@
 
 namespace luce::common {
 
+// A per-slot value the current mode may never have sized (the pool path has no KVFlash vectors): the fallback, not a read past the end.
+inline int slot_value_or(const std::vector<int> & v, int slot, int fallback) {
+    return slot >= 0 && (size_t)slot < v.size() ? v[(size_t)slot] : fallback;
+}
+
+// The scheduler's per-lane switch for a speculative burst: the budget is settled, no grammar masks the
+// position, and the request did not ask for AR decode (`luce_force_ar_decode`, the C-O2 oracle's T2).
+inline bool step_allows_speculation(bool budget_settled, bool constrained, bool force_ar) {
+    return budget_settled && !constrained && !force_ar;
+}
+
+// The accepted prefix of a chain round is committed to KV, recurrent state, features and history before the
+// scheduler reads it, so it may not pass the request's output budget: `gen_cap` is the generation bound the
+// request was admitted with, `generated_fed` the generated tokens already fed (committed). The pending root is
+// the next token and is always kept.
+inline size_t chain_budget_cap(size_t accepted, int gen_cap, int generated_fed) {
+    const int64_t left = (int64_t)gen_cap - (int64_t)generated_fed;
+    return std::min<size_t>(accepted, (size_t)std::max<int64_t>(1, left));
+}
+
+// First position the drafter window may read for a slot: its ring window [committed - cap, committed), clipped to
+// the first feature row the slot's current session wrote (a resumed or restored session has no features below
+// its resume point; the ring still holds the previous occupant's rows there).
+inline int draft_window_lo(int committed, int cap, int valid_from) {
+    const int lo = committed - std::min(committed, cap);
+    return std::min(committed, std::max(lo, valid_from));
+}
+
+// The valid-feature start after the slot rewinds from `old_cur` to `new_cur`: rows older than old_cur - cap were
+// overwritten in the ring, and rows at or past new_cur are rewritten by the replay.
+inline int feature_valid_after_rewind(int valid_from, int old_cur, int new_cur, int cap) {
+    return std::min(new_cur, std::max(valid_from, std::max(0, old_cur - cap)));
+}
+
+// A fixed DFlash2 chain can run only when the engine was handed an enabled chain
+// config whose width is the drafter's block (2..16), each slot's scratch stride
+// holds a whole chain, and the target feature ring exists.
+inline bool chain_config_ready(bool enabled, int width, int draft_block, int scratch_stride, bool feat_ring_ok) {
+    return enabled && width > 1 && width <= 16 && width == draft_block &&
+           scratch_stride >= width && feat_ring_ok;
+}
+
 inline int chain_decode_bucket_width(int lanes) {
     static constexpr int buckets[] = {
         1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,

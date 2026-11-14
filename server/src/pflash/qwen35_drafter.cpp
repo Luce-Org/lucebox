@@ -571,6 +571,7 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.capacity = 0;
     session.ids.clear();
     session.checkpoint = 0;
+    session.proj_rows.clear();
     session.probe_raw.clear();
     session.subunit_raw.clear();
     session.request_raw.clear();
@@ -646,6 +647,9 @@ void zero_recurrent_state(TargetCache & cache) {
     }
 }
 
+// Defined with the session offload helpers below.
+bool grow_scoring_session(Qwen35DrafterState & st, Qwen35ScoringSession & session, int capacity);
+
 // The session to score ``ids`` with, and the token it resumes from: a stored
 // session's checkpoint (pflash_scoring_resume: on the 8192 grid, inside the
 // shared prefix, at or before S - 64 and at or before ``resume_cap``), so the
@@ -688,54 +692,63 @@ Qwen35ScoringSession * acquire_scoring_session(
         return end <= shared &&
                session.query_windows.lookup(luce::pflash::pflash_span_tokens(begin, end), w.n_embd, rows);
     };
-    Qwen35ScoringSession * best = nullptr;
-    int best_shared = 0;
+    // An undersized session stays a candidate (pflash_pick_resume): it is grown below, not discarded.
+    std::vector<luce::pflash::PFlashResumeCandidate> candidates;
     for (auto & owned : st.sessions) {
-        Qwen35ScoringSession * session = owned.get();
-        if (limit == 0) break;
-        if (!session || session->capacity < S_padded || session->ids.empty() ||
-            session->keys_trained != st.head_loaded) {
-            continue;
+        const Qwen35ScoringSession * session = owned.get();
+        luce::pflash::PFlashResumeCandidate c;
+        c.usable = limit != 0 && session && session->keys_trained == st.head_loaded;
+        if (session) {
+            c.ids = &session->ids;
+            c.checkpoint = session->checkpoint;
+            c.capacity = session->capacity;
+            c.rows_cover = [&, session](int r, int shared) {
+                // The query window and every other window this call scores that starts before the resume point
+                // need their exact stored rows; with one snapshot per session, the call otherwise starts at 0.
+                if (r > query_start && !(query_end <= shared && row_floats > 0 &&
+                                         stored_window(*session, query_start, query_end, shared))) {
+                    return 0;
+                }
+                for (const auto & span : other_windows) {
+                    if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
+                    if (!stored_window(*session, span.begin, span.end, shared)) return 0;
+                }
+                if (!luce::pflash::pflash_scoring_proj_rows_cover(
+                        r, session->proj_rows_begin, (int) (session->proj_rows.size() / (size_t) w.n_embd))) {
+                    return 0;
+                }
+                if ((need_probe && (int) session->probe_raw.size() < r) ||
+                    (need_subunit && (int) session->subunit_raw.size() < r) ||
+                    (need_request && (int) session->request_raw.size() < r)) {
+                    return 0;
+                }
+                return r;
+            };
         }
-        const size_t n = std::min(session->ids.size(), ids.size());
-        const int shared = (int) (std::mismatch(session->ids.begin(),
-            session->ids.begin() + (long) n, ids.begin()).first -
-            session->ids.begin());
-        int r = luce::pflash::pflash_scoring_resume(session->checkpoint, shared, S, resume_cap);
-        // The query window and every other window this call scores that
-        // starts before the resume point need their exact stored rows; with
-        // one snapshot per session, the call otherwise starts at 0.
-        if (r > query_start && !(query_end <= shared && row_floats > 0 &&
-                                 stored_window(*session, query_start, query_end, shared))) {
-            r = 0;
-        }
-        for (const auto & span : other_windows) {
-            if (r == 0) break;
-            if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
-            if (!stored_window(*session, span.begin, span.end, shared)) r = 0;
-        }
-        if ((need_probe && (int) session->probe_raw.size() < r) ||
-            (need_subunit && (int) session->subunit_raw.size() < r) ||
-            (need_request && (int) session->request_raw.size() < r)) {
-            r = 0;
-        }
-        if (r > resume) {
-            resume = r;
-            best = session;
-            best_shared = shared;
-        }
+        candidates.push_back(std::move(c));
+    }
+    const luce::pflash::PFlashResumePick pick = luce::pflash::pflash_pick_resume(candidates, ids, resume_cap);
+    Qwen35ScoringSession * best = pick.index >= 0 ? st.sessions[(size_t) pick.index].get() : nullptr;
+    resume = pick.resume;
+    Qwen35ScoringSession * target = nullptr;
+    if (best && pick.needs_grow &&
+        !grow_scoring_session(st, *best, luce::pflash::pflash_session_capacity(S, st.session_ctx_limit))) {
+        // No room for a second copy: score fresh into this session, reallocated below, as before.
+        target = best;
+        best = nullptr;
+        resume = 0;
     }
     if (best) {
         if (!restore_ssm_state(best->cache, w.backend)) {
             resume = 0;
         } else {
-            shared_prefix = best_shared;
+            shared_prefix = pick.shared;
             best->host_valid = false;   // this call extends it: its host copy (if any) goes stale
             return best;
         }
     }
 
-    Qwen35ScoringSession * target = best;
+    if (!target) target = best;
     if (!target) {
         if (limit == 0) {
             scratch = std::make_unique<Qwen35ScoringSession>();
@@ -772,6 +785,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     zero_recurrent_state(target->cache);
     target->ids.clear();
     target->checkpoint = 0;
+    target->proj_rows.clear();
     target->probe_raw.clear();
     target->subunit_raw.clear();
     target->request_raw.clear();
@@ -815,6 +829,8 @@ std::vector<int> qwen35_session_token_dims(const Qwen35ScoringSession & session,
 void copy_session_bookkeeping(const Qwen35ScoringSession & from, Qwen35ScoringSession & to) {
     to.ids = from.ids;
     to.checkpoint = from.checkpoint;
+    to.proj_rows = from.proj_rows;
+    to.proj_rows_begin = from.proj_rows_begin;
     to.keys_trained = from.keys_trained;
     to.probe_raw = from.probe_raw;
     to.subunit_raw = from.subunit_raw;
@@ -824,6 +840,52 @@ void copy_session_bookkeeping(const Qwen35ScoringSession & from, Qwen35ScoringSe
     to.query_windows = from.query_windows;
     to.query_sets = from.query_sets;
     to.last_used = from.last_used;
+}
+
+// Grows ``session`` to ``capacity`` tokens in place, keeping what a resume reads: the token-indexed tensors (attention
+// K/V along max_ctx, block-15 keys) below its checkpoint, every other tensor (recurrent state and its snapshot) whole,
+// and the bookkeeping, cache position and last token. Goes through host memory with the offload helpers. On any
+// failure the session is left as it was and false is returned.
+bool grow_scoring_session(Qwen35DrafterState & st, Qwen35ScoringSession & session, int capacity) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int old_capacity = session.capacity;
+    Qwen35ScoringSession grown;
+    if (!allocate_scoring_session(st.weights, capacity, grown)) {
+        std::fprintf(stderr, "[qwen35-sessions] session not grown (%d -> %d): allocation failed\n", old_capacity,
+                     capacity);
+        std::fflush(stderr);
+        return false;
+    }
+    const auto old_tensors = qwen35_session_tensors(session);
+    luce::pflash::PFlashHostCopy host;
+    std::string error;
+    if (grown.cache.max_ctx < session.cache.max_ctx) {
+        error = "cache size differs";
+    } else if (luce::pflash::pflash_copy_to_host(old_tensors, qwen35_session_token_dims(session, old_tensors),
+                                                 session.checkpoint, nullptr, host, error)) {
+        luce::pflash::pflash_copy_from_host(host, qwen35_session_tensors(grown), error);
+    }
+    if (!error.empty()) {
+        free_qwen35_scoring_session(grown);
+        std::fprintf(stderr, "[qwen35-sessions] session not grown (%d -> %d): %s\n", old_capacity, capacity,
+                     error.c_str());
+        std::fflush(stderr);
+        return false;
+    }
+    ggml_backend_synchronize(st.weights.backend);
+    grown.cache.cur_pos = session.cache.cur_pos;
+    grown.cache.last_tok = session.cache.last_tok;
+    copy_session_bookkeeping(session, grown);
+    grown.host_id = session.host_id;
+    grown.host_valid = session.host_valid;
+    const int checkpoint = session.checkpoint;
+    std::swap(session, grown);          // ``grown`` now owns the old tensors
+    free_qwen35_scoring_session(grown);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[qwen35-sessions] grew session: %d -> %d, kept checkpoint %d (%.0f ms)\n", old_capacity,
+                 capacity, checkpoint, ms);
+    std::fflush(stderr);
+    return true;
 }
 
 size_t host_store_bytes(const DrafterHostSessions & store) {
@@ -1212,7 +1274,7 @@ static std::vector<int32_t> strict_score_impl(
     TargetCache & cache = session->cache;
     const int n_new = S - resume;
     // Ubatches are cut once at S - 64, exactly as in a fresh call, and the
-    // recurrent state is snapshotted at the last 8192-grid point at or before
+    // recurrent state is snapshotted at the last 1024-grid point at or before
     // that cut: the next turn (which replaces this prompt's generation prompt,
     // or repeats it) resumes there and recomputes the rest on the fresh
     // call's own partition.
@@ -1388,6 +1450,21 @@ static std::vector<int32_t> strict_score_impl(
     ggml_gallocr_free(alloc);
     auto t1 = std::chrono::steady_clock::now();
 
+    // Exact block-14 rows [proj_begin(checkpoint), checkpoint) for the next resume: this call's own activations from
+    // ``resume`` on, the session's earlier rows ahead of it (they cover [proj_begin(resume), resume)).
+    const int keep_begin = luce::pflash::pflash_scoring_proj_begin(checkpoint);
+    std::vector<float> keep_proj((size_t) hidden * (size_t) std::max(0, checkpoint - keep_begin));
+    if (!keep_proj.empty()) {
+        const int from_session = std::max(0, resume - keep_begin);
+        if (from_session > 0) {
+            std::copy_n(session->proj_rows.data() + (size_t) (keep_begin - session->proj_rows_begin) * hidden,
+                        (size_t) from_session * hidden, keep_proj.data());
+        }
+        ggml_backend_tensor_get(act_in, keep_proj.data() + (size_t) from_session * hidden,
+                                (size_t) (keep_begin + from_session - resume) * act_in->nb[1],
+                                (size_t) (checkpoint - keep_begin - from_session) * act_in->nb[1]);
+    }
+
     // Block-14 rows of each query window -- the query, then earlier
     // questions -- from this call when it computed them, else from the
     // session while they sit in the shared prefix. The query's are always
@@ -1466,11 +1543,14 @@ static std::vector<int32_t> strict_score_impl(
 
     ggml_tensor * wk_src = st.head_loaded ? st.head_wk : L.wk;
     session->keys_trained = st.head_loaded;
-    session->probe_raw.resize(use_probe ? (size_t) resume : 0);
+    // The projection chunks are the fresh call's: a resume inside one re-projects it whole from ``proj_begin``.
+    const int proj_begin = luce::pflash::pflash_scoring_proj_begin(resume);
+    const int n_proj = S - proj_begin;
+    session->probe_raw.resize(use_probe ? (size_t) proj_begin : 0);
     session->subunit_raw.resize(
-        use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
-    session->request_raw.resize(request_probe ? (size_t) resume : 0);
-    session->stage2_cand.resize(stage2_on ? (size_t) resume * luce::pflash::kStage2Embed : 0);
+        use_probe && st.probe_sub_fc2_w ? (size_t) proj_begin : 0);
+    session->request_raw.resize(request_probe ? (size_t) proj_begin : 0);
+    session->stage2_cand.resize(stage2_on ? (size_t) proj_begin * luce::pflash::kStage2Embed : 0);
     // Stage 2: the fresh latest user message's x̂ column sums, one per key chunk it overlaps ([parts][hidden]).
     const bool stage2_latest_fresh = stage2_on && stage2_latest_span.end > stage2_latest_span.begin &&
         stage2_latest_span.begin >= resume;
@@ -1479,25 +1559,61 @@ static std::vector<int32_t> strict_score_impl(
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
     // into a HIP grid y/z dimension (65,535 limit). The chunks start at the
-    // (grid) resume point, so they fall where a fresh call's do.
-    const int key_chunk = luce::pflash::kScoringResumeGrid;
-    if (n_new > 0) {
+    // chunk start before the resume point, so they fall where a fresh call's do.
+    const int key_chunk = luce::pflash::kScoringProjChunk;
+    // Phase clocks of the score half (the [qwen35-scorer] line): key / probe projection, segmentations, query
+    // windows (full probabilities read back), request / candidate tiles (reduced on the device).
+    double proj_ms = 0.0, seg_ms = 0.0, win_ms = 0.0, tile_ms = 0.0;
+    int seg_calls = 0, win_calls = 0;
+    const auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+    const auto tp0 = std::chrono::steady_clock::now();
+    if (n_proj > 0) {
         ggml_init_params nip{};
         nip.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
         nip.no_alloc = true;
         ggml_context * nctx = ggml_init(nip);
-        ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+        ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_tensor * subunit_new = use_probe && st.probe_sub_fc2_w
-            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_tensor * request_new = request_probe
-            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_proj) : nullptr;
         ggml_backend_buffer_t nbuf = use_probe || request_probe
             ? ggml_backend_alloc_ctx_tensors(nctx, w.backend) : nullptr;
         if ((use_probe || request_probe) && !nbuf) {
             ggml_free(nctx);
             return fail("qwen35 probe buffer allocation failed");
         }
-        const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
+        // The chunk that holds the resume point: the session's rows ahead of it, then this call's activations.
+        ggml_context * hctx = nullptr;
+        ggml_backend_buffer_t hbuf = nullptr;
+        ggml_tensor * head_x = nullptr;
+        if (proj_begin < resume) {
+            const int n_head = std::min(key_chunk, n_proj);
+            ggml_init_params hip{};
+            hip.mem_size = (size_t)2 * ggml_tensor_overhead() + 4096;
+            hip.no_alloc = true;
+            hctx = ggml_init(hip);
+            head_x = hctx ? ggml_new_tensor_2d(hctx, GGML_TYPE_F32, hidden, n_head) : nullptr;
+            hbuf = head_x ? ggml_backend_alloc_ctx_tensors(hctx, w.backend) : nullptr;
+            if (!hbuf || session->proj_rows_begin != proj_begin ||
+                session->proj_rows.size() < (size_t) hidden * (size_t) (resume - proj_begin)) {
+                if (hbuf) ggml_backend_buffer_free(hbuf);
+                if (hctx) ggml_free(hctx);
+                if (nbuf) ggml_backend_buffer_free(nbuf);
+                ggml_free(nctx);
+                session->ids.clear();
+                return fail("qwen35 scorer: chunk rows ahead of the resume point unavailable");
+            }
+            std::vector<float> head_host((size_t) hidden * (size_t) n_head);
+            const size_t kept = (size_t) hidden * (size_t) (resume - proj_begin);
+            std::copy_n(session->proj_rows.data(), kept, head_host.data());
+            ggml_backend_tensor_get(act_in, head_host.data() + kept, 0,
+                                    head_host.size() * sizeof(float) - kept * sizeof(float));
+            ggml_backend_tensor_set(head_x, head_host.data(), 0, head_host.size() * sizeof(float));
+        }
+        const int n_key_chunks = (n_proj + key_chunk - 1) / key_chunk;
         // Stage 2: c(t) of the new tokens, and the fresh latest message's x̂ column sums.
         ggml_context * s2ctx = nullptr;
         ggml_backend_buffer_t s2buf = nullptr;
@@ -1505,17 +1621,17 @@ static std::vector<int32_t> strict_score_impl(
         ggml_tensor * msum_new = nullptr;
         int msum_parts = 0;
         if (stage2_on) {
-            for (int b = 0; b < n_new && stage2_latest_fresh; b += key_chunk) {
-                const int n = std::min(key_chunk, n_new - b);
-                if (std::max(stage2_latest_span.begin, resume + b) <
-                    std::min(stage2_latest_span.end, resume + b + n)) ++msum_parts;
+            for (int b = 0; b < n_proj && stage2_latest_fresh; b += key_chunk) {
+                const int n = std::min(key_chunk, n_proj - b);
+                if (std::max(stage2_latest_span.begin, proj_begin + b) <
+                    std::min(stage2_latest_span.end, proj_begin + b + n)) ++msum_parts;
             }
             ggml_init_params sip2{};
             sip2.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
             sip2.no_alloc = true;
             s2ctx = ggml_init(sip2);
             if (s2ctx) {
-                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_new);
+                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_proj);
                 msum_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, hidden, std::max(1, msum_parts));
                 s2buf = ggml_backend_alloc_ctx_tensors(s2ctx, w.backend);
             }
@@ -1535,16 +1651,18 @@ static std::vector<int32_t> strict_score_impl(
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
         ggml_cgraph * kgf = ggml_new_graph_custom(kctx, 4096, false);
-        for (int b = 0; b < n_new; b += key_chunk) {
-            const int n = std::min(key_chunk, n_new - b);
-            ggml_tensor * x_c = ggml_view_2d(kctx, act_in, hidden, n, act_in->nb[1],
-                                             (size_t)b * act_in->nb[1]);
+        for (int b = 0; b < n_proj; b += key_chunk) {
+            const int n = std::min(key_chunk, n_proj - b);
+            ggml_tensor * x_c = head_x && b == 0
+                ? ggml_view_2d(kctx, head_x, hidden, n, head_x->nb[1], 0)
+                : ggml_view_2d(kctx, act_in, hidden, n, act_in->nb[1],
+                               (size_t) (proj_begin + b - resume) * act_in->nb[1]);
             ggml_tensor * x_norm = ggml_mul(kctx, ggml_rms_norm(kctx, x_c, w.rms_eps), L.attn_norm);
             ggml_tensor * K = ggml_reshape_3d(kctx, ggml_mul_mat(kctx, wk_src, x_norm), D, Hk, n);
             K = ggml_mul(kctx, ggml_rms_norm(kctx, K, w.rms_eps), L.k_norm);
             ggml_tensor * k_dst = ggml_view_3d(kctx, session->keys, D, Hk, n,
                                                session->keys->nb[1], session->keys->nb[2],
-                                               (size_t)(resume + b) * session->keys->nb[2]);
+                                               (size_t)(proj_begin + b) * session->keys->nb[2]);
             ggml_build_forward_expand(kgf, ggml_cpy(kctx, K, k_dst));
             if (use_probe) {
                 // Segment probe on the same tap: LayerNorm -> fc1 -> GELU trunk,
@@ -1589,11 +1707,11 @@ static std::vector<int32_t> strict_score_impl(
                 ggml_build_forward_expand(kgf, ggml_cpy(kctx, c, c_dst));
             }
             if (msum_new) {
-                const int lo = std::max(stage2_latest_span.begin, resume + b);
-                const int hi = std::min(stage2_latest_span.end, resume + b + n);
+                const int lo = std::max(stage2_latest_span.begin, proj_begin + b);
+                const int hi = std::min(stage2_latest_span.end, proj_begin + b + n);
                 if (lo < hi) {
                     ggml_tensor * col = luce::pflash::pflash_stage2_build_column_sum(
-                        kctx, x_norm, lo - (resume + b), hi - (resume + b));
+                        kctx, x_norm, lo - (proj_begin + b), hi - (proj_begin + b));
                     const int part = (int) (stage2_msum.size() / (size_t) hidden);
                     stage2_msum.resize(stage2_msum.size() + (size_t) hidden);
                     ggml_tensor * m_dst = ggml_view_1d(kctx, msum_new, hidden, (size_t) part * msum_new->nb[1]);
@@ -1608,70 +1726,72 @@ static std::vector<int32_t> strict_score_impl(
         ggml_free(kctx);
         if (key_ok && use_probe) {
             session->probe_raw.resize((size_t) S);
-            ggml_backend_tensor_get(probe_new, session->probe_raw.data() + resume, 0,
-                                    (size_t) n_new * sizeof(float));
+            ggml_backend_tensor_get(probe_new, session->probe_raw.data() + proj_begin, 0,
+                                    (size_t) n_proj * sizeof(float));
             if (subunit_new) {
                 session->subunit_raw.resize((size_t) S);
-                ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + resume, 0,
-                                        (size_t) n_new * sizeof(float));
+                ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + proj_begin, 0,
+                                        (size_t) n_proj * sizeof(float));
             }
         }
         if (key_ok && request_new) {
             session->request_raw.resize((size_t) S);
-            ggml_backend_tensor_get(request_new, session->request_raw.data() + resume, 0,
-                                    (size_t) n_new * sizeof(float));
+            ggml_backend_tensor_get(request_new, session->request_raw.data() + proj_begin, 0,
+                                    (size_t) n_proj * sizeof(float));
         }
         if (key_ok && cand_new) {
             session->stage2_cand.resize((size_t) S * luce::pflash::kStage2Embed);
             ggml_backend_tensor_get(cand_new,
-                session->stage2_cand.data() + (size_t) resume * luce::pflash::kStage2Embed, 0,
-                (size_t) n_new * luce::pflash::kStage2Embed * sizeof(float));
+                session->stage2_cand.data() + (size_t) proj_begin * luce::pflash::kStage2Embed, 0,
+                (size_t) n_proj * luce::pflash::kStage2Embed * sizeof(float));
         }
         if (key_ok && msum_new && !stage2_msum.empty()) {
             ggml_backend_tensor_get(msum_new, stage2_msum.data(), 0, stage2_msum.size() * sizeof(float));
         }
+        if (hbuf) ggml_backend_buffer_free(hbuf);
+        if (hctx) ggml_free(hctx);
         if (s2buf) ggml_backend_buffer_free(s2buf);
         if (s2ctx) ggml_free(s2ctx);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         ggml_free(nctx);
         if (!key_ok) return fail("qwen35 key graph compute failed");
     }
+    proj_ms = ms_since(tp0);
 
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
 
+    // The segmentation's per-call constants, computed on first use: the boundary scores (tap-count Conv1d over
+    // the raw logits plus the residual, sigmoid), the sub-unit split scores (the oversize interior argmax only)
+    // and the token line flags. Only the pins change between the segmentations of one call.
+    std::vector<float> boundary, split_scores;
+    luce::pflash::PFlashLineFlags lines;
+    bool boundary_ready = false, lines_ready = false;
+    const auto probe_boundary = [&]() {
+        if (boundary_ready) return;
+        boundary_ready = true;
+        boundary = luce::pflash::pflash_probe_boundary_scores(probe_raw, st.probe_conv_w, st.probe_conv_b);
+        if (!subunit_raw.empty()) {
+            split_scores = luce::pflash::pflash_probe_boundary_scores(subunit_raw, st.probe_sub_conv_w,
+                                                                      st.probe_sub_conv_b);
+        }
+    };
+    const auto probe_lines = [&]() {
+        if (lines_ready) return;
+        lines_ready = true;
+        std::vector<std::string> texts((size_t) S);
+        for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
+        lines = luce::pflash::pflash_line_flags(texts);
+    };
+
     // Candidates: probe segments cut at the pinned spans' edges, or fixed
     // chunks when the probe is off or finds too few boundaries.
-    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
-                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+    const auto segment_impl = [&](const std::vector<PFlashTokenSpan> & pins,
+                                  std::vector<PFlashTokenSpan> & segments, bool & density) {
         segments.clear();
         density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
         if (!use_probe) return;
-        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
-        // padding) plus the residual logit, then sigmoid: the boundary score
-        // per token.
-        const auto smooth = [&](const std::vector<float> & raw,
-                                const std::vector<float> & conv_w, float conv_b,
-                                std::vector<float> & out) {
-            const int taps = (int) conv_w.size();
-            const int radius = taps / 2;
-            out.assign((size_t) S, 0.0f);
-            for (int t = 0; t < S; ++t) {
-                float acc = raw[(size_t) t] + conv_b;
-                for (int k = 0; k < taps; ++k) {
-                    const int u = t + k - radius;
-                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
-                }
-                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
-            }
-        };
-        std::vector<float> boundary;
-        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
-        // Sub-unit scores feed only the oversize interior argmax below.
-        std::vector<float> split_scores;
-        if (!subunit_raw.empty()) {
-            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
-        }
+        probe_boundary();
         const int query_end = score_query_end < 0 ? S : score_query_end;
         const int query_begin = query_end - std::min(n_lookahead, query_end);
         std::vector<int> forced{query_begin, query_end};
@@ -1691,9 +1811,7 @@ static std::vector<int32_t> strict_score_impl(
             experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
         if (boundaries_in_context >= 4 || forced_probe) {
             if (st.probe_line_aligned && st.probe_vocab) {
-                std::vector<std::string> texts((size_t) S);
-                for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
-                const auto lines = luce::pflash::pflash_line_flags(texts);
+                probe_lines();
                 segments = luce::pflash::pflash_probe_segments(
                     boundary, S, st.probe_threshold, st.probe_min_segment,
                     st.probe_max_segment, forced, split_scores, &lines);
@@ -1720,6 +1838,13 @@ static std::vector<int32_t> strict_score_impl(
                 density ? "density" : "sum");
         }
         std::fflush(stderr);
+    };
+    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
+                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+        const auto t = std::chrono::steady_clock::now();
+        segment_impl(pins, segments, density);
+        seg_ms += ms_since(t);
+        ++seg_calls;
     };
 
     // Tokens the selector keeps whatever their score, counted the way it charges them
@@ -2218,6 +2343,8 @@ static std::vector<int32_t> strict_score_impl(
     // while the query stays put, reusing its rows.
     session->ids = ids;
     session->checkpoint = checkpoint;
+    session->proj_rows = std::move(keep_proj);
+    session->proj_rows_begin = keep_begin;
     // Only exact rows are kept for later prompts: those in full grid ubatches
     // (pflash_scoring_resume.h).
     for (const auto & [tokens, rows] : qrows) {
@@ -2240,8 +2367,8 @@ static std::vector<int32_t> strict_score_impl(
     // a single softmax. History windows share the query's key set and mix
     // into its mass at their weights.
     const int n_key_chunks = (S + key_chunk - 1) / key_chunk;
-    const auto score_window = [&](const ScoredWindow & window,
-                                  std::vector<float> & mass) -> bool {
+    const auto score_window_impl = [&](const ScoredWindow & window,
+                                       std::vector<float> & mass) -> bool {
         const int nq = window.end - window.begin;
         ggml_init_params lip{};
         lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
@@ -2326,15 +2453,26 @@ static std::vector<int32_t> strict_score_impl(
         }
         ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
                                                 1.0f / std::sqrt((float)D), 0.0f);
-        ggml_set_output(probs);
-        ggml_build_forward_expand(sgf, probs);
+        // Default: sum over (query, head) per key on device, read back S floats.
+        // PFLASH_TW_HOST_REDUCE=1 keeps the old full-probability readback.
+        static const bool host_reduce = []{
+            const char * e = std::getenv("PFLASH_TW_HOST_REDUCE");
+            return e && e[0] == '1';
+        }();
+        ggml_tensor * out_t = probs;
+        if (!host_reduce) {
+            out_t = ggml_sum_rows(sctx, ggml_cont(sctx,
+                ggml_transpose(sctx, ggml_reshape_2d(sctx, probs, S, (int64_t) nq * H))));
+        }
+        ggml_set_output(out_t);
+        ggml_build_forward_expand(sgf, out_t);
         ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
         const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
             ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
         std::vector<float> probs_h;
         if (ok) {
-            probs_h.resize((size_t)S * nq * H);
-            ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
+            probs_h.resize(host_reduce ? (size_t)S * nq * H : (size_t)S);
+            ggml_backend_tensor_get(out_t, probs_h.data(), 0, probs_h.size() * sizeof(float));
         }
         ggml_gallocr_free(salloc);
         ggml_free(sctx);
@@ -2354,8 +2492,21 @@ static std::vector<int32_t> strict_score_impl(
             set_last_error(message);
             return false;
         }
-        scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
+        if (host_reduce) {
+            scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
+        } else {
+            const double denominator = (double) H * (double) nq;
+            mass.assign((size_t) S, 0.0f);
+            for (int j = 0; j < S; ++j) mass[(size_t) j] = (float) (probs_h[(size_t) j] / denominator);
+        }
         return true;
+    };
+    const auto score_window = [&](const ScoredWindow & window, std::vector<float> & mass) -> bool {
+        const auto t = std::chrono::steady_clock::now();
+        const bool ok = score_window_impl(window, mass);
+        win_ms += ms_since(t);
+        ++win_calls;
+        return ok;
     };
     std::vector<float> token_mass;
     // Today's windows: each scored on its own, mixed at their weights.
@@ -2382,9 +2533,9 @@ static std::vector<int32_t> strict_score_impl(
     // device, so only [S] floats per tile come back.
     // The identifier query uses the same scoring with its tokens left among
     // the keys (scored, not pinned: arm viii's key mask).
-    const auto score_request_set = [&](const std::vector<int> & tokens,
-                                       const std::vector<float> & rows,
-                                       bool mask_query_tokens, int & tiles) -> bool {
+    const auto score_request_set_impl = [&](const std::vector<int> & tokens,
+                                            const std::vector<float> & rows,
+                                            bool mask_query_tokens, int & tiles) -> bool {
         constexpr int kTile = 32;
         const int nq = (int) tokens.size();
         std::vector<float> mask_row((size_t) S, -INFINITY);
@@ -2503,6 +2654,13 @@ static std::vector<int32_t> strict_score_impl(
         token_mass.assign((size_t) S, 0.0f);
         for (int j = 0; j < S; ++j) token_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
         return true;
+    };
+    const auto score_request_set = [&](const std::vector<int> & tokens, const std::vector<float> & rows,
+                                       bool mask_query_tokens, int & tiles) -> bool {
+        const auto t = std::chrono::steady_clock::now();
+        const bool ok = score_request_set_impl(tokens, rows, mask_query_tokens, tiles);
+        tile_ms += ms_since(t);
+        return ok;
     };
     // ---------------------------------------------------------------- query step 1
     // Masses of query token sets, cached per set (one tile stream per set; tiles never mix sets).
@@ -2907,13 +3065,16 @@ static std::vector<int32_t> strict_score_impl(
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d, resumed at %d, "
-        "%d new) score %.2fs (%zu query windows) total %.2fs head=%s\n",
+        "%d new) score %.2fs (%zu query windows) total %.2fs head=%s "
+        "phases: proj %.0f ms, segments %d/%.0f ms, windows %d/%.0f ms, tiles %d/%.0f ms\n",
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
         std::chrono::duration<double>(t2 - t1).count(),
         qcand ? query_trace.set.candidates.size() : request_set || ident_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
-        st.head_loaded ? "trained" : "native-block15");
+        st.head_loaded ? "trained" : "native-block15",
+        proj_ms, seg_calls, seg_ms, win_calls, win_ms,
+        qtiles + request_trace.query_tiles + ident_trace.query_tiles, tile_ms);
     std::fflush(stderr);
     pflash_set_scoring_stats({resume, n_new,
                               qcand ? (int) query_trace.set.candidates.size()

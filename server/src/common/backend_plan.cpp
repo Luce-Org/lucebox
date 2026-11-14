@@ -104,13 +104,15 @@ BackendPreparation BackendPlanBuilder::resolve(
                 "Qwen3.6 SpecLA requires --draft <path>",
                 std::move(warnings));
         } else {
-            args.ddtree_mode = true;
+            // SpecLA verifies through DDTree, which KVFlash refuses.
             if (admission.kvflash_requested()) {
-                warnings.push_back(
-                    "--specla is unavailable with KVFlash; using ordinary "
-                    "DDTree verification");
-                args.specla_mode = false;
+                return failure(
+                    BackendPreparationError::FeatureCompatibility,
+                    "--specla cannot run with --kvflash (LUCE_KVFLASH): SpecLA verifies "
+                    "with the DDTree loop, which does not settle terminal steps like AR; "
+                    "drop --specla");
             }
+            args.ddtree_mode = true;
         }
         if (!args.specla_mode && !args.ddtree_tau_explicit) {
             args.ddtree_tau = std::numeric_limits<float>::infinity();
@@ -157,6 +159,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.speculation_.draft_path = std::move(args.draft_path);
     plan.speculation_.draft_block_size = args.draft_block_size;
     plan.speculation_.fast_rollback = args.fast_rollback;
+    plan.speculation_.fast_rollback_explicit = args.fast_rollback_explicit;
     plan.speculation_.seq_verify = args.seq_verify;
     plan.speculation_.specla_mode = args.specla_mode;
     plan.speculation_.specla_top_k = args.specla_top_k;
@@ -173,6 +176,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.execution_.chunk =
         plan.model_.metadata.arch == "qwen4exp" && !args.chunk_set ? 0 : args.chunk;
     plan.execution_.max_concurrency = args.max_concurrency;
+    plan.execution_.max_concurrency_set = args.max_concurrency_set;
     plan.execution_.prefill_mode = args.ds4_prefill_mode;
     plan.execution_.expert_top_k = args.ds4_expert_top_k;
     plan.execution_.fused_decode = args.ds4_fused_decode;
