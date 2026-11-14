@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <string>
 #include <utility>
 
 #if !defined(_WIN32)
@@ -40,7 +41,13 @@ json pin_json(const SharedPrefixPin & p) {
 bool write_durably(const std::string & path, const std::string & text) {
     std::error_code ec;
     fs::create_directories(fs::path(path).parent_path(), ec);
+    // One temporary per process: servers of one token identity on a directory share the catalog, and the last
+    // whole write wins.
+#if defined(_WIN32)
     const std::string tmp = path + ".tmp";
+#else
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+#endif
     FILE * f = std::fopen(tmp.c_str(), "wb");
     if (!f) return false;
     bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size() &&

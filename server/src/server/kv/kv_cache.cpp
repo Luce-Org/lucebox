@@ -653,10 +653,10 @@ void KvCache::captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & even
     const int captured_slot = EngineCheckpoints::of(event.ticket.checkpoint).cache_slot();
     // The checkpoint this capture replaced in its slot (the reservation's
     // victim) left RAM: write it to disk unless it was only an edit backup.
-    // Claimed on every outcome, and freed here when there is no disk to
-    // write it to.
-    OwnedSnapshot displaced =
-        checkpoints_.take_displaced(Checkpoint::of_cache_slot(captured_slot));
+    // Claimed on every outcome: taken when it is written, else dropped
+    // (a backend that packs its snapshots would copy one for nothing).
+    const Checkpoint captured_checkpoint = Checkpoint::of_cache_slot(captured_slot);
+    bool displaced_claimed = false;
     for (auto & evicted : index_.take_evicted()) {
         if (evicted.slot != captured_slot) {
             // A further checkpoint the capture's resident-budget plan
@@ -669,9 +669,15 @@ void KvCache::captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & even
             engine_->discard(victim, (int)evicted.ids.size());
             continue;
         }
-        write_out(evicted, std::move(displaced), "ram eviction");
-        displaced.reset();
+        if (displaced_claimed) continue;
+        displaced_claimed = true;
+        if (concurrent_disk_ && worth_writing(evicted)) {
+            write_out(evicted, checkpoints_.take_displaced(captured_checkpoint), "ram eviction");
+        } else {
+            checkpoints_.drop_displaced(captured_checkpoint);
+        }
     }
+    if (!displaced_claimed) checkpoints_.drop_displaced(captured_checkpoint);
     if (resolution == Resolution::saved) {
         // The slot holds the new checkpoint now; its entry starts with no
         // disk key, aux or agent-turn mark.

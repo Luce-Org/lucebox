@@ -78,6 +78,14 @@ public:
     size_t snapshot_state_bytes_estimate(int tokens) const override;
     bool snapshot_drop_kv(int slot) override;
     bool snapshot_state_only(int slot) const override;
+    // The disk session cache: snapshots in their disk form (export_qwen4exp_snapshot).
+    bool snapshot_exports() const override { return true; }
+    OwnedSnapshot snapshot_copy(int slot) const override;
+    OwnedSnapshot snapshot_detach(int slot) override;
+    bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
+    OwnedSnapshot snapshot_take_displaced(int slot) override;
+    void snapshot_drop_displaced(int slot) override;
     // Prompt forwards end at every restore point (see run()); 4096-token
     // spacing keeps them long enough for the expert reads to pay off.
     int restore_point_spacing() const override { return 4096; }
@@ -128,6 +136,10 @@ private:
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
+    // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.
+    std::array<Qwen4ExpSnapshot, kMaxSlots> displaced_;
+    // The snapshots' disk layout (qwen4exp_disk_layout), taken when the cache is made: they outlive a released cache.
+    std::string disk_layout_;
     int live_slot_ = -1;
     std::vector<int32_t> tokens_;
     std::vector<float> logits_;

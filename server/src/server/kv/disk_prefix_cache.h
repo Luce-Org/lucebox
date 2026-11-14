@@ -165,7 +165,9 @@ public:
     Stats stats() const;
 
     // Learn the layout fingerprint from a live snapshot (call once after
-    // first snapshot_save, before any disk operations).
+    // first snapshot_save, before any disk operations). A store that packs
+    // its payloads itself (CheckpointStore::exports) gives no SnapshotRef:
+    // its layout is learned from the first snapshot saved.
     void learn_layout(Checkpoint checkpoint);
 
     // Set a config/model identity salt prepended to the layout hash buffer
@@ -190,6 +192,7 @@ private:
     // The directory's files, shared with the other models of the process
     // (null before init and when the disk cache is off).
     std::shared_ptr<DiskStore> disk_;
+    bool holds_identity_ = false;  // DiskStore::hold_identity
     // Some backends support in-memory snapshots but deliberately do not
     // implement SnapshotRef/adoption. Detect that once from a live slot and
     // stop scheduling disk work for the rest of the process.

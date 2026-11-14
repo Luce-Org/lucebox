@@ -48,13 +48,19 @@ public:
     // No prefix-index entry ever lives there.
     virtual Checkpoint staging() const = 0;
 
-    // The disk boundary. `ref` reads the payload in place (layout, digest,
-    // a copy for the writer); `detach` hands it to a new owner and leaves the
-    // checkpoint empty; `adopt` takes a payload read from disk, and leaves it
-    // with `snapshot` when it fails.
+    // The disk boundary. `ref` reads the payload in place (layout, digest);
+    // `copy` is a host copy for the writer, the checkpoint keeping its own;
+    // `detach` hands it to a new owner and leaves the checkpoint empty;
+    // `adopt` takes a payload read from disk, and leaves it with `snapshot`
+    // when it fails.
     virtual ModelBackend::SnapshotRef ref(Checkpoint checkpoint) const = 0;
+    virtual OwnedSnapshot copy(Checkpoint checkpoint) const = 0;
     virtual OwnedSnapshot detach(Checkpoint checkpoint) = 0;
     virtual bool adopt(Checkpoint checkpoint, OwnedSnapshot & snapshot) = 0;
+    // The store packs its payloads for the disk itself and gives no `ref`
+    // (ModelBackend::snapshot_exports): an empty `ref` of a used checkpoint
+    // does not mean memory-only then.
+    virtual bool exports() const { return false; }
 };
 
 // Checkpoints in the backend's snapshot slots.
@@ -74,8 +80,10 @@ public:
     void free(Checkpoint checkpoint) override;
     Checkpoint staging() const override;
     ModelBackend::SnapshotRef ref(Checkpoint checkpoint) const override;
+    OwnedSnapshot copy(Checkpoint checkpoint) const override;
     OwnedSnapshot detach(Checkpoint checkpoint) override;
     bool adopt(Checkpoint checkpoint, OwnedSnapshot & snapshot) override;
+    bool exports() const override;
 
     // Generation, for the single-sequence path. A request saves at most one
     // checkpoint during its prefill: `bind_capture` names it and its
@@ -102,8 +110,10 @@ public:
     bool save_deferred(Checkpoint checkpoint);
     void flush_deferred();
 
-    // A concurrent capture's replaced payload (ModelBackend::snapshot_take_displaced).
+    // A concurrent capture's replaced payload (ModelBackend::snapshot_take_displaced),
+    // or freed unwritten (snapshot_drop_displaced).
     OwnedSnapshot take_displaced(Checkpoint checkpoint);
+    void drop_displaced(Checkpoint checkpoint);
 
 private:
     ModelBackend & backend_;

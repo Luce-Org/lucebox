@@ -70,6 +70,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <functional>
 #include <map>
 #include <string>
 #include <unordered_set>
@@ -84,6 +85,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #else
@@ -14810,6 +14812,185 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_deletes_corrupt_files) {
     }
     rm_rf(dir);
 }
+
+#if !defined(_WIN32)
+namespace {
+
+// A second server: a child process forked before this one opens the
+// directory, so its store is its own. `script` runs there, one step per
+// byte the parent sends; each step's result comes back as one byte.
+struct OtherServer {
+    pid_t pid = -1;
+    int to_child = -1, from_child = -1;
+    explicit OtherServer(const std::function<bool(int)> & script) {
+        int down[2], up[2];
+        if (::pipe(down) != 0 || ::pipe(up) != 0) return;
+        std::fflush(nullptr);
+        pid = ::fork();
+        if (pid == 0) {
+            ::close(down[1]);
+            ::close(up[0]);
+            char step = 0;
+            while (::read(down[0], &step, 1) == 1) {
+                const char ok = script(step) ? 1 : 0;
+                if (::write(up[1], &ok, 1) != 1) break;
+            }
+            ::_exit(0);
+        }
+        ::close(down[0]);
+        ::close(up[1]);
+        to_child = down[1];
+        from_child = up[0];
+    }
+    bool run(int step) {
+        const char c = (char)step;
+        char ok = 0;
+        return pid > 0 && ::write(to_child, &c, 1) == 1 && ::read(from_child, &ok, 1) == 1 && ok == 1;
+    }
+    ~OtherServer() {
+        if (to_child >= 0) ::close(to_child);
+        if (from_child >= 0) ::close(from_child);
+        int status = 0;
+        if (pid > 0) ::waitpid(pid, &status, 0);
+    }
+};
+
+uint64_t dkv_bytes(const std::string & dir) {
+    uint64_t total = 0;
+    for (const auto & path : dkv_files(dir)) total += (uint64_t)fs::file_size(path);
+    return total;
+}
+
+}  // namespace
+
+// Two servers on one directory: both keep a disk cache, the directory keeps
+// one budget across both (the least recently used file of either goes when
+// one of them publishes), one identity is served by one server only, and an
+// older server's exclusive lock stays refused while they run.
+TEST_CASE(ServerUnitFixture, test_disk_store_shared_by_two_servers) {
+    MockBackendWithAdopt backend;
+    std::array<uint8_t, 16> salt_a{}, salt_b{};
+    salt_a[0] = 0x0A;
+    salt_b[0] = 0x0B;
+    const std::string dir = test_tmp_path("luce_test_disk_two_servers").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    TEST_ASSERT(one > 0);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 3 + one / 2);  // room for three files
+    const auto a1 = disk_test_key(40, 1), a2 = disk_test_key(40, 100);
+    const auto b1 = disk_test_key(40, 500), b2 = disk_test_key(40, 600);
+    std::unique_ptr<DiskPrefixCache> b;
+    uint64_t clock_b = 0;
+    OtherServer other([&](int step) {
+        if (step == 1) {
+            // Server B starts beside A, writes two files, and cannot serve A's identity.
+            b = std::make_unique<DiskPrefixCache>(cfg, backend);
+            b->set_identity_salt(salt_b);
+            b->set_clock([&] { return clock_b; });
+            if (!b->init() || b->disabled()) return false;
+            b->learn_layout(Checkpoint::of_cache_slot(0));
+            clock_b = 10; if (!b->save(Checkpoint::of_cache_slot(0), b1)) return false;
+            clock_b = 11; if (!b->save(Checkpoint::of_cache_slot(0), b2)) return false;
+            b->drain();
+            DiskPrefixCache same_as_a(cfg, backend);
+            same_as_a.set_identity_salt(salt_a);
+            return same_as_a.init() && same_as_a.disabled() && dkv_files(dir).size() == 3;
+        }
+        // Server B lost b1 to A's publish and keeps b2. Its index still lists
+        // b1, and saving b1 again writes it again.
+        clock_b = 30;
+        if (!b->lookup(b2, Checkpoint::of_cache_slot(1))) return false;
+        clock_b = 31;
+        if (!b->save(Checkpoint::of_cache_slot(0), b1)) return false;
+        b->drain();
+        return b->lookup(b1, Checkpoint::of_cache_slot(1));
+    });
+    TEST_ASSERT(other.pid > 0);
+    {
+        uint64_t clock_a = 12;
+        DiskPrefixCache a(cfg, backend);
+        a.set_identity_salt(salt_a);
+        a.set_clock([&] { return clock_a; });
+        TEST_ASSERT(a.init() && !a.disabled());
+        a.learn_layout(Checkpoint::of_cache_slot(0));
+        TEST_ASSERT(a.save(Checkpoint::of_cache_slot(0), a1));
+        a.drain();
+        // An older server, which takes the directory exclusively, is refused.
+        const int fd = ::open((dir + "/.lock").c_str(), O_RDWR | O_CLOEXEC);
+        TEST_ASSERT(fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) != 0);
+        if (fd >= 0) ::close(fd);
+        TEST_ASSERT(other.run(1));
+        // A's next file needs room: the directory's LRU file is B's b1 (10),
+        // not A's own a1 (12), and the directory stays within the budget.
+        clock_a = 20;
+        TEST_ASSERT(a.save(Checkpoint::of_cache_slot(0), a2));
+        a.drain();
+        const auto files = dkv_files(dir);
+        TEST_ASSERT(files.size() == 3);
+        TEST_ASSERT(dkv_bytes(dir) <= cfg.budget_bytes);
+        TEST_ASSERT(a.lookup(a1, Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(a.lookup(a2, Checkpoint::of_cache_slot(1)));
+        TEST_ASSERT(other.run(2));
+    }
+    rm_rf(dir);
+}
+
+// A server that holds the directory's index lock for good (stopped, or stuck
+// on a slow disk) costs this one the write, not a hung drain or shutdown.
+TEST_CASE(ServerUnitFixture, test_disk_store_index_lock_held_by_a_stuck_server) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_stuck_index").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1; cfg.ttl_seconds = 0;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init() && !cache.disabled());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        const int stuck = ::open((dir + "/.index.lock").c_str(), O_RDWR | O_CLOEXEC);
+        TEST_ASSERT(stuck >= 0 && ::flock(stuck, LOCK_EX | LOCK_NB) == 0);
+        const auto key = disk_test_key(40, 1);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), key));
+        const auto t0 = std::chrono::steady_clock::now();
+        cache.drain(0.5);
+        TEST_ASSERT(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+        TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
+        // Once the lock is free, the next write lands.
+        ::close(stuck);
+        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), key));
+        cache.drain();
+        TEST_ASSERT(cache.lookup(key, Checkpoint::of_cache_slot(1)));
+    }
+    rm_rf(dir);
+}
+
+// A temporary file a writer holds survives another server's start-up; one
+// nobody holds (an interrupted write) is removed.
+TEST_CASE(ServerUnitFixture, test_disk_store_keeps_temporaries_being_written) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_live_temp").string();
+    rm_rf(dir);
+    const std::string layout_dir = dir + "/" + std::string(32, 'c');
+    fs::create_directories(layout_dir);
+    const std::string live = layout_dir + "/" + std::string(32, 'd') + ".dkv.tmp";
+    const std::string stale = layout_dir + "/" + std::string(32, 'e') + ".dkv.tmp";
+    const int live_fd = ::open(live.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    TEST_ASSERT(live_fd >= 0 && ::flock(live_fd, LOCK_EX | LOCK_NB) == 0);
+    { FILE * f = std::fopen(stale.c_str(), "wb"); std::fputs("partial", f); std::fclose(f); }
+    {
+        // Started in another process, as another server would.
+        OtherServer other([&](int) {
+            DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+            DiskPrefixCache cache(cfg, backend);
+            return cache.init() && !cache.disabled();
+        });
+        TEST_ASSERT(other.run(1));
+    }
+    TEST_ASSERT(fs::exists(live));
+    TEST_ASSERT(!fs::exists(stale));
+    ::close(live_fd);
+    rm_rf(dir);
+}
+#endif
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_verifies_stored_tokens) {
     MockBackendWithAdopt backend;

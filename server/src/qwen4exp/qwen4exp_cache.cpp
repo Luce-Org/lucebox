@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace luce::common {
 
@@ -603,6 +605,199 @@ bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) 
     kept.logits = std::move(s.logits);
     free_qwen4exp_snapshot(s);
     s = std::move(kept);
+    return true;
+}
+
+namespace {
+// The disk form's metadata (export_qwen4exp_snapshot): a version, the host fields, each strip's place and type, then
+// ple_prev, the tokens and the logits' bits.
+constexpr int32_t kQwen4ExpDiskVersion = 0x51344401;
+constexpr int kQwen4ExpDiskHeader = 13;
+constexpr int kQwen4ExpDiskStrip = 5;
+constexpr const char * kQwen4ExpDiskMeta = "qwen4exp.meta";
+
+void put64(std::vector<int32_t> & m, uint64_t v) {
+    m.push_back((int32_t) (uint32_t) v);
+    m.push_back((int32_t) (uint32_t) (v >> 32));
+}
+uint64_t get64(const int32_t * m) {
+    return (uint64_t) (uint32_t) m[0] | ((uint64_t) (uint32_t) m[1] << 32);
+}
+
+} // namespace
+
+// Every strip a snapshot of `c` can hold, as types and row widths: the same for every position of one layout.
+std::string qwen4exp_disk_layout(const Qwen4ExpCache & c) {
+    if (!c.buf) return {};
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) {
+        for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 1099511628211ull; }
+    };
+    const int all = std::numeric_limits<int>::max() / 2;
+    snapshot_strips(c, all, all, c.mtp_k != nullptr, [&](ggml_tensor * t, size_t, size_t, bool rows) {
+        mix((uint64_t) t->type);
+        mix((uint64_t) t->ne[0]);
+        mix((uint64_t) rows);
+    });
+    char name[GGML_MAX_NAME];
+    std::snprintf(name, sizeof name, "qwen4exp.%016llx", (unsigned long long) h);
+    return name;
+}
+
+// `take`: export_qwen4exp_snapshot's snapshot, handed over (take_qwen4exp_snapshot).
+static OwnedSnapshot qwen4exp_disk_form(const std::string & layout, const Qwen4ExpSnapshot & s,
+                                        Qwen4ExpSnapshot * take) {
+    if (layout.empty() || !s.ctx || !s.buf || s.state_only || s.cur_pos <= 0) return {};
+    const size_t size = ggml_backend_buffer_get_size(s.buf);
+    auto * base = (uint8_t *) ggml_backend_buffer_get_base(s.buf);
+    std::vector<int32_t> meta = {kQwen4ExpDiskVersion, s.cur_pos, s.indexer_blocks, s.mtp ? 1 : 0, s.mtp_prev_pos};
+    put64(meta, (uint64_t) s.kv_bucket_base);
+    meta.push_back((int32_t) s.strips.size());
+    meta.push_back((int32_t) s.ple_prev.size());
+    meta.push_back((int32_t) s.tokens.size());
+    meta.push_back((int32_t) s.logits.size());
+    put64(meta, size);
+    for (const auto & [live, copy] : s.strips) {
+        (void) live;
+        put64(meta, (uint64_t) ((uint8_t *) copy->data - base));
+        put64(meta, ggml_nbytes(copy));
+        meta.push_back((int32_t) copy->type);
+    }
+    meta.insert(meta.end(), s.ple_prev.begin(), s.ple_prev.end());
+    meta.insert(meta.end(), s.tokens.begin(), s.tokens.end());
+    const size_t logits_at = meta.size();
+    meta.resize(meta.size() + s.logits.size());
+    if (!s.logits.empty()) std::memcpy(meta.data() + logits_at, s.logits.data(), s.logits.size() * sizeof(float));
+
+    ggml_context * ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
+    if (!ctx) return {};
+    ggml_tensor * blob = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 1, (int64_t) size);
+    ggml_set_name(blob, layout.c_str());
+    ggml_tensor * info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, (int64_t) meta.size());
+    ggml_set_name(info, kQwen4ExpDiskMeta);
+    const int32_t last_tok = s.tokens.empty() ? -1 : s.tokens.back();
+    const int pos = s.cur_pos;
+    // Only a plain system-memory buffer is handed over: the disk writer frees it on its own thread, maybe after the
+    // backends are gone.
+    if (take && ggml_backend_buffer_get_type(s.buf) == ggml_backend_cpu_buffer_type()) {
+        // The snapshot's buffer becomes the payload; only the metadata gets a buffer of its own.
+        if (ggml_backend_tensor_alloc(s.buf, blob, base) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return {}; }
+        ggml_backend_buffer_t info_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        if (!info_buf) { ggml_free(ctx); return {}; }
+        std::memcpy(info->data, meta.data(), meta.size() * sizeof(int32_t));
+        OwnedSnapshot out(ctx, take->buf, pos, last_tok);
+        out.own_buffer(info_buf);
+        ggml_free(take->ctx);
+        *take = {};
+        return out;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    if (!buf) { ggml_free(ctx); return {}; }
+    if (ggml_backend_buffer_is_host(s.buf)) {
+        std::memcpy(blob->data, base, size);
+    } else {
+        std::memset(blob->data, 0, size);   // alignment gaps
+        for (const auto & [live, copy] : s.strips) {
+            (void) live;
+            ggml_backend_tensor_get(copy, (uint8_t *) blob->data + ((uint8_t *) copy->data - base), 0, ggml_nbytes(copy));
+        }
+    }
+    std::memcpy(info->data, meta.data(), meta.size() * sizeof(int32_t));
+    return OwnedSnapshot(ctx, buf, pos, last_tok);
+}
+
+OwnedSnapshot export_qwen4exp_snapshot(const std::string & layout, const Qwen4ExpSnapshot & s) {
+    return qwen4exp_disk_form(layout, s, nullptr);
+}
+
+OwnedSnapshot take_qwen4exp_snapshot(const std::string & layout, Qwen4ExpSnapshot & s) {
+    OwnedSnapshot out = qwen4exp_disk_form(layout, s, &s);
+    free_qwen4exp_snapshot(s);   // no disk form, or copied rather than handed over
+    return out;
+}
+
+bool import_qwen4exp_snapshot(ggml_backend_t store, const Qwen4ExpCache & c, OwnedSnapshot & in, Qwen4ExpSnapshot & out) {
+    if (in.empty() || !c.buf) return false;
+    const std::string name = qwen4exp_disk_layout(c);
+    ggml_tensor * blob = nullptr, * info = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(in.ctx()); t; t = ggml_get_next_tensor(in.ctx(), t)) {
+        if (name == t->name) blob = t;
+        else if (std::strcmp(t->name, kQwen4ExpDiskMeta) == 0) info = t;
+        else return false;
+    }
+    if (!blob || !info || blob->type != GGML_TYPE_I8 || info->type != GGML_TYPE_I32 ||
+        !blob->data || !info->data || !ggml_backend_buffer_is_host(blob->buffer) ||
+        !ggml_backend_buffer_is_host(info->buffer)) return false;
+    const int64_t n_meta = ggml_nelements(info);
+    const auto * m = (const int32_t *) info->data;
+    if (n_meta < kQwen4ExpDiskHeader || m[0] != kQwen4ExpDiskVersion) return false;
+    const int pos = m[1], blocks = m[2], n_strips = m[7], n_ple = m[8], n_tokens = m[9], n_logits = m[10];
+    const bool mtp = (m[3] & 1) != 0;
+    const uint64_t size = get64(m + 11);
+    if (pos <= 0 || pos > c.max_ctx || blocks < 0 || n_strips <= 0 || n_ple < 0 || n_tokens < 0 || n_logits < 0 ||
+        size != (uint64_t) ggml_nbytes(blob) || (mtp && !c.mtp_k) ||
+        n_meta != kQwen4ExpDiskHeader + (int64_t) n_strips * kQwen4ExpDiskStrip + n_ple + n_tokens + n_logits) return false;
+    // The strips a snapshot of `c` at this position holds, in the order they were saved: each must match in type
+    // and bytes, and lie inside the payload.
+    struct Strip { ggml_tensor * t; size_t off, bytes; uint64_t at; };
+    std::vector<Strip> strips;
+    snapshot_strips(c, pos, blocks, mtp, [&](ggml_tensor * t, size_t off, size_t bytes, bool) {
+        strips.push_back({t, off, bytes, 0});
+    });
+    if ((int) strips.size() != n_strips) return false;
+    for (int i = 0; i < n_strips; ++i) {
+        const int32_t * e = m + kQwen4ExpDiskHeader + i * kQwen4ExpDiskStrip;
+        const uint64_t at = get64(e), bytes = get64(e + 2);
+        if (e[4] != (int32_t) strips[(size_t) i].t->type || bytes != strips[(size_t) i].bytes ||
+            at > size || bytes > size - at) return false;
+        strips[(size_t) i].at = at;
+    }
+    Qwen4ExpSnapshot s;
+    s.ctx = ggml_init({(2 * strips.size() + 1) * ggml_tensor_overhead(), nullptr, true});
+    if (!s.ctx) return false;
+    s.strips.reserve(strips.size());
+    for (const Strip & strip : strips) {
+        const int64_t n = strip.bytes / ggml_type_size(strip.t->type) * ggml_blck_size(strip.t->type);
+        s.strips.emplace_back(ggml_view_1d(s.ctx, strip.t, n, strip.off), ggml_new_tensor_1d(s.ctx, strip.t->type, n));
+    }
+    const bool in_place = ggml_backend_get_default_buffer_type(store) == ggml_backend_cpu_buffer_type() &&
+        in.single_buffer() && blob->buffer == in.buf() &&
+        ggml_backend_buffer_get_type(in.buf()) == ggml_backend_cpu_buffer_type();
+    if (in_place) {
+        // The strips stay where the disk read put them.
+        for (size_t i = 0; i < strips.size(); ++i) {
+            if (ggml_backend_view_init(s.strips[i].first) != GGML_STATUS_SUCCESS ||
+                ggml_backend_tensor_alloc(in.buf(), s.strips[i].second, (uint8_t *) blob->data + strips[i].at) !=
+                    GGML_STATUS_SUCCESS) {
+                ggml_free(s.ctx);
+                return false;
+            }
+        }
+    } else {
+        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, store);
+        if (!s.buf) { free_qwen4exp_snapshot(s); return false; }
+        for (size_t i = 0; i < strips.size(); ++i) {
+            ggml_backend_tensor_set(s.strips[i].second, (const uint8_t *) blob->data + strips[i].at, 0, strips[i].bytes);
+        }
+    }
+    s.cur_pos = pos;
+    s.indexer_blocks = blocks;
+    s.mtp = mtp;
+    s.mtp_prev_pos = m[4];
+    s.kv_bucket_base = (int64_t) get64(m + 5);
+    const int32_t * tail = m + kQwen4ExpDiskHeader + (int64_t) n_strips * kQwen4ExpDiskStrip;
+    s.ple_prev.assign(tail, tail + n_ple);
+    s.tokens.assign(tail + n_ple, tail + n_ple + n_tokens);
+    s.logits.resize((size_t) n_logits);
+    if (n_logits) std::memcpy(s.logits.data(), tail + n_ple + n_tokens, (size_t) n_logits * sizeof(float));
+    if (in_place) {
+        s.buf = in.buf();
+        ggml_context * read_ctx = in.ctx();
+        in.release();
+        ggml_free(read_ctx);
+    }
+    free_qwen4exp_snapshot(out);
+    out = std::move(s);
     return true;
 }
 
