@@ -900,14 +900,29 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     // Free buffers keyed by size. alloc() takes the smallest cached buffer
-    // that fits, the same best-fit choice the original linear scan made, and
-    // free() returns a buffer to the cache; both are O(log n). A DeepSeek4
+    // that fits when it is not much larger than the request (serves() below),
+    // and free() returns a buffer to the cache; both are O(log n). A DeepSeek4
     // gathered graph that packs prompt rows memoizes thousands of q8_1
     // activations per evaluation (LUCE_Q8_MEMO keeps one per quantized
     // matmul), so the original per-operation scan of the whole pool and its
     // cudaFree fallback on a full pool (which serializes the stream) both
     // showed up in the round time. 8192 (upstream 256) bounds the cache.
     static const int MAX_BUFFERS = 8192;
+
+    // A cached buffer serves a request only when it is at most twice the
+    // request plus this slack. Without the bound the best-fit choice hands a
+    // buffer of any size to any smaller request, and a request that stays
+    // allocated then keeps that buffer out of the cache: the q8_1 activation
+    // memos live until the next graph evaluation, so a few KiB of memo could
+    // hold a context-sized buffer (the F16 K or V copy a flash-attention
+    // kernel had just returned). The next attention layer found neither copy
+    // cached and allocated two more, and one evaluation ended up owning two
+    // such buffers per attention layer instead of two in all.
+    static constexpr size_t REUSE_SLACK = 1024 * 1024;
+
+    static bool serves(size_t buffer_size, size_t size) {
+        return buffer_size - size <= size + REUSE_SLACK;
+    }
 
     int device;
     std::multimap<size_t, void *> free_buffers;
@@ -928,8 +943,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        // The smallest cached buffer that fits; every other one that fits is
+        // larger, so if this one is too large for the request none serves it.
         auto it = free_buffers.lower_bound(size);
-        if (it != free_buffers.end()) {
+        if (it != free_buffers.end() && serves(it->first, size)) {
             void * ptr = it->second;
             *actual_size = it->first;
             free_buffers.erase(it);
@@ -940,17 +957,25 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-        if (err != cudaSuccess && !free_buffers.empty()) {
-            // The cached blocks are all smaller than this request (a long DeepSeek4
-            // prompt after another long one asks for a little more than the last
-            // left behind), yet they hold the memory it needs: give them back,
-            // then try once more before failing.
-            (void) cudaGetLastError();
-            const size_t cached = trim();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            GGML_LOG_WARN("%s: device %d: %.1f MiB did not fit; returned %.1f MiB of cached blocks, retry %s\n",
-                          __func__, device, look_ahead_size / 1048576.0, cached / 1048576.0,
-                          err == cudaSuccess ? "succeeded" : "failed");
+        if (err != cudaSuccess) {
+            const size_t owned = pool_size;
+            const bool   retry = !free_buffers.empty();
+            size_t       cached = 0;
+            if (retry) {
+                // The cached blocks are all smaller than this request (a long
+                // DeepSeek4 prompt after another long one asks for a little more
+                // than the last left behind), yet they hold the memory it needs:
+                // give them back, then try once more before failing.
+                (void) cudaGetLastError();
+                cached = trim();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            }
+            // What this pool held says where the memory went: blocks in use
+            // cannot be returned, cached ones just were.
+            GGML_LOG_WARN("%s: device %d: %.1f MiB did not fit; pool had %.1f MiB in use, returned %.1f MiB of cached blocks, "
+                          "retry %s\n",
+                          __func__, device, look_ahead_size / 1048576.0, (owned - cached) / 1048576.0,
+                          cached / 1048576.0, !retry ? "skipped" : err == cudaSuccess ? "succeeded" : "failed");
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
