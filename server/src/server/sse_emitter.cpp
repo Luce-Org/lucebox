@@ -841,6 +841,28 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
     // Parse tool calls from buffer
     std::string fr = "stop";
+    // A codec's template puts the calls after the thinking, so tool syntax the
+    // thinking quotes is text when the thinking closes after it (a model that
+    // reasons about a tool-call format quotes its tags). The calls are read
+    // from the reply after </think>; the thinking and the text before the
+    // calls go out as they are.
+    std::string before_calls;
+    if (mode_ == StreamMode::TOOL_BUFFER && chat_codec_ && tool_from_reasoning_) {
+        const size_t think_close = tool_buffer_.find(THINK_CLOSE);
+        if (think_close != std::string::npos) {
+            const size_t after = think_close + THINK_CLOSE_LEN;
+            size_t start = std::string::npos;
+            const size_t cut = find_tool_syntax_start(tool_buffer_.substr(after), tools_, start)
+                ? after + start : tool_buffer_.size();
+            before_calls = tool_buffer_.substr(0, cut);
+            tool_buffer_.erase(0, cut);
+            tool_from_reasoning_ = false;
+            if (tool_buffer_.empty()) {
+                emit_tool_buffer_text(out, before_calls);
+                before_calls.clear();
+            }
+        }
+    }
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
         ToolParseResult parsed;
         if (!chat_codec_ || !chat_codec_->parse_tool_calls(tool_buffer_, tools_, parsed)) {
@@ -856,7 +878,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         if (!drop_calls) tool_calls_ = std::move(parsed.tool_calls);
 
         if (drop_calls) {
-            emit_tool_buffer_text(out, parsed.cleaned_text);
+            emit_tool_buffer_text(out, before_calls + parsed.cleaned_text);
         } else if (!tool_calls_.empty()) {
             static const bool log_tools = []() {
                 const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
@@ -888,7 +910,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 tool_memory_->remember(ids, accumulated_raw_);
             }
 
-            emit_tool_buffer_text(out, parsed.cleaned_text);
+            emit_tool_buffer_text(out, before_calls + parsed.cleaned_text);
             fr = "tool_calls";
 
             // Format-specific tool call events
@@ -975,6 +997,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             // Any call that failed to parse is a lost turn: the text is not
             // sent and nothing runs, whatever the reason the parser rejected it.
             dropped_tool_call_ = true;
+            emit_tool_buffer_text(out, before_calls);
 
             if (tool_from_reasoning_) {
                 size_t think_close = find_top_level_think_close(tool_buffer_, tools_);
