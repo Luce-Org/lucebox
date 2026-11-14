@@ -180,6 +180,35 @@ struct SchedulerTestHarness {
         server.enqueue(job);
     }
 
+    // Residency (residency.cpp): a client's release request, and the serving
+    // thread's dequeues.
+    static bool request_release(HttpServer & server, std::vector<int> gpus, std::string & error) {
+        HttpServer::ResidencyOp op;
+        op.release = true;
+        op.gpus = std::move(gpus);
+        const bool ok = server.run_residency_op(op);
+        error = op.error;
+        return ok;
+    }
+    static bool residency_pending(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.queue_mu_);
+        return server.residency_head_ != nullptr;
+    }
+    static ServerJob * dequeue(HttpServer & server) { return server.dequeue(); }
+    static void cancel_residency(HttpServer & server) { server.cancel_queued_residency_ops(); }
+    static void residency_post(HttpServer & server, SocketHandle fd, const std::string & body) {
+        server.handle_residency_request(fd, "POST", body);
+    }
+    static bool residency_release(HttpServer & server, const std::vector<int> & gpus, std::string & error) {
+        return server.residency_release(gpus, error);
+    }
+    static ServerJob * try_dequeue(HttpServer & server) { return server.try_dequeue(); }
+    static void refresh_residency(HttpServer & server) { server.refresh_residency(); }
+    static json residency_info(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.residency_info_mu_);
+        return server.residency_info_;
+    }
+
     static void run(HttpServer & server, SeqEngine & engine) {
         server.scheduler_loop(engine);
     }
@@ -9696,6 +9725,220 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+// Model switching: a backend that holds GPU 0 until released.
+struct ResidencyBackend : MockBackend {
+    bool released = false;
+    int releases = 0, reinstates = 0;
+    bool fail_reinstate = false;
+    Residency residency() const override {
+        Residency r;
+        r.supported = true;
+        r.gpus = {0};
+        if (released) r.released = {0};
+        r.bytes = {released ? 0u : 1024u};
+        return r;
+    }
+    bool release_gpus(const std::vector<int> &, std::string &) override {
+        released = true;
+        ++releases;
+        return true;
+    }
+    bool reinstate(std::string & error) override {
+        if (fail_reinstate) {
+            error = "no room";
+            return false;
+        }
+        released = false;
+        ++reinstates;
+        return true;
+    }
+};
+
+// A queued release stops admission, runs in the blocking dequeue once nothing
+// runs, and the next request brings the model back before it is handed out.
+TEST_CASE(ServerUnitFixture, test_residency_release_then_request_reinstates) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ResidencyBackend>();
+    ResidencyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    SchedulerTestHarness::refresh_residency(server);
+    TEST_ASSERT(SchedulerTestHarness::residency_info(server)["state"] == "resident");
+
+    ServerJob job;
+    job.fd = -1;
+    job.req.response_id = "after-release";
+    SchedulerTestHarness::enqueue(server, &job);
+
+    std::string error;
+    bool released_ok = false;
+    std::thread client([&] { released_ok = SchedulerTestHarness::request_release(server, {0}, error); });
+    while (!SchedulerTestHarness::residency_pending(server)) std::this_thread::yield();
+    // Polling admission takes nothing while the release waits.
+    TEST_ASSERT(SchedulerTestHarness::try_dequeue(server) == nullptr);
+    // The blocking dequeue runs the release, then reinstates for the job.
+    ServerJob * got = SchedulerTestHarness::dequeue(server);
+    client.join();
+    TEST_ASSERT(released_ok);
+    TEST_ASSERT(got == &job);
+    TEST_ASSERT(backend.releases == 1);
+    TEST_ASSERT(backend.reinstates == 1);
+    TEST_ASSERT(!backend.released);
+    const json info = SchedulerTestHarness::residency_info(server);
+    TEST_ASSERT(info["state"] == "resident");
+    TEST_ASSERT(info["counts"]["release"] == 1);
+    TEST_ASSERT(info["counts"]["reinstate"] == 1);
+}
+
+#if !defined(_WIN32)  // socketpair()
+// A model that cannot come back answers the waiting request instead of
+// running it on released GPUs.
+TEST_CASE(ServerUnitFixture, test_residency_failed_reinstate_answers_the_request) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ResidencyBackend>();
+    ResidencyBackend & backend = *backend_owner;
+    backend.released = true;
+    backend.fail_reinstate = true;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    SchedulerTestHarness::refresh_residency(server);
+    TEST_ASSERT(SchedulerTestHarness::residency_info(server)["state"] == "released");
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.response_id = "cannot-load";
+    SchedulerTestHarness::enqueue(server, &job);
+    // The failed job is answered and taken off the queue; the next dequeue
+    // then waits, so stop the server to end it.
+    std::thread stopper([&] {
+        while (!job.done) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        SchedulerTestHarness::stop(server);
+    });
+    ServerJob * got = SchedulerTestHarness::dequeue(server);
+    stopper.join();
+    TEST_ASSERT(got == nullptr);
+    TEST_ASSERT(job.done);
+    char buf[512] = {};
+    const ssize_t n = ::recv(sockets[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
+    TEST_ASSERT(n > 0);
+    TEST_ASSERT(std::string(buf).find(" 503 ") != std::string::npos);
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+    TEST_ASSERT(SchedulerTestHarness::residency_info(server)["last"]["reinstate"]["ok"] == false);
+}
+
+// A request with the wrong JSON types is answered 400 and changes nothing.
+TEST_CASE(ServerUnitFixture, test_residency_rejects_malformed_requests) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ResidencyBackend>();
+    ResidencyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    for (const char * body : {"{\"state\": 123}", "{\"state\": null}", "[1]",
+                              "{\"state\": \"released\", \"gpus\": [-1]}",
+                              "{\"state\": \"released\", \"gpus\": [4294967296]}",
+                              "{\"state\": \"released\", \"gpus\": 0}"}) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        SchedulerTestHarness::residency_post(server, sockets[0], body);
+        char buf[512] = {};
+        const ssize_t n = ::recv(sockets[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        ::close(sockets[0]);
+        ::close(sockets[1]);
+        TEST_ASSERT(n > 0);
+        TEST_ASSERT(std::string(buf).find(" 400 ") != std::string::npos);
+    }
+    TEST_ASSERT(backend.releases == 0);
+    TEST_ASSERT(!backend.released);
+    unlink(path.c_str());
+}
+#endif  // !defined(_WIN32)
+
+// A release of GPUs the model holds nothing on leaves it as it is.
+TEST_CASE(ServerUnitFixture, test_residency_release_of_other_gpus_changes_nothing) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<ResidencyBackend>();
+    ResidencyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    std::string error;
+    TEST_ASSERT(SchedulerTestHarness::residency_release(server, {5}, error));
+    TEST_ASSERT(backend.releases == 0);
+    TEST_ASSERT(!backend.released);
+    unlink(path.c_str());
+}
+
+// At shutdown, an operation the serving thread has started keeps its client
+// waiting until it finishes; one still queued gives up.
+struct GatedResidencyBackend : ResidencyBackend {
+    std::atomic<bool> entered{false}, open{false};
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override {
+        entered = true;
+        while (!open.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return ResidencyBackend::release_gpus(gpus, error);
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_residency_shutdown_waits_for_the_running_operation) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<GatedResidencyBackend>();
+    GatedResidencyBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    HttpServer server(engine, tokenizer, config);
+    SchedulerTestHarness::refresh_residency(server);
+
+    std::atomic<bool> first_returned{false};
+    bool first_ok = false;
+    std::string first_error;
+    std::thread first([&] {
+        first_ok = SchedulerTestHarness::request_release(server, {0}, first_error);
+        first_returned = true;
+    });
+    while (!SchedulerTestHarness::residency_pending(server)) std::this_thread::yield();
+    ServerJob * got = nullptr;
+    std::thread serving([&] { got = SchedulerTestHarness::dequeue(server); });
+    while (!backend.entered.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    bool second_ok = true;
+    std::string second_error;
+    std::thread second([&] { second_ok = SchedulerTestHarness::request_release(server, {0}, second_error); });
+    while (!SchedulerTestHarness::residency_pending(server)) std::this_thread::yield();
+    SchedulerTestHarness::stop(server);
+    SchedulerTestHarness::cancel_residency(server);
+    second.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool first_returned_early = first_returned.load();
+
+    backend.open = true;
+    first.join();
+    serving.join();
+    TEST_ASSERT(!second_ok);
+    TEST_ASSERT(second_error == "server stopping");
+    TEST_ASSERT(!first_returned_early);
+    TEST_ASSERT(first_ok);
+    TEST_ASSERT(got == nullptr);
+    TEST_ASSERT(backend.releases == 1);
+    unlink(path.c_str());
+}
+
 struct ShortInlineSnapshotBackend : MockBackend {
     int saved_slot = -1;
     int saved_position = 0;
@@ -12489,6 +12732,70 @@ TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_pr
 TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_prompts_together) {
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/200, /*prompts=*/2) >= 5);
     TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/300, /*prompts=*/2) == 0);
+}
+
+// Shutdown while a residency operation waits behind a decoding chat: the
+// scheduler answers the request queued behind it, and the operation's client
+// gives up once the serving thread is gone.
+TEST_CASE(ServerUnitFixture, test_scheduler_shutdown_answers_requests_behind_a_residency_operation) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[4] = {-1, -1, -1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    const auto make_job = [](ServerJob & job, int fd, const char * id) {
+        job.fd = fd;
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens.assign(4, 100);
+        job.req.max_output = 400;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = id;
+    };
+    ServerJob chat, queued;
+    make_job(chat, fds[0], "chat");
+    make_job(queued, fds[2], "queued");
+    SchedulerTestHarness::enqueue(server, &chat);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    backend.engine.hold();
+    size_t stepped = 0;
+    {
+        std::lock_guard<std::mutex> lock(backend.engine.mu);
+        stepped = backend.engine.steps.size();
+    }
+    TEST_ASSERT(backend.engine.wait_steps(stepped + 1));
+
+    bool release_ok = true;
+    std::string error;
+    std::thread client([&] { release_ok = SchedulerTestHarness::request_release(server, {0}, error); });
+    while (!SchedulerTestHarness::residency_pending(server)) std::this_thread::yield();
+    SchedulerTestHarness::enqueue(server, &queued);
+    SchedulerTestHarness::stop(server);
+    backend.engine.release();
+    scheduler.join();
+    bool queued_done = false;
+    {
+        std::lock_guard<std::mutex> lock(queued.mu);
+        queued_done = queued.done;
+    }
+    SchedulerTestHarness::cancel_residency(server);
+    client.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(queued_done);
+    TEST_ASSERT(!release_ok);
 }
 
 // A prompt that fits in one step runs before a longer one, alone.

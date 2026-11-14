@@ -8,6 +8,7 @@
 #include "qwen4exp_graph.h"
 #include "qwen4exp_mtp.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <future>
 #include <memory>
@@ -85,6 +86,12 @@ public:
     // drafting while a thinking budget is still open and hands off to single tokens only near its close.
     int max_decode_tokens() const override { return mtp_slot_ >= 0 ? caches_[(size_t) mtp_slot_]->mtp_draft + 1 : 1; }
     void set_decode_mode(DecodeMode mode) { decode_mode_ = mode; }
+
+    // Model switching (Qwen4ExpBackend::release_gpus): drops every graph workspace built over the caches, whose
+    // device memory goes next. The checkpoints and each slot's bookkeeping stay. No sequence may be live.
+    void release_device_state();
+    // The caches were rebuilt in place: the prompt chunk the planner chose this time.
+    void reinstate_device_state(int prefill_granule) { prefill_granule_ = std::max(prefill_granule, 1); }
 
 private:
     AdmitResult admit_cold(uint64_t request_id, const std::vector<int32_t> & prompt,

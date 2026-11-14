@@ -619,7 +619,8 @@ bool Qwen4ExpBackend::create_main_cache() {
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
     return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
         cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
-        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx));
+        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
+        take_kept_remote(0));
 }
 
 // --kvflash: each slot's pool, sized with the weights resident and no cache yet ("auto" takes a share of the free
@@ -660,20 +661,30 @@ int Qwen4ExpBackend::remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t mi
     return (size_t) remote * plan.layer_bytes <= available - available / 10 ? remote : remote_layers_;
 }
 
-bool Qwen4ExpBackend::start_seq_engine() {
-    if (cfg_.max_concurrency <= 1) return true;
+// The concurrency slots after the first, in place: the sequence engine keeps pointers to them across a release.
+bool Qwen4ExpBackend::create_seq_caches() {
     seq_caches_.resize((size_t)cfg_.max_concurrency - 1);
-    std::vector<Qwen4ExpCache *> caches{&cache_};
+    int state_slot = 1;
     for (Qwen4ExpCache & cache : seq_caches_) {
         // With MTP, each slot drafts and verifies too (Qwen4ExpSeqEngine): the rollback rows of a batched verify.
         const bool mtp = cfg_.verify_width != 1 && qwen4exp_verify_supported(cache_);
+        const int slot = state_slot++;
         if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, mtp,
                                    mtp ? std::min(kQwen4ExpBatchedVerifyRows, cache_.mtp_draft + 1) - 1 : 1,
-                                   &slot_states_, (int) caches.size(), remote_layers_,
-                                   kvflash_pool_for(cfg_.device.max_ctx))) return false;
+                                   &slot_states_, slot, remote_layers_,
+                                   kvflash_pool_for(cfg_.device.max_ctx), take_kept_remote((size_t) slot))) {
+            return false;
+        }
         cache.split_owner = &cache_;
-        caches.push_back(&cache);
     }
+    return true;
+}
+
+bool Qwen4ExpBackend::start_seq_engine() {
+    if (cfg_.max_concurrency <= 1) return true;
+    if (!create_seq_caches()) return false;
+    std::vector<Qwen4ExpCache *> caches{&cache_};
+    for (Qwen4ExpCache & cache : seq_caches_) caches.push_back(&cache);
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
         backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_,
         cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_, prompt_lookup_on() ? &lookup_policy_ : nullptr);
@@ -722,6 +733,182 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
     parked_ = false;
     std::printf("[qwen4exp] target unparked\n");
     std::fflush(stdout);
+    return true;
+}
+
+// ── Residency ──────────────────────────────────────────────────────────
+// Split mode holds two kinds of memory: the routed expert stacks on the expert device (71.7 GiB for Flash Next) and
+// everything else on the target. A release of the target device keeps the stacks where they are, so bringing the
+// model back uploads only the target's part (7 GiB) and rebuilds the caches. The layout found at first load (the
+// fitted context, the slots, the attention layers moved to the expert device) is reused as it is, and the prefix
+// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release.
+
+ModelBackend::Residency Qwen4ExpBackend::residency() const {
+    Residency r;
+    r.gpus.push_back(target_gpu());
+    if (expert_gpu() >= 0) r.gpus.push_back(expert_gpu());
+    if (cache_.kvflash || kvflash_pool_ > 0) {
+        r.reason = "qwen4exp: --kvflash pages KV rows the release would drop";
+    } else if (!backend_) {
+        r.reason = "qwen4exp: not loaded";
+    } else {
+        r.supported = true;
+        if (expert_gpu() >= 0) r.keepable.push_back(expert_gpu());
+    }
+    if (held_ != Held::all) r.released.push_back(target_gpu());
+    if (held_ == Held::none && expert_gpu() >= 0) r.released.push_back(expert_gpu());
+    auto size = [](ggml_backend_buffer_t b) -> size_t { return b ? ggml_backend_buffer_get_size(b) : 0; };
+    size_t target = 0, expert = 0;
+    if (held_ == Held::all) {
+        target += size(weights_.buf) + size(weights_.mtp_vocab_buf) + size(slot_states_.buf);
+        target += size(cache_.buf);
+        expert += size(cache_.remote_buf);
+        for (const Qwen4ExpCache & c : seq_caches_) {
+            target += size(c.buf);
+            expert += size(c.remote_buf);
+        }
+    }
+    expert += size(weights_.expert_buf) + size(weights_.kept_expert_buf);
+    for (ggml_backend_buffer_t b : kept_remote_bufs_) expert += size(b);   // K/V kept through a release
+    r.bytes.push_back(expert_gpu() >= 0 ? target : target + expert);
+    if (expert_gpu() >= 0) r.bytes.push_back(expert);
+    return r;
+}
+
+void Qwen4ExpBackend::free_kept_remote_bufs() {
+    for (ggml_backend_buffer_t b : kept_remote_bufs_) {
+        if (b) ggml_backend_buffer_free(b);
+    }
+    kept_remote_bufs_.clear();
+}
+
+void Qwen4ExpBackend::release_device_state(bool keep_experts) {
+    using clock = std::chrono::steady_clock;
+    auto t = clock::now();
+    auto lap = [&t]() {
+        const auto now = clock::now();
+        const double s = std::chrono::duration<double>(now - t).count();
+        t = now;
+        return s;
+    };
+    snapshot_flush_deferred();   // a deferred snapshot is the live cache: save it before the cache goes
+    tokens_.clear();             // the serial path's cache no longer holds them
+    logits_.clear();
+    free_drafter();
+    if (seq_engine_) seq_engine_->release_device_state();
+    const double s_engine = lap();
+    free_kept_remote_bufs();
+    auto free_cache = [&](Qwen4ExpCache & cache) {
+        if (keep_experts) {
+            // The expert device keeps this cache's rows buffer: freeing and allocating tens of GiB of shared
+            // memory there costs about a second each way.
+            kept_remote_bufs_.push_back(cache.remote_buf);
+            cache.remote_buf = nullptr;
+        }
+        free_qwen4exp_cache(cache);
+        cache = {};
+    };
+    free_cache(cache_);
+    for (Qwen4ExpCache & cache : seq_caches_) free_cache(cache);
+    free_qwen4exp_slot_states(slot_states_);
+    slot_states_ = {};
+    const double s_caches = lap();
+    free_qwen4exp_weights(weights_, keep_experts);
+    const double s_weights = lap();
+    // The pools' cached blocks, retained graphs and the weight shadows keyed by the freed weights' addresses.
+    ggml_backend_cuda_trim_pool(backend_);
+    if (weights_.expert_backend) ggml_backend_cuda_trim_pool(weights_.expert_backend);
+    std::fprintf(stderr, "[qwen4exp] release stages: engine %.2f, caches %.2f, weights %.2f, pools %.2f s\n",
+                 s_engine, s_caches, s_weights, lap());
+}
+
+bool Qwen4ExpBackend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    const Residency r = residency();
+    if (!r.supported) {
+        error = r.reason;
+        return false;
+    }
+    if (parked_) {
+        error = "qwen4exp: parked";
+        return false;
+    }
+    auto named = [&](int gpu) { return gpus.empty() || std::find(gpus.begin(), gpus.end(), gpu) != gpus.end(); };
+    const bool split = expert_gpu() >= 0;
+    const bool experts_go = !split || named(expert_gpu());
+    const Held want = experts_go ? Held::none : named(target_gpu()) ? Held::experts : Held::all;
+    // A release only reduces what is held (all, then experts, then none): GPUs this model does not hold are a
+    // no-op, never a way back to Held::all without a reinstate.
+    if ((int) want <= (int) held_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (held_ == Held::all) {
+        release_device_state(/*keep_experts=*/want == Held::experts);
+    } else if (weights_.kept_expert_buf) {   // experts -> none
+        ggml_backend_buffer_free(weights_.kept_expert_buf);
+        weights_.kept_expert_buf = nullptr;
+        free_kept_remote_bufs();
+        ggml_backend_cuda_trim_pool(weights_.expert_backend);
+    }
+    held_ = want;
+    std::fprintf(stderr, "[qwen4exp] released %s in %.2f s\n",
+                 held_ == Held::experts ? "the target device (the expert stacks stay)" : "every device",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return true;
+}
+
+bool Qwen4ExpBackend::reinstate(std::string & error) {
+    if (held_ == Held::all) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int frozen_chunk = chunk_;
+    auto fail = [&](const std::string & why) {
+        error = "qwen4exp: " + why;
+        std::fprintf(stderr, "[qwen4exp] reinstate failed: %s; nothing stays on the GPUs\n", why.c_str());
+        release_device_state(/*keep_experts=*/false);
+        held_ = Held::none;
+        return false;
+    };
+    std::vector<std::pair<const char *, double>> stages;
+    auto lap = [&, t = t0](const char * name) mutable {
+        const auto now = std::chrono::steady_clock::now();
+        stages.emplace_back(name, std::chrono::duration<double>(now - t).count());
+        t = now;
+    };
+    if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
+                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
+        return fail(std::string("model load failed: ") + luce_last_error());
+    }
+    lap("load");
+    load_qwen4exp_output_tail(weights_, backend_);
+    lap("tail");
+    // The context, the slots and the attention layers on the expert device are the ones found at first load.
+    if (!create_main_cache()) return fail("cache creation failed");
+    lap("cache");
+    if (remote_layers_ && !move_qwen4exp_attention(weights_, remote_layers_)) {
+        return fail("moving attention to the expert device failed");
+    }
+    lap("attention");
+    chunk_ = plan_chunk();
+    if (chunk_ <= 0) return fail("insufficient prefill memory at the fitted context");
+    lap("plan");
+    if (!load_hot_experts()) return fail("hot experts failed");
+    lap("hot");
+    if (cfg_.max_concurrency > 1) {
+        if (!create_seq_caches()) return fail("full-cache slot allocation failed");
+        if (seq_engine_) seq_engine_->reinstate_device_state(chunk_);
+    }
+    lap("slots");
+    if (chunk_ != frozen_chunk) {
+        std::fprintf(stderr, "[qwen4exp] prompt chunk %d (was %d at first load)\n", chunk_, frozen_chunk);
+    }
+    free_kept_remote_bufs();   // none should be left
+    held_ = Held::all;
+    std::string detail;
+    for (const auto & [name, sec] : stages) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%s %.2f", detail.empty() ? "" : ", ", name, sec);
+        detail += buf;
+    }
+    std::fprintf(stderr, "[qwen4exp] reinstated in %.2f s (%s)\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), detail.c_str());
     return true;
 }
 
@@ -1225,6 +1412,7 @@ void Qwen4ExpBackend::free_drafter() {
 
 void Qwen4ExpBackend::shutdown() {
     free_drafter();
+    free_kept_remote_bufs();
     if (backend_) release_target();
     free_snapshot_backend(snap_backend_, backend_);
     snap_backend_ = nullptr;

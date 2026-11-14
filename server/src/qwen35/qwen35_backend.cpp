@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <typeinfo>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -591,6 +592,12 @@ bool Qwen35Backend::init() {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
+    // reinstate() rebuilds this cache with the same arguments, not ones
+    // derived from the memory free then, so snapshots keep matching it.
+    layout_max_verify_tokens_ = max_verify_tokens;
+    layout_ctx_alloc_ = ctx_alloc;
+    layout_feat_cap_ = target_feat_cap;
+    layout_fixed_chain_ = fixed_chain.enabled;
     if (cfg_.paged_attention) {
         const auto supported_type = [](ggml_type type) {
             return type == GGML_TYPE_F16 ||
@@ -689,13 +696,19 @@ bool Qwen35Backend::init() {
         std::fflush(stdout);
     }
 
+    init_feature_mirror(fixed_chain.enabled);
+
+    return true;
+}
+
+void Qwen35Backend::init_feature_mirror(bool fixed_chain_enabled) {
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is a conversion buffer; on split-GPU, a cross-device mirror.
     // Cap at the drafter's trained window (DFLASH_DRAFTER_TRAINED_CTX), not at
     // draft_ctx_max: the old floor let the drafter see only a shallow suffix, so
     // accept collapsed once committed exceeded it (8K+).
-    if (cfg_.draft_path && !use_remote_draft &&
-        !fixed_chain.enabled) {
+    if (cfg_.draft_path && !cfg_.remote_draft.enabled() &&
+        !fixed_chain_enabled) {
         const int mirror_cap = w_.is_moe
             ? luce::common::dflash_drafter_window(cfg_.device.max_ctx)
             : std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
@@ -707,7 +720,105 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
+}
 
+// ── Residency (model switching) ─────────────────────────────────────────
+// One request at a time with a local drafter on the target GPU: the target
+// and draft weights go and come back through park()/unpark(), and the KV
+// cache, draft KV and feature mirror are freed and rebuilt with the layout
+// found at init. Prefix snapshots live in system memory and stay.
+
+ModelBackend::Residency Qwen35Backend::residency() const {
+    Residency r;
+    r.gpus.push_back(cfg_.device.gpu);
+    if (typeid(*this) != typeid(Qwen35Backend)) {
+        r.reason = "qwen35: not implemented for this variant";
+    } else if (concurrent_slots() > 1 || seq_engine_) {
+        r.reason = "qwen35: needs --max-concurrency 1";
+    } else if (cfg_.paged_attention) {
+        r.reason = "qwen35: paged attention is not supported";
+    } else if (kvflash_active()) {
+        r.reason = "qwen35: --kvflash pages KV rows the release would drop";
+    } else if (cfg_.remote_draft.enabled()) {
+        r.reason = "qwen35: a remote draft is not supported";
+    } else if (cfg_.device.is_multi_device() || tensor_parallel_ || split_gpus_) {
+        r.reason = "qwen35: needs the target and the draft on one GPU";
+    } else if (!target_backend_) {
+        r.reason = "qwen35: not loaded";
+    } else {
+        r.supported = true;
+    }
+    if (released_) r.released.push_back(cfg_.device.gpu);
+    size_t bytes = 0;
+    if (!released_) {
+        auto size = [](ggml_backend_buffer_t b) -> size_t { return b ? ggml_backend_buffer_get_size(b) : 0; };
+        const MemoryReport m = memory_report();
+        if (!m.cache.host) {
+            bytes = m.cache.kv_bytes + m.cache.recurrent_bytes + m.cache.draft_feature_bytes + m.cache.other_bytes;
+        }
+        if (!target_parked_) bytes += size(w_.buf);
+        if (!draft_parked_) bytes += size(dw_.buf);
+    }
+    r.bytes.push_back(bytes);
+    return r;
+}
+
+bool Qwen35Backend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    const Residency r = residency();
+    if (!r.supported) {
+        error = r.reason;
+        return false;
+    }
+    if (released_ || (!gpus.empty() && std::find(gpus.begin(), gpus.end(), cfg_.device.gpu) == gpus.end())) {
+        return true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(target_backend_);
+    // park() copies a deferred snapshot (the live cache) to system memory and
+    // releases the weights and the graphs built over them.
+    park(ParkTarget::All);
+    dflash_target_.reset();
+    free_drafter();
+    state_ladder_clear();   // its checkpoints complete the KV about to go
+    draft_kv_free(draft_kv_);
+    draft_feature_mirror_free(feature_mirror_);
+    free_target_cache(cache_);
+    cache_ = TargetCache{};
+    release_scratch();   // also trims the device pools
+    released_ = true;
+    std::printf("[residency] released GPU %d in %.2f s\n", cfg_.device.gpu,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    return true;
+}
+
+bool Qwen35Backend::reinstate(std::string & error) {
+    if (!released_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!unpark(ParkTarget::All)) {
+        error = std::string("qwen35: reload failed: ") + luce_last_error();
+        park(ParkTarget::All);
+        return false;
+    }
+    const auto t_weights = std::chrono::steady_clock::now();
+    if (!create_target_cache(w_, cfg_.device.max_ctx, layout_max_verify_tokens_, target_backend_, cache_,
+                             /*prefill_only=*/true, layout_ctx_alloc_, /*paged=*/false, /*n_slots=*/1,
+                             layout_fixed_chain_, cfg_.cache_type_k, cfg_.cache_type_v, layout_feat_cap_)) {
+        error = std::string("qwen35: cache: ") + luce_last_error();
+        free_target_cache(cache_);
+        cache_ = TargetCache{};
+        park(ParkTarget::All);
+        return false;
+    }
+    const auto t_cache = std::chrono::steady_clock::now();
+    init_feature_mirror(layout_fixed_chain_);
+    released_ = false;
+    const auto t_end = std::chrono::steady_clock::now();
+    auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    std::printf("[residency] reinstated GPU %d in %.2f s (weights %.2f s, cache %.2f s, mirror %.2f s)\n",
+                cfg_.device.gpu, secs(t0, t_end), secs(t0, t_weights), secs(t_weights, t_cache),
+                secs(t_cache, t_end));
+    std::fflush(stdout);
     return true;
 }
 

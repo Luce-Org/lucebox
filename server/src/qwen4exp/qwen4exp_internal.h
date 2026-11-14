@@ -157,6 +157,9 @@ struct Qwen4ExpWeights {
     // caller before loading, not owned); everything else stays on `backend`.
     ggml_backend_t        expert_backend = nullptr;
     ggml_backend_buffer_t expert_buf     = nullptr;
+    // A release of the target device only: the expert stacks' buffer, kept on the expert device while nothing else
+    // is loaded. The next load_qwen4exp_gguf places the stacks back in it instead of uploading them again.
+    ggml_backend_buffer_t kept_expert_buf = nullptr;
     bool                  expert_gfx1151 = false;
     // Split mode: experts the target computes beside the expert device in decode and verify steps (null: none).
     std::unique_ptr<Qwen4ExpHotSet> hot;
@@ -276,7 +279,8 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path);
 // The sidecar among the file names of a repo's MTP/ directory: the first mtp-*.gguf in name order, or empty.
 std::string pick_qwen4exp_mtp_sidecar(std::vector<std::string> names);
 
-void free_qwen4exp_weights(Qwen4ExpWeights & w);
+// keep_experts: the expert stacks stay on the expert device as kept_expert_buf (a release of the target device).
+void free_qwen4exp_weights(Qwen4ExpWeights & w, bool keep_experts = false);
 // Release the derived constants and clear every pointer into them.
 void free_qwen4exp_derived(Qwen4ExpWeights & w);
 

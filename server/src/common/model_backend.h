@@ -252,6 +252,42 @@ struct ModelBackend {
     virtual bool unpark(ParkTarget target) = 0;
     virtual bool is_target_parked() const = 0;
 
+    // ── Residency (model switching) ──────────────────────────────────
+    // Lets models that share a GPU take turns on it without a restart. Unlike
+    // park(), which a backend uses for its own drafter juggling, a release
+    // keeps every prefix snapshot and checkpoint in system memory, and
+    // reinstate() rebuilds the layout fixed at first load (context, slots, KV
+    // placement), never one re-derived from the memory free at that moment,
+    // so the snapshots restore afterwards. The server calls both only while
+    // no request runs.
+    struct Residency {
+        bool supported = false;
+        std::string reason;           // why not, when unsupported
+        std::vector<int> gpus;        // every GPU the model uses
+        std::vector<int> released;    // GPUs it holds nothing on now
+        std::vector<int> keepable;    // GPUs it can keep while releasing the others
+        std::vector<size_t> bytes;    // per entry of `gpus`: device memory it holds now
+    };
+    virtual Residency residency() const {
+        Residency r;
+        r.reason = "this backend cannot release its GPUs";
+        return r;
+    }
+    // Frees everything the model holds on `gpus` (empty: every GPU). A backend
+    // may free more than asked (residency().released says what it holds
+    // nothing on afterwards). False leaves the model as it was, or fully
+    // released with `error` saying so.
+    virtual bool release_gpus(const std::vector<int> & gpus, std::string & error) {
+        (void) gpus;
+        error = residency().reason;
+        return false;
+    }
+    // Brings back what release_gpus() freed. False leaves the model released.
+    virtual bool reinstate(std::string & error) {
+        error = residency().reason;
+        return false;
+    }
+
     // ── Generation ───────────────────────────────────────────────────
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).

@@ -1,5 +1,6 @@
 #include "qwen4exp_cache.h"
 #include "common/layer_split_kvflash.h"
+#include "ggml-alloc.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda-gdn-chain.h"
 
@@ -55,7 +56,7 @@ void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s) {
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft,
                            const Qwen4ExpSlotStates * slot_states, int state_slot, int remote_layers,
-                           int kvflash_pool) {
+                           int kvflash_pool, ggml_backend_buffer_t reuse_remote_buf) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -216,7 +217,24 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
-    if (out.remote_ctx) out.remote_buf = ggml_backend_alloc_ctx_tensors(out.remote_ctx, w.expert_backend);
+    if (out.remote_ctx && reuse_remote_buf) {
+        // The same tensors in the same order take the same offsets in the kept buffer.
+        out.remote_buf = reuse_remote_buf;
+        ggml_tallocr talloc = ggml_tallocr_new(reuse_remote_buf);
+        for (ggml_tensor * t = ggml_get_first_tensor(out.remote_ctx); t; t = ggml_get_next_tensor(out.remote_ctx, t)) {
+            if (talloc.offset + ggml_backend_buffer_get_alloc_size(reuse_remote_buf, t) >
+                    ggml_backend_buffer_get_size(reuse_remote_buf) ||
+                ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[qwen4exp] cache: the kept expert-device buffer does not fit the rows\n");
+                free_qwen4exp_cache(out);
+                return false;
+            }
+        }
+    } else if (reuse_remote_buf) {
+        ggml_backend_buffer_free(reuse_remote_buf);   // nothing remote any more
+    } else if (out.remote_ctx) {
+        out.remote_buf = ggml_backend_alloc_ctx_tensors(out.remote_ctx, w.expert_backend);
+    }
     if (!out.buf || (out.remote_ctx && !out.remote_buf)) {
         free_qwen4exp_cache(out);
         return false;

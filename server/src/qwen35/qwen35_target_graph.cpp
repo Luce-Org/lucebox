@@ -401,29 +401,10 @@ bool create_target_cache_partial(const TargetWeights & w,
     }
 
     // ── Zero-initialize all state tensors ─────────────────────────────
-    const bool meta_backend = ggml_backend_buft_is_meta(
-        ggml_backend_get_default_buffer_type(backend));
-    if (meta_backend) {
-        ggml_backend_buffer_clear(out.base_buf, 0);
-        if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
-    } else {
-        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-        ggml_context * ctx_list[] = { out.base_ctx, out.rollback_ctx };
-        for (int ci = 0; ci < 2; ci++) {
-            ggml_context * c = ctx_list[ci];
-            if (!c) continue;
-            for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr;
-                 t = ggml_get_next_tensor(c, t)) {
-                size_t nb = ggml_nbytes(t);
-                size_t off = 0;
-                while (off < nb) {
-                    size_t chunk = std::min(nb - off, zeros.size());
-                    ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-                    off += chunk;
-                }
-            }
-        }
-    }
+    // A device memset: uploading host zeros 1 MiB at a time, a synchronized
+    // staged copy each, took seconds for a 262K-token cache.
+    ggml_backend_buffer_clear(out.base_buf, 0);
+    if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
 
     return true;
 }

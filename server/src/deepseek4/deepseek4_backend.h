@@ -27,6 +27,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -103,6 +104,9 @@ public:
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -272,6 +276,16 @@ private:
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void release_target_state(bool keep_snapshots);
+    bool released_ = false;   // residency: every GPU released for another model
+    // Residency: the devices besides the target that the model has used (expert, drafter, vision). Kept when
+    // their backends are freed, so a released model still reports them.
+    std::vector<int> used_gpus_;
+    void note_used_gpu(int gpu) {
+        if (gpu >= 0 && std::find(used_gpus_.begin(), used_gpus_.end(), gpu) == used_gpus_.end()) {
+            used_gpus_.push_back(gpu);
+        }
+    }
     void release_pflash_drafter();
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;

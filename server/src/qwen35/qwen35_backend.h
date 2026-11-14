@@ -129,6 +129,9 @@ public:
     void print_ready_banner() const override;
 
     bool park(ParkTarget target) override;
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return target_parked_; }
 
@@ -449,6 +452,14 @@ private:
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
+
+    // Residency: the cache arguments init() chose, replayed by reinstate().
+    int  layout_max_verify_tokens_ = 0;
+    int  layout_ctx_alloc_ = 0;
+    int  layout_feat_cap_ = 0;
+    bool layout_fixed_chain_ = false;
+    bool released_ = false;
+    void init_feature_mirror(bool fixed_chain_enabled);
 
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.

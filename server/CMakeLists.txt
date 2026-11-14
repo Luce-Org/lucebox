@@ -590,6 +590,7 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/qwen4exp/qwen4exp_hot.cpp
+    src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
@@ -2860,6 +2861,10 @@ if(LUCE_TESTS)
             test/unit/test_moe_hybrid_storage.cpp
             test/unit/test_meta_buffer_oom.cpp
             test/unit/test_tensor_file_reader.cpp)
+        # Swap groups are POSIX only (flock, kill, sockets).
+        if(NOT WIN32)
+            list(APPEND _server_unit_sources test/unit/test_swap_group.cpp)
+        endif()
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/unit/test_gpu_sampler_cuda.cpp
@@ -2870,6 +2875,8 @@ if(LUCE_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/residency.cpp
+            src/server/swap_group.cpp
             src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
@@ -3503,6 +3510,8 @@ if(LUCE_SERVER)
         add_executable(luce_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/residency.cpp
+            src/server/swap_group.cpp
             src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
