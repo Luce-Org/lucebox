@@ -4,6 +4,10 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#if defined(__HIPCC__)
+// Compiled as HIP here; the CUDA build compiles this file as plain C++ in test_server_unit.
+#include "ggml-cuda/common.cuh"
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -147,3 +151,38 @@ TEST_CASE(CudaPoolShutdownFixture, meta_backend_pool_shutdown) {
     ggml_backend_free(backend);
     REQUIRE_TRUE(true);
 }
+
+#if defined(__HIPCC__)
+// The legacy pool (non-VMM devices, the HIP builds) reuses a cached buffer only
+// when it is at most twice the request plus 1 MiB: a small request that stays
+// allocated must not hold a large buffer.
+TEST_CASE(CudaPoolShutdownFixture, legacy_pool_reuses_only_near_sizes) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, "skip: no CUDA/HIP backend available\n");
+        return;
+    }
+    ggml_cuda_pool & pool = static_cast<ggml_backend_cuda_context *>(backend->context)->pool();
+    if (!pool.is_legacy()) {
+        std::fprintf(stderr, "skip: the device uses the VMM pool\n");
+        ggml_backend_free(backend);
+        return;
+    }
+    constexpr size_t MiB = 1024 * 1024;
+    size_t big_size = 0;
+    void * big = pool.alloc(64 * MiB, &big_size);
+    REQUIRE(big != nullptr);
+    pool.free(big, big_size);
+    size_t small_size = 0;
+    void * small = pool.alloc(8 * MiB, &small_size);
+    CHECK(small != big);   // far smaller: a buffer of its own
+    pool.free(small, small_size);
+    const size_t near_request = (big_size - MiB + 1) / 2;   // the smallest request the big buffer serves
+    size_t near_size = 0;
+    void * near = pool.alloc(near_request, &near_size);
+    CHECK(near == big && near_size == big_size);
+    pool.free(near, near_size);
+    ggml_backend_cuda_trim_pool(backend);
+    ggml_backend_free(backend);
+}
+#endif
