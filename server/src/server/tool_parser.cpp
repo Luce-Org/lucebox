@@ -349,24 +349,77 @@ static size_t include_following_tool_call_close(const std::string & text,
     return pos;
 }
 
+// ─── Where a value ends when it may hold the tags ──────────────────────
+//
+// Values in the XML-like formats are raw text, so a value may hold the
+// format's own tags (a command that writes a test of a tool-call parser). A
+// close tag then ends a block only where what follows can come after it in
+// a reply: another block, or the end. When no close tag qualifies, the first
+// one does, as before.
+
+QuotedCall::QuotedCall(const std::string & text, size_t from, std::string open, std::string close)
+    : text_(text), open_(std::move(open)), close_(std::move(close)),
+      next_open_(text.find(open_, from)), next_close_(text.find(close_, from)) {}
+
+bool QuotedCall::open_before(size_t to) {
+    for (; next_open_ != std::string::npos && next_open_ + open_.size() <= to;
+         next_open_ = text_.find(open_, next_open_ + open_.size())) {
+        ++depth_;
+    }
+    for (; next_close_ != std::string::npos && next_close_ + close_.size() <= to;
+         next_close_ = text_.find(close_, next_close_ + close_.size())) {
+        --depth_;
+    }
+    return depth_ > 0;
+}
+
+static size_t skip_ws(const std::string & text, size_t pos) {
+    while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r')) {
+        ++pos;
+    }
+    return pos;
+}
+
+// Where a block that opened before `from` closes: at the first `close` after
+// which only whitespace or the next block's `opener` follows; else at the
+// first `close` (npos: none).
+static size_t block_close(const std::string & text, size_t from, const std::string & close,
+                          const std::string & opener = std::string()) {
+    const size_t first = text.find(close, from);
+    for (size_t at = first; at != std::string::npos; at = text.find(close, at + 1)) {
+        const size_t next = skip_ws(text, at + close.size());
+        if (next == text.size() || (!opener.empty() && text.compare(next, opener.size(), opener) == 0)) {
+            return at;
+        }
+    }
+    return first;
+}
+
+// Where an <arg_value> that starts at `from` ends: at the first </arg_value>
+// that the next <arg_key> or the end follows (in `text` with its wrapper
+// stripped, also the next call's NAME<arg_key>), outside any call the value
+// itself quotes (more <tool_call> than </tool_call> before it); else at the
+// first one.
+static size_t arg_value_end(const std::string & text, size_t from, bool stripped_wrapper) {
+    static const std::string kClose = "</arg_value>", kKey = "<arg_key>";
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+    };
+    QuotedCall quoted(text, from, TOOL_OPEN, "</tool_call>");
+    const size_t first = text.find(kClose, from);
+    for (size_t at = first; at != std::string::npos; at = text.find(kClose, at + 1)) {
+        if (quoted.open_before(at)) continue;
+        const size_t next = skip_ws(text, at + kClose.size());
+        size_t name_end = next;
+        while (stripped_wrapper && name_end < text.size() && is_ident(text[name_end])) ++name_end;
+        if (next == text.size() || text.compare(name_end, kKey.size(), kKey) == 0) return at;
+    }
+    return first;
+}
+
 // ─── Pattern regexes ────────────────────────────────────────────────────
 
 // We use std::regex for portability. Compiled once (function-local static).
-
-static const std::regex & re_tool_call_complete() {
-    static std::regex r(R"(<tool_call>([\s\S]*?)</tool_call>)");
-    return r;
-}
-
-static const std::regex & re_tool_call_function() {
-    static std::regex r(R"(<function=([\s\S]*?)</function>|<function=([\s\S]*)$)");
-    return r;
-}
-
-static const std::regex & re_tool_call_parameter() {
-    static std::regex r(R"(<parameter=([\s\S]*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|(?![\s\S])))");
-    return r;
-}
 
 static const std::regex & re_bare_function_xml() {
     static std::regex r(R"(<function=([A-Za-z_][\w.\-]*?)>([\s\S]*?)</function>(?:\s*</tool_call>)?)");
@@ -625,21 +678,58 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
 
 static json parse_xml_params(const std::string & region, const std::string & fn_name,
                              const json & tools) {
+    static const std::string kOpen = "<parameter=", kClose = "</parameter>";
     json props = find_tool_properties(tools, fn_name);
     json args = json::object();
-
-    auto begin = std::sregex_iterator(region.begin(), region.end(), re_tool_call_parameter());
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        std::string match_text = (*it)[1].str();
-        size_t eq = match_text.find('>');
-        if (eq == std::string::npos) continue;
-        std::string k = match_text.substr(0, eq);
-        // trim whitespace from key
+    const auto key_at = [&](size_t open) {
+        const size_t gt = region.find('>', open + kOpen.size());
+        if (gt == std::string::npos) return std::string();
+        std::string k = region.substr(open + kOpen.size(), gt - open - kOpen.size());
         while (!k.empty() && k.back() == ' ') k.pop_back();
         while (!k.empty() && k.front() == ' ') k.erase(k.begin());
+        return k;
+    };
+    // A value ends at the first </parameter> that another <parameter= or the
+    // end follows, or (unclosed) at a <parameter=KEY> for another argument the
+    // tool declares (any, when it declares none); else, as before, at the
+    // first </parameter>, or at the end. Tags inside a call the value itself
+    // quotes (more <function= than </function> before them) are text.
+    for (size_t open = region.find(kOpen); open != std::string::npos;) {
+        const size_t gt = region.find('>', open + kOpen.size());
+        if (gt == std::string::npos) break;
+        const std::string k = key_at(open);
+        const size_t start = gt + 1;
+        QuotedCall quoted(region, start, "<function=", "</function>");
+        size_t end = std::string::npos, resume = std::string::npos, first_close = std::string::npos;
+        for (size_t at = start; at < region.size();) {
+            const size_t close = region.find(kClose, at), next_open = region.find(kOpen, at);
+            if (close == std::string::npos && next_open == std::string::npos) break;
+            if (next_open != std::string::npos && (close == std::string::npos || next_open < close)) {
+                const std::string next_key = key_at(next_open);
+                if (!next_key.empty() && next_key != k && !args.contains(next_key) &&
+                    (props.empty() || props.contains(next_key)) && !quoted.open_before(next_open)) {
+                    end = resume = next_open;
+                    break;
+                }
+                at = next_open + 1;
+                continue;
+            }
+            if (first_close == std::string::npos) first_close = close;
+            const size_t after = skip_ws(region, close + kClose.size());
+            if ((after == region.size() || region.compare(after, kOpen.size(), kOpen) == 0) && !quoted.open_before(close)) {
+                end = close;
+                resume = close + kClose.size();
+                break;
+            }
+            at = close + 1;
+        }
+        if (end == std::string::npos && first_close != std::string::npos) {
+            end = first_close;
+            resume = first_close + kClose.size();
+        }
+        if (end == std::string::npos) end = region.size();
 
-        std::string v = match_text.substr(eq + 1);
+        std::string v = region.substr(start, end - start);
         if (v.rfind("\r\n", 0) == 0) v.erase(0, 2);
         else if (!v.empty() && v.front() == '\n') v.erase(v.begin());
         if (v.size() >= 2 && v.compare(v.size() - 2, 2, "\r\n") == 0) {
@@ -649,6 +739,7 @@ static json parse_xml_params(const std::string & region, const std::string & fn_
         }
 
         args[k] = convert_param_value(v, k, props);
+        open = resume == std::string::npos ? std::string::npos : region.find(kOpen, resume);
     }
     return args;
 }
@@ -1229,7 +1320,7 @@ static ToolParseResult parse_tool_calls_on_this_stack(const std::string & raw_te
         size_t pos = 0;
         while ((pos = text.find("<tool_call>", pos)) != std::string::npos) {
             const size_t body_start = pos + 11;
-            const size_t close = text.find("</tool_call>", body_start);
+            const size_t close = block_close(text, body_start, "</tool_call>", "<tool_call>");
             if (close == std::string::npos) break;
             const std::string body = text.substr(body_start, close - body_start);
             const bool is_legacy_qwen =
@@ -1272,7 +1363,7 @@ static ToolParseResult parse_tool_calls_on_this_stack(const std::string & raw_te
                             trim_ws(body.substr(kpos + 9, kend - (kpos + 9)));
                         const size_t vpos = body.find("<arg_value>", kend);
                         if (vpos == std::string::npos) break;
-                        const size_t vend = body.find("</arg_value>", vpos);
+                        const size_t vend = arg_value_end(body, vpos, false);
                         if (vend == std::string::npos) break;
                         const std::string val =
                             trim_ws(body.substr(vpos + 11, vend - (vpos + 11)));
@@ -1317,7 +1408,7 @@ static ToolParseResult parse_tool_calls_on_this_stack(const std::string & raw_te
                 if (kend == std::string::npos) break;
                 const size_t vpos = text.find("<arg_value>", kend);
                 if (vpos == std::string::npos) break;
-                const size_t vend = text.find("</arg_value>", vpos);
+                const size_t vend = arg_value_end(text, vpos, true);
                 if (vend == std::string::npos) break;
                 const std::string key = trim_ws(text.substr(kpos + 9, kend - (kpos + 9)));
                 const std::string val = trim_ws(text.substr(vpos + 11, vend - (vpos + 11)));
@@ -1339,22 +1430,28 @@ static ToolParseResult parse_tool_calls_on_this_stack(const std::string & raw_te
 
     // Pattern 1: <tool_call>...<function=NAME>...params...</function>...</tool_call>
     {
-        auto begin = std::sregex_iterator(text.begin(), text.end(), re_tool_call_complete());
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string body = (*it)[1].str();
-            std::smatch fn_match;
-            if (!std::regex_search(body, fn_match, re_tool_call_function())) continue;
-            std::string fn_text = fn_match[1].matched ? fn_match[1].str() : fn_match[2].str();
-            size_t gt = fn_text.find('>');
-            if (gt == std::string::npos) continue;
-            std::string fn_name = fn_text.substr(0, gt);
-            while (!fn_name.empty() && fn_name.back() == ' ') fn_name.pop_back();
-            while (!fn_name.empty() && fn_name.front() == ' ') fn_name.erase(fn_name.begin());
-            std::string params_region = fn_text.substr(gt + 1);
-
-            add_call(fn_name, parse_xml_params(params_region, fn_name, tools),
-                     it->position(), it->position() + it->length());
+        static const std::string kCallClose = "</tool_call>", kFunction = "<function=", kFunctionClose = "</function>";
+        for (size_t pos = text.find(TOOL_OPEN); pos != std::string::npos;) {
+            const size_t body_start = pos + std::strlen(TOOL_OPEN);
+            const size_t close = block_close(text, body_start, kCallClose, TOOL_OPEN);
+            if (close == std::string::npos) break;
+            const std::string body = text.substr(body_start, close - body_start);
+            const size_t fn = body.find(kFunction);
+            if (fn != std::string::npos) {
+                const size_t fn_start = fn + kFunction.size();
+                size_t fn_end = block_close(body, fn_start, kFunctionClose);
+                if (fn_end == std::string::npos) fn_end = body.size();
+                const std::string fn_text = body.substr(fn_start, fn_end - fn_start);
+                const size_t gt = fn_text.find('>');
+                if (gt != std::string::npos) {
+                    std::string fn_name = fn_text.substr(0, gt);
+                    while (!fn_name.empty() && fn_name.back() == ' ') fn_name.pop_back();
+                    while (!fn_name.empty() && fn_name.front() == ' ') fn_name.erase(fn_name.begin());
+                    add_call(fn_name, parse_xml_params(fn_text.substr(gt + 1), fn_name, tools),
+                             pos, close + kCallClose.size());
+                }
+            }
+            pos = text.find(TOOL_OPEN, close + kCallClose.size());
         }
     }
 

@@ -56,6 +56,25 @@ std::string new_tool_call_id();
 // The parameter schemas (`properties`) of declared tool `name`; {} if none.
 json tool_parameter_properties(const json & tools, const std::string & name);
 
+// Whether a tool-call value quotes a call that is still open. A value is raw
+// text in the XML-like formats and may hold a whole call (a command that
+// writes a test of a tool-call parser): a close tag inside that quoted call is
+// text. Counts `open` and `close` tags from `from` up to a point that only
+// moves forward, so a scan over a value's candidate ends stays one pass.
+class QuotedCall {
+public:
+    QuotedCall(const std::string & text, size_t from, std::string open, std::string close);
+    // True when text[from, to) holds more `open` than `close` tags. `to` must
+    // not go back from one call to the next.
+    bool open_before(size_t to);
+
+private:
+    const std::string & text_;
+    std::string open_, close_;
+    size_t next_open_, next_close_;
+    long depth_ = 0;
+};
+
 // Parse tool calls from generated text. `tools` is the tool definitions
 // (used for type coercion and allow-list filtering). May be null/empty.
 ToolParseResult parse_tool_calls(const std::string & text,

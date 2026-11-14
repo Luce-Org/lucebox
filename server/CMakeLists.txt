@@ -2803,6 +2803,7 @@ if(LUCE_TESTS)
             test/unit/test_mixed_mmq_policy.cpp
             test/unit/test_spec_acceptance.cpp
             test/unit/test_output_constraint.cpp
+            test/unit/test_tool_call_tags.cpp
             test/unit/test_gbnf.cpp
             test/unit/test_ds4_spec_sampling.cpp
             test/unit/test_penalty_history.cpp
