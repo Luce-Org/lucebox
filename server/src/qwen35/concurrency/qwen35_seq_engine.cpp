@@ -278,6 +278,7 @@ void Qwen35SeqEngine::init_slots_() {
 }
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
+    for (size_t s = 0; s < uq_store_.size(); s++) uq_clear_((int)s);   // the ledger outlives the engine: leave nothing held
     slot_state_stash_free(stash_);
     release_draft_graphs();
     for (DraftFeatureMirror & mirror : slot_feature_mirrors_) {
@@ -770,7 +771,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         ckpt_[(size_t)result.slot] = SlotCkpt{};
         trunk_[(size_t)result.slot] = SlotCkpt{};
         extra_[(size_t)result.slot] = SlotCkpt{};
-        uq_store_[(size_t)result.slot].clear();   // a new session: the rows of the one before it go
+        uq_clear_(result.slot);   // a new session: the rows of the one before it go
         book_.begin_session(result.slot, who.client, who.sid);
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
@@ -787,7 +788,7 @@ void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
         std::fprintf(stderr, "[kvflash] slot %d session dropped: history=%zu (%s)\n",
                      slot, parked_[(size_t)slot].history.size(), why);
     parked_[(size_t)slot] = ParkedSession{};
-    uq_store_[(size_t)slot].clear();
+    uq_clear_(slot);
     kvf_kv_->drop_parked(slot);
     book_.reset(slot);   // the slot's owner goes with its session
 }
@@ -1012,9 +1013,21 @@ void Qwen35SeqEngine::take_uq_rows_(int slot, int kv_pos, int n) {
     st.rows = std::move(rc.uq_rows);
     rc.uq_rows.clear();
     if (st.rows.size() != (size_t)st.n * qd.n_layers * qd.n_q_heads * qd.head_dim) { rc.uq_miss = "capture-incomplete"; return; }
-    for (int ev : kvflash_uq_slot_put(uq_store_, slot, std::move(st)))
+    std::vector<int> evicted;
+    if (!kvflash_uq_put_held(uq_store_[(size_t)slot], std::move(st), kKvFlashUqSlotMaxStores, [&](int64_t d) { return uq_hold_(d); }, &evicted)) {
+        std::fprintf(stderr, "[kvflash] slot %d uq capture skipped: host budget\n", slot);
+        rc.uq_miss = "host-budget";
+        return;
+    }
+    for (int ev : evicted)
         std::fprintf(stderr, "[kvflash] slot %d uq store evicted hi=%d (%zu kept)\n", slot, ev, uq_store_[(size_t)slot].size());
     rc.uq_miss = "";
+}
+
+// The live question stores are host memory outside every request's reservation: their bytes are held on the gate's host ledger.
+bool Qwen35SeqEngine::uq_hold_(int64_t delta) { return !kvf_kv_ || kvf_kv_->ledger().hold(delta); }
+void Qwen35SeqEngine::uq_clear_(int slot) {
+    kvflash_uq_clear_held(uq_store_[(size_t)slot], [&](int64_t d) { return uq_hold_(d); });
 }
 
 bool Qwen35SeqEngine::supports_images() const {

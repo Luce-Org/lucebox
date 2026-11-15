@@ -6,6 +6,7 @@
 #include "kvflash_exact_fast.h"
 #include "kvflash_gpu_mass.h"
 #include "kvflash_mass_synth.h"
+#include "kvflash_slot_plan.h"
 #include "kvflash_uq.h"
 
 #include <cstdint>
@@ -350,3 +351,72 @@ TEST_CASE(KvflashUqFixture, gpu_mass_release_ws_helps_only_when_it_turns_a_refus
     CHECK(!kvflash_gpu_mass_release_ws_helps(9999 * MiB, 0, 0, margin, 256 * MiB));              // unknown total: no guard, never refused
 }
 
+// The live question stores are host memory no request reserved (24 MiB a store on qwen35-27B, 4 a slot): the list's bytes
+// are held on the host ledger, put by put, and given back when a store leaves.
+namespace {
+KvFlashUqStore mkb(int hi, uint64_t hash, size_t floats) {
+    KvFlashUqStore st; st.lo = hi - 1; st.hi = hi; st.n = 1; st.hash = hash; st.rows.assign(floats, (float)hi);
+    return st;
+}
+}  // namespace
+TEST_CASE(KvflashUqFixture, the_host_ledger_holds_bytes_outside_a_reservation_up_to_its_budget) {
+    KvFlashHostLedger lg(100);
+    CHECK(lg.hold(60));
+    CHECK(lg.used_bytes() == 60);
+    CHECK(!lg.hold(41));                                                // past the budget: refused, nothing charged
+    CHECK(lg.used_bytes() == 60);
+    CHECK(lg.hold(40));
+    CHECK(lg.hold(-100));                                               // a release is never refused
+    CHECK(lg.used_bytes() == 0);
+}
+TEST_CASE(KvflashUqFixture, a_put_holds_the_stores_bytes_and_an_lru_eviction_releases_the_evicted_ones) {
+    KvFlashHostLedger lg(1000);
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    std::vector<KvFlashUqStore> v;
+    CHECK(kvflash_uq_put_held(v, mkb(100, 1, 10), 2, hold));
+    CHECK(lg.used_bytes() == 40);
+    CHECK(kvflash_uq_put_held(v, mkb(200, 2, 20), 2, hold));
+    CHECK(lg.used_bytes() == 120);
+    std::vector<int> ev;
+    CHECK(kvflash_uq_put_held(v, mkb(300, 3, 5), 2, hold, &ev));        // past the cap: 100 (40 bytes) goes
+    CHECK(ev == std::vector<int>({100}));
+    CHECK(lg.used_bytes() == 100);
+    CHECK(kvflash_uq_put_held(v, mkb(200, 2, 1), 2, hold));             // the same key: the old rows are released
+    CHECK(lg.used_bytes() == 24);
+    CHECK(lg.used_bytes() == kvflash_uq_bytes(v));
+    CHECK(kvflash_uq_put_held(v, mkb(400, 4, 3), 0, hold));             // max 0 keeps none
+    CHECK(v.empty());
+    CHECK(lg.used_bytes() == 0);
+}
+TEST_CASE(KvflashUqFixture, a_clear_releases_every_store_of_the_list_and_nothing_else) {
+    KvFlashHostLedger lg(1000);
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots s(2);
+    CHECK(kvflash_uq_put_held(s[0], mkb(100, 1, 10), 4, hold));
+    CHECK(kvflash_uq_put_held(s[0], mkb(200, 2, 20), 4, hold));
+    CHECK(kvflash_uq_put_held(s[1], mkb(100, 1, 7), 4, hold));
+    kvflash_uq_clear_held(s[0], hold);
+    CHECK(s[0].empty());
+    CHECK(lg.used_bytes() == 28);                                       // the other slot's store stays charged
+    kvflash_uq_clear_held(s[0], hold);                                  // idempotent
+    CHECK(lg.used_bytes() == 28);
+}
+TEST_CASE(KvflashUqFixture, a_put_the_ledger_refuses_keeps_the_old_stores_and_does_not_throw) {
+    KvFlashHostLedger lg(100);
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    std::vector<KvFlashUqStore> v;
+    CHECK(kvflash_uq_put_held(v, mkb(100, 1, 10), 4, hold));
+    std::vector<int> ev{7};
+    CHECK(!kvflash_uq_put_held(v, mkb(200, 2, 20), 4, hold, &ev));      // 40 + 80 > 100
+    REQUIRE(v.size() == 1u);
+    CHECK(v[0].hi == 100);
+    CHECK(v[0].rows.size() == 10u);
+    CHECK(ev == std::vector<int>({7}));                                 // nothing was evicted
+    CHECK(lg.used_bytes() == 40);
+    CHECK(kvflash_uq_put_held(v, mkb(200, 2, 20), 1, hold));            // the eviction makes the room: charged by the net change
+    CHECK(lg.used_bytes() == 80);
+    KvFlashHostLedger none(0);
+    std::vector<KvFlashUqStore> w;
+    CHECK(!kvflash_uq_put_held(w, mkb(100, 1, 10), 4, [&](int64_t d) { return none.hold(d); }));
+    CHECK(w.empty());
+}

@@ -369,6 +369,8 @@ private:
     // The first pass of a slot ended this step: score, restore the R state, rewind, apply the picks; the replay follows.
     bool rewind_slot_turn_(int slot);
     void take_uq_rows_(int slot, int kv_pos, int n);
+    bool uq_hold_(int64_t delta);   // charge (negative: release) the stores' bytes on the host ledger; false = refused
+    void uq_clear_(int slot);       // the slot's stores go, and their bytes with them
     std::vector<int32_t> column_buf_;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;

@@ -59,6 +59,7 @@ public:
     void set_next_slot(int slot) { next_slot_ = slot; next_resume_ = -1; }
     void set_next_resume(int slot, uint32_t len) { next_slot_ = slot; next_resume_ = (int64_t)len; }
     const KvFlashHostLedger & ledger() const { return ledger_; }
+    KvFlashHostLedger & ledger() { return ledger_; }
     int64_t reserved_bytes(int slot) const { return slot >= 0 && slot < (int)slots_.size() ? ledger_.reserved_of(slots_[(size_t)slot].request) : 0; }
     bool parked(int slot) const { return slot >= 0 && slot < (int)slots_.size() && slots_[(size_t)slot].parked; }
     void drop_parked(int slot) {

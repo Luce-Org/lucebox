@@ -145,6 +145,36 @@ inline const KvFlashUqStore * kvflash_uq_slot_get(KvFlashUqSlots & s, int slot, 
     return &v.front();
 }
 
+// The stores are host memory no request reserved: the engine holds a list's bytes on its host ledger. `hold(delta)` charges
+// delta bytes (negative: gives them back) and answers false when the budget refuses, with nothing charged.
+inline int64_t kvflash_uq_bytes(const KvFlashUqStore & s) { return (int64_t)(s.rows.size() * sizeof(float)); }
+inline int64_t kvflash_uq_bytes(const std::vector<KvFlashUqStore> & v) {
+    int64_t b = 0;
+    for (const KvFlashUqStore & s : v) b += kvflash_uq_bytes(s);
+    return b;
+}
+// What kvflash_uq_put would change the list's bytes by: the new store, less the same key's old rows and the entries past `max`.
+inline int64_t kvflash_uq_put_delta(const std::vector<KvFlashUqStore> & v, const KvFlashUqStore & s, size_t max) {
+    const int same = kvflash_uq_find(v, s.hi, s.hash);
+    int64_t after = max > 0 ? kvflash_uq_bytes(s) : 0;
+    size_t kept = 1;
+    for (size_t i = 0; i < v.size() && kept < max; i++)
+        if ((int)i != same) { after += kvflash_uq_bytes(v[i]); kept++; }
+    return after - kvflash_uq_bytes(v);
+}
+// kvflash_uq_put under the ledger. Refused: false, the list and `evicted` are as they were and the new rows are dropped.
+template <class Hold>
+bool kvflash_uq_put_held(std::vector<KvFlashUqStore> & v, KvFlashUqStore && s, size_t max, Hold && hold, std::vector<int> * evicted = nullptr) {
+    if (!hold(kvflash_uq_put_delta(v, s, max))) return false;
+    std::vector<int> ev = kvflash_uq_put(v, std::move(s), max);
+    if (evicted) *evicted = std::move(ev);
+    return true;
+}
+template <class Hold>
+void kvflash_uq_clear_held(std::vector<KvFlashUqStore> & v, Hold && hold) {
+    hold(-kvflash_uq_bytes(v));
+    v.clear();
+}
 // The forced batch cut: the question's end, whenever it falls strictly inside the prefill (-1 otherwise),
 // independent of any store, so identical requests get identical batch schedules.
 inline int kvflash_uq_cut(const KvFlashHumanTurn & t, int n_queries, int kv_offset, int end) {

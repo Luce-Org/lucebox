@@ -190,6 +190,13 @@ public:
         used_ -= it->second;
         reserved_.erase(it);
     }
+    // Host bytes held outside any request's reservation (the slots' live question stores); a negative delta gives them back.
+    // Refused past the budget, nothing charged.
+    bool hold(int64_t delta) {
+        if (delta > 0 && used_ + delta > budget_) return false;
+        used_ += delta;
+        return true;
+    }
     int64_t used_bytes() const { return used_; }
     int64_t budget_bytes() const { return budget_; }
     int64_t reserved_of(uint64_t request_id) const { const auto it = reserved_.find(request_id); return it == reserved_.end() ? 0 : it->second; }
