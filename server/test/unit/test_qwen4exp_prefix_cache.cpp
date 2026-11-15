@@ -295,6 +295,101 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
                 store == backend ? "device" : "system");
 }
 
+// The disk session cache's form of a snapshot: a copy and a hand-over both restore the very bytes the snapshot
+// restores, with its host fields; a read back into one system-memory buffer (what the disk reader makes) is kept in
+// place; a cache of another layout and a state-only snapshot are refused.
+static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
+    auto make_cache = [&](Qwen4ExpCache & c, int64_t head_dim) {
+        c.max_ctx = 63;
+        c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
+        auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, head_dim, 64, 2); };
+        c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+        c.mtp_k = kv(); c.mtp_v = kv();
+        c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16);
+        for (int i = 0; i < 2; ++i) {
+            c.indexer_raw.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx));
+            c.indexer_k.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx / 4 + 1));
+            c.ssm_state.push_back(ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2));
+            c.conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16));
+            c.ple_conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 9, 16));
+        }
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
+        CHECK(c.buf);
+    };
+    Qwen4ExpCache c, other;
+    make_cache(c, 8);
+    make_cache(other, 16);
+    unsigned char value = 1;
+    for (auto * t = ggml_get_first_tensor(c.ctx); t; t = ggml_get_next_tensor(c.ctx, t)) {
+        ggml_backend_tensor_memset(t, value++, 0, ggml_nbytes(t));
+    }
+    const int pos = 31;
+    c.cur_pos = pos; c.indexer_blocks = pos / 4;
+    c.mtp_prev_pos = pos - 1; c.kv_bucket_base = 512; c.ple_prev = {11, 12};
+    Qwen4ExpSnapshot s;
+    CHECK(save_qwen4exp_snapshot(backend, store, c, s));
+    for (int i = 0; i < pos; ++i) s.tokens.push_back(100 + i);
+    s.logits = {0.5f, -1.25f, 3.0f};
+    std::vector<std::vector<char>> saved;
+    for (auto [live, copy] : s.strips) saved.push_back(bytes(copy));
+    // The restored cache, bytes and host fields, after an import of `form` (consumed when kept in place).
+    auto check_import = [&](OwnedSnapshot & form) {
+        Qwen4ExpSnapshot back;
+        CHECK(import_qwen4exp_snapshot(store, c, form, back));
+        CHECK(back.cur_pos == pos && back.indexer_blocks == pos / 4 && back.mtp && back.mtp_prev_pos == pos - 1);
+        CHECK(back.kv_bucket_base == 512 && back.ple_prev == std::vector<int32_t>({11, 12}));
+        CHECK(back.tokens.size() == (size_t)pos && back.tokens.front() == 100 && back.tokens.back() == 100 + pos - 1);
+        CHECK(back.logits == std::vector<float>({0.5f, -1.25f, 3.0f}) && !back.state_only);
+        CHECK(back.strips.size() == saved.size());
+        for (size_t i = 0; i < saved.size(); ++i) CHECK(bytes(back.strips[i].second) == saved[i]);
+        reset_qwen4exp_state(backend, c);
+        ggml_backend_buffer_clear(c.buf, 0xa5);
+        CHECK(restore_qwen4exp_snapshot(backend, back, c));
+        CHECK(c.cur_pos == pos && c.ple_prev == std::vector<int32_t>({11, 12}));
+        for (size_t i = 0; i < saved.size(); ++i) CHECK(bytes(s.strips.empty() ? back.strips[i].first
+                                                                              : s.strips[i].first) == saved[i]);
+        free_qwen4exp_snapshot(back);
+    };
+    const bool system_store = ggml_backend_get_default_buffer_type(store) == ggml_backend_cpu_buffer_type();
+    // A copy: one buffer, the snapshot keeps its own.
+    const std::string layout = qwen4exp_disk_layout(c);
+    CHECK(layout.rfind("qwen4exp.", 0) == 0 && layout != qwen4exp_disk_layout(other));
+    OwnedSnapshot copy = export_qwen4exp_snapshot(layout, s);
+    CHECK(!copy.empty() && copy.single_buffer() && copy.cur_pos() == pos && copy.last_tok() == 100 + pos - 1);
+    CHECK(s.buf);
+    int n_tensors = 0;
+    for (auto * t = ggml_get_first_tensor(copy.ctx()); t; t = ggml_get_next_tensor(copy.ctx(), t)) {
+        ++n_tensors;
+        CHECK(std::strncmp(t->name, "qwen4exp.", 9) == 0 && t->ne[0] == 1);
+    }
+    CHECK(n_tensors == 2);
+    // Another layout refuses it and leaves it whole.
+    Qwen4ExpSnapshot refused;
+    CHECK(!import_qwen4exp_snapshot(store, other, copy, refused) && !refused.buf && !copy.empty());
+    check_import(copy);
+    CHECK(copy.empty() == system_store);   // kept in place in system memory
+    // A hand-over: the snapshot is left empty; in system memory its buffer is the payload itself.
+    ggml_backend_buffer_t snapshot_buf = s.buf;
+    const bool snapshot_in_system = ggml_backend_buffer_get_type(snapshot_buf) == ggml_backend_cpu_buffer_type();
+    OwnedSnapshot taken = take_qwen4exp_snapshot(layout, s);
+    CHECK(!taken.empty() && !s.buf && !s.ctx && s.strips.empty());
+    CHECK((taken.buf() == snapshot_buf) == snapshot_in_system);
+    // What the disk reader hands back: the same tensors in one fresh system-memory buffer.
+    OwnedSnapshot read = OwnedSnapshot::clone_to_host(taken.ctx(), taken.cur_pos(), taken.last_tok());
+    taken.reset();
+    check_import(read);
+    // A state-only snapshot has no disk form.
+    CHECK(save_qwen4exp_snapshot(backend, store, c, s));
+    CHECK(drop_qwen4exp_snapshot_rows(c, s) && s.state_only);
+    CHECK(export_qwen4exp_snapshot(layout, s).empty());
+    CHECK(take_qwen4exp_snapshot(layout, s).empty() && !s.buf);
+    free_qwen4exp_cache(other);
+    free_qwen4exp_cache(c);
+    std::printf("PASS prefix snapshot disk form: copy, hand-over, read back, other layout, state-only (%s memory)\n",
+                store == backend ? "device" : "system");
+}
+
 // A state-only backup restores, with the rows of a deeper snapshot of its prompt, the very bytes its whole snapshot
 // restored; a donor that cannot supply the rows is refused before the cache changes.
 static void state_backup(ggml_backend_t backend, ggml_backend_t store) {
@@ -772,10 +867,12 @@ int main(int argc, char ** argv) {
     CHECK(backend);
     copies(backend, backend);
     state_backup(backend, backend);
+    disk_form(backend, backend);
     const ggml_backend_t store = create_snapshot_backend(backend);
     if (store != backend) {
         copies(backend, store);
         state_backup(backend, store);
+        disk_form(backend, store);
     }
     free_snapshot_backend(store, backend);
     memory(backend);
