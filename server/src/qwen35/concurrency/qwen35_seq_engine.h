@@ -337,7 +337,7 @@ private:
     // point, or the rung the ladder demoted).
     struct SlotCkpt {
         int pos = -1;
-        SlotStateSnapshot slab;
+        std::shared_ptr<const SlotStateSnapshot> slab;   // immutable once taken: a rung copy and a queued park share it
         uint32_t file = 0;               // its slab file id in the slot's session directory (slab.<file>), 0: not on disk
         bool pinned = false;             // the third rung only: a branch point, kept until a deeper branch
     };
@@ -356,7 +356,7 @@ private:
     std::vector<SlotCkpt> trunk_;                     // the rung below it
     std::vector<SlotCkpt> extra_;                     // the third rung
     static KvFlashLadder ladder_of_(const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex) { return {ck.pos, tr.pos, ex.pos, ex.pos > 0 && ex.pinned}; }
-    // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is copied.
+    // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is shared.
     static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
     int end_rung_min_ = -1;                           // LUCE_KVFLASH_END_RUNG_MIN: a recall turn's header rung when end - R reaches it; -1 off
     void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)

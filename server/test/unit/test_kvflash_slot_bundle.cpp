@@ -545,6 +545,43 @@ TEST_CASE(KvflashSlotBundleFixture, the_writer_reports_a_slot_in_flight_until_it
     fs::remove_all(dir);
 }
 
+// The slab-sized copies of a park (the packs) are the writer thread's: the job carries the tensors themselves, the end
+// state's its own, a rung's shared and immutable. A session resumed while its park is still queued gets other rungs and
+// another end state, and what lands is the park that was staged.
+TEST_CASE(KvflashSlotBundleFixture, a_park_resumed_while_its_packing_is_queued_lands_the_rows_it_was_staged_with) {
+    using Tensors = KvFlashBundleSlab::Tensors;
+    const std::string dir = "kvflash_spw_unit_resumed", other = "kvflash_spw_unit_resumed_other";
+    fs::remove_all(dir); fs::remove_all(other);
+    std::mutex m; std::condition_variable cv; bool release = false, started = false;
+    auto slot_ssm = std::make_shared<const Tensors>(Tensors{{0x20, 3}});    // the slot's checkpoint rung
+    auto slot_conv = std::make_shared<const Tensors>(Tensors{{0x20, 4}});
+    {
+        KvFlashBundleWriter w([&](const KvFlashBundleWriter::Job & j, bool, double) {
+            if (j.slot != 9) return;
+            std::unique_lock<std::mutex> lk(m); started = true; cv.notify_all(); cv.wait(lk, [&] { return release; });
+        });
+        w.submit({9, park(other, 1, 1, 0x11, 3)});                           // the writer is held on another slot's park
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return started; }); }
+        KvFlashBundleCommit c = park(dir, 1, 2, 0x20, 3);
+        c.files.clear();
+        c.slabs = {{kvflash_bundle_slab_name(2), std::make_shared<const Tensors>(Tensors{{0x20, 1}}), std::make_shared<const Tensors>(Tensors{{0x20, 2}})},
+                   {kvflash_bundle_slab_name(3), slot_ssm, slot_conv}};
+        CHECK(c.slabs[0].bytes() == kvflash_slab_pack({{0x20, 1}}, {{0x20, 2}}).size());
+        w.submit({1, std::move(c)});
+        CHECK(w.in_flight(1));                                               // nothing of it is packed yet
+        slot_ssm = std::make_shared<const Tensors>(Tensors{{0x77, 0x77}});   // the resume: the slot's rung is another state now
+        slot_conv = std::make_shared<const Tensors>(Tensors{{0x78, 0x78}});
+        { std::lock_guard<std::mutex> lk(m); release = true; } cv.notify_all();
+        w.wait(1);
+    }
+    KvFlashBundleLoaded l;
+    std::string why;
+    REQUIRE(kvflash_bundle_load(dir, 3, CB, LIM, l, why));
+    CHECK((l.end_ssm == Tensors{{0x20, 1}})); CHECK((l.end_conv == Tensors{{0x20, 2}}));
+    CHECK((l.ckpt_ssm == Tensors{{0x20, 3}})); CHECK((l.ckpt_conv == Tensors{{0x20, 4}}));
+    kvflash_bundle_remove(dir); kvflash_bundle_remove(other);
+}
+
 // A bundle holds KV that one paged-attention route computed (WMMA or V_DOT2); the other route
 // rounds differently, so a bundle saved under one must not be adopted under the other.
 TEST_CASE(KvflashSlotBundleFixture, the_identity_differs_when_only_the_paged_attention_route_differs) {

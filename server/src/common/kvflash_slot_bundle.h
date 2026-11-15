@@ -27,6 +27,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -534,6 +535,15 @@ inline bool kvflash_fsync_dir(const std::string & dir) {
 
 // ---- a park on disk: commit, load, cleanup -----------------------------------------------------
 
+// A slab file the writer thread packs: the tensors are the job's own (the end state) or shared and immutable (a rung),
+// never the slot's live copy, so the slab-sized pack is off the step thread and a resume cannot change a queued park.
+struct KvFlashBundleSlab {
+    using Tensors = std::vector<std::vector<uint8_t>>;
+    std::string name;
+    std::shared_ptr<const Tensors> ssm, conv;
+    size_t bytes() const { return kvflash_slab_bytes(*ssm, *conv); }   // of its file
+};
+
 // Everything one park writes, built by the engine, executed by the writer thread.
 struct KvFlashBundleCommit {
     std::string dir;                       // the slot directory
@@ -546,7 +556,8 @@ struct KvFlashBundleCommit {
     std::vector<uint64_t> copies;          // offsets of live records in copy_from, written in order after the header
     size_t record_bytes = 0;               // kKvFlashRecordTag + chunk_bytes
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> records;         // (chunk, KV bytes), written in order after the copies
-    std::vector<std::pair<std::string, std::vector<uint8_t>>> files;        // slab files: name, bytes
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> files;        // files staged whole (the question rows): name, bytes
+    std::vector<KvFlashBundleSlab> slabs;  // slab files, packed at the write
     std::vector<uint8_t> head;             // kvflash_head_pack of the park's head
     std::vector<std::string> unlink;       // files the new head no longer names
 };
@@ -587,6 +598,7 @@ inline bool kvflash_bundle_commit(const KvFlashBundleCommit & c, int crash_after
     if (std::fclose(f) != 0 || !ok) return false;
     if (crash_after_step == 1) return false;
     for (const auto & [name, bytes] : c.files) if (!kvflash_bundle_write(c.dir + "/" + name, bytes)) return false;
+    for (const auto & sl : c.slabs) if (!kvflash_bundle_write(c.dir + "/" + sl.name, kvflash_slab_pack(*sl.ssm, *sl.conv))) return false;   // one pack alive at a time
     if (crash_after_step == 2) return false;
     if (!kvflash_fsync_dir(c.dir)) return false;
     if (c.new_dir) {
