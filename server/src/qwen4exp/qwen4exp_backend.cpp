@@ -46,7 +46,7 @@ static void load_qwen4exp_read_ahead(Qwen4ExpWeights & w) {
     for (int il = 0; il < w.n_layer; ++il) {
         const Qwen4ExpLayer & L = w.layers[(size_t) il];
         const ggml_tensor * R = L.ffn_gate_inp;
-        if (!L.ffn_gate_exps || L.ffn_gate_exps->buffer != w.expert_buf || !R || R->type != GGML_TYPE_F32 ||
+        if (!w.on_expert_device(L.ffn_gate_exps) || !R || R->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(R) || R->ne[0] != w.n_embd || R->ne[1] != w.n_expert || w.n_embd % qk != 0) continue;
         std::vector<uint8_t> held((size_t) w.n_expert, 0);
         if (w.hot) for (int32_t e : w.hot->initial[(size_t) il]) held[(size_t) e] = 1;
@@ -777,7 +777,8 @@ ModelBackend::Residency Qwen4ExpBackend::residency() const {
             expert += size(c.remote_buf);
         }
     }
-    expert += size(weights_.expert_buf) + size(weights_.kept_expert_buf);
+    expert += size(weights_.expert_buf) + size(weights_.expert_host_buf);   // the stacks in locked host memory too
+    expert += size(weights_.kept_expert_buf) + size(weights_.kept_expert_host_buf);
     for (ggml_backend_buffer_t b : kept_remote_bufs_) expert += size(b);   // K/V kept through a release
     r.bytes.push_back(expert_gpu() >= 0 ? target : target + expert);
     if (expert_gpu() >= 0) r.bytes.push_back(expert);
@@ -852,8 +853,10 @@ bool Qwen4ExpBackend::release_gpus(const std::vector<int> & gpus, std::string & 
     if (held_ == Held::all) {
         release_device_state(/*keep_experts=*/want == Held::experts);
     } else if (weights_.kept_expert_buf) {   // experts -> none
-        ggml_backend_buffer_free(weights_.kept_expert_buf);
-        weights_.kept_expert_buf = nullptr;
+        for (ggml_backend_buffer_t * b : {&weights_.kept_expert_buf, &weights_.kept_expert_host_buf}) {
+            if (*b) ggml_backend_buffer_free(*b);
+            *b = nullptr;
+        }
         free_kept_remote_bufs();
         ggml_backend_cuda_trim_pool(weights_.expert_backend);
     }

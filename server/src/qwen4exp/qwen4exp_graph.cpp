@@ -343,7 +343,7 @@ static ggml_tensor * build_moe_routed(ggml_context * c, const Qwen4ExpMoeRoute &
 // A layer whose routed expert stacks were placed on the expert device (the MTP
 // draft layer's stay on the target).
 static bool qwen4exp_split_layer(const Qwen4ExpLayer & L, const Qwen4ExpWeights & w) {
-    return w.expert_buf && L.ffn_gate_exps && L.ffn_gate_exps->buffer == w.expert_buf;
+    return w.on_expert_device(L.ffn_gate_exps);
 }
 
 // Split decode and verify steps: in every MoE layer the target waits for the expert device's routed sum once its shared
