@@ -342,6 +342,7 @@ TEST_CASE(KvflashSlotPlanFixture, v5_the_third_rung_adds_exactly_two_slabs_to_th
     const int64_t small = 48 + 16 * kNSlabTensors + kHeader + kChunkBytes;
     const int64_t two_rungs = 2 * kSlab + 4 * kSlab + small;
     CHECK(st.fixed_bytes == 5 * kSlab + small);                                   // one more rung pack in the staging
+    CHECK(kvflash_park_staging(kSlab, kNSlabTensors, kHeader, 64, kChunkBytes, 96 * kMiB).fixed_bytes == st.fixed_bytes + 96 * kMiB);   // the packed question rows of every store a bundle names
     CHECK(kvflash_ladder_bytes(kSlab, false, true, true, st) - two_rungs == 2 * kSlab);   // one more live rung, one more staged pack
     KvFlashAdmitInput now = sticky_bundle_admit(true), before = now;
     before.ladder_bytes = two_rungs;

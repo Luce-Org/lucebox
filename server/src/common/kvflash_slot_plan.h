@@ -142,13 +142,14 @@ inline int64_t kvflash_host_need_bytes(const KvFlashAdmitInput & in) {
 // of the changed chunks (at most every chunk of the session), the ledger and the head. `fixed` does not depend on
 // the session; `per_chunk` is one chunk's record, its ledger entry and its 4-byte history tokens. Reserving the
 // max_ctx bound of it (kvflash_park_staging_max_bytes) charged a 2K session ~5 GiB; reserving the session's own
-// chunks (KvFlashAdmitInput::stage_chunk_bytes) charges what the park can hold.
+// chunks (KvFlashAdmitInput::stage_chunk_bytes) charges what the park can hold. `uq_bytes`: the packed question rows a park
+// can stage, every store the head names (a fresh log writes them all).
 struct KvFlashParkStaging { int64_t fixed_bytes = 0, per_chunk_bytes = 0; };
 constexpr int kKvFlashLadderRungs = 3;   // a sticky session's rungs: checkpoint, trunk and the third (kvflash_slot_turn.h rule v5)
 inline KvFlashParkStaging kvflash_park_staging(int64_t slab_bytes, int64_t n_slab_tensors, int64_t header_bytes,
-                                               int64_t chunk_tokens, int64_t chunk_bytes) {
+                                               int64_t chunk_tokens, int64_t chunk_bytes, int64_t uq_bytes = 0) {
     KvFlashParkStaging s;
-    s.fixed_bytes = (2 + kKvFlashLadderRungs) * slab_bytes + 48 + 16 * n_slab_tensors + header_bytes + chunk_bytes;
+    s.fixed_bytes = (2 + kKvFlashLadderRungs) * slab_bytes + 48 + 16 * n_slab_tensors + header_bytes + chunk_bytes + uq_bytes;
     s.per_chunk_bytes = chunk_bytes + 16 + 4 * chunk_tokens;
     return s;
 }

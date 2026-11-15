@@ -109,13 +109,6 @@ inline bool kvflash_uq_belongs(const KvFlashUqStore & s, const std::vector<int32
     return !s.empty() && s.lo >= 0 && s.lo < s.hi && s.hi <= (int)ids.size() && s.n <= s.hi - s.lo && !s.rows.empty() &&
            s.rows.size() % (size_t)s.n == 0 && s.hash == kvflash_uq_hash(ids, s.hi);
 }
-// A slot holds the stores of several questions: the one a bundle save keeps is this history's latest question's (null: none).
-inline const KvFlashUqStore * kvflash_uq_of_history(const std::vector<KvFlashUqStore> & v, const std::vector<int32_t> & ids) {
-    const KvFlashUqStore * best = nullptr;
-    for (const KvFlashUqStore & s : v)
-        if (kvflash_uq_belongs(s, ids) && (!best || s.hi > best->hi)) best = &s;
-    return best;
-}
 
 // LRU of stores, most recent first, keyed by {hi, hash of ids[0, hi)}: the key is the content of the
 // prompt prefix, so a store stays valid whatever the pager or history did since.
@@ -149,6 +142,20 @@ constexpr size_t kKvFlashUqSlotMaxStores = 4;
 using KvFlashUqSlots = std::vector<std::vector<KvFlashUqStore>>;
 inline std::vector<int> kvflash_uq_slot_put(KvFlashUqSlots & s, int slot, KvFlashUqStore && st, size_t max = kKvFlashUqSlotMaxStores) {
     return kvflash_uq_put(s[(size_t)slot], std::move(st), max);
+}
+// A slot holds the stores of several questions: a bundle save keeps every one that belongs to the parked history, most recent
+// first, at most `max`. A side question's park then keeps the session's own question rows beside the side question's.
+inline std::vector<const KvFlashUqStore *> kvflash_uq_saved(const std::vector<KvFlashUqStore> & v, const std::vector<int32_t> & ids,
+                                                            size_t max = kKvFlashUqSlotMaxStores) {
+    std::vector<const KvFlashUqStore *> out;
+    for (const KvFlashUqStore & s : v)
+        if (out.size() < max && kvflash_uq_belongs(s, ids)) out.push_back(&s);
+    return out;
+}
+// A bundle restore: the slot holds the saved stores alone (most recent first, as kvflash_uq_saved gave them), in that LRU order.
+inline void kvflash_uq_slot_restore(KvFlashUqSlots & s, int slot, std::vector<KvFlashUqStore> && saved, size_t max = kKvFlashUqSlotMaxStores) {
+    s[(size_t)slot].clear();
+    for (auto it = saved.rbegin(); it != saved.rend(); ++it) kvflash_uq_slot_put(s, slot, std::move(*it), max);
 }
 // The slot's store for {hi, hash}, now its most recent; null when the slot holds none.
 inline const KvFlashUqStore * kvflash_uq_slot_get(KvFlashUqSlots & s, int slot, int hi, uint64_t hash) {

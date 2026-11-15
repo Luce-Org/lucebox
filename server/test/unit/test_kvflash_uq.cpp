@@ -367,24 +367,43 @@ TEST_CASE(KvflashUqFixture, a_store_belongs_to_the_history_it_was_captured_from)
     t = s; t.rows.pop_back();                         CHECK(!kvflash_uq_belongs(t, ids));   // ragged rows
     CHECK(!kvflash_uq_belongs(KvFlashUqStore{}, ids));
 }
-// A slot keeps the stores of several questions: the save takes the one of this history's latest question, not the most recent put.
-TEST_CASE(KvflashUqFixture, a_save_takes_the_store_of_the_historys_latest_question) {
-    const std::vector<int32_t> ids{5, 6, 7, 8, 9, 10, 11, 12};
-    auto side = ids; side[5] = 99;                                      // a side request: other ids from position 5
+// l2012 defect 1 (land24/m4once 35da2c9cd), steps (a) to (f): a side question followed by a trip to disk. The save keeps every store
+// that belongs to the parked history, most recent first; the restore puts them back in that order.
+TEST_CASE(KvflashUqFixture, a_disk_round_trip_after_a_side_question_keeps_the_sessions_question) {
+    const std::vector<int32_t> main_ids{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};                    // question A ends at 6
+    const std::vector<int32_t> side_ids{1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 52, 53, 54};       // the conversation up to 8, then question B ending at 12
     auto st = [](const std::vector<int32_t> & of, int hi) {
-        KvFlashUqStore s; s.lo = hi - 2; s.hi = hi; s.n = 2; s.hash = kvflash_uq_hash(of, hi); s.rows = {1.f, 2.f, 3.f, 4.f};
+        KvFlashUqStore s; s.lo = hi - 2; s.hi = hi; s.n = 2; s.hash = kvflash_uq_hash(of, hi); s.rows = {1.f, 2.f, 3.f, (float)hi};
         return s;
     };
+    KvFlashUqSlots slots(1);
+    auto to_disk_and_back = [&](const std::vector<int32_t> & parked) {                     // save -> the slot is cleared (evicted, restart) -> restore
+        std::vector<KvFlashUqStore> disk;
+        for (const KvFlashUqStore * s : kvflash_uq_saved(slots[0], parked)) disk.push_back(*s);
+        slots[0].clear();
+        kvflash_uq_slot_restore(slots, 0, std::move(disk));
+    };
+    CHECK(kvflash_uq_saved(slots[0], main_ids).empty());
+    kvflash_uq_slot_put(slots, 0, st(main_ids, 6));                                        // A, the session's turn
+    kvflash_uq_slot_put(slots, 0, st(side_ids, 12));                                       // B, the side request
+    to_disk_and_back(side_ids);                                                            // parked on the side request's history: both belong
+    REQUIRE(slots[0].size() == 2u);
+    CHECK(slots[0][0].hi == 12); CHECK(slots[0][1].hi == 6);                               // the LRU order as saved
+    CHECK(slots[0][1].rows == st(main_ids, 6).rows);
+    CHECK(kvflash_uq_slot_get(slots, 0, 12, kvflash_uq_hash(side_ids, 12)) != nullptr);
+    CHECK(kvflash_uq_slot_get(slots, 0, 6, kvflash_uq_hash(main_ids, 6)) != nullptr);     // the conversation goes on from before the side request: A is there
+    to_disk_and_back(main_ids);                                                            // parked on its own history: B is another history's, never saved
+    REQUIRE(slots[0].size() == 1u);
+    CHECK(slots[0][0].hi == 6);
+    CHECK(kvflash_uq_saved(slots[0], std::vector<int32_t>{9, 9, 9, 9, 9, 9, 9, 9}).empty());
+    // the cap: of six stores of one history the save keeps the four most recent
+    const std::vector<int32_t> longer{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
     std::vector<KvFlashUqStore> v;
-    CHECK(kvflash_uq_of_history(v, ids) == nullptr);
-    kvflash_uq_put(v, st(ids, 4), 4);                                   // the session's first question
-    kvflash_uq_put(v, st(ids, 7), 4);                                   // its latest
-    kvflash_uq_put(v, st(side, 8), 4);                                  // the side question: the most recent put
-    const KvFlashUqStore * s = kvflash_uq_of_history(v, ids);
-    REQUIRE(s != nullptr);
-    CHECK(s->hi == 7);
-    CHECK(kvflash_uq_of_history(v, side)->hi == 8);
-    CHECK(kvflash_uq_of_history(v, std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}) == nullptr);
+    for (int hi = 4; hi <= 14; hi += 2) kvflash_uq_put(v, st(longer, hi), kKvFlashUqMaxStores);
+    const auto kept = kvflash_uq_saved(v, longer);
+    REQUIRE(kept.size() == kKvFlashUqSlotMaxStores);
+    CHECK(kept[0]->hi == 14); CHECK(kept[3]->hi == 8);
+    CHECK(kvflash_uq_saved(v, longer, 1).size() == 1u);
 }
 
 // The live question stores are host memory no request reserved (24 MiB a store on qwen35-27B, 4 a slot): the list's bytes

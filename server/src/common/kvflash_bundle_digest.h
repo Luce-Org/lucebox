@@ -45,7 +45,7 @@ struct KvFlashStateDigest {
 // chunk_at(ci, dst) writes chunk_bytes of chunk ci (KvFlashSlotPager::read_chunk, or a slice of a blob).
 template <class ChunkAt>
 inline KvFlashStateDigest kvflash_state_digest(const std::vector<int32_t> & hist, const std::vector<uint8_t> & slab, const std::vector<uint8_t> & pager_hdr,
-                                               const std::vector<uint8_t> & ledger, const KvFlashDigestRungs & rungs, size_t chunk_bytes, ChunkAt && chunk_at, const KvFlashUqStore * uq = nullptr, const std::vector<uint8_t> * pool = nullptr) {
+                                               const std::vector<uint8_t> & ledger, const KvFlashDigestRungs & rungs, size_t chunk_bytes, ChunkAt && chunk_at, const std::vector<const KvFlashUqStore *> & uqs = {}, const std::vector<uint8_t> * pool = nullptr) {
     KvFlashStateDigest d;
     d.hist = fnv1a_bytes(kFnvBasis, (const uint8_t *)hist.data(), hist.size() * 4);
     d.slab = fnv1a_bytes(kFnvBasis, slab.data(), slab.size());
@@ -76,7 +76,8 @@ inline KvFlashStateDigest kvflash_state_digest(const std::vector<int32_t> & hist
         d.bytes += chunk_bytes;
     }
     d.uq = kFnvBasis;
-    if (uq && !uq->empty()) {
+    for (const KvFlashUqStore * uq : uqs) {   // every question store, in the slot's LRU order
+        if (!uq || uq->empty()) continue;
         const int32_t meta[3] = {uq->lo, uq->hi, uq->n};
         d.uq = fnv1a_bytes(d.uq, (const uint8_t *)meta, 12);
         d.uq = fnv1a_bytes(d.uq, (const uint8_t *)&uq->hash, 8);

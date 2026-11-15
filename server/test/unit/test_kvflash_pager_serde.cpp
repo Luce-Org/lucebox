@@ -1592,7 +1592,7 @@ TEST_CASE(KvflashPagerSerdeFixture, a_restore_that_loses_the_pool_layout_shows_i
         const std::vector<uint8_t> slab = {1, 2, 3}, pool = p.pool_layout_blob();
         const std::vector<int32_t> hist((size_t)p.n_chunks() * kChunk, 1);
         return kvflash_state_digest(hist, slab, p.blob_header(), p.ledger_blob(), KvFlashDigestRungs{}, p.chunk_bytes(),
-                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, nullptr, &pool);
+                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, {}, &pool);
     };
     Harness A;
     TestPager live;
@@ -1622,7 +1622,7 @@ TEST_CASE(KvflashPagerSerdeFixture, a_restore_that_loses_the_hard_pins_shows_in_
         const std::vector<uint8_t> slab = {1, 2, 3}, pool = p.pool_layout_blob();
         const std::vector<int32_t> hist((size_t)p.n_chunks() * kChunk, 1);
         return kvflash_state_digest(hist, slab, p.blob_header(), p.ledger_blob(), KvFlashDigestRungs{}, p.chunk_bytes(),
-                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, nullptr, &pool);
+                                    [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, {}, &pool);
     };
     Harness A;
     TestPager live;

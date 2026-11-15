@@ -1954,7 +1954,11 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         // thread has the park on disk (one staged park per slot: save_bundle_ waits for the slot's earlier one)
         const int64_t chunk_tokens = raw.back()->chunk_tokens();
         const int64_t chunk_bytes = (int64_t)raw.back()->chunk_bytes();
-        const KvFlashParkStaging staging = kvflash_park_staging(slab, n_slab_tensors, (int64_t)raw.back()->blob_header(0).size(), chunk_tokens, chunk_bytes);
+        // and the packed question rows of every store a bundle names (up to kKvFlashUqSlotMaxStores files of uq_queries rows)
+        const KvFlashQkDims qd = kvflash_exact_dims();
+        const int64_t uq_bytes = (int64_t)luce::common::kKvFlashUqSlotMaxStores * (12 + (int64_t)kvflash_uq_queries_ * qd.n_layers * qd.n_q_heads * qd.head_dim * (int64_t)sizeof(float));
+        const KvFlashParkStaging staging = kvflash_park_staging(slab, n_slab_tensors, (int64_t)raw.back()->blob_header(0).size(), chunk_tokens, chunk_bytes,
+                                                                kvflash_uq_queries_ > 0 ? uq_bytes : 0);
         kc.ladder_bytes = kvflash_ladder_bytes(slab, kvflash_slot_recall_profile(), sticky_on, staged, staging);
         kc.stage_chunk_bytes = staged ? staging.per_chunk_bytes : 0;   // the session's own chunks, not nc_max of them
         std::fprintf(stderr, "[kvflash] per-slot ladder: %d rungs x slab %lld B + staging %lld B = %lld B (%.1f MiB)\n", sticky_on ? kKvFlashLadderRungs : 0,
