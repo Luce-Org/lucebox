@@ -192,22 +192,39 @@ inline KvFlashHead kvflash_head_capture(KvFlashHeadBinder & bd, int slot, Pager 
     return h;
 }
 
+// HostBusy: the host ledger lacks room for the head's reservation, the one refusal an eviction cures.
+enum class KvFlashHeadAttach { Ok, HostBusy, Refused };
+
 // Attach the head to the free slot: bind, adopt the blob as a parked session of k chunks, and check that the pager
-// kept the pins. False leaves the slot free and unbound (the request goes cold). The caller then resumes the slot at
-// k chunks and restores `head.slab`.
+// kept the pins. Anything but Ok leaves the slot free and unbound (the request goes cold). The caller then resumes
+// the slot at k chunks and restores `head.slab`.
 template <class Kv>
-inline bool kvflash_head_attach(Kv & kv, KvFlashHeadBinder & bd, int slot, uint64_t ledger_id, const KvFlashHead & head) {
-    if (head.k <= 0 || head.hdr.empty() || head.slab.empty()) return false;
-    if (!bd.bind(slot, head.hash, head.k)) return false;
+inline KvFlashHeadAttach kvflash_head_attach_once(Kv & kv, KvFlashHeadBinder & bd, int slot, uint64_t ledger_id, const KvFlashHead & head) {
+    if (head.k <= 0 || head.hdr.empty() || head.slab.empty()) return KvFlashHeadAttach::Refused;
+    if (!bd.bind(slot, head.hash, head.k)) return KvFlashHeadAttach::Refused;
     const std::vector<uint8_t> blob = kvflash_head_blob(head);
     const uint32_t len = (uint32_t)head.k * kv.block_size();
     const auto adopted = kv.adopt_parked(slot, ledger_id, len, blob.data(), blob.size());
-    if (adopted != std::decay_t<decltype(adopted)>::Ok || bd.binding(slot).k != head.k) {
-        if (kv.parked(slot)) kv.drop_parked(slot);   // adopted, but the pins did not hold
+    using St = std::decay_t<decltype(adopted)>;
+    if (adopted != St::Ok || bd.binding(slot).k != head.k) {
+        if (adopted == St::Ok) kv.drop_parked(slot);   // adopted, but the pins did not hold (a refused adopt left the slot as it was)
         bd.unbind(slot);
-        return false;
+        return adopted == St::BlocksExhausted ? KvFlashHeadAttach::HostBusy : KvFlashHeadAttach::Refused;
     }
-    return true;
+    return KvFlashHeadAttach::Ok;
+}
+template <class Kv>
+inline bool kvflash_head_attach(Kv & kv, KvFlashHeadBinder & bd, int slot, uint64_t ledger_id, const KvFlashHead & head) {
+    return kvflash_head_attach_once(kv, bd, slot, ledger_id, head) == KvFlashHeadAttach::Ok;
+}
+// The attach with the eviction the admit has: while the host ledger refuses the head's reservation and `evict_one()`
+// sends a parked session away, try again. Any other refusal is final at once.
+template <class Kv, class Evict>
+inline KvFlashHeadAttach kvflash_head_attach_evicting(Kv & kv, KvFlashHeadBinder & bd, int slot, uint64_t ledger_id, const KvFlashHead & head, Evict evict_one) {
+    for (;;) {
+        const KvFlashHeadAttach got = kvflash_head_attach_once(kv, bd, slot, ledger_id, head);
+        if (got != KvFlashHeadAttach::HostBusy || !evict_one()) return got;
+    }
 }
 
 // A restored session (restart, evicted-to-disk): honour its persisted binding when the history still starts with the

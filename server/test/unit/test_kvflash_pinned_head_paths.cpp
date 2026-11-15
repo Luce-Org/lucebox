@@ -46,16 +46,16 @@ struct World {
     std::vector<std::unique_ptr<Slot>> s;
     KvFlashTestLedger ledger;
     std::unique_ptr<KvFlashSlotKv> kv;
-    KvFlashHeadBinder binder{kN};
+    KvFlashHeadBinder binder;
     std::map<uint64_t, KvFlashHead> heads;                      // what the engine keeps host-side, keyed by hash
-    explicit World(int64_t host_budget = 1000000) : ledger(host_budget) {
+    explicit World(int64_t host_budget = 1000000, int n = kN) : ledger(host_budget), binder(n) {
         arena.set_host_wait([] {});
         std::vector<KvFlashSlotPager *> raw;
-        for (int i = 0; i < kN; i++) {
+        for (int i = 0; i < n; i++) {
             s.push_back(std::make_unique<Slot>());
             KvFlashConfig c; c.chunk_tokens = kChunk; c.sink_chunks = 1; c.tail_window_chunks = 2;
             arena.add(*s.back());
-            if (!s.back()->attach_slice(i, kN, kQ, c, {}, {})) throw std::runtime_error("attach failed");
+            if (!s.back()->attach_slice(i, n, kQ, c, {}, {})) throw std::runtime_error("attach failed");
             raw.push_back(s.back().get());
         }
         KvFlashSlotKvConfig cfg; cfg.quota_chunks = kQ; cfg.headroom_blocks = 2; cfg.max_ctx = kMaxCtx; cfg.chunk_bytes = kChunkBytes;
@@ -279,6 +279,79 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_failed_admission_leaves_no_stale_bind
     CHECK(mgr.admit_at(a.slot, 3, prompt_of(900), SamplerCfg{}, 0).status != SeqEngine::AdmitResult::Status::admitted);
     CHECK(!w.kv->parked(a.slot));
     CHECK(unbound(w, a.slot, kK));
+}
+
+namespace {
+// Two sessions parked in two of three slots (the first captured the head), the third free: 11 chunks reserved each
+// (640 tokens and the reply bound).
+struct TwoParked { Captured a; int b_slot = -1, free_slot = -1; };
+TwoParked two_parked(World & w, SeqSlotManager & mgr) {
+    TwoParked t;
+    std::vector<int32_t> hist;
+    t.a = capture_on_miss(w, mgr, 1, 640);
+    must(prefill(w, mgr, t.a.slot, 640 - kK * kChunk));
+    mgr.commit_prefill(t.a.slot);
+    must(mgr.park(t.a.slot, hist));
+    t.b_slot = (t.a.slot + 1) % 3;
+    t.free_slot = (t.a.slot + 2) % 3;
+    w.kv->set_next_total_tokens(640 + 60);
+    w.kv->set_next_slot(t.b_slot);
+    must(mgr.admit_at(t.b_slot, 2, prompt_of(640, 7), SamplerCfg{}, 0).status == SeqEngine::AdmitResult::Status::admitted);
+    must(prefill(w, mgr, t.b_slot, 640));
+    mgr.commit_prefill(t.b_slot);
+    must(mgr.park(t.b_slot, hist));
+    must(w.kv->parked(t.a.slot) && w.kv->parked(t.b_slot) && w.ledger.used_bytes() == 22 * kChunkBytes);
+    return t;
+}
+}  // namespace
+
+// Before: the eviction wrapped only the admit, so with two long sessions parked the head's own reservation was refused
+// and the new session went cold (and the cold admit then evicted the same session anyway).
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_head_attach_the_host_ledger_refuses_evicts_a_parked_session_and_attaches) {
+    World w(/*host budget*/ 24 * kChunkBytes, 3);
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const TwoParked t = two_parked(w, mgr);
+    const int slot = t.free_slot;
+    REQUIRE(w.kv->adopt_probe(slot, 0x77, kK * kChunk) == PagedKvStatus::BlocksExhausted);   // 2 chunks free, the head needs 3
+    CHECK(w.kv->adopt_need_bytes(slot, kK * kChunk) == kK * kChunkBytes);
+    const std::vector<int> oldest_first{t.a.slot, t.b_slot};
+    size_t evicted = 0;
+    auto evict_one = [&] { if (evicted == oldest_first.size()) return false; w.kv->drop_parked(oldest_first[evicted++]); return true; };
+    REQUIRE(kvflash_head_attach_evicting(*w.kv, w.binder, slot, 0x77, w.heads.at(t.a.hash), evict_one) == KvFlashHeadAttach::Ok);
+    CHECK(evicted == 1u);                                        // the oldest only
+    CHECK(!w.kv->parked(t.a.slot));
+    CHECK(unbound(w, t.a.slot, kK));
+    CHECK(w.kv->parked(t.b_slot));
+    CHECK(bound(w, slot, kK));
+    const auto p = prompt_of(400, 9);                            // 460 tokens with its reply: 8 chunks beside the parked 11
+    w.kv->set_next_total_tokens((int64_t)p.size() + 60);
+    w.kv->set_next_resume(slot, kK * kChunk);
+    const auto r = mgr.admit_at(slot, 3, p, SamplerCfg{}, kK * kChunk);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    CHECK(mgr.slot(slot).cur_pos == kK * kChunk);                // admitted at L
+    CHECK(bound(w, slot, kK));
+    CHECK(w.ledger.reservation_count() == 2);
+}
+
+TEST_CASE(KvflashPinnedHeadPathsFixture, a_refused_head_attach_evicts_only_for_the_host_budget_and_leaves_the_slot_free) {
+    World w(/*host budget*/ 24 * kChunkBytes, 3);
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    const TwoParked t = two_parked(w, mgr);
+    const KvFlashHead & head = w.heads.at(t.a.hash);
+    int asked = 0;
+    // nothing can be evicted: host-busy, cold
+    CHECK(kvflash_head_attach_evicting(*w.kv, w.binder, t.free_slot, 0x77, head, [&] { asked++; return false; }) == KvFlashHeadAttach::HostBusy);
+    CHECK(asked == 1);
+    CHECK(!w.kv->parked(t.free_slot));
+    CHECK(unbound(w, t.free_slot, kK));
+    // a refusal that is not the ledger's (the slot holds a session): cold at once, nobody is evicted
+    asked = 0;
+    CHECK(kvflash_head_attach_evicting(*w.kv, w.binder, t.b_slot, 0x78, head, [&] { asked++; return true; }) == KvFlashHeadAttach::Refused);
+    CHECK(asked == 0);
+    CHECK(w.kv->parked(t.a.slot));
+    CHECK(bound(w, t.a.slot, kK));
+    CHECK(w.kv->parked(t.b_slot));
+    CHECK(w.ledger.reservation_count() == 2);
 }
 
 TEST_CASE(KvflashPinnedHeadPathsFixture, cold_slot_reuse_releases_the_old_binding_and_the_new_session_binds_on_its_own) {

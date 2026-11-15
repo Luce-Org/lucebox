@@ -113,6 +113,10 @@ public:
         settle_floors_();
         return admit_status_(ledger_.would_admit(id, admit_input_(*pagers_[(size_t)slot], (int64_t)len)));
     }
+    // Host bytes adopt_parked(slot, id, len, ...) asks of the ledger (what a refusal's log line names).
+    int64_t adopt_need_bytes(int slot, uint32_t len) const {
+        return slot < 0 || slot >= (int)slots_.size() ? 0 : kvflash_host_need_bytes(admit_input_(*pagers_[(size_t)slot], (int64_t)len));
+    }
     // Does a request of `total` tokens (prompt + generation bound) alone exceed the whole host budget? Permanent: no eviction
     // makes room, and a cold admit needs the same bytes. Asked before a resume; charges and moves nothing.
     // The charge is the one acquire_reserved makes (charged_tokens_), so a total of max_ctx + 1 is charged max_ctx here too. A prompt

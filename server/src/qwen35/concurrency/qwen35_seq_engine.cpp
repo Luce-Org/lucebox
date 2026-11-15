@@ -826,21 +826,37 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
     if ((plan.action == KvFlashAdmitAction::attach || plan.action == KvFlashAdmitAction::archive_attach) && plan.L > 0) {
         const KvFlashHead * head = find_head_(prompt, plan.L / hct);
         SlotStateSnapshot hs;
-        if (head && kvflash_slab_unpack(head->slab.data(), head->slab.size(), hs.ssm, hs.conv) &&
-            kvflash_head_attach(*kvf_kv_, head_binder_, slot, kHeadRequest + (uint64_t)slot, *head)) {
-            if (restore_slot_state(b_.cache_, slot, hs)) {
-                for (;;) {
-                    kvf_kv_->set_next_total_tokens(total);
-                    kvf_kv_->set_next_resume(slot, (uint32_t)plan.L);
-                    result = slots_.admit_at(slot, request_id, prompt, sampler, plan.L);
-                    const int old = result.status == AdmitResult::Status::busy ? evict_oldest_("host budget needed to attach a head", keep_slot) : -1;
-                    if (old < 0) break;
+        std::string why = "no head";
+        if (head && !kvflash_slab_unpack(head->slab.data(), head->slab.size(), hs.ssm, hs.conv)) {
+            why = "bad head slab";
+        } else if (head) {
+            // The head's host reservation gets the eviction the admit below has: a parked session is a cache and goes to disk.
+            const KvFlashHeadAttach got = kvflash_head_attach_evicting(*kvf_kv_, head_binder_, slot, kHeadRequest + (uint64_t)slot, *head,
+                [&] { return evict_oldest_("host budget needed to attach a head", keep_slot) >= 0; });
+            if (got == KvFlashHeadAttach::Ok) {
+                why = "state restore";
+                if (restore_slot_state(b_.cache_, slot, hs)) {
+                    for (;;) {
+                        kvf_kv_->set_next_total_tokens(total);
+                        kvf_kv_->set_next_resume(slot, (uint32_t)plan.L);
+                        result = slots_.admit_at(slot, request_id, prompt, sampler, plan.L);
+                        const int old = result.status == AdmitResult::Status::busy ? evict_oldest_("host budget needed to attach a head", keep_slot) : -1;
+                        if (old < 0) break;
+                    }
+                    if (result.status == AdmitResult::Status::admitted) attached_at = plan.L;
+                    else why = "admit: " + result.error;
                 }
-                if (result.status == AdmitResult::Status::admitted) attached_at = plan.L;
+                if (!attached_at) { kvf_kv_->drop_parked(slot); head_binder_.unbind(slot); }
+            } else if (got == KvFlashHeadAttach::HostBusy) {
+                const KvFlashHostLedger & lg = kvf_kv_->ledger();
+                why = "adopt BlocksExhausted (host used " + std::to_string(lg.used_bytes() >> 20) + " of " + std::to_string(lg.budget_bytes() >> 20) +
+                      " MiB, head needs " + std::to_string(kvf_kv_->adopt_need_bytes(slot, (uint32_t)plan.L) >> 20) + ")";
+            } else {
+                why = "adopt refused";
             }
-            if (!attached_at) { kvf_kv_->drop_parked(slot); head_binder_.unbind(slot); }
         }
-        std::fprintf(stderr, "[kvflash] slot %d pinned head attach %s (L=%d)\n", slot, attached_at ? "ok" : "FAILED: cold", plan.L);
+        if (attached_at) std::fprintf(stderr, "[kvflash] slot %d pinned head attach ok (L=%d)\n", slot, plan.L);
+        else std::fprintf(stderr, "[kvflash] slot %d pinned head attach FAILED: %s: cold (L=%d)\n", slot, why.c_str(), plan.L);
     }
     if (!attached_at) for (;;) {
         kvf_kv_->set_next_total_tokens(total);
