@@ -41,8 +41,7 @@ static constexpr int kMaxPromptCopies = 128;
 
 static bool split_layer(const Qwen4ExpWeights & w, int il) {
     const Qwen4ExpLayer & L = w.layers[(size_t) il];
-    return w.expert_buf && L.ffn_gate_exps && L.ffn_gate_exps->buffer == w.expert_buf && L.ffn_up_exps &&
-           L.ffn_down_exps;
+    return w.on_expert_device(L.ffn_gate_exps) && L.ffn_up_exps && L.ffn_down_exps;
 }
 
 Qwen4ExpHotSet::~Qwen4ExpHotSet() {

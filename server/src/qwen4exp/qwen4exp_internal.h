@@ -157,10 +157,19 @@ struct Qwen4ExpWeights {
     // caller before loading, not owned); everything else stays on `backend`.
     ggml_backend_t        expert_backend = nullptr;
     ggml_backend_buffer_t expert_buf     = nullptr;
-    // A release of the target device only: the expert stacks' buffer, kept on the expert device while nothing else
-    // is loaded. The next load_qwen4exp_gguf places the stacks back in it instead of uploading them again.
+    // An integrated expert device whose carve cannot hold every stack (qwen4exp_carve.h): the stacks past the carve,
+    // in locked host memory that device reads directly; expert_buf holds the ones before them. Null: all in expert_buf.
+    ggml_backend_buffer_t expert_host_buf = nullptr;
+    // A release of the target device only: the expert stacks' buffers, kept on the expert device while nothing else
+    // is loaded. The next load_qwen4exp_gguf places the stacks back in them instead of uploading them again.
     ggml_backend_buffer_t kept_expert_buf = nullptr;
+    ggml_backend_buffer_t kept_expert_host_buf = nullptr;
     bool                  expert_gfx1151 = false;
+    // True when `t` lives in one of the expert device's stack buffers.
+    bool on_expert_device(const ggml_tensor * t) const {
+        return t && t->buffer && ((expert_buf && t->buffer == expert_buf) ||
+                                  (expert_host_buf && t->buffer == expert_host_buf));
+    }
     // Split mode: experts the target computes beside the expert device in decode and verify steps (null: none).
     std::unique_ptr<Qwen4ExpHotSet> hot;
     ggml_tensor *              qsa_ones = nullptr;   // [indexer_n_head, 128] f32 ones: QSA's uniform head weights
@@ -279,7 +288,8 @@ std::string find_qwen4exp_mtp_sidecar(const std::string & model_path);
 // The sidecar among the file names of a repo's MTP/ directory: the first mtp-*.gguf in name order, or empty.
 std::string pick_qwen4exp_mtp_sidecar(std::vector<std::string> names);
 
-// keep_experts: the expert stacks stay on the expert device as kept_expert_buf (a release of the target device).
+// keep_experts: the expert stacks stay on the expert device as kept_expert_buf and kept_expert_host_buf (a release
+// of the target device).
 void free_qwen4exp_weights(Qwen4ExpWeights & w, bool keep_experts = false);
 // Release the derived constants and clear every pointer into them.
 void free_qwen4exp_derived(Qwen4ExpWeights & w);
