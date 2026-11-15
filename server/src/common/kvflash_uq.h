@@ -127,6 +127,24 @@ inline std::vector<int> kvflash_uq_put(std::vector<KvFlashUqStore> & v, KvFlashU
     return evicted;
 }
 
+// The slot engine keeps one such LRU per slot, never shared: a scorer that read another slot's rows would depend on
+// how far that slot's request had run. A side request with another last human question (a regenerate, a title call)
+// then leaves the session's own question rows in place. 4 a slot, not 8: a store is 24 MiB on qwen35-27B at 64 rows
+// (64 * 16 layers * 24 q heads * 256 * 4 bytes), so 4 slots hold at most 384 MiB.
+constexpr size_t kKvFlashUqSlotMaxStores = 4;
+using KvFlashUqSlots = std::vector<std::vector<KvFlashUqStore>>;
+inline std::vector<int> kvflash_uq_slot_put(KvFlashUqSlots & s, int slot, KvFlashUqStore && st, size_t max = kKvFlashUqSlotMaxStores) {
+    return kvflash_uq_put(s[(size_t)slot], std::move(st), max);
+}
+// The slot's store for {hi, hash}, now its most recent; null when the slot holds none.
+inline const KvFlashUqStore * kvflash_uq_slot_get(KvFlashUqSlots & s, int slot, int hi, uint64_t hash) {
+    std::vector<KvFlashUqStore> & v = s[(size_t)slot];
+    const int i = kvflash_uq_find(v, hi, hash);
+    if (i < 0) return nullptr;
+    kvflash_uq_touch(v, i);
+    return &v.front();
+}
+
 // The forced batch cut: the question's end, whenever it falls strictly inside the prefill (-1 otherwise),
 // independent of any store, so identical requests get identical batch schedules.
 inline int kvflash_uq_cut(const KvFlashHumanTurn & t, int n_queries, int kv_offset, int end) {

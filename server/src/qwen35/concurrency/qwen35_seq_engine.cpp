@@ -105,7 +105,7 @@ void Qwen35SeqEngine::init_slots_() {
     restored_kv_tokens_.assign(static_cast<size_t>(n_slots), 0);
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
     recall_.assign(static_cast<size_t>(n_slots), SlotRecall{});
-    uq_store_.assign(static_cast<size_t>(n_slots), KvFlashUqStore{});
+    uq_store_.assign(static_cast<size_t>(n_slots), {});
     parked_.assign(static_cast<size_t>(n_slots), ParkedSession{});
     ckpt_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
     trunk_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
@@ -770,6 +770,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         ckpt_[(size_t)result.slot] = SlotCkpt{};
         trunk_[(size_t)result.slot] = SlotCkpt{};
         extra_[(size_t)result.slot] = SlotCkpt{};
+        uq_store_[(size_t)result.slot].clear();   // a new session: the rows of the one before it go
         book_.begin_session(result.slot, who.client, who.sid);
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
@@ -786,6 +787,7 @@ void Qwen35SeqEngine::drop_session_(int slot, const char * why) {
         std::fprintf(stderr, "[kvflash] slot %d session dropped: history=%zu (%s)\n",
                      slot, parked_[(size_t)slot].history.size(), why);
     parked_[(size_t)slot] = ParkedSession{};
+    uq_store_[(size_t)slot].clear();
     kvf_kv_->drop_parked(slot);
     book_.reset(slot);   // the slot's owner goes with its session
 }
@@ -942,8 +944,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     bool scored = false;
     rc.scores.clear();
     if (uq_queries_ > 0) {
-        const KvFlashUqStore & st = uq_store_[(size_t)slot];
-        kvflash_uq_join(qs, kvflash_uq_holds(st, rc.uq.cut, rc.uq_hash) ? &st : nullptr, rc.uq_miss, qsize, qs.size());
+        kvflash_uq_join(qs, kvflash_uq_slot_get(uq_store_, slot, rc.uq.cut, rc.uq_hash), rc.uq_miss, qsize, qs.size());
     }
     if (!qs.empty()) {
         std::vector<std::vector<float>> o;
@@ -1011,7 +1012,8 @@ void Qwen35SeqEngine::take_uq_rows_(int slot, int kv_pos, int n) {
     st.rows = std::move(rc.uq_rows);
     rc.uq_rows.clear();
     if (st.rows.size() != (size_t)st.n * qd.n_layers * qd.n_q_heads * qd.head_dim) { rc.uq_miss = "capture-incomplete"; return; }
-    uq_store_[(size_t)slot] = std::move(st);
+    for (int ev : kvflash_uq_slot_put(uq_store_, slot, std::move(st)))
+        std::fprintf(stderr, "[kvflash] slot %d uq store evicted hi=%d (%zu kept)\n", slot, ev, uq_store_[(size_t)slot].size());
     rc.uq_miss = "";
 }
 

@@ -298,7 +298,7 @@ private:
         std::vector<float> scores;
         std::vector<float> q_tail;   // the first pass's last select_queries prompt queries across its cuts, oldest first (the serial engine's kvflash_q_tail_)
         // LUCE_KVFLASH_UQ_QUERIES: the latest human question. uq.capture while its window rows are still to
-        // be captured; complete, they are the slot's store (uq_store_) under the key {uq.cut, uq_hash}.
+        // be captured; complete, they are a store of the slot (uq_store_) under the key {uq.cut, uq_hash}.
         KvFlashUqPlan uq;
         uint64_t uq_hash = 0;
         std::vector<float> uq_rows;
@@ -310,9 +310,10 @@ private:
     std::vector<SlotRecall> recall_;
     bool recall_on_ = false;                          // the recall profile is on for the slot engine
     int uq_queries_ = 0;                              // LUCE_KVFLASH_UQ_QUERIES with mode-4 recall, else 0
-    // The question rows of each slot's session. One per slot and never shared: a scorer that read another
-    // slot's rows would depend on how far that slot's request had run.
-    std::vector<KvFlashUqStore> uq_store_;
+    // The question rows of each slot's session: an LRU per slot (kvflash_uq_slot_put), never shared between
+    // slots, emptied when the slot's session leaves or another begins. Host memory outside the slot ledger,
+    // as the serial engine's stores are.
+    KvFlashUqSlots uq_store_;
     // Sticky sessions (LUCE_KVFLASH_SLOT_STICKY, on by default with KVFlash slots). A retired slot keeps its KV and
     // recurrent state parked in place; a prompt that extends its history resumes it where it parked.
     // The recurrent state cannot be sliced back, so a prompt that diverges inside the history (the client re-renders

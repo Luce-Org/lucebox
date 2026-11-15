@@ -128,6 +128,30 @@ TEST_CASE(KvflashUqFixture, store_lru_keeps_other_conversations_and_evicts_the_o
     kvflash_uq_put(v, mk(100, 1), 3);                                   // same key replaces, no growth
     CHECK(v.size() == 3);
 }
+TEST_CASE(KvflashUqFixture, a_slot_keeps_the_first_questions_store_after_a_side_question) {
+    KvFlashUqSlots s(2);
+    CHECK(kvflash_uq_slot_put(s, 0, mk(100, 0xa)).empty());             // the session's question A
+    CHECK(kvflash_uq_slot_put(s, 0, mk(200, 0xb)).empty());             // a side request's question B, same slot
+    const KvFlashUqStore * a = kvflash_uq_slot_get(s, 0, 100, 0xa);
+    REQUIRE(a != nullptr);                                              // A is still there
+    CHECK(a->hi == 100);
+    CHECK(kvflash_uq_slot_get(s, 0, 200, 0xb) != nullptr);
+    CHECK(s[1].empty());                                                // the other slot: untouched, and never read
+    CHECK(kvflash_uq_slot_get(s, 1, 100, 0xa) == nullptr);
+}
+TEST_CASE(KvflashUqFixture, a_slots_stores_evict_the_least_recent_past_the_cap) {
+    KvFlashUqSlots s(2);
+    const int cap = (int)kKvFlashUqSlotMaxStores;
+    for (int i = 1; i <= cap; i++) CHECK(kvflash_uq_slot_put(s, 0, mk(100 * i, (uint64_t)i)).empty());
+    CHECK(kvflash_uq_slot_get(s, 0, 100, 1) != nullptr);                // the oldest is used again: 200 is now the least recent
+    const auto ev = kvflash_uq_slot_put(s, 0, mk(100 * (cap + 1), (uint64_t)(cap + 1)));
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0] == 200);
+    CHECK((int)s[0].size() == cap);
+    CHECK(kvflash_uq_slot_get(s, 0, 100, 1) != nullptr);
+    CHECK(kvflash_uq_slot_get(s, 0, 200, 2) == nullptr);
+    CHECK(s[1].empty());
+}
 TEST_CASE(KvflashUqFixture, store_lru_with_max_zero_keeps_no_store) {
     std::vector<KvFlashUqStore> v;
     const auto ev = kvflash_uq_put(v, mk(100, 1), 0);
