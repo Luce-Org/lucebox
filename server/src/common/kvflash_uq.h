@@ -153,6 +153,21 @@ inline int64_t kvflash_uq_bytes(const std::vector<KvFlashUqStore> & v) {
     for (const KvFlashUqStore & s : v) b += kvflash_uq_bytes(s);
     return b;
 }
+// The stores are a cache: under host pressure those of the slots nobody owns (keep[slot] false: no live request and no parked
+// session) are released. Returns what was given back; nothing reclaimable = 0 stores, the ledger untouched.
+struct KvFlashUqReclaimed { int stores = 0; int64_t bytes = 0; };
+template <class Hold>
+KvFlashUqReclaimed kvflash_uq_reclaim_idle(KvFlashUqSlots & s, const std::vector<bool> & keep, Hold && hold) {
+    KvFlashUqReclaimed r;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (i < keep.size() && keep[i]) continue;
+        r.stores += (int)s[i].size();
+        r.bytes += kvflash_uq_bytes(s[i]);
+        s[i].clear();
+    }
+    if (r.bytes) hold(-r.bytes);
+    return r;
+}
 // What kvflash_uq_put would change the list's bytes by: the new store, less the same key's old rows and the entries past `max`.
 inline int64_t kvflash_uq_put_delta(const std::vector<KvFlashUqStore> & v, const KvFlashUqStore & s, size_t max) {
     const int same = kvflash_uq_find(v, s.hi, s.hash);

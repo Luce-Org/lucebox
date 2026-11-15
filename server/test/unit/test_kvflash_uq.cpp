@@ -369,6 +369,58 @@ TEST_CASE(KvflashUqFixture, the_host_ledger_holds_bytes_outside_a_reservation_up
     CHECK(lg.hold(-100));                                               // a release is never refused
     CHECK(lg.used_bytes() == 0);
 }
+// A request that fits the budget alone, a ledger with no reservation, and question stores no session owns.
+KvFlashAdmitInput uq_admit_in() {
+    KvFlashAdmitInput in;
+    in.slot_free = true; in.quota_chunks = 352; in.headroom_blocks = 8;
+    in.prompt_tokens = 1000; in.max_new_tokens = 24; in.max_ctx = 131072; in.chunk_tokens = 64; in.chunk_bytes = 17 * 1024 * 1024 / 8;
+    return in;
+}
+TEST_CASE(KvflashUqFixture, a_request_that_fits_the_budget_alone_is_not_busy_behind_an_idle_slots_question_stores) {
+    const KvFlashAdmitInput in = uq_admit_in();
+    KvFlashHostLedger lg(kvflash_host_need_bytes(in));                  // the budget fits this request alone
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[1], mkb(8, 1, 64), 4, hold));       // an earlier request's capture; that request is gone
+    CHECK(kvflash_uq_put_held(slots[1], mkb(9, 2, 36), 4, hold));
+    CHECK(lg.admit(1, in) == KvFlashAdmit::BusyHost);                   // not HostTooSmall: deferred, and nothing live to finish
+    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(slots, {false, false}, hold);
+    CHECK(r.stores == 2);
+    CHECK(r.bytes == 400);
+    CHECK(slots[1].empty());
+    CHECK(lg.used_bytes() == 0);
+    CHECK(lg.admit(1, in) == KvFlashAdmit::Ok);                         // the retried admit
+}
+TEST_CASE(KvflashUqFixture, a_reclaim_never_touches_the_stores_of_a_slot_with_a_live_request_or_a_parked_session) {
+    KvFlashHostLedger lg(1000);
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots slots(3);
+    CHECK(kvflash_uq_put_held(slots[0], mkb(100, 1, 10), 4, hold));     // slot 0: a live request
+    CHECK(kvflash_uq_put_held(slots[1], mkb(100, 1, 20), 4, hold));     // slot 1: a parked session
+    CHECK(kvflash_uq_put_held(slots[2], mkb(100, 1, 5), 4, hold));      // slot 2: nobody
+    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(slots, {true, true, false}, hold);
+    CHECK(r.stores == 1);
+    CHECK(r.bytes == 20);
+    CHECK(slots[0].size() == 1u);
+    CHECK(slots[1].size() == 1u);
+    CHECK(slots[2].empty());
+    CHECK(lg.used_bytes() == 120);
+}
+TEST_CASE(KvflashUqFixture, with_nothing_to_reclaim_the_admit_stays_busy_and_is_not_retried) {
+    const KvFlashAdmitInput in = uq_admit_in();
+    KvFlashHostLedger lg(kvflash_host_need_bytes(in));
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[1], mkb(8, 1, 64), 4, hold));       // slot 1's session is parked: its stores stay
+    CHECK(lg.admit(1, in) == KvFlashAdmit::BusyHost);
+    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(slots, {false, true}, hold);
+    CHECK(r.stores == 0);                                               // 0 is the engine's "do not retry": the admit is deferred
+    CHECK(r.bytes == 0);
+    CHECK(slots[1].size() == 1u);
+    CHECK(lg.used_bytes() == 256);
+    CHECK(lg.admit(1, in) == KvFlashAdmit::BusyHost);
+    CHECK(kvflash_uq_reclaim_idle(slots, {false, true}, hold).stores == 0);   // and a second ask frees nothing either
+}
 TEST_CASE(KvflashUqFixture, a_put_holds_the_stores_bytes_and_an_lru_eviction_releases_the_evicted_ones) {
     KvFlashHostLedger lg(1000);
     auto hold = [&](int64_t d) { return lg.hold(d); };

@@ -607,6 +607,10 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded_(
     if (sticky_on_) return admit_sticky_(request_id, prompt, sampler, total, meta);
     if (kvf_kv_) kvf_kv_->set_next_total_tokens(total);
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
+    if (result.status == AdmitResult::Status::busy && kvf_kv_ && uq_reclaim_idle_()) {   // the stores are a cache: one retry without them
+        kvf_kv_->set_next_total_tokens(total);
+        result = slots_.admit(request_id, prompt, sampler);
+    }
     if (result.status == AdmitResult::Status::admitted) {
         if (result.slot >= 0 && (size_t)result.slot < restored_kv_checkpoint_.size()) {
             restored_kv_checkpoint_[(size_t)result.slot] = -1;
@@ -765,7 +769,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
         // Parked reservations are a cache, never a reason to refuse: the oldest go until the budget fits.
         const int old = result.status == AdmitResult::Status::busy
             ? kvflash_evict_for_cold([&](int keep) { return evict_oldest_("host budget needed for a new session (cold)", keep); }, keep_slot, any_slot_live_()) : -1;
-        if (old < 0) break;
+        if (old < 0 && (result.status != AdmitResult::Status::busy || !uq_reclaim_idle_())) break;   // no parked victim left: the idle slots' question stores go, one more try
     }
     if (result.status == AdmitResult::Status::admitted) {
         ckpt_[(size_t)result.slot] = SlotCkpt{};
@@ -1028,6 +1032,13 @@ void Qwen35SeqEngine::take_uq_rows_(int slot, int kv_pos, int n) {
 bool Qwen35SeqEngine::uq_hold_(int64_t delta) { return !kvf_kv_ || kvf_kv_->ledger().hold(delta); }
 void Qwen35SeqEngine::uq_clear_(int slot) {
     kvflash_uq_clear_held(uq_store_[(size_t)slot], [&](int64_t d) { return uq_hold_(d); });
+}
+int Qwen35SeqEngine::uq_reclaim_idle_() {
+    std::vector<bool> keep = active_slots_();
+    for (size_t s = 0; s < keep.size(); s++) keep[s] = keep[s] || parked_[s].valid;
+    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(uq_store_, keep, [&](int64_t d) { return uq_hold_(d); });
+    if (r.stores) std::fprintf(stderr, "[kvflash] uq stores reclaimed: %d stores, %.1f MiB\n", r.stores, (double)r.bytes / (1024.0 * 1024.0));
+    return r.stores;
 }
 
 bool Qwen35SeqEngine::supports_images() const {
