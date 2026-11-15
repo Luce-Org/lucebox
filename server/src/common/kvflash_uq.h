@@ -153,6 +153,14 @@ inline int64_t kvflash_uq_bytes(const std::vector<KvFlashUqStore> & v) {
     for (const KvFlashUqStore & s : v) b += kvflash_uq_bytes(s);
     return b;
 }
+// Which slots' stores a reclaim keeps: a live request's and a parked session's. `own` (the parked slot a resume is asking for, -1:
+// none) is given up when nothing is live: its session's own rows would hold the room it asks for and no retry could change the
+// answer (kvflash_evict_for_cold's rule). The rows are derived data: the session resumes without them and a new question recaptures.
+inline std::vector<bool> kvflash_uq_keep(std::vector<bool> active, const std::vector<bool> & parked, int own = -1) {
+    const bool any_live = std::find(active.begin(), active.end(), true) != active.end();
+    for (size_t s = 0; s < active.size(); s++) active[s] = active[s] || (s < parked.size() && parked[s] && (any_live || (int)s != own));
+    return active;
+}
 // The stores are a cache: under host pressure those of the slots nobody owns (keep[slot] false: no live request and no parked
 // session) are released. Returns what was given back; nothing reclaimable = 0 stores, the ledger untouched.
 struct KvFlashUqReclaimed { int stores = 0; int64_t bytes = 0; };

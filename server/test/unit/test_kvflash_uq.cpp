@@ -444,15 +444,40 @@ TEST_CASE(KvflashUqFixture, a_resume_that_fits_the_budget_alone_is_not_busy_behi
     CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::wait_parked);   // a second refusal waits
     CHECK(asks == 2);
 }
+// The resumed session's own question rows are kept like any parked session's, but not when they are what holds its room and
+// nothing is live: no request will finish, so the wait would never end.
+TEST_CASE(KvflashUqFixture, a_resume_is_not_busy_behind_its_own_question_stores_when_nothing_is_live) {
+    UqResume u;
+    auto hold = [&](int64_t d) { return u.lg.hold(d); };
+    CHECK(u.lg.admit(1, u.parked) == KvFlashAdmit::Ok);                 // the session parked in slot 0, slot 1 free, nothing live
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[0], mkb(8, 1, 64), 4, hold));       // its own rows, captured the turn before
+    CHECK(u.ask() == KvFlashAdmit::BusyHost);
+    int asks = 0;
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, kvflash_uq_keep({false, false}, {true, false}, 0), hold).stores; };
+    CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::reclaimed_retry);
+    CHECK(slots[0].empty());
+    CHECK(u.ask() == KvFlashAdmit::Ok);                                 // the one more try
+    CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::wait_parked);   // nothing left: a second refusal waits
+    CHECK(asks == 2);
+}
+TEST_CASE(KvflashUqFixture, the_reclaim_keep_gives_up_only_the_resumed_slot_and_only_with_nothing_live) {
+    using B = std::vector<bool>;
+    CHECK(kvflash_uq_keep({false, true, false}, {true, false, false}) == B({true, true, false}));        // live or parked: kept; nobody's: not
+    CHECK(kvflash_uq_keep({false, false, false}, {true, true, false}, 0) == B({false, true, false}));    // nothing live: the resumed slot alone is given up
+    CHECK(kvflash_uq_keep({false, false, true}, {true, true, false}, 0) == B({true, true, true}));       // a request is live: it will finish, the rows stay
+    CHECK(kvflash_uq_keep({false, false}, {true, true}, -1) == B({true, true}));                         // no resume (admit, cold, restore): as before
+    CHECK(kvflash_uq_keep({false, false}, {false, false}, 1) == B({false, false}));
+}
 TEST_CASE(KvflashUqFixture, a_busy_resume_with_nothing_to_reclaim_waits_parked_and_is_not_retried) {
     UqResume u;
     auto hold = [&](int64_t d) { return u.lg.hold(d); };
     CHECK(u.lg.admit(1, u.parked) == KvFlashAdmit::Ok);
     KvFlashUqSlots slots(2);
-    CHECK(kvflash_uq_put_held(slots[0], mkb(8, 1, 64), 4, hold));       // the parked session's own stores: kept
+    CHECK(kvflash_uq_put_held(slots[0], mkb(8, 1, 64), 4, hold));       // the parked session's own stores: kept while slot 1 runs a request
     CHECK(u.ask() == KvFlashAdmit::BusyHost);
     int asks = 0;
-    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, {true, false}, hold).stores; };
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, kvflash_uq_keep({false, true}, {true, false}, 0), hold).stores; };
     CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::wait_parked);
     CHECK(asks == 1);
     CHECK(slots[0].size() == 1u);

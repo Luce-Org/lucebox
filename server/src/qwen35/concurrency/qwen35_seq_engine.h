@@ -371,7 +371,7 @@ private:
     void take_uq_rows_(int slot, int kv_pos, int n);
     bool uq_hold_(int64_t delta);   // charge (negative: release) the stores' bytes on the host ledger; false = refused
     void uq_clear_(int slot);       // the slot's stores go, and their bytes with them
-    int uq_reclaim_idle_();         // host pressure: the stores of slots with no live request and no parked session go; how many
+    int uq_reclaim_idle_(int own = -1);   // host pressure: the stores of slots with no live request and no parked session go; how many. own: a resume's slot, given up when nothing is live
     std::vector<int32_t> column_buf_;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;

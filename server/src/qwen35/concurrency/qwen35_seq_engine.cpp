@@ -703,8 +703,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                 const bool busy = result.status == AdmitResult::Status::busy;
                 bool other_parked = false;
                 for (const auto & o : parked_list_()) other_parked |= o.parked.slot != pick.slot;
-                const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded, [&] { return uq_reclaim_idle_(); });
-                if (act == KvFlashResumeRefused::reclaimed_retry) continue;   // no parked victim: the idle slots' question stores went, one more try
+                const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded, [&] { return uq_reclaim_idle_(pick.slot); });
+                if (act == KvFlashResumeRefused::reclaimed_retry) continue;   // no parked victim: the idle slots' question stores went (and, with nothing live, this session's own), one more try
                 if (act == KvFlashResumeRefused::refuse) {   // the backstop of the early refusal: the session stays parked, the HTTP boundary answers the refusal
                     std::fprintf(stderr, "[kvflash] slot %d resume of sid=%s refused: %s (the session stays parked)\n", pick.slot, who.sid.c_str(), result.error.c_str());
                     return result;
@@ -1034,10 +1034,10 @@ bool Qwen35SeqEngine::uq_hold_(int64_t delta) { return !kvf_kv_ || kvf_kv_->ledg
 void Qwen35SeqEngine::uq_clear_(int slot) {
     kvflash_uq_clear_held(uq_store_[(size_t)slot], [&](int64_t d) { return uq_hold_(d); });
 }
-int Qwen35SeqEngine::uq_reclaim_idle_() {
-    std::vector<bool> keep = active_slots_();
-    for (size_t s = 0; s < keep.size(); s++) keep[s] = keep[s] || parked_[s].valid;
-    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(uq_store_, keep, [&](int64_t d) { return uq_hold_(d); });
+int Qwen35SeqEngine::uq_reclaim_idle_(int own) {
+    std::vector<bool> parked(parked_.size());
+    for (size_t s = 0; s < parked.size(); s++) parked[s] = parked_[s].valid;
+    const KvFlashUqReclaimed r = kvflash_uq_reclaim_idle(uq_store_, kvflash_uq_keep(active_slots_(), parked, own), [&](int64_t d) { return uq_hold_(d); });
     if (r.stores) std::fprintf(stderr, "[kvflash] uq stores reclaimed: %d stores, %.1f MiB\n", r.stores, (double)r.bytes / (1024.0 * 1024.0));
     return r.stores;
 }
