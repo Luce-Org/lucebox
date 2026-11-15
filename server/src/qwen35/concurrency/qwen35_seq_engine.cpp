@@ -22,6 +22,7 @@
 #include "common/sampler.h"
 #include "internal.h"
 #include "ggml-cuda.h"
+#include "server/kv/kvflash_head_view.h"
 #include "server/kv/session_tenant.h"
 
 #include <algorithm>
@@ -103,23 +104,6 @@ Qwen35SeqEngine::Qwen35SeqEngine(
 }
 
 namespace {
-// The head files' disk view never touches a checkpoint: a head goes in and out as host bytes (OwnedSnapshot).
-class NoCheckpoints final : public CheckpointStore {
-public:
-    int granularity() const override { return 1; }
-    int restore_point_spacing() const override { return 0; }
-    bool prefill_cuts_at_restore_points() const override { return false; }
-    size_t estimate_bytes(int) const override { return 0; }
-    bool used(Checkpoint) const override { return false; }
-    CheckpointKind kind(Checkpoint) const override { return CheckpointKind::dense; }
-    int position(Checkpoint) const override { return 0; }
-    void free(Checkpoint) override {}
-    Checkpoint staging() const override { return {}; }
-    ModelBackend::SnapshotRef ref(Checkpoint) const override { return {}; }
-    OwnedSnapshot copy(Checkpoint) const override { return {}; }
-    OwnedSnapshot detach(Checkpoint) override { return {}; }
-    bool adopt(Checkpoint, OwnedSnapshot &) override { return false; }
-};
 constexpr size_t kHeadsHost = 16, kHeadsPinned = 16;           // heads kept in host memory, head files pinned on disk
 constexpr uint64_t kHeadRequest = 0x4b56480000000000ULL;      // ledger ids of an attached head: no HTTP request reaches them
 }  // namespace
@@ -1285,15 +1269,8 @@ void Qwen35SeqEngine::init_heads_() {
     head_k_max_ = sticky_on_ ? kvflash_head_k_max(p0.n_pool_blocks()) : 0;
     if (head_k_max_ <= 0) { std::fprintf(stderr, "[kvflash] pinned heads: off\n"); return; }
     if (disk_) {
-        DiskCacheConfig dc;
-        dc.cache_dir = bundle_dir_;
-        dc.min_tokens = 1;
-        head_nostore_ = std::make_unique<NoCheckpoints>();
-        auto disk = std::make_unique<DiskPrefixCache>(dc, *head_nostore_);
-        if (disk->init() && !disk->disabled()) {
-            disk->use_layout(kvflash_head_layout_id(identity_key_()));
-            head_disk_ = std::move(disk);
-        }
+        head_nostore_ = std::make_unique<KvFlashNoCheckpoints>();
+        head_disk_ = kvflash_open_head_view(bundle_dir_, *head_nostore_, identity_key_());
     }
     std::fprintf(stderr, "[kvflash] pinned heads: up to %d chunks per slot, %s\n", head_k_max_,
                  head_disk_ ? "persisted in the cache directory" : "host memory only");

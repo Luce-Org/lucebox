@@ -8,6 +8,7 @@
 #include "../../src/common/kvflash_session_store.h"
 #include "../../src/common/kvflash_sessions_plan.h"
 #include "../../src/server/kv/disk_store.h"
+#include "../../src/server/kv/kvflash_head_view.h"
 #include "../../src/server/kv/session_tenant.h"
 
 #include <cstdio>
@@ -1392,6 +1393,23 @@ TEST_CASE(KvflashSessionStoreFixture, a_second_server_of_the_same_identity_is_re
         CHECK(beside([] {}, [&] { return start("model-a|q8") == 1; }));   // the first server gone: its identity is free again
     }
     CHECK(kvflash_session_salt("model-a|q8") != kvflash_session_salt("model-b|q8"));
+    fs::remove_all(root);
+}
+
+// The pinned-head view holds its own identity on the directory: servers of different models both keep their heads on
+// disk, and of two servers of one model the second keeps its heads in host memory.
+TEST_CASE(KvflashSessionStoreFixture, head_views_of_different_identities_share_a_directory_and_a_second_of_the_same_identity_is_off) {
+    const std::string root = fresh_root("kvflash_s10b_head_view_identity");
+    auto on = [&](const std::string & identity) {
+        KvFlashNoCheckpoints none;
+        return kvflash_open_head_view(root, none, identity) != nullptr;
+    };
+    KvFlashNoCheckpoints none;
+    std::unique_ptr<DiskPrefixCache> first;
+    CHECK(beside([&] { first = kvflash_open_head_view(root, none, "model-a|q8"); }, [&] { return on("model-b|q8") && !on("model-a|q8"); }));
+    CHECK(first != nullptr);
+    first.reset();
+    CHECK(beside([] {}, [&] { return on("model-a|q8"); }));   // the first server gone: its identity is free again
     fs::remove_all(root);
 }
 
