@@ -320,11 +320,19 @@ inline KvFlashEarlyRefusal kvflash_early_refusal(int64_t prompt_tokens, int64_t 
 //  drop_cold         - the pool cannot ever take the resume (not busy): the session goes, the request prefills cold
 //  refuse            - capacity_exceeded: the request alone exceeds a fixed bound, a cold admit needs the same bytes; the session
 //                      is neither evicted (never for room it is itself asking for) nor dropped, and the request is refused
-enum class KvFlashResumeRefused { evict_other_retry, wait_parked, drop_cold, refuse };
+//  reclaimed_retry   - it would wait, and question stores no session owns were given back: the resume is asked once more
+enum class KvFlashResumeRefused { evict_other_retry, wait_parked, drop_cold, refuse, reclaimed_retry };
 inline KvFlashResumeRefused kvflash_resume_refused(bool busy, bool other_parked, bool exceeds_capacity = false) {
     if (exceeds_capacity) return KvFlashResumeRefused::refuse;
     if (!busy) return KvFlashResumeRefused::drop_cold;
     return other_parked ? KvFlashResumeRefused::evict_other_retry : KvFlashResumeRefused::wait_parked;
+}
+// The idle slots' question stores are a cache: `reclaim()` (how many stores went) is asked only when the resume would wait.
+// N > 0 = one more try; N = 0 = it waits as before, and a second refusal finds nothing left to reclaim.
+template <class Reclaim>
+inline KvFlashResumeRefused kvflash_resume_refused(bool busy, bool other_parked, bool exceeds_capacity, Reclaim reclaim) {
+    const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, exceeds_capacity);
+    return act == KvFlashResumeRefused::wait_parked && reclaim() > 0 ? KvFlashResumeRefused::reclaimed_retry : act;
 }
 
 }  // namespace luce::common

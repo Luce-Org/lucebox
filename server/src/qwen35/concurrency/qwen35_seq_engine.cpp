@@ -703,7 +703,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_sticky_(
                 const bool busy = result.status == AdmitResult::Status::busy;
                 bool other_parked = false;
                 for (const auto & o : parked_list_()) other_parked |= o.parked.slot != pick.slot;
-                const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded);
+                const KvFlashResumeRefused act = kvflash_resume_refused(busy, other_parked, result.status == AdmitResult::Status::capacity_exceeded, [&] { return uq_reclaim_idle_(); });
+                if (act == KvFlashResumeRefused::reclaimed_retry) continue;   // no parked victim: the idle slots' question stores went, one more try
                 if (act == KvFlashResumeRefused::refuse) {   // the backstop of the early refusal: the session stays parked, the HTTP boundary answers the refusal
                     std::fprintf(stderr, "[kvflash] slot %d resume of sid=%s refused: %s (the session stays parked)\n", pick.slot, who.sid.c_str(), result.error.c_str());
                     return result;

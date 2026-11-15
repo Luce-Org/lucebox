@@ -7,6 +7,7 @@
 #include "kvflash_gpu_mass.h"
 #include "kvflash_mass_synth.h"
 #include "kvflash_slot_plan.h"
+#include "kvflash_slot_turn.h"
 #include "kvflash_uq.h"
 
 #include <cstdint>
@@ -420,6 +421,46 @@ TEST_CASE(KvflashUqFixture, with_nothing_to_reclaim_the_admit_stays_busy_and_is_
     CHECK(lg.used_bytes() == 256);
     CHECK(lg.admit(1, in) == KvFlashAdmit::BusyHost);
     CHECK(kvflash_uq_reclaim_idle(slots, {false, true}, hold).stores == 0);   // and a second ask frees nothing either
+}
+// A parked session's next turn: the parked reservation makes room, the new total is asked; refused, the parked one is back.
+struct UqResume {
+    KvFlashAdmitInput parked = uq_admit_in(), turn = uq_admit_in();
+    KvFlashHostLedger lg;
+    UqResume() : lg((turn.prompt_tokens = 1200, kvflash_host_need_bytes(turn))) { parked.max_new_tokens = 0; }   // the budget fits the resumed turn alone
+    KvFlashAdmit ask() { lg.release(1); const KvFlashAdmit v = lg.admit(2, turn); if (v != KvFlashAdmit::Ok) lg.admit(1, parked); return v; }
+};
+TEST_CASE(KvflashUqFixture, a_resume_that_fits_the_budget_alone_is_not_busy_behind_an_idle_slots_question_stores) {
+    UqResume u;
+    auto hold = [&](int64_t d) { return u.lg.hold(d); };
+    CHECK(u.lg.admit(1, u.parked) == KvFlashAdmit::Ok);                 // session A parked in slot 0
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[1], mkb(8, 1, 64), 4, hold));       // slot 1: a request that retired tainted, its stores stay
+    CHECK(u.ask() == KvFlashAdmit::BusyHost);                           // no other parked session: nothing to evict, nothing live to finish
+    int asks = 0;
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, {true, false}, hold).stores; };
+    CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::reclaimed_retry);
+    CHECK(slots[1].empty());
+    CHECK(u.ask() == KvFlashAdmit::Ok);                                 // the one more try
+    CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::wait_parked);   // a second refusal waits
+    CHECK(asks == 2);
+}
+TEST_CASE(KvflashUqFixture, a_busy_resume_with_nothing_to_reclaim_waits_parked_and_is_not_retried) {
+    UqResume u;
+    auto hold = [&](int64_t d) { return u.lg.hold(d); };
+    CHECK(u.lg.admit(1, u.parked) == KvFlashAdmit::Ok);
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[0], mkb(8, 1, 64), 4, hold));       // the parked session's own stores: kept
+    CHECK(u.ask() == KvFlashAdmit::BusyHost);
+    int asks = 0;
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, {true, false}, hold).stores; };
+    CHECK(kvflash_resume_refused(true, false, false, reclaim) == KvFlashResumeRefused::wait_parked);
+    CHECK(asks == 1);
+    CHECK(slots[0].size() == 1u);
+    // the stores are asked for only when the resume would wait: an eviction, a cold drop and a refusal never reclaim
+    CHECK(kvflash_resume_refused(true, true, false, reclaim) == KvFlashResumeRefused::evict_other_retry);
+    CHECK(kvflash_resume_refused(false, false, false, reclaim) == KvFlashResumeRefused::drop_cold);
+    CHECK(kvflash_resume_refused(true, false, true, reclaim) == KvFlashResumeRefused::refuse);
+    CHECK(asks == 1);
 }
 TEST_CASE(KvflashUqFixture, a_put_holds_the_stores_bytes_and_an_lru_eviction_releases_the_evicted_ones) {
     KvFlashHostLedger lg(1000);
