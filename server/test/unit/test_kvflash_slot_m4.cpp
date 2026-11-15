@@ -5,6 +5,7 @@
 
 #include "kvflash_slot_m4.h"
 #include "kvflash_slot_turn.h"
+#include "kvflash_uq.h"
 
 #include <vector>
 
@@ -47,6 +48,19 @@ TEST_CASE(KvflashSlotM4Fixture, anything_off_or_unfit_runs_the_full_path) {
     CHECK(kvflash_slot_m4_path(true, 1, true, Skip::PoolTooSmall, last_scored(), ask(), ids) == KvFlashM4Path::Full);
     CHECK(kvflash_slot_m4_path(true, 1, true, Skip::NoSealedChunk, last_scored(), ask(), ids) == KvFlashM4Path::Full);
     CHECK(kvflash_slot_m4_path(true, 1, true, Skip::None, KvFlashM4Last{}, ask(), ids) == KvFlashM4Path::Full);      // no record
+}
+// A side request with another last human question runs in the session's slot (a regenerate, a title call, a probe) and the
+// session then goes on from before it: its own question's rows are still in the slot, so the turn is not Full. With one
+// store per slot the side question replaced them and every later turn of the question ran two passes without its rows.
+TEST_CASE(KvflashSlotM4Fixture, a_side_question_keeps_the_first_questions_rows) {
+    auto store = [](int hi, uint64_t hash) { KvFlashUqStore s; s.lo = hi - 2; s.hi = hi; s.n = 2; s.hash = hash; s.rows.assign(8, 1.0f); return s; };
+    KvFlashUqSlots stores(1);
+    kvflash_uq_slot_put(stores, 0, store(900, 7));     // question A: the key ask() and last_scored() carry
+    kvflash_uq_slot_put(stores, 0, store(1000, 8));    // question B, the side request's
+    KvFlashM4Ask a = ask();
+    a.uq_stored = kvflash_uq_slot_get(stores, 0, a.uq_hi, a.uq_hash) != nullptr;
+    CHECK(a.uq_stored);
+    CHECK(kvflash_slot_m4_path(true, 1, true, Skip::None, last_scored(), a, extend(seq(6400), 300)) != KvFlashM4Path::Full);
 }
 TEST_CASE(KvflashSlotM4Fixture, single_turn_is_one_pass_applied_at_the_resume_point) {
     KvFlashSlotTurn t = first_pass_turn();
