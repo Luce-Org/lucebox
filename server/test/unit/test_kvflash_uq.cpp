@@ -541,6 +541,41 @@ TEST_CASE(KvflashUqFixture, a_busy_resume_with_nothing_to_reclaim_waits_parked_a
     CHECK(kvflash_resume_refused(true, false, true, reclaim) == KvFlashResumeRefused::refuse);
     CHECK(asks == 1);
 }
+// A restore from disk reserves like an admit; Busy with no parked session left to evict used to be final.
+TEST_CASE(KvflashUqFixture, a_restore_that_fits_the_budget_alone_is_not_busy_behind_question_stores_no_session_owns) {
+    const KvFlashAdmitInput in = uq_admit_in();
+    KvFlashHostLedger lg(kvflash_host_need_bytes(in));                  // the budget fits the returning session alone
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[0], mkb(8, 1, 64), 4, hold));       // the target slot's leftovers: the restore drops them anyway
+    CHECK(kvflash_uq_put_held(slots[1], mkb(9, 2, 36), 4, hold));       // slot 1: a request that retired tainted
+    int adopts = 0, asks = 0;
+    auto adopt = [&] { adopts++; return KvFlashRestoreResult{lg.admit(1, in) == KvFlashAdmit::Ok ? KvFlashAdopt::Ok : KvFlashAdopt::Busy, false}; };
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, {false, false}, hold).stores; };
+    CHECK(kvflash_restore_reclaim_retry(adopt, reclaim).adopt == KvFlashAdopt::Ok);
+    CHECK(adopts == 2);
+    CHECK(asks == 1);
+    CHECK(slots[0].empty());
+    CHECK(slots[1].empty());
+}
+TEST_CASE(KvflashUqFixture, a_busy_restore_with_nothing_to_reclaim_stays_busy_and_is_not_retried) {
+    const KvFlashAdmitInput in = uq_admit_in();
+    KvFlashHostLedger lg(kvflash_host_need_bytes(in));
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots slots(2);
+    CHECK(kvflash_uq_put_held(slots[1], mkb(9, 2, 36), 4, hold));       // slot 1: a live request, its stores stay
+    int adopts = 0, asks = 0;
+    auto reclaim = [&] { asks++; return kvflash_uq_reclaim_idle(slots, {false, true}, hold).stores; };
+    CHECK(kvflash_restore_reclaim_retry([&] { adopts++; return KvFlashRestoreResult{lg.admit(1, in) == KvFlashAdmit::Ok ? KvFlashAdopt::Ok : KvFlashAdopt::Busy, false}; }, reclaim).adopt == KvFlashAdopt::Busy);
+    CHECK(adopts == 1);
+    CHECK(asks == 1);
+    CHECK(slots[1].size() == 1u);
+    // only a Busy restore asks for the stores: a refused bundle and an unreadable one are final
+    CHECK(kvflash_restore_reclaim_retry([&] { adopts++; return KvFlashRestoreResult{KvFlashAdopt::Refused, false}; }, reclaim).adopt == KvFlashAdopt::Refused);
+    CHECK(kvflash_restore_reclaim_retry([&] { adopts++; return KvFlashRestoreResult{KvFlashAdopt::Busy, true}; }, reclaim).load_failed);
+    CHECK(adopts == 3);
+    CHECK(asks == 1);
+}
 TEST_CASE(KvflashUqFixture, a_put_holds_the_stores_bytes_and_an_lru_eviction_releases_the_evicted_ones) {
     KvFlashHostLedger lg(1000);
     auto hold = [&](int64_t d) { return lg.hold(d); };

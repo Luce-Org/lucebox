@@ -424,5 +424,13 @@ inline KvFlashRestoreResult kvflash_restore_adopt(Probe probe, HasVictim has_vic
     });
     return {got, reload_failed};
 }
+// Busy with no victim left is final only when the question stores are not what holds the room: `reclaim()` gives back those of
+// the slots no session owns (how many stores; the target slot's own count, the restore drops them anyway). N > 0 = `adopt()`
+// once more; N = 0, a refused bundle or an unreadable one = the first answer stands.
+template <class Adopt, class Reclaim>
+inline KvFlashRestoreResult kvflash_restore_reclaim_retry(Adopt adopt, Reclaim reclaim) {
+    const KvFlashRestoreResult r = adopt();
+    return r.adopt == KvFlashAdopt::Busy && !r.load_failed && reclaim() > 0 ? adopt() : r;
+}
 
 }  // namespace luce::common

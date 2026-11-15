@@ -1201,7 +1201,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     // When the ledger lacks room the returning bundle's memory (the pager blob and the slabs, not charged yet) is freed, the
     // oldest parked session leaves (to disk, as an admit does), the bundle is read again and the adopt retried, so the session
     // resumes from disk instead of going cold and no victim is staged beside an uncharged bundle
-    const KvFlashRestoreResult res = kvflash_restore_adopt(
+    const KvFlashRestoreResult res = kvflash_restore_reclaim_retry([&] { return kvflash_restore_adopt(
         probe, has_victim, validate, load,
         [&] {
             const PagedKvStatus st = kvf_kv_->adopt_parked(slot, kBundleRequest + (uint64_t)slot, (uint32_t)l.head.history.size(), l.pager.data(), l.pager.size());
@@ -1209,7 +1209,8 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
         },
         [&] { l = KvFlashBundleLoaded{}; end = SlotStateSnapshot{}; },
         [&] { return evict_oldest_("host budget needed to restore a session", slot) >= 0; },
-        evict_for_room);
+        evict_for_room); },
+        [&] { return evict_for_room ? uq_reclaim_idle_() : 0; });   // Busy with no victim: the idle slots' question stores go, one more try
     if (res.load_failed) return why;
     const KvFlashAdopt got = res.adopt;
     if (got == KvFlashAdopt::Busy && busy) { *busy = true; return "the host budget is full"; }
