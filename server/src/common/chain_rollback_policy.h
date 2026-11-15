@@ -33,6 +33,14 @@ inline bool split_chain_fast_rollback_enabled() {
     return env_flag_enabled("LUCE_SPLIT_FAST_ROLLBACK");
 }
 
+// Speculative fast rollback under the KVFlash pager is measured not
+// token-identical to AR (25/80 outputs differ), so with the pager it needs an
+// explicit --fast-rollback; the default there is exact restore + replay.
+// Without the pager the requested mode stands.
+inline bool spec_fast_rollback_enabled(bool pager_on, bool fast_rollback, bool explicit_optin) {
+    return fast_rollback && (!pager_on || explicit_optin);
+}
+
 inline ChainRollbackPolicy resolve_chain_rollback_policy(
         bool tensor_parallel = false,
         bool exact_fast_rollback = false) {

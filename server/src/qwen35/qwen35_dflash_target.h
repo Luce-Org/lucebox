@@ -51,6 +51,7 @@ public:
     bool snapshot_kv() override;
     bool restore_kv() override;
     bool supports_fast_rollback() const override;
+    bool verify_pool_exhausted() const override { return verify_pool_exhausted_; }
     bool exact_fast_rollback() const override { return specla_active(); }
     bool rollback_failure_is_recoverable() const override { return !specla_active(); }
     bool rollback_to(int base_pos, int commit_n) override;
@@ -120,6 +121,7 @@ private:
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
     bool ddtree_mode_ = false;
+    bool verify_pool_exhausted_ = false;   // last verify_batch failed on a pool slot, nothing touched
     const int * rope_offset_ = nullptr;
     int rope_offset() const { return rope_offset_ ? *rope_offset_ : 0; }
 

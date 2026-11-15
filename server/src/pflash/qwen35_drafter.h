@@ -40,9 +40,13 @@ static constexpr int kQwen35HeadBlock = 15;
 // carry no position (NoPE), and the probe's raw logits are per token.
 struct Qwen35ScoringSession {
     std::vector<int32_t> ids;       // prompt tokens the state covers
-    // Recurrent-state snapshot position: pflash_scoring_checkpoint(ids.size()), on the 8192 grid, the only point a
+    // Recurrent-state snapshot position: pflash_scoring_checkpoint(ids.size()), on the 1024 grid, the only point a
     // later call resumes from (pflash_scoring_resume.h: a resumed call is then bit-identical to a fresh one).
     int checkpoint = 0;
+    // Exact F32 block-14 rows [proj_rows_begin, checkpoint) with proj_rows_begin = pflash_scoring_proj_begin(
+    // checkpoint) ([hidden] per token): a resume re-projects its whole 8192 chunk from them.
+    std::vector<float>    proj_rows;
+    int                   proj_rows_begin = 0;
     int capacity = 0;               // tokens the cache and keys can hold
     TargetCache cache;              // blocks 0..14 only
     ggml_context *        key_ctx = nullptr;

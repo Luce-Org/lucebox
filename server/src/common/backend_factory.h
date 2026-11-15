@@ -68,6 +68,7 @@ public:
         std::optional<std::string> draft_path;
         int draft_block_size = 0;
         bool fast_rollback = true;
+        bool fast_rollback_explicit = false;
         bool seq_verify = false;
         bool specla_mode = false;
         int specla_top_k = 4;
@@ -87,6 +88,7 @@ public:
         int stream_fd = -1;
         int chunk = 512;
         int max_concurrency = 1;
+        bool max_concurrency_set = false;
 
         PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
         int expert_top_k = 0;

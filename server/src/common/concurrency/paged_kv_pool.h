@@ -33,6 +33,7 @@ enum class PagedKvStatus : uint8_t {
     SequenceSlotsExhausted,  // all max_sequences slots are in use
     BlocksExhausted,         // not enough free physical blocks for the growth
     StaleHandle,             // handle refers to a released or reused slot
+    CapacityExceeded,        // the request alone exceeds a fixed bound (the whole host budget): waiting or evicting a peer cannot help
 };
 
 // Human-readable status name for logs and error messages.
