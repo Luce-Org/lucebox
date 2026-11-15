@@ -370,6 +370,7 @@ private:
     KvFlashBundleLimits bundle_lim_;
     std::shared_ptr<DiskStore> disk_;                 // the directory's store; the session store is attached to it
     uint64_t tenant_id_ = 0;
+    std::array<uint8_t, 16> session_salt_{};          // the identity held on disk_ while the store is attached
     std::unique_ptr<KvFlashBundleWriter> bundle_writer_;   // the park saves, off the step thread (after bundle_failed_: it uses it)
     void init_bundles_();
     // Pinned heads (kvflash_pinned_head.h): the shared system/tools prefix #941's cut found, rounded to the chunk grid. A

@@ -310,7 +310,7 @@ void Qwen35SeqEngine::init_slots_() {
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
     bundle_writer_.reset();   // the pending saves land before the store is detached
-    if (disk_ && tenant_id_) disk_->detach_tenant(tenant_id_);
+    if (disk_ && tenant_id_) detach_session_store(disk_, tenant_id_, session_salt_);
     for (size_t s = 0; s < uq_store_.size(); s++) uq_clear_((int)s);   // the ledger outlives the engine: leave nothing held
     slot_state_stash_free(stash_);
     release_draft_graphs();
@@ -1078,6 +1078,16 @@ void Qwen35SeqEngine::init_bundles_() {
         std::fprintf(stderr, "[kvflash] sessions: no open cache directory %s: sessions stay in memory\n", dir);
         return;
     }
+    // One server per identity owns the sessions of a directory several servers share; the store is a tenant of the
+    // directory's DiskStore (one budget, one LRU, one TTL).
+    session_salt_ = kvflash_session_salt(identity_key_());
+    KvFlashSessionStore store(dir);
+    tenant_id_ = attach_session_store(disk_, store, session_salt_);
+    if (!tenant_id_) {
+        std::fprintf(stderr, "[kvflash] sessions: another server on %s serves this model with the same settings: sessions stay in memory\n", dir);
+        disk_.reset();
+        return;
+    }
     bundle_dir_ = dir;
     bundle_writer_ = std::make_unique<KvFlashBundleWriter>([this](const KvFlashBundleWriter::Job & j, bool ok, double ms) {
         size_t bytes = j.commit.head.size() + (j.commit.new_log ? kKvFlashLogHeader : 0) + j.commit.copies.size() * j.commit.record_bytes;
@@ -1094,10 +1104,8 @@ void Qwen35SeqEngine::init_bundles_() {
     const size_t slab = slab_bytes_();   // the read cap: a file past what this server can write is skipped before it is loaded
     const size_t max_ctx = (size_t)slots_.max_context(), ct = (size_t)p0.chunk_tokens();
     bundle_lim_ = KvFlashBundleLimits{max_ctx, (max_ctx + ct - 1) / ct, kvflash_slab_max_bytes(slab), (size_t)p0.n_pool_blocks()};
-    // The session store is a tenant of the cache directory's DiskStore (one budget, one LRU, one TTL); every session
-    // directory is listed, the newest ones fill the slots and the rest stay on disk.
-    book_.enable_store(KvFlashSessionStore(dir), bundle_identity_);
-    tenant_id_ = attach_session_store(disk_, book_.store());
+    // Every session directory is listed, the newest ones fill the slots and the rest stay on disk.
+    book_.enable_store(std::move(store), bundle_identity_);
     book_.resume_claim = [this](const std::string & key) { return book_.store().claim(key); };   // the budget cannot evict a session a restore is about to read
     std::error_code mk;
     std::filesystem::create_directories(book_.store().dir(""), mk);

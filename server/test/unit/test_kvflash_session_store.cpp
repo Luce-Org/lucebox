@@ -15,6 +15,10 @@
 #include <fstream>
 #include <set>
 #include <stdexcept>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 using namespace luce::common;
 namespace fs = std::filesystem;
@@ -1328,3 +1332,87 @@ TEST_CASE(KvflashSessionStoreFixture, sessions_are_on_whenever_kvflash_and_a_dis
     CHECK(kvflash_sessions_flag_parse("off", f) && f == KvFlashSessionsFlag::off);
     CHECK(!kvflash_sessions_flag_parse("auto", f) && f == KvFlashSessionsFlag::off);   // only on|off; a bad value leaves it
 }
+
+#if !defined(_WIN32)
+namespace {
+// Another server on the directory: `second` runs in a process forked before `first` opens anything, once `first`
+// has returned. What `second` returned.
+bool beside(const std::function<void()> & first, const std::function<bool()> & second) {
+    int go[2];
+    if (::pipe(go) != 0) return false;
+    std::fflush(nullptr);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        char c = 0;
+        ::close(go[1]);
+        ::_exit(::read(go[0], &c, 1) == 1 && second() ? 0 : 1);
+    }
+    ::close(go[0]);
+    first();
+    const bool sent = ::write(go[1], "g", 1) == 1;
+    ::close(go[1]);
+    int status = 0;
+    return pid > 0 && ::waitpid(pid, &status, 0) == pid && sent && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+}  // namespace
+
+// Two servers of one identity on a directory would list, restore, evict and overwrite the same sessions: the second
+// is refused and attaches nothing. Servers of different identities each attach their own.
+TEST_CASE(KvflashSessionStoreFixture, a_second_server_of_the_same_identity_is_refused_the_session_tenant_and_another_identity_attaches) {
+    const std::string root = fresh_root("kvflash_s10b_tenant_identity");
+    {
+        KvFlashSessionStore seed(root);
+        commit_session(seed, "header", "s", {1, 2, 3}, 0x10, 100);
+    }
+    // 0: refused, nothing attached. 1: attached, the directory's sessions in its budget. -1: anything else.
+    auto start = [&](const std::string & identity) {
+        uint64_t clock = 1000;
+        auto disk = open_disk(root, 1 << 20, 0, &clock);
+        KvFlashSessionStore store(root);
+        rescan(store);
+        if (!disk || store.ledger()->usage() == 0) return -1;
+        const std::array<uint8_t, 16> salt = kvflash_session_salt(identity);
+        const uint64_t id = attach_session_store(disk, store, salt);
+        const int got = id == 0 ? (disk->tenant_bytes() == 0 ? 0 : -1) : (disk->tenant_bytes() == store.ledger()->usage() ? 1 : -1);
+        if (id) detach_session_store(disk, id, salt);
+        return got;
+    };
+    for (const auto & other : {std::make_pair("model-a|q8", 0), std::make_pair("model-b|q8", 1)}) {
+        uint64_t clock = 1000;
+        std::shared_ptr<DiskStore> disk;
+        KvFlashSessionStore store(root);
+        uint64_t id = 0;
+        const std::array<uint8_t, 16> salt = kvflash_session_salt("model-a|q8");
+        CHECK(beside([&] { disk = open_disk(root, 1 << 20, 0, &clock); rescan(store); id = attach_session_store(disk, store, salt); },
+                     [&] { return start(other.first) == other.second; }));
+        REQUIRE(id != 0);
+        CHECK(disk->tenant_bytes() == store.ledger()->usage());
+        detach_session_store(disk, id, salt);
+        disk.reset();
+        CHECK(beside([] {}, [&] { return start("model-a|q8") == 1; }));   // the first server gone: its identity is free again
+    }
+    CHECK(kvflash_session_salt("model-a|q8") != kvflash_session_salt("model-b|q8"));
+    fs::remove_all(root);
+}
+
+// The store attached before the book takes it keeps its budget: the engine attaches first and enables on success.
+TEST_CASE(KvflashSessionStoreFixture, a_store_attached_with_its_identity_keeps_its_budget_when_the_book_takes_it) {
+    const std::string root = fresh_root("kvflash_s10b_tenant_identity_book");
+    fs::create_directories(root + "/sessions");
+    uint64_t clock = 1000;
+    auto disk = open_disk(root, 1000, 0, &clock);
+    const std::array<uint8_t, 16> salt = kvflash_session_salt("model-a|q8");
+    KvFlashSessionStore store(root);
+    const uint64_t id = attach_session_store(disk, store, salt);
+    REQUIRE(id != 0);
+    KvFlashSessionBook book;
+    book.init(1);
+    book.enable_store(std::move(store), ID);
+    book.begin_session(0, "claude", "S", 1000);
+    CHECK(!book.publish_park(0, KvFlashParkStats{3, 5000, 0}, 1001));   // 5000 bytes in a 1000-byte budget
+    CHECK(book.publish_park(0, KvFlashParkStats{3, 600, 0}, 1002));
+    CHECK(disk->tenant_bytes() == 600);
+    detach_session_store(disk, id, salt);
+    fs::remove_all(root);
+}
+#endif
