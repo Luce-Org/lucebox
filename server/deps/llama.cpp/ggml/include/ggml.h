@@ -2606,6 +2606,22 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Marks a flash attention whose mask leaves whole spans of the KV cache at
+    // -inf for every query (a ring cache with an unfilled middle, say). A
+    // backend may then skip the KV tiles that every query row masks out: such
+    // a tile adds exact zeros to the softmax sums and does not move their
+    // maximum, so the result is bit-identical. Backends that ignore the hint
+    // stay correct. Op param GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM: every slot
+    // is taken, so it shares slot 12 with the DS4 inverse RoPE's attn_factor.
+    // The mark is refused on, and never read from, a DS4 flash attention.
+    #define GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM 12
+    GGML_API void ggml_flash_attn_ext_set_sparse_mask(
+            struct ggml_tensor * a,
+            bool                 sparse);
+
+    GGML_API bool ggml_flash_attn_ext_get_sparse_mask(
+            const struct ggml_tensor * a);
+
     // Block-sparse flash attention (pFlash).
     // Selects top-scoring K-blocks dynamically based on alpha threshold.
     // alpha=1.0 selects all blocks (equivalent to dense attention).

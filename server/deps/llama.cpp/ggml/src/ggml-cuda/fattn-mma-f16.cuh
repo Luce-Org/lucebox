@@ -1562,6 +1562,7 @@ static __global__ void flash_attn_ext_f16(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const uint32_t * __restrict__ KV_live,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1719,7 +1720,7 @@ static __global__ void flash_attn_ext_f16(
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_live, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
