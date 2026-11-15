@@ -172,7 +172,10 @@ public:
     bool kv_restore_feasible(int slot) const override {
         return slots_.kv_restore_feasible(slot);
     }
-    void retire(int slot) override;
+    void retire(int slot) override { retire_(slot, false); }
+    void retire_reply_first(int slot) override { retire_(slot, true); }
+    void stage_parked() override;
+    void retire_(int slot, bool reply_first);
     bool supports_images() const override;
     AdmitResult admit_images(uint64_t request_id,
                              const std::vector<int32_t> & prompt,
@@ -348,6 +351,7 @@ private:
         KvFlashResumeWait wait;          // a resume rewound it to L and was refused busy: the retry resumes it there
     };
     std::vector<ParkedSession> parked_;
+    std::vector<uint64_t> stage_pending_;             // per slot: the tick of a park whose staging waits for the reply to go out (0: none)
     std::vector<SlotCkpt> ckpt_;                      // the live slot's prompt-end checkpoint, taken at commit
     std::vector<SlotCkpt> trunk_;                     // the rung below it
     std::vector<SlotCkpt> extra_;                     // the third rung

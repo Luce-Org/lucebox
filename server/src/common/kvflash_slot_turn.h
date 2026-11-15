@@ -199,6 +199,13 @@ inline int kvflash_park_point(int len, int stash_pos, int ckpt, int trunk, int t
     return stash_pos > 0 && stash_pos < len && stash_pos >= len - tail && stash_pos >= ckpt && stash_pos >= trunk ? stash_pos : len;
 }
 
+// A park whose staging was put off until the reply is out (pending: that park's tick, 0 when none) is staged only while
+// the slot still holds that very park: not once the session was resumed (active), evicted or dropped (not parked), or
+// parked again (another tick). The rows staged must be the ones that were parked.
+inline bool kvflash_stage_due(uint64_t pending, bool parked, uint64_t parked_tick, bool active) {
+    return pending != 0 && parked && !active && parked_tick == pending;
+}
+
 // The park-short switches (env strings, null when unset). LUCE_KVFLASH_PARK_SHORT=0: everything off. The prefill-only
 // tail stash (one copy per turn) is on by default with tail 4 (R's replay window); LUCE_KVFLASH_PARK_DECODE=1 adds the
 // per-step decode stash (a copy before every decode step, ~4-5% decode), off by default.

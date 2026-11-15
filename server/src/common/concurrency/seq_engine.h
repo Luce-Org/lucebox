@@ -403,6 +403,13 @@ public:
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;
 
+    // The retirement of a request whose reply is still in the send buffer:
+    // work the client need not wait for is put off until stage_parked(),
+    // which the scheduler calls once the reply is out. The engine runs it
+    // itself before its next admission, step or retirement.
+    virtual void retire_reply_first(int slot) { retire(slot); }
+    virtual void stage_parked() {}
+
     // EOS check for scheduler-side stop decisions.
     virtual bool token_is_eos(int32_t token) const = 0;
 

@@ -118,6 +118,7 @@ void Qwen35SeqEngine::init_slots_() {
     recall_.assign(static_cast<size_t>(n_slots), SlotRecall{});
     uq_store_.assign(static_cast<size_t>(n_slots), {});
     parked_.assign(static_cast<size_t>(n_slots), ParkedSession{});
+    stage_pending_.assign(static_cast<size_t>(n_slots), 0);
     ckpt_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
     trunk_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
     extra_.assign(static_cast<size_t>(n_slots), SlotCkpt{});
@@ -293,6 +294,7 @@ void Qwen35SeqEngine::init_slots_() {
 }
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
+    stage_parked();
     bundle_writer_.reset();   // the pending saves land before the store is detached
     if (disk_ && tenant_id_) detach_session_store(disk_, tenant_id_, session_salt_);
     for (size_t s = 0; s < uq_store_.size(); s++) uq_clear_((int)s);   // the ledger outlives the engine: leave nothing held
@@ -620,6 +622,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded_(
         const SamplerCfg & sampler,
         int max_new_tokens,
         const AdmitMeta & meta) {
+    stage_parked();
     const int64_t total = (int64_t)prompt.size() + max_new_tokens;   // host backing for the whole request (R5)
     if (sticky_on_) return admit_sticky_(request_id, prompt, sampler, total, meta);
     if (kvf_kv_) kvf_kv_->set_next_total_tokens(total);
@@ -3057,6 +3060,7 @@ void Qwen35SeqEngine::log_kvflash_chain_round_(const StepResult & result, const 
 }
 
 SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
+    stage_parked();
     StepResult result;
     std::vector<DecodeOutput> & decode_outputs = result.decode;
     std::vector<PrefillOutput> & prefill_outputs = result.prefills;
@@ -3715,7 +3719,18 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
     return true;
 }
 
-void Qwen35SeqEngine::retire(int slot) {
+// The stagings retire_reply_first put off, each only while its park is still the slot's (kvflash_stage_due).
+void Qwen35SeqEngine::stage_parked() {
+    for (size_t i = 0; i < stage_pending_.size(); ++i) {
+        const uint64_t pending = std::exchange(stage_pending_[i], 0);
+        if (pending == 0) continue;
+        if (kvflash_stage_due(pending, parked_[i].valid, parked_[i].tick, slots_.is_active((int)i))) save_bundle_((int)i, parked_[i]);
+        else std::fprintf(stderr, "[kvflash] slot %zu bundle not staged: the park it was queued for is gone\n", i);
+    }
+}
+
+void Qwen35SeqEngine::retire_(int slot, bool reply_first) {
+    stage_parked();
     if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
         restored_kv_checkpoint_[(size_t)slot] = -1;
         restored_kv_tokens_[(size_t)slot] = 0;
@@ -3755,7 +3770,8 @@ void Qwen35SeqEngine::retire(int slot) {
                          slot, history.size(), P < fed ? " (short)" : "", ckpt.pos, trunk.pos, extra.pos, p.resident_blocks(), p.n_pool_blocks(),
                          (long long)kvf_kv_->page_outs(slot));
             parked_[(size_t)slot] = ParkedSession{std::move(history), ++park_tick_, true, std::move(ckpt), std::move(trunk), std::move(extra), KvFlashResumeWait{}};
-            save_bundle_(slot, parked_[(size_t)slot]);
+            if (reply_first) stage_pending_[(size_t)slot] = parked_[(size_t)slot].tick;   // staged once the reply is out
+            else save_bundle_(slot, parked_[(size_t)slot]);
             return;
         }
         // a queued save of this slot (a session resumed and then cancelled or tainted) is charged to the reservation the

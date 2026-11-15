@@ -250,6 +250,16 @@ TEST_CASE(KvflashSlotTurnFixture, resume_point_takes_the_highest_rung_the_prompt
     CHECK(kvflash_resume_point(4500, 4535, 4000, 4470, 4674) == 4470);   // the largest wins whatever the argument order
 }
 
+// The park's staging waits for the reply to go out: it runs only while the slot still holds that very park.
+TEST_CASE(KvflashSlotTurnFixture, a_deferred_stage_runs_only_on_the_park_it_was_queued_for) {
+    CHECK(kvflash_stage_due(7, true, 7, false));     // the park is still there: staged
+    CHECK(!kvflash_stage_due(0, true, 7, false));    // nothing queued
+    CHECK(!kvflash_stage_due(7, true, 7, true));     // resumed: the rows are a running turn's
+    CHECK(!kvflash_stage_due(7, false, 0, false));   // evicted or dropped: nothing parked
+    CHECK(!kvflash_stage_due(7, true, 8, false));    // parked again since: that park has its own stage
+    CHECK(!kvflash_stage_due(7, true, 0, false));    // picked for archive (tick 0): not the queued park
+}
+
 // G-D: park one token short. The slot keeps the state before its last fed token (the stash) and
 // parks there, so the history is len-1 tokens and an identical prompt still has a token to prefill.
 TEST_CASE(KvflashSlotTurnFixture, park_point_is_one_token_short_when_the_stash_holds_that_state) {

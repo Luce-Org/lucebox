@@ -445,7 +445,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             idx, s.queue_s, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
 
-        engine.retire(idx);
+        engine.retire_reply_first(idx);
         // A retirement may have released the blocks the head job needs.
         deferred_retry_at = {};
         // Before the reply goes out: the client's next request finds the
@@ -465,6 +465,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 drained = s.send_buffer.flush(s.fd) ? s.send_buffer.empty() : true;
             }
         }
+        engine.stage_parked();   // what the retirement put off until the reply was out
         if (drained) {
             finish_job(s.job);
         } else if (s.send_buffer.pending() > kMaxSlotSendBuffer) {
