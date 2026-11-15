@@ -23,6 +23,7 @@
       "aliases": ["ds41-lucebox"],
       "summary": "DeepSeek V4.1 Flash on the 128 GB Lucebox: dense work, hot experts and the drafter on the R9700 (gfx1201), a second expert stack on Strix Halo (gfx1151, carve plus locked host memory), the rest streamed from SSD; the Lucebox placement and router bias from share/deepseek41. One request at a time with --draft; for several at once add --paged-attention --max-concurrency N --ds4-prefill sparse, without --draft",
       "gpus": ["gfx1201", "gfx1151"],
+      "notes": "Decode and verify: ds41-r9700-gorgon's decode switches without grouped MUL_MAT_ID, which changes the greedy text on this layout for no speed: the fused router and HC collapse, lane batching, dedicated copy streams, the HC boundary split, one peer-copy kernel per handoff, the ROCmFP2 prefetch loop, GPU argmax and the drafter's context K/V cache. Prefill: twelve of its prefill switches, WMMA for the ROCmFP2 experts and the MLA attention, F16 K/V, device top-k, 4,096-token long-context chunks, decoder SWA bounded replay, the residual and Engram on the R9700 and the grouped hybrid prefill. Left out: joining both owners on the device (LUCE_DS4_SPLIT_DEVICE_JOIN) garbles the output on this layout, and the pipelined bands, the single arena and the side-stream copy undo the grouped prefill's gain here. Measured on the 1017 checkpoint with the DSpark drafter at 204,800 tokens against this profile without them: greedy text identical on 39 of 40 prompts, GSM8K first 150 145/150 for both (one lost, one gained) in 541 s instead of 601 s, decode median 31.8 -> 34.9 tok/s, a 5,517-token prompt read in 12.4 s instead of 45.5 s.",
       "flags": {
         "--target-device": "hip:0",
         "--expert-device": "hip:1",
@@ -56,7 +57,28 @@
         "LUCE_DS4_DIRECT_INDEXER_TOPK": "1",
         "GGML_DS4_TOPK_BLOCK_RADIX": "1",
         "ROCBLAS_USE_HIPBLASLT": "0",
-        "GPU_MAX_HW_QUEUES": "8"
+        "GPU_MAX_HW_QUEUES": "8",
+        "LUCE_DS4_FUSE_ROUTER": "1",
+        "LUCE_DS4_FUSE_COLLAPSE": "1",
+        "LUCE_DS4_LANE_BATCH": "1",
+        "LUCE_DS4_SCHED_DEDICATED_COPIES": "1",
+        "LUCE_DS4_HC_BOUNDARY_SPLIT": "1",
+        "GGML_CUDA_PEER_COPY_KERNEL": "1",
+        "LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH": "1",
+        "LUCE_DS4_GPU_ARGMAX_VERIFY": "1",
+        "LUCE_DS4_DRAFT_CONTEXT_KV_CACHE": "1",
+        "LUCE_ROCMFP2_WMMA_PREFILL": "1",
+        "GGML_CUDA_MLA_STREAM_WMMA": "1",
+        "GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS": "2",
+        "GGML_CUDA_MLA_DENSE_WMMA": "1",
+        "GGML_CUDA_MLA_DENSE_HIGH_RATIO": "1",
+        "LUCE_DS4_PREFILL_F16_KV_ALL": "1",
+        "LUCE_DS4_DEVICE_TOPK": "1",
+        "LUCE_DS4_LONG_CONTEXT_CHUNK": "4096",
+        "LUCE_DS41_DECODER_BOUNDED_REPLAY": "1",
+        "LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL": "1",
+        "LUCE_DS4_ENGRAM_DEVICE": "1",
+        "LUCE_DS4_GROUPED_HYBRID_PREFILL": "1"
       }
     },
     "ds41-r9700-gorgon": {

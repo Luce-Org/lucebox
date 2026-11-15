@@ -608,7 +608,29 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(value_of(args, "--ds4-protected-experts") == "share/deepseek41/massive_experts.json");
         CHECK(env_of(profile, "LUCE_EXPERT_BUDGET_MB") == "10500");
         CHECK(env_of(profile, "GPU_MAX_HW_QUEUES") == "8");
-        CHECK(profile.env.size() == 22);
+        // ds41-r9700-gorgon's decode switches without grouped MUL_MAT_ID (it changes
+        // the greedy text on this layout, for no speed), and twelve of its prefill
+        // switches.
+        for (const char * name : {"LUCE_DS4_FUSE_ROUTER", "LUCE_DS4_FUSE_COLLAPSE", "LUCE_DS4_LANE_BATCH",
+                                  "LUCE_DS4_SCHED_DEDICATED_COPIES", "LUCE_DS4_HC_BOUNDARY_SPLIT",
+                                  "GGML_CUDA_PEER_COPY_KERNEL", "LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH",
+                                  "LUCE_DS4_GPU_ARGMAX_VERIFY", "LUCE_DS4_DRAFT_CONTEXT_KV_CACHE",
+                                  "LUCE_ROCMFP2_WMMA_PREFILL", "GGML_CUDA_MLA_STREAM_WMMA", "GGML_CUDA_MLA_DENSE_WMMA",
+                                  "GGML_CUDA_MLA_DENSE_HIGH_RATIO", "LUCE_DS4_PREFILL_F16_KV_ALL", "LUCE_DS4_DEVICE_TOPK",
+                                  "LUCE_DS41_DECODER_BOUNDED_REPLAY", "LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL",
+                                  "LUCE_DS4_ENGRAM_DEVICE", "LUCE_DS4_GROUPED_HYBRID_PREFILL"}) {
+            CHECK(env_of(profile, name) == "1");
+        }
+        CHECK(env_of(profile, "GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS") == "2");
+        CHECK(env_of(profile, "LUCE_DS4_LONG_CONTEXT_CHUNK") == "4096");
+        CHECK(env_of(profile, "LUCE_MMID_GROUPED").empty());
+        // Joining both owners on the device garbles the output on this layout.
+        CHECK(env_of(profile, "LUCE_DS4_SPLIT_DEVICE_JOIN").empty());
+        // Measured slower here: the grouped prefill's gain goes.
+        CHECK(env_of(profile, "LUCE_DS4_PREFILL_PIPELINE").empty());
+        CHECK(env_of(profile, "LUCE_DS4_PREFILL_ARENA_CHUNK_MB").empty());
+        CHECK(env_of(profile, "LUCE_MOE_SIDE_COPY").empty());
+        CHECK(profile.env.size() == 43);
         for (const LaunchProfileEnv & entry : profile.env) {
             CHECK(entry.name != "LUCE_DS4_MOE_TP");
             CHECK(entry.name != "LUCE_DS4_MOE_TP_INPROC");
