@@ -219,6 +219,22 @@ void kvflash_uq_clear_held(std::vector<KvFlashUqStore> & v, Hold && hold) {
     hold(-kvflash_uq_bytes(v));
     v.clear();
 }
+// kvflash_uq_slot_restore under the ledger: the slot's old stores are released, then the saved ones are held from the most
+// recent on, until one is refused. Returns how many saved stores were left out (the next question recaptures them).
+template <class Hold>
+int kvflash_uq_slot_restore_held(KvFlashUqSlots & s, int slot, std::vector<KvFlashUqStore> && saved, Hold && hold, size_t max = kKvFlashUqSlotMaxStores) {
+    std::vector<KvFlashUqStore> & v = s[(size_t)slot];
+    kvflash_uq_clear_held(v, hold);
+    size_t keep = 0;
+    int64_t held = 0;
+    while (keep < saved.size() && keep < max && hold(kvflash_uq_bytes(saved[keep]))) held += kvflash_uq_bytes(saved[keep++]);
+    const int skipped = (int)(saved.size() - keep);
+    saved.resize(keep);
+    kvflash_uq_slot_restore(s, slot, std::move(saved), max);
+    hold(kvflash_uq_bytes(v) - held);   // a file that names one key twice keeps one store: never more than was held
+    return skipped;
+}
+
 // The forced batch cut: the question's end, whenever it falls strictly inside the prefill (-1 otherwise),
 // independent of any store, so identical requests get identical batch schedules.
 inline int kvflash_uq_cut(const KvFlashHumanTurn & t, int n_queries, int kv_offset, int end) {

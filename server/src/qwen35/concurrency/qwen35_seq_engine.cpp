@@ -904,7 +904,7 @@ void Qwen35SeqEngine::release_host_(int slot, const char * why) {
     if (book_.release_to_last_commit(slot)) {
         std::fprintf(stderr, "[kvflash] slot %d session released from host memory, its last committed bundle %s stays on disk: its newer park cannot be written (%s)\n", slot, key.c_str(), why);
         parked_[(size_t)slot] = ParkedSession{};
-        uq_store_[(size_t)slot].clear();   // the rows go with the session: the next occupant must not save them
+        uq_clear_(slot);   // the rows go with the session: the next occupant must not save them
         kvf_kv_->drop_parked(slot);
         bundle_failed_[(size_t)slot] = false;
         return;
@@ -957,7 +957,7 @@ bool Qwen35SeqEngine::evict_session_(int slot, const char * why) {
     const std::string evicted_key = sb.key;
     if (!book_.evict(slot, bundle_failed_[(size_t)slot].load())) std::fprintf(stderr, "[kvflash] slot %d session %s: no committed head or meta and index not written\n", slot, evicted_key.c_str());
     parked_[(size_t)slot] = ParkedSession{};
-    uq_store_[(size_t)slot].clear();
+    uq_clear_(slot);
     kvf_kv_->drop_parked(slot);
     bundle_failed_[(size_t)slot] = false;
     return true;
@@ -1247,8 +1247,10 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     // the slot's question rows come back with it, every store the head named, in their LRU order (a lost file: without that
     // store, the next question recaptures it)
     if (!l.uq_why.empty()) std::fprintf(stderr, "[kvflash] slot %d bundle %s\n", slot, l.uq_why.c_str());
-    for (const KvFlashUqStore & u : l.uq) std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, u.lo, u.hi, u.n);
-    kvflash_uq_slot_restore(uq_store_, slot, std::move(l.uq));   // the slot's stores are the restored session's alone
+    // the slot's stores are the restored session's alone, held on the host ledger like the captured ones
+    if (const int skipped = kvflash_uq_slot_restore_held(uq_store_, slot, std::move(l.uq), [&](int64_t d) { return uq_hold_(d); }))
+        std::fprintf(stderr, "[kvflash] slot %d bundle uq rows not restored: host budget (%d stores)\n", slot, skipped);
+    for (const KvFlashUqStore & u : uq_store_[(size_t)slot]) std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, u.lo, u.hi, u.n);
     const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind: the hard pins came back with the pager's layout, the rebind only adds the head's again
     if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the rebind and any reselect
         ParkedSession & q = parked_[(size_t)slot];

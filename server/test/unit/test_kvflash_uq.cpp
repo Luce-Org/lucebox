@@ -592,3 +592,16 @@ TEST_CASE(KvflashUqFixture, a_put_the_ledger_refuses_keeps_the_old_stores_and_do
     CHECK(!kvflash_uq_put_held(w, mkb(100, 1, 10), 4, [&](int64_t d) { return none.hold(d); }));
     CHECK(w.empty());
 }
+TEST_CASE(KvflashUqFixture, a_restore_releases_the_slots_old_stores_and_holds_the_most_recent_that_fit) {
+    KvFlashHostLedger lg(100);
+    auto hold = [&](int64_t d) { return lg.hold(d); };
+    KvFlashUqSlots s(1);
+    CHECK(kvflash_uq_put_held(s[0], mkb(900, 9, 20), 4, hold));         // the occupant before the restore: 80 bytes
+    std::vector<KvFlashUqStore> disk;
+    disk.push_back(mkb(300, 3, 10)); disk.push_back(mkb(200, 2, 10)); disk.push_back(mkb(100, 1, 10));   // most recent first, 40 each
+    CHECK(kvflash_uq_slot_restore_held(s, 0, std::move(disk), hold) == 1);   // two fit: the least recent is skipped
+    REQUIRE(s[0].size() == 2u);
+    CHECK(s[0][0].hi == 300); CHECK(s[0][1].hi == 200);
+    CHECK(lg.used_bytes() == 80);
+    CHECK(lg.used_bytes() == kvflash_uq_bytes(s[0]));
+}
