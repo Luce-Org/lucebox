@@ -239,6 +239,8 @@ Placement order:
 3. One available GPU that holds it, discrete first.
 4. For backends with expert offload, the roomiest available GPU.
 
+With `--draft` and no `--draft-device`, the drafter is loaded on the target's GPU. For a `qwen35` target on one GPU, auto first checks that this GPU has enough memory for the model, the drafter and the rollback checkpoints (allocated at the first speculative request). When it does not, and another available GPU has enough memory for the drafter, the drafter is loaded on that GPU and the log reports the choice.
+
 Otherwise auto stops before loading. It preserves requested single-device features: for example, Qwen paged attention or a vision projector, and Gemma/Laguna speculative decoding, prevent automatic layer splitting. A separately placed DeepSeek vision encoder (`--mmproj-device`) prevents automatic expert parallelism. DeepSeek paged expert parallelism requires a HIP `gfx1201` primary and `gfx1151` secondary. With `--profile`, auto chooses only the device, because a profile is qualified for one topology. On an R9700 + Strix Halo machine, the 91.5 GiB DeepSeek V4 model therefore loads expert parallel on both when both are free, on Strix Halo alone when the R9700 is busy, and not at all when Strix Halo is busy. The expert-parallel choice uses no tuning profile; `--profile ds4-r9700-strix` remains the qualified recipe for that topology.
 
 Availability is a startup snapshot, not a GPU reservation: near-simultaneous launches can race. CUDA has no busy-process signal here and uses free memory only. KFD process IDs belong to the host PID namespace; in a container with a separate PID namespace, process labels and self-exclusion are not reliable unless `/proc` and the process share the host PID namespace.
@@ -286,7 +288,7 @@ DeepSeek's hybrid hot-expert budget reserves the same headroom floor as its post
 | Option | Default | Purpose |
 |---|---|---|
 | `--target-device <backend:gpu\|auto>` | `auto:0` or `LUCE_TARGET_DEVICE` | Place the target on a CUDA or HIP device. `auto` uses available free memory and the model's supported topology, preserving requested features; see the placement policy above. |
-| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. DeepSeek V4 and `--target-device auto` default to the target GPU. |
+| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. DeepSeek V4 and `--target-device auto` default to the target GPU; auto chooses another GPU for the drafter when the target GPU does not have enough memory (see above). |
 | `--expert-device <backend:gpu>` | none | DeepSeek V4: keep dense work and hot experts on the target and run the remaining routed experts on this GPU in the same process. |
 | `--target-devices <list>` | one device | Select multiple target devices, such as `cuda:0,cuda:1`. |
 | `--target-split-mode layer\|tensor` | `layer` | Select the multi-GPU target strategy. |
