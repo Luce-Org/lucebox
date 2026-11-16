@@ -1,5 +1,6 @@
 #include "device_select.h"
 
+#include "common/chain_rollback_policy.h"
 #include "common/gguf_inspect.h"
 #include "common/gpu_runtime_compat.h"
 #include "ggml-cuda.h"
@@ -235,6 +236,51 @@ uint64_t gguf_kv_cache_bytes(const std::string & path, int max_ctx,
                         (int) n_head_kv, kv_k, (int) key_length,
                         kv_v, (int) (value_length ? value_length : key_length)) *
                     (uint64_t) max_ctx;
+        }
+    }
+    gguf_free(gctx);
+    return bytes;
+}
+
+uint32_t gguf_draft_block_size(const std::string & draft_path) {
+    gguf_init_params params{};
+    params.no_alloc = true;
+    gguf_context * gctx = gguf_init_from_file(draft_path.c_str(), params);
+    if (!gctx) return 0;
+    const int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+    const std::string arch = arch_id >= 0 ? gguf_get_val_str(gctx, arch_id) : "";
+    const uint32_t block_size = arch.empty() ? 0 : gguf_u32(gctx, arch + ".dflash.block_size");
+    gguf_free(gctx);
+    return block_size;
+}
+
+uint64_t gguf_rollback_cache_bytes(const std::string & model_path, int max_verify_tokens,
+                                   bool checkpoint_f32, bool specla) {
+    gguf_init_params params{};
+    params.no_alloc = true;
+    gguf_context * gctx = gguf_init_from_file(model_path.c_str(), params);
+    if (!gctx) return 0;
+
+    uint64_t bytes = 0;
+    const int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+    const std::string arch = arch_id >= 0 ? gguf_get_val_str(gctx, arch_id) : "";
+    if (arch == "qwen35") {
+        const std::string pre = arch + ".";
+        uint32_t n_layer = 0;
+        std::string error;
+        const uint32_t interval = gguf_u32(gctx, pre + "full_attention_interval");
+        if (interval &&
+            derive_effective_target_layer_count(
+                arch, gguf_u32(gctx, pre + "block_count"),
+                gguf_u32(gctx, pre + "nextn_predict_layers"), n_layer, error)) {
+            RollbackCacheDims dims;
+            dims.n_delta_layers = (int) (n_layer - n_layer / interval);
+            dims.ssm_d_inner = (int) gguf_u32(gctx, pre + "ssm.inner_size");
+            dims.ssm_dt_rank = (int) gguf_u32(gctx, pre + "ssm.time_step_rank");
+            dims.ssm_d_state = (int) gguf_u32(gctx, pre + "ssm.state_size");
+            dims.ssm_n_group = (int) gguf_u32(gctx, pre + "ssm.group_count");
+            dims.ssm_d_conv = (int) gguf_u32(gctx, pre + "ssm.conv_kernel");
+            bytes = rollback_cache_bytes(dims, max_verify_tokens, checkpoint_f32, specla);
         }
     }
     gguf_free(gctx);

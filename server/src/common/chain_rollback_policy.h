@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,6 +71,53 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
         policy.fast_rollback_threshold = 1;
     }
     return policy;
+}
+
+// The recurrent-state shape of a Gated-DeltaNet target, as its GGUF header
+// gives it (<arch>.ssm.* and the layer counts).
+struct RollbackCacheDims {
+    int n_delta_layers = 0;   // target layers that are not full attention
+    int ssm_d_inner = 0;      // ssm.inner_size
+    int ssm_dt_rank = 0;      // ssm.time_step_rank
+    int ssm_d_state = 0;      // ssm.state_size
+    int ssm_n_group = 0;      // ssm.group_count
+    int ssm_d_conv = 0;       // ssm.conv_kernel
+};
+
+// Bytes migrate_prefill_cache() allocates on the target's device at the first
+// speculative request, which is after the load succeeded: per delta layer the
+// SSM and conv snapshots, then either the conv input window and one SSM
+// checkpoint per verified token (F32 or F16), or with SpecLA the two factor
+// banks. Placement counts them because nothing else reserves them: Qwen3.8-27B
+// with an 8-token drafter allocates 1,386,479,616 bytes (1322.25 MiB) here.
+// Keep in step with migrate_prefill_cache() (qwen35_target_graph.cpp).
+inline uint64_t rollback_cache_bytes(const RollbackCacheDims & d,
+                                     int max_verify_tokens,
+                                     bool checkpoint_f32,
+                                     bool specla) {
+    if (d.n_delta_layers <= 0 || d.ssm_dt_rank <= 0 || d.ssm_d_inner <= 0 ||
+        d.ssm_d_conv <= 0 || max_verify_tokens <= 0) {
+        return 0;
+    }
+    const uint64_t f32 = sizeof(float);
+    const uint64_t q = (uint64_t) max_verify_tokens;
+    const uint64_t rank = (uint64_t) d.ssm_dt_rank;
+    const uint64_t head_v = (uint64_t) d.ssm_d_inner / rank;
+    const uint64_t head_k = (uint64_t) d.ssm_d_state;
+    const uint64_t conv_ch =
+        (uint64_t) d.ssm_d_inner + 2ull * (uint64_t) d.ssm_n_group * (uint64_t) d.ssm_d_state;
+    const uint64_t conv_taps = (uint64_t) d.ssm_d_conv - 1;
+
+    const uint64_t ssm_state = head_v * head_v * rank * f32;
+    uint64_t per_layer = ssm_state + conv_taps * conv_ch * f32;   // the two snapshots
+    if (specla) {
+        // Two banks of k, v, g and conv factors per verified token.
+        per_layer += 2 * q * (head_k * rank + head_v * rank + rank + conv_ch) * f32;
+    } else {
+        per_layer += (conv_taps + q) * conv_ch * f32;             // conv input window
+        per_layer += q * (checkpoint_f32 ? ssm_state : ssm_state / 2);
+    }
+    return per_layer * (uint64_t) d.n_delta_layers;
 }
 
 // Rollback diagnostics shared by the two spec-decode loops
