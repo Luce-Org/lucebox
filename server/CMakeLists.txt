@@ -2310,6 +2310,11 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen4exp_prefix_cache PRIVATE ${LUCE_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     target_link_libraries(test_qwen4exp_prefix_cache PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        # KvFlashPager's layout keys on LUCE_BACKEND_CUDA, which luce_common sets PRIVATE (HIP builds match through
+        # ggml's GGML_USE_HIP). Without it this test's pager has no DMA members and luce_common reads past them.
+        target_compile_definitions(test_qwen4exp_prefix_cache PRIVATE LUCE_BACKEND_CUDA=1)
+    endif()
     add_test(NAME qwen4exp_prefix_cache COMMAND test_qwen4exp_prefix_cache)
     # Guards the batched verify's QSA rows: one synthetic full-attention layer (no model file), each slot's rows
     # against consecutive T=1 decode steps, bit for bit. Compiles qwen4exp_graph.cpp into the test for its builders.
@@ -2405,6 +2410,7 @@ if(LUCE_TESTS)
         target_link_libraries(test_kvflash PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
+            target_compile_definitions(test_kvflash PRIVATE LUCE_BACKEND_CUDA=1)   # luce_common's KvFlashPager layout
         endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_paged_kv_pool.cpp")
