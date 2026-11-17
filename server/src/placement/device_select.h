@@ -51,6 +51,18 @@ uint64_t gguf_kv_cache_bytes(const std::string & path, int max_ctx,
                              ggml_type cache_type_k = GGML_TYPE_COUNT,
                              ggml_type cache_type_v = GGML_TYPE_COUNT);
 
+// Tokens a decode drafter proposes per step, from its GGUF header
+// (<arch>.dflash.block_size); 0 when the file is not a GGUF or has no such key.
+uint32_t gguf_draft_block_size(const std::string & draft_path);
+
+// Bytes a Qwen3.5/3.6/3.8 hybrid target allocates on its GPU for speculative
+// rollback (rollback_cache_bytes, chain_rollback_policy.h), with the shape from
+// the target's GGUF header. The backend allocates them at the first request
+// with a drafter, not at load, so a placement that leaves them out loads and
+// then fails every request. Returns 0 for other families and unreadable files.
+uint64_t gguf_rollback_cache_bytes(const std::string & model_path, int max_verify_tokens,
+                                   bool checkpoint_f32, bool specla);
+
 // Weights, the estimated KV cache (0 when unknown), and a margin for compute
 // buffers, runtime overhead and any cache the estimate does not cover: a tenth
 // of the weights, kept between 2 and 4 GiB.
@@ -168,6 +180,11 @@ struct AutoPlacementRequest {
     // The paged DeepSeek backend only implements expert parallelism for
     // a local HIP gfx1201 primary paired with a gfx1151 secondary.
     bool paged_expert_parallel = false;
+    // A decode drafter auto may place (in process, no --draft-device): its
+    // weights, and the rollback checkpoints the target allocates on its own
+    // GPU once the drafter is used. 0: no such drafter, placement is unchanged.
+    uint64_t draft_bytes = 0;
+    uint64_t rollback_bytes = 0;
 };
 
 struct AutoPlacement {
@@ -176,6 +193,9 @@ struct AutoPlacement {
     // ExpertParallel: {main, expert}. Empty: no placement.
     std::vector<int>    gpus;
     std::vector<double> layer_weights;  // LayerSplit: free memory per shard
+    // Single device with a drafter auto places: the GPU the drafter moves to
+    // when the target's cannot also hold it; -1 leaves it on the target's.
+    int         draft_gpu = -1;
     bool        fits = false;
     std::string reason;
 };
@@ -186,10 +206,46 @@ inline uint64_t auto_device_capacity(const GpuDeviceInfo & device) {
     return device.free_bytes;
 }
 
+// The GPU for a drafter auto places, once the target sits alone on
+// `target_index`. `need` covers the target only: beside it the drafter adds its
+// weights, and the target adds its rollback checkpoints at the first
+// speculative request, after the load succeeded. A GPU that holds the target
+// but not all three loads both models and then fails every request (two 15 GiB
+// T4s, a 12.2 GiB Qwen3.8-27B and its 1.9 GiB drafter: 1.3 GiB of checkpoints
+// do not fit, while the other T4 stays empty). The drafter then goes to
+// another available GPU that holds it, discrete first, then the roomiest: the
+// target keeps its GPU, which is the fastest placement. -1 keeps the drafter
+// on the target's GPU: it fits there, or no other GPU can take it.
+inline int choose_auto_draft_gpu(const std::vector<GpuDeviceInfo> & available,
+                                 int target_index,
+                                 const AutoPlacementRequest & request) {
+    if (request.draft_bytes == 0) return -1;
+    const uint64_t beside =
+        auto_device_required_bytes(request.model_bytes, request.kv_bytes) +
+        request.draft_bytes + request.rollback_bytes;
+    const uint64_t alone = auto_device_required_bytes(request.draft_bytes);
+    const GpuDeviceInfo * best = nullptr;
+    for (const GpuDeviceInfo & device : available) {
+        if (device.index == target_index) {
+            if (device.total_bytes >= beside) return -1;
+            continue;
+        }
+        if (device.total_bytes < alone) continue;
+        if (!best || (best->integrated && !device.integrated) ||
+            (best->integrated == device.integrated &&
+             device.total_bytes > best->total_bytes)) {
+            best = &device;
+        }
+    }
+    return best ? best->index : -1;
+}
+
 // `--target-device auto` over live device state. Devices another process
 // computes on are skipped, and capacity is free memory.
 //  1. A discrete GPU that holds the model alone: the fastest placement
 //     (Qwen 27B decodes 36 tok/s on an R9700, 15 split with Strix Halo).
+//     A drafter auto places moves to another GPU when this one cannot also
+//     hold it and the rollback checkpoints (choose_auto_draft_gpu).
 //  2. Otherwise, with two or more available GPUs and a multi-GPU technique,
 //     spread the model over them when their free memory holds it together:
 //     subject to the launch's feature and topology constraints.
@@ -229,6 +285,7 @@ inline AutoPlacement choose_auto_placement(
     }
     if (fastest && fastest->total_bytes >= need) {
         placement.gpus = {fastest->index};
+        placement.draft_gpu = choose_auto_draft_gpu(available, fastest->index, request);
         placement.fits = true;
         placement.reason = "a discrete GPU holds the model alone" + busy_note;
         return placement;
@@ -275,6 +332,9 @@ inline AutoPlacement choose_auto_placement(
         return placement;
     }
     placement.gpus = {single.index};
+    if (single.fits) {
+        placement.draft_gpu = choose_auto_draft_gpu(available, single.index, request);
+    }
     placement.fits = single.fits;
     placement.reason = (single.fits ? single.reason
                                     : "no available GPU holds the model; using the roomiest") +

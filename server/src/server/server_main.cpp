@@ -17,6 +17,7 @@
 #include "admission.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
+#include "luce.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "cluster/cluster_config.h"
@@ -1358,11 +1359,15 @@ static uint64_t model_kv_cache_bytes(const ModelOptions & model) {
 static AutoPlacement plan_auto_placement(const std::vector<GpuDeviceInfo> & devices,
                                          const BackendArgs & args,
                                          uint64_t model_bytes, uint64_t kv_bytes,
-                                         bool allow_multi_gpu) {
+                                         bool allow_multi_gpu,
+                                         uint64_t draft_bytes = 0,
+                                         uint64_t rollback_bytes = 0) {
     const std::string arch = inspect_gguf_model_info(args.model_path.c_str()).arch;
     AutoPlacementRequest request;
     request.model_bytes = model_bytes;
     request.kv_bytes = kv_bytes;
+    request.draft_bytes = draft_bytes;
+    request.rollback_bytes = rollback_bytes;
     request.technique = allow_multi_gpu ? auto_multi_gpu_technique(arch, args)
                                         : MultiGpuTechnique::None;
     request.can_offload = arch_has_expert_offload(arch);
@@ -1377,6 +1382,45 @@ static std::string auto_placement_devices(const AutoPlacement & placement) {
         out += std::string(out.empty() ? "" : ",") + backend + ":" + std::to_string(gpu);
     }
     return out;
+}
+
+// The decode drafter `--target-device auto` places with the target, and what
+// the two cost beside each other: the drafter's weights, and the rollback
+// checkpoints the target allocates at its first speculative request
+// (migrate_prefill_cache). Only the single-sequence Qwen3.5/3.6/3.8 hybrid with
+// an in-process drafter on no device of its own. Left alone: a profile (a
+// recipe qualified for one topology), concurrent serving (it keeps the drafter
+// on the target's GPU) and PFlash (its drafter follows the decode drafter, and
+// parking is sized for it beside the target). Both 0: auto ignores the drafter.
+static void auto_drafter_bytes(const ModelOptions & model,
+                               uint64_t & draft_bytes, uint64_t & rollback_bytes) {
+    draft_bytes = 0;
+    rollback_bytes = 0;
+    const BackendArgs & args = model.bargs;
+    if (!args.draft_path || model.draft_device_set || model.profile ||
+        args.remote_draft.enabled() || args.paged_attention || args.max_concurrency > 1 ||
+        model.sconfig.pflash ||
+        inspect_gguf_model_info(args.model_path.c_str()).arch != "qwen35") {
+        return;
+    }
+    draft_bytes = gguf_model_bytes(*args.draft_path);
+    if (draft_bytes == 0) return;
+
+    // The verify width the backend sizes the checkpoints for (the
+    // max_verify_tokens it passes to migrate_prefill_cache): the drafter's
+    // block, or a DDTree's nodes.
+    // --specla turns DDTree on during backend planning, after this runs.
+    const bool tree = args.ddtree_mode || args.specla_mode;
+    if (!args.fast_rollback && !tree) return;
+    int block = args.draft_block_size > 0 ? args.draft_block_size
+                                          : (int) gguf_draft_block_size(*args.draft_path);
+    if (block <= 0) block = LUCE_DRAFT_BLOCK_SIZE;
+    const int max_verify_tokens = tree ? std::max(block, args.ddtree_budget + 1) : block;
+    const bool kvflash = !model.kvflash_pool.empty() || std::getenv("LUCE_KVFLASH") != nullptr;
+    rollback_bytes = gguf_rollback_cache_bytes(
+        args.model_path, max_verify_tokens,
+        luce::common::resolve_chain_rollback_policy().checkpoint_f32,
+        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash);
 }
 
 // --target-device auto: bind the model block to the placement the policy picks.
@@ -1398,9 +1442,11 @@ static bool resolve_auto_target_device(ModelOptions & model) {
             device.name.c_str(), device.arch.c_str(), bytes_to_gib(auto_device_capacity(device)),
             device.busy ? ", busy: " : "", device.busy_by.c_str());
     }
+    uint64_t draft_bytes = 0, rollback_bytes = 0;
+    auto_drafter_bytes(model, draft_bytes, rollback_bytes);
     const AutoPlacement placement = plan_auto_placement(
         devices, model.bargs, model_bytes, kv_bytes,
-        /*allow_multi_gpu=*/!model.profile);
+        /*allow_multi_gpu=*/!model.profile, draft_bytes, rollback_bytes);
     if (placement.gpus.empty()) {
         std::fprintf(stderr, "[server] --target-device auto: %s (%.1f GiB model + %.1f GiB KV)\n",
                      placement.reason.c_str(), bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes));
@@ -1428,6 +1474,18 @@ static bool resolve_auto_target_device(ModelOptions & model) {
         multi_gpu_technique_name(placement.technique), auto_placement_devices(placement).c_str(),
         bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes), target.max_ctx,
         placement.reason.c_str());
+    if (placement.draft_gpu >= 0) {
+        // An explicit placement from here on: resolve_draft_placement() keeps it.
+        model.bargs.draft_device.backend = backend;
+        model.bargs.draft_device.gpu = placement.draft_gpu;
+        model.draft_device_set = true;
+        std::fprintf(stderr,
+            "[server] --target-device auto: drafter on %s:%d: beside the model on %s:%d its %.1f GiB "
+            "and the %.1f GiB of rollback checkpoints do not fit\n",
+            placement_backend_name(backend), placement.draft_gpu,
+            placement_backend_name(backend), target.gpu,
+            bytes_to_gib(draft_bytes), bytes_to_gib(rollback_bytes));
+    }
     return true;
 }
 
