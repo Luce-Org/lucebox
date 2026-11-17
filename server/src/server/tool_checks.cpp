@@ -295,9 +295,22 @@ json * reply_message(json & response) {
     return &choice["message"];
 }
 
+bool advisor_call(const std::string & name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const char * prefix : {"lucebox_", "lucebox__", "mcp__lucebox__", "mcp__lucebox_", "mcp_lucebox_"}) {
+        if (lower == std::string(prefix) + "advisor") return true;
+    }
+    return false;
+}
+
 bool needs_replan(const json & reply) {
     std::set<std::string> names;
-    for (const auto & call : calls_of(reply)) names.insert(call_key(call).first);
+    for (const auto & call : calls_of(reply)) {
+        const std::string name = call_key(call).first;
+        if (!advisor_call(name)) names.insert(name);
+    }
     return names.size() > 1;
 }
 
