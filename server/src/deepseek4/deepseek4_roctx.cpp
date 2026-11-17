@@ -80,8 +80,8 @@ DeepSeek4RoctxCallbacks runtime_callbacks() {
 #if defined(LUCE_BACKEND_HIP)
     static const DeepSeek4RoctxCallbacks callbacks =
         deepseek4_roctx_load_callbacks(
-            true, {platform_open, platform_find_push, platform_find_pop,
-                   platform_close, platform_diagnose});
+            {platform_open, platform_find_push, platform_find_pop,
+             platform_close, platform_diagnose});
 #else
     static const DeepSeek4RoctxCallbacks callbacks{};
 #endif
@@ -123,9 +123,7 @@ bool deepseek4_roctx_env_enabled(const char * value) {
                      equals_ignore_case(value, "on"));
 }
 
-DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
-        bool enabled, DeepSeek4RoctxLoader loader) {
-    if (!enabled) return {};
+DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(DeepSeek4RoctxLoader loader) {
     if (!loader.open || !loader.find_push || !loader.find_pop || !loader.close) {
         return {};
     }
@@ -201,12 +199,12 @@ const char * deepseek4_roctx_phase_name(InferencePhase phase) {
 
 DeepSeek4RoctxRange::DeepSeek4RoctxRange(
         const char * scope, const DeepSeek4RoctxMetadata & metadata)
-    : DeepSeek4RoctxRange(scope, metadata, true, configured_callbacks()) {}
+    : DeepSeek4RoctxRange(scope, metadata, configured_callbacks()) {}
 
 DeepSeek4RoctxRange::DeepSeek4RoctxRange(
         const char * scope, const DeepSeek4RoctxMetadata & metadata,
-        bool enabled, DeepSeek4RoctxCallbacks callbacks) {
-    if (!enabled || !scope || !scope[0] || !callbacks.push || !callbacks.pop) return;
+        DeepSeek4RoctxCallbacks callbacks) {
+    if (!scope || !scope[0] || !callbacks.push || !callbacks.pop) return;
 
     // A stack buffer avoids allocation and per-layer string ownership. ROCTX
     // consumes the message during push, so the buffer need not outlive this call.

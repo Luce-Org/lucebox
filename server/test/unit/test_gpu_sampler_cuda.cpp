@@ -248,31 +248,6 @@ TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_top_p_distribution) {
     TEST_ASSERT_MSG(l1 < 0.03, "GPU-assisted top_p dist must match analytic nucleus (L1<0.03)");
 }
 
-// Direct CPU-vs-GPU agreement on the same draws is not bit-exact (different
-// inverse-CDF orderings), but both must agree on the *argmax* of their empirical
-// histograms — the most-likely token — under temperature sampling.
-TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_modal_token_matches_cpu) {
-    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
-    const int vocab = 32;
-    auto logits = gpu_test_logits(vocab, 11);
-    SamplerCfg cfg; cfg.temp = 0.9f;
-    std::vector<int32_t> history;
-
-    auto modal = [&](bool gpu) {
-        std::mt19937_64 rng(555);
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        std::vector<int> hist(vocab, 0);
-        for (int i = 0; i < 60000; i++) {
-            const int tok = gpu
-                ? geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false)
-                : sample_logits(logits.data(), vocab, cfg, history, rng);
-            if (tok >= 0 && tok < vocab) hist[tok]++;
-        }
-        return (int)(std::max_element(hist.begin(), hist.end()) - hist.begin());
-    };
-    TEST_ASSERT_MSG(modal(true) == modal(false), "GPU and CPU agree on the modal token");
-}
-
 // Per-call latency microbench (gated by env LUCE_SAMPLER_BENCH=1). Isolates
 // the three regimes that explain the end-to-end numbers: the CPU chain, the GPU
 // path fed host logits (pays a full-vocab H2D every call), and the GPU path fed

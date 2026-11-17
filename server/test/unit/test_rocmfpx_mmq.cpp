@@ -318,7 +318,7 @@ int main() {
         std::strncmp(properties.gcnArchName, "gfx12", 5) != 0) {
         std::printf("SKIP: ROCmFPX dispatch test expects gfx1151/gfx12xx (found %s)\n",
                     properties.gcnArchName);
-        return 0;
+        return 77;
     }
 
     ggml_backend_t hip_backend = ggml_backend_cuda_init(0);

@@ -35,8 +35,6 @@ extern "C" int roctxRangePop() {
 #endif
 
 static_assert(std::is_same_v<std::underlying_type_t<InferencePhase>, int32_t>);
-static_assert(std::is_same_v<
-    decltype(TargetShardDaemonForwardRequest{}.semantic_phase), InferencePhase>);
 
 namespace {
 
@@ -101,13 +99,6 @@ void reset_loader_state() {
     loader_close_calls = 0;
     loader_diagnostic_calls = 0;
     loader_diagnostic.clear();
-}
-
-bool return_failure_with_range() {
-    const DeepSeek4RoctxRange range(
-        "ds4.layer_range", {InferencePhase::Verify, 4, 0, 43, 0}, true,
-        {record_push, record_pop});
-    return false;
 }
 
 void test_env_policy() {
@@ -245,17 +236,6 @@ void test_malformed_phases_do_not_desynchronize_pipe() {
 }
 #endif
 
-void test_disabled_loader_is_silent_and_unopened() {
-    reset_loader_state();
-    const DeepSeek4RoctxCallbacks callbacks = deepseek4_roctx_load_callbacks(
-        false, {loader_open_success, loader_find_push, loader_find_pop,
-                loader_close, loader_diagnose});
-    CHECK(!callbacks.push && !callbacks.pop);
-    CHECK(loader_open_calls == 0);
-    CHECK(loader_close_calls == 0);
-    CHECK(loader_diagnostic_calls == 0);
-}
-
 #if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
 constexpr const char * roctx_interposition_child_arg =
     "--roctx-interposition-child";
@@ -328,8 +308,8 @@ void test_runtime_loader_prefers_interposed_roctx_symbols(
 void test_missing_library_is_diagnosed() {
     reset_loader_state();
     const DeepSeek4RoctxCallbacks callbacks = deepseek4_roctx_load_callbacks(
-        true, {loader_open_fail, loader_find_push, loader_find_pop,
-               loader_close, loader_diagnose});
+        {loader_open_fail, loader_find_push, loader_find_pop,
+         loader_close, loader_diagnose});
     CHECK(!callbacks.push && !callbacks.pop);
     CHECK(loader_open_calls == 1);
     CHECK(loader_close_calls == 0);
@@ -341,8 +321,8 @@ void test_missing_library_is_diagnosed() {
 void test_missing_symbol_closes_and_is_diagnosed() {
     reset_loader_state();
     const DeepSeek4RoctxCallbacks callbacks = deepseek4_roctx_load_callbacks(
-        true, {loader_open_success, loader_find_push_missing, loader_find_pop,
-               loader_close, loader_diagnose});
+        {loader_open_success, loader_find_push_missing, loader_find_pop,
+         loader_close, loader_diagnose});
     CHECK(!callbacks.push && !callbacks.pop);
     CHECK(loader_open_calls == 1);
     CHECK(loader_close_calls == 1);
@@ -351,22 +331,12 @@ void test_missing_symbol_closes_and_is_diagnosed() {
           std::string::npos);
 }
 
-void test_disabled_is_silent() {
-    events.clear();
-    {
-        const DeepSeek4RoctxRange range(
-            "ds4.prefill", {InferencePhase::Exact, 8, 0, 43, 0}, false,
-            {record_push, record_pop});
-    }
-    CHECK(events.empty());
-}
-
 void test_metadata_and_balance() {
     events.clear();
     push_result = 0;
     {
         const DeepSeek4RoctxRange range(
-            "ds4.layer_range", {InferencePhase::Exact, 4, 2, 17, 1}, true,
+            "ds4.layer_range", {InferencePhase::Exact, 4, 2, 17, 1},
             {record_push, record_pop});
         CHECK(events.size() == 1);
         CHECK(events[0] ==
@@ -381,7 +351,7 @@ void test_failed_push_is_not_popped() {
     push_result = -1;
     {
         const DeepSeek4RoctxRange range(
-            "ds4.spec_decode", {InferencePhase::ReferenceExact, 32, -1, -1, 0}, true,
+            "ds4.spec_decode", {InferencePhase::ReferenceExact, 32, -1, -1, 0},
             {record_push, record_pop});
     }
     CHECK(events.size() == 1);
@@ -390,22 +360,13 @@ void test_failed_push_is_not_popped() {
     push_result = 0;
 }
 
-void test_early_failure_balances_range() {
-    events.clear();
-    CHECK(!return_failure_with_range());
-    CHECK(events.size() == 2);
-    CHECK(events[0] ==
-          "push:ds4.layer_range mode=verify tokens=4 layer_begin=0 layer_end=43 device=0");
-    CHECK(events[1] == "pop");
-}
-
 void test_missing_callback_is_silent() {
     events.clear();
     {
         const DeepSeek4RoctxRange no_push(
-            "ds4.prefill", {}, true, {nullptr, record_pop});
+            "ds4.prefill", {}, {nullptr, record_pop});
         const DeepSeek4RoctxRange no_pop(
-            "ds4.prefill", {}, true, {record_push, nullptr});
+            "ds4.prefill", {}, {record_push, nullptr});
     }
     CHECK(events.empty());
 }
@@ -430,13 +391,10 @@ int main(int argc, char ** argv) {
 #if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
     test_runtime_loader_prefers_interposed_roctx_symbols(argv[0]);
 #endif
-    test_disabled_loader_is_silent_and_unopened();
     test_missing_library_is_diagnosed();
     test_missing_symbol_closes_and_is_diagnosed();
-    test_disabled_is_silent();
     test_metadata_and_balance();
     test_failed_push_is_not_popped();
-    test_early_failure_balances_range();
     test_missing_callback_is_silent();
     if (failures) {
         std::fprintf(stderr, "FAILED: %d assertion(s)\n", failures);

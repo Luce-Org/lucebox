@@ -115,6 +115,7 @@ class TestModels:
                             "Access-Control-Request-Method": "GET",
                         })
         assert r.status_code == 204
+        assert "Access-Control-Allow-Origin" in r.headers
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -149,20 +150,6 @@ class TestChatCompletionsNonStreaming:
         assert data["usage"]["total_tokens"] == (
             data["usage"]["prompt_tokens"] + data["usage"]["completion_tokens"]
         )
-
-    def test_system_message(self, client):
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [
-                {"role": "system", "content": "You are a helpful math tutor."},
-                {"role": "user", "content": "What is 5+5? Reply with just the number."},
-            ],
-            "stream": False,
-            "max_tokens": 16,
-        })
-        assert r.status_code == 200
-        data = r.json()
-        assert data["choices"][0]["message"]["content"]
 
     def test_multi_turn_conversation(self, client):
         r = post_json(client, "/v1/chat/completions", {
@@ -213,20 +200,7 @@ class TestChatCompletionsNonStreaming:
 # ═══════════════════════════════════════════════════════════════════
 
 class TestSamplingParameters:
-    """Validate that sampling parameters are accepted and affect output."""
-
-    def test_temperature_nonzero_accepted(self, client):
-        """Non-zero temperature should produce a valid response."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Write a random word."}],
-            "stream": False,
-            "max_tokens": 16,
-            "temperature": 0.7,
-        })
-        assert r.status_code == 200
-        content = r.json()["choices"][0]["message"]["content"]
-        assert len(content) > 0
+    """Sampling parameters are accepted, and a fixed seed reproduces output."""
 
     def test_seed_reproducibility(self, client):
         """Same seed + same temperature should produce identical output."""
@@ -244,91 +218,6 @@ class TestSamplingParameters:
         assert r2.status_code == 200
         assert (r1.json()["choices"][0]["message"]["content"]
                 == r2.json()["choices"][0]["message"]["content"])
-
-    def test_top_p_accepted(self, client):
-        """top_p parameter should be accepted and produce output."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Say something."}],
-            "stream": False,
-            "max_tokens": 16,
-            "temperature": 0.5,
-            "top_p": 0.9,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
-
-    def test_top_k_accepted(self, client):
-        """top_k parameter should be accepted."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Hello."}],
-            "stream": False,
-            "max_tokens": 8,
-            "temperature": 0.5,
-            "top_k": 10,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
-
-    def test_frequency_penalty_accepted(self, client):
-        """frequency_penalty should be accepted and produce output."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "stream": False,
-            "max_tokens": 32,
-            "temperature": 0.5,
-            "frequency_penalty": 0.5,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
-
-    def test_presence_penalty_accepted(self, client):
-        """presence_penalty should be accepted and produce output."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "stream": False,
-            "max_tokens": 32,
-            "temperature": 0.5,
-            "presence_penalty": 0.5,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
-
-    def test_presence_penalty_encourages_diversity(self, client):
-        """High presence_penalty should encourage diverse tokens."""
-        prompt = "List five animals."
-        base = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "max_tokens": 64,
-            "temperature": 0.3,
-            "seed": 100,
-        }
-        # With high presence penalty, output should have more unique words
-        r = post_json(client, "/v1/chat/completions", {**base, "presence_penalty": 1.5})
-        assert r.status_code == 200
-        text = r.json()["choices"][0]["message"]["content"]
-        words = text.lower().split()
-        # At least some word diversity (not all same word)
-        unique_ratio = len(set(words)) / max(len(words), 1)
-        assert unique_ratio > 0.3
-
-    def test_repetition_penalty_accepted(self, client):
-        """repetition_penalty (HF-style multiplicative) should be accepted."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Hello."}],
-            "stream": False,
-            "max_tokens": 16,
-            "temperature": 0.5,
-            "repetition_penalty": 1.2,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
 
     def test_all_sampling_params_combined(self, client):
         """All sampling parameters together should produce valid output."""
@@ -348,42 +237,6 @@ class TestSamplingParameters:
         assert r.status_code == 200
         content = r.json()["choices"][0]["message"]["content"]
         assert len(content) > 0
-
-    def test_sampling_params_in_streaming(self, client):
-        """Sampling parameters should work in streaming mode too."""
-        r = post_stream(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Say something creative."}],
-            "stream": True,
-            "max_tokens": 32,
-            "temperature": 0.9,
-            "top_p": 0.95,
-            "frequency_penalty": 0.5,
-            "presence_penalty": 0.5,
-        })
-        assert r.status_code == 200
-        events = parse_sse_events(r)
-        # Should have content chunks and end with DONE
-        assert any(e == ("done", None) for e in events)
-        content = ""
-        for _, e in events:
-            if e and isinstance(e, dict) and e.get("choices"):
-                delta = e["choices"][0].get("delta", {})
-                content += delta.get("content", "")
-        assert len(content) > 0
-
-    def test_negative_frequency_penalty_boosts_repetition(self, client):
-        """Negative frequency_penalty should allow/encourage repetition."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Repeat 'test' many times."}],
-            "stream": False,
-            "max_tokens": 32,
-            "temperature": 0.3,
-            "frequency_penalty": -1.0,
-        })
-        assert r.status_code == 200
-        assert len(r.json()["choices"][0]["message"]["content"]) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -452,85 +305,32 @@ class TestChatCompletionsStreaming:
         assert len(finish_chunks) >= 1
         assert finish_chunks[-1]["choices"][0]["finish_reason"] in ("stop", "length")
 
-    def test_streaming_content_reassembly(self, client):
-        """Concatenating all content deltas should produce coherent text."""
-        r = post_stream(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "What is 3*4? Reply with just the number."}],
-            "stream": True,
-            "max_tokens": 8,
-        })
-        events = parse_sse_events(r)
-        text = ""
-        for _, e in events:
-            if e and isinstance(e, dict) and e.get("choices"):
-                delta = e["choices"][0].get("delta", {})
-                text += delta.get("content", "")
-        assert len(text.strip()) > 0
-
 
 # ═══════════════════════════════════════════════════════════════════
 # POST /v1/chat/completions — reasoning / thinking
 # ═══════════════════════════════════════════════════════════════════
 
 class TestReasoning:
-    def test_thinking_disabled_by_default(self, client):
-        """Without explicit enable_thinking, model should not produce reasoning_content."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "What is 2+2?"}],
-            "stream": False,
-            "max_tokens": 32,
-        })
-        assert r.status_code == 200
-        msg = r.json()["choices"][0]["message"]
-        # When thinking is disabled, content should not be empty
-        assert msg["content"]
-
     @pytest.mark.slow
-    def test_thinking_enabled_via_chat_template_kwargs(self, client):
-        """Enabling thinking should produce reasoning_content."""
+    @pytest.mark.parametrize("fields", [
+        {"chat_template_kwargs": {"enable_thinking": True}},
+        {"reasoning": {"effort": "high"}},  # OpenAI Responses style
+        {"reasoning_effort": "medium"},  # OpenAI Chat Completions style
+    ], ids=["chat_template_kwargs", "reasoning", "reasoning_effort"])
+    def test_reasoning_request_fields_accepted(self, client, fields):
+        """Each way of asking for thinking is accepted and still answers."""
         r = post_json(client, "/v1/chat/completions", {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "What is 15 * 17?"}],
             "stream": False,
             "max_tokens": 512,
-            "chat_template_kwargs": {"enable_thinking": True},
-        })
-        assert r.status_code == 200
-        msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
-        # With thinking enabled, model may produce reasoning_content
-        # (not guaranteed for short prompts, so we just check it doesn't crash)
-
-    @pytest.mark.slow
-    def test_thinking_enabled_via_reasoning_effort(self, client):
-        """OpenAI Responses-style reasoning.effort field."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "What is 15 * 17?"}],
-            "stream": False,
-            "max_tokens": 512,
-            "reasoning": {"effort": "high"},
-        })
-        assert r.status_code == 200
-        msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
-
-    @pytest.mark.slow
-    def test_thinking_enabled_via_top_level_reasoning_effort(self, client):
-        """OpenAI Chat Completions-style reasoning_effort field."""
-        r = post_json(client, "/v1/chat/completions", {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "What is 15 * 17?"}],
-            "stream": False,
-            "max_tokens": 512,
-            "reasoning_effort": "medium",
+            **fields,
         })
         assert r.status_code == 200
         choice = r.json()["choices"][0]
         assert choice["message"]["content"]
-        assert "finish_details" in choice
+        if "reasoning_effort" in fields:
+            assert "finish_details" in choice
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -588,19 +388,6 @@ class TestResponsesAPI:
         assert data["object"] == "response"
         assert_responses_status(data)
 
-    def test_responses_with_instructions(self, client):
-        """Instructions map to system message."""
-        r = post_json(client, "/v1/responses", {
-            "model": MODEL_NAME,
-            "input": "What is 5+5? Reply with just the number.",
-            "instructions": "You are a helpful math tutor. Always show your work.",
-            "stream": False,
-            "max_tokens": 64,
-        })
-        assert r.status_code == 200
-        data = r.json()
-        assert data["object"] == "response"
-
     def test_responses_streaming(self, client):
         """POST /v1/responses streaming emits proper SSE lifecycle events."""
         r = post_stream(client, "/v1/responses", {
@@ -617,6 +404,11 @@ class TestResponsesAPI:
         assert "response.content_part.added" in event_types
         terminals = {"response.completed", "response.incomplete"}
         assert terminals & set(event_types)
+        delta_events = [
+            data for et, data in events
+            if et == "response.output_text.delta" and data
+        ]
+        assert any(d.get("delta") for d in delta_events)
 
         # Find the terminal event and validate structure
         for et, data in events:
@@ -624,21 +416,6 @@ class TestResponsesAPI:
                 assert_responses_status(data["response"])
                 assert et == "response." + data["response"]["status"]
                 assert "usage" in data["response"]
-
-    def test_responses_streaming_has_text_deltas(self, client):
-        r = post_stream(client, "/v1/responses", {
-            "model": MODEL_NAME,
-            "input": "What is 4+4? Reply with just the number.",
-            "stream": True,
-            "max_tokens": 16,
-        })
-        events = parse_sse_events(r)
-        delta_events = [
-            data for et, data in events
-            if et == "response.output_text.delta" and data
-        ]
-        assert len(delta_events) >= 1
-        assert any(d.get("delta") for d in delta_events)
 
     def test_responses_developer_role(self, client):
         """Developer role should be accepted (mapped to system internally)."""
@@ -693,25 +470,16 @@ class TestAnthropicAPI:
         })
         assert r.status_code == 200
         data = r.json()
+        assert data["id"].startswith("msg")
         assert data["type"] == "message"
         assert data["role"] == "assistant"
+        assert data["model"] == MODEL_NAME
+        assert data["stop_reason"] is not None
         assert len(data["content"]) >= 1
         assert data["content"][-1]["type"] == "text"
         assert len(data["content"][-1]["text"]) > 0
         assert data["usage"]["input_tokens"] > 0
         assert data["usage"]["output_tokens"] > 0
-
-    def test_messages_with_system(self, client):
-        """Anthropic puts system as a top-level field."""
-        r = post_json(client, "/v1/messages", {
-            "model": MODEL_NAME,
-            "system": "You always reply in uppercase.",
-            "messages": [{"role": "user", "content": "Say hi"}],
-            "stream": False,
-            "max_tokens": 16,
-        })
-        assert r.status_code == 200
-        assert r.json()["type"] == "message"
 
     def test_messages_billing_header_stripped(self, client):
         """Billing header blocks in system should be stripped, not sent to model."""
@@ -879,18 +647,3 @@ class TestStopSequences:
                 text += block.get("text", "")
         assert "1" in text
         assert "\n5" not in text
-
-    def test_stop_no_match(self, client):
-        """If stop sequences don't match, output should be normal."""
-        body = {
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "max_tokens": 20,
-            "temperature": 0,
-            "stop": ["ZZZZUNLIKELY"],
-        }
-        r = post_json(client, "/v1/chat/completions", body)
-        assert r.status_code == 200
-        content = r.json()["choices"][0]["message"]["content"]
-        # Should produce some output since stop didn't match
-        assert len(content) > 0

@@ -77,13 +77,13 @@ TEST_CASE(DeepSeek4PagedCacheFixture, shared_compressed_cache_geometry) {
 }
 
 TEST_CASE(DeepSeek4PagedCacheFixture, gathered_lane_history) {
-    const int32_t slots[] = {2, 5, -1};
-    const int64_t positions[] = {3, 259, 999};
-    const int32_t tables[] = {4, 3, 2, 6, 1, 7, 0, 0, 0};
+    const int32_t slots[] = {2, 5, -1, 3};
+    const int64_t positions[] = {3, 259, 999, 0};
+    const int32_t tables[] = {4, 3, 2, 6, 1, 7, 0, 0, 0, 5, 0, 0};
     std::vector<DeepSeek4GatheredLaneRows> rows;
     REQUIRE_TRUE(prepare_deepseek4_gathered_lane_rows(
-        slots, positions, 3, tables, 3, 8, 4, rows));
-    CHECK(rows.size() == 3);
+        slots, positions, 4, tables, 3, 8, 4, rows));
+    CHECK(rows.size() == 4);
     CHECK(rows[0].raw_history == std::vector<int64_t>({256, 257, 258}));
     CHECK(rows[0].raw_history_valid == 3);
     CHECK(rows[0].raw_scatter == 259);
@@ -106,27 +106,8 @@ TEST_CASE(DeepSeek4PagedCacheFixture, gathered_lane_history) {
           rows[2].compressed_history_valid == 0);
     CHECK(rows[2].raw_scatter == -1 && rows[2].compressed_scatter == -1);
     CHECK(rows[2].position == 0);
-
-}
-
-TEST_CASE(DeepSeek4PagedCacheFixture, six_active_lanes) {
-    std::vector<DeepSeek4GatheredLaneRows> rows;
-    std::vector<int32_t> six_slots(6);
-    std::vector<int64_t> six_positions(6, 0);
-    std::vector<int32_t> six_tables(6);
-    for (int i = 0; i < 6; ++i) {
-        six_slots[(size_t) i] = i;
-        six_tables[(size_t) i] = i;
-    }
-    REQUIRE_TRUE(prepare_deepseek4_gathered_lane_rows(
-        six_slots.data(), six_positions.data(), 6,
-        six_tables.data(), 1, 6, 4, rows));
-    CHECK(rows.size() == 6);
-    for (int i = 0; i < 6; ++i) {
-        CHECK(rows[(size_t) i].slot == i);
-        CHECK(rows[(size_t) i].raw_history.empty());
-        CHECK(rows[(size_t) i].raw_scatter == int64_t(i * 128));
-    }
+    CHECK(rows[3].slot == 3 && rows[3].raw_history.empty() &&
+          rows[3].raw_scatter == 3 * 128);
 
 }
 

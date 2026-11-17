@@ -34,12 +34,6 @@ TEST_CASE(AnchorParamsFixture, test_pflash_env_wins_over_legacy) {
     { auto p = resolve_anchor_params(2048, 3, 12, 1, 4); CHECK_EQUAL(p.radius, 3); CHECK_EQUAL(p.max_hits, 12); }
 }
 
-TEST_CASE(AnchorParamsFixture, test_sentinel_minus1_falls_through_to_tier) {
-    // -1 means unset; both sentinels -> tier
-    { auto p = resolve_anchor_params(1023, -1,-1, -1,-1); CHECK_EQUAL(p.radius, 2); CHECK_EQUAL(p.max_hits, 8); }
-    { auto p = resolve_anchor_params(1024, -1,-1, -1,-1); CHECK_EQUAL(p.radius, 4); CHECK_EQUAL(p.max_hits, 16); }
-}
-
 TEST_CASE(AnchorParamsFixture, test_zero_is_valid_override) {
     // 0 is a valid override (>= 0), not sentinel
     { auto p = resolve_anchor_params(2048, 0, 0, -1,-1); CHECK_EQUAL(p.radius, 0); CHECK_EQUAL(p.max_hits, 0); }

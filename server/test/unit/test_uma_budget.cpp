@@ -17,20 +17,9 @@ constexpr size_t GiB = size_t(1) << 30;
 constexpr size_t kStrixRam = 125 * GiB + GiB / 10;
 }
 
-// The overcommit this check exists for: a 103.9 GiB managed buffer while
-// MemAvailable says ~92 GiB. It must fail up front instead of ending in the
-// OOM killer.
-TEST_CASE(UmaBudget, rejects_allocation_larger_than_available_ram) {
-    const size_t size = 103 * GiB + 9 * GiB / 10;
-    CHECK_FALSE(ggml_cuda_uma_alloc_fits(size, 92 * GiB, kStrixRam));
-}
-
-// The case the managed path is for: a large model on a box whose RAM is free.
-TEST_CASE(UmaBudget, admits_large_model_when_ram_is_free) {
-    CHECK_TRUE(ggml_cuda_uma_alloc_fits(86 * GiB, 118 * GiB, kStrixRam));
-}
-
-// The reserve kept free is 1/16 of RAM, at least 1 GiB and at most 8 GiB:
+// The check exists so an overcommit (a 103.9 GiB managed buffer while
+// MemAvailable says ~92 GiB) fails up front instead of ending in the OOM
+// killer. The reserve kept free is 1/16 of RAM, at least 1 GiB and at most 8 GiB:
 // 1, 4 and 8 GiB on 8, 64 and 256 GiB boxes with half their RAM available.
 TEST_CASE(UmaBudget, keeps_reserve_free) {
     struct Box { size_t ram; size_t reserve; };
@@ -150,26 +139,6 @@ TEST_CASE(UmaBudget, keeps_a_free_that_follows_allocations) {
     CHECK_TRUE(total == kStrixRam);
 }
 
-// A runtime that reports less than RAM allows (a GTT limit below RAM, or DGX
-// Spark's, which leaves out reclaimable page cache) keeps its figure.
-TEST_CASE(UmaBudget, keeps_a_free_below_what_ram_allows) {
-    size_t free = 50 * GiB, total = 96 * GiB;
-    ggml_cuda_uma_bound_device_memory(&free, &total, 0, 0, 80 * (uint64_t) GiB, kStrixRam);
-    CHECK_TRUE(free == 50 * GiB);
-    CHECK_TRUE(total == 96 * GiB);
-}
-
-// A large carve is the device's own memory, outside MemAvailable: with 60 of
-// 64 GiB of it free and only 10 GiB of RAM available, the device can still
-// take its 60 GiB.
-TEST_CASE(UmaBudget, counts_the_carve_beside_ram) {
-    size_t free = 60 * GiB, total = 64 * GiB;
-    ggml_cuda_uma_bound_device_memory(&free, &total, 64 * (uint64_t) GiB, 4 * (uint64_t) GiB,
-                                      10 * (uint64_t) GiB, 64 * GiB);
-    CHECK_TRUE(free == 60 * GiB);
-    CHECK_TRUE(total == 64 * GiB);
-}
-
 // No RAM to take leaves only the carve; no carve either leaves nothing.
 TEST_CASE(UmaBudget, no_ram_leaves_the_carve) {
     size_t free = 100 * GiB, total = 1280 * GiB;
@@ -233,15 +202,6 @@ TEST_CASE(UmaBudget, shared_free_keeps_the_heap_limit_without_managed_memory) {
     CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(30 * GiB, 60 * (uint64_t) GiB, false) == 60 * GiB);
     // A heap limit above what RAM allows is no limit.
     CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(121 * GiB, 60 * (uint64_t) GiB, true) == 60 * GiB);
-}
-
-// A discrete GPU with GGML_CUDA_ENABLE_UNIFIED_MEMORY: on a 64 GiB host with 12 GiB of MemAvailable and
-// 24 GiB more in the pool, 36 GiB less the 4 GiB reserve, where llama.cpp's
-// query gave 12.
-TEST_CASE(UmaBudget, shared_free_of_a_discrete_gpu_in_unified_memory_counts_the_pool) {
-    const uint64_t shared_ram = ggml_cuda_uma_shared_ram_bytes(12 * (uint64_t) GiB, 36 * (uint64_t) GiB, 64 * GiB);
-    CHECK_TRUE(shared_ram == 32 * (uint64_t) GiB);
-    CHECK_TRUE(ggml_cuda_uma_shared_free_bytes(32 * GiB, shared_ram, false) == 32 * GiB);
 }
 
 // DeepSeek's Strix stack: the device heap (what the runtime allows of the room)

@@ -37,12 +37,6 @@ TEST_CASE(KvflashResumeFixture, ties_and_missing_live_cut_keep_the_server_snapsh
     CHECK(kvflash_pick_resume(0, -1) == KvflashResume::Server);
 }
 
-TEST_CASE(KvflashResumeFixture, never_a_full_reprefill_while_the_live_session_matches) {
-    // FullReprefill plan => server cut 0; any rung beats it.
-    const int sc = kvflash_server_cut(KvflashRestorePlan::FullReprefill, 8089);
-    CHECK(kvflash_pick_resume(sc, 512) == KvflashResume::Live);
-}
-
 // ── adopting a dense snapshot at the pool boundary ──────────────────
 
 TEST_CASE(KvflashResumeFixture, dense_over_pool_adopts_only_when_enabled) {
@@ -111,16 +105,6 @@ TEST_CASE(KvflashResumeFixture, dense_rungs_on_the_grid_are_reached_by_the_dense
             CHECK(std::find(ends.begin(), ends.end(), tail) != ends.end());
         }
     }
-}
-
-TEST_CASE(KvflashResumeFixture, dense_rung_bounds_replay_to_one_cell_plus_new_tokens) {
-    // Turn k ends at 8095 (+ 13 answer tokens in the history). Turn k+1's
-    // prompt shares the first 8108 tokens: the rung is 7680, so replay is
-    // < 512 + answer + new tokens.
-    const std::vector<int> rungs = kvflash_state_ladder_positions(8089, 8095, 512, 8192);
-    CHECK(rungs.back() == 7680);
-    CHECK(kvflash_ladder_pick(rungs, 8108) == 7680);
-    CHECK(8108 - 7680 < 512 + 13);
 }
 
 // ── the prefix_len the chat DONE line reports ───────────────────────

@@ -8,7 +8,7 @@
 //
 // Model-gated: needs a real qtype-105 model. Set DS4_TEST_MODEL to a *.gguf that
 // has a valid <model>.p4mix.bin sidecar next to it. Without it the test skips
-// (returns 0) so it is CI-safe on hosts without the fixture model.
+// (returns 77) so it is CI-safe on hosts without the fixture model.
 //
 // It never touches the real model or sidecar: temp symlinks stand in for both, and the
 // presence of the sidecar links is toggled to exercise the failure and success paths against
@@ -44,7 +44,7 @@ int main() {
     if (!model || !model[0]) {
         std::fprintf(stderr, "SKIP: set DS4_TEST_MODEL to a qtype-105 *.gguf "
                      "(with a valid .p4mix.bin) to run this test\n");
-        return 0;
+        return 77;
     }
     const std::string real_model = model;
     const std::string real_side  = real_model + ".p4mix.bin";
@@ -56,14 +56,14 @@ int main() {
     ::unlink(tmp_side.c_str());
     if (symlink(real_model.c_str(), tmp_model.c_str()) != 0) {
         std::fprintf(stderr, "SKIP: could not create temp model symlink\n");
-        return 0;
+        return 77;
     }
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "SKIP: no CUDA/HIP device\n");
         ::unlink(tmp_model.c_str());
-        return 0;
+        return 77;
     }
 
     DeepSeek4Weights w;  // the SAME object is reused across both loads

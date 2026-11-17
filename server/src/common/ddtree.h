@@ -89,13 +89,4 @@ std::vector<int> follow_verified_tree(const DDTree & tree,
                                       int & out_next_token,
                                       int * out_node_idx = nullptr);
 
-// Bound a verified path to the number of tokens that can actually be
-// committed. When truncation removes the old tip, the pending token must be
-// recomputed from the posterior at the new tip; otherwise it describes model
-// state that was never committed.
-bool truncate_verified_path(std::vector<int> & accepted,
-                            std::size_t max_committed,
-                            const int32_t * posterior,
-                            int & out_next_token);
-
 }  // namespace luce::common

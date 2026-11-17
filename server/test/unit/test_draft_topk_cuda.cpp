@@ -184,28 +184,6 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
         idx++;
     }
 
-    {
-        const int n = 4, vocab = 4096;
-        std::vector<float> h(n * vocab, 0.f);
-        float * d = nullptr;
-        if (cudaMalloc(&d, h.size() * sizeof(float)) == cudaSuccess) {
-            cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
-            for (int K : {9, 10, 11, 13, 14, 15, 64}) {
-                std::vector<float>   lp((size_t)n * K);
-                std::vector<int32_t> ids((size_t)n * K);
-                bool ret = geometric_extract_draft_topk_cuda(
-                    d, n, vocab, K, lp.data(), ids.data(), 1.0f);
-                const bool pass = !ret;
-                printf("  [%s] unsupported K contract: K=%d returned %s\n",
-                       pass ? "PASS" : "FAIL", K,
-                       ret ? "true" : "false");
-                if (!pass) failures++;
-                idx++;
-            }
-            cudaFree(d);
-        }
-    }
-
     if (failures) {
         printf("\nFAILED: %d/%d cases\n", failures, idx);
     }

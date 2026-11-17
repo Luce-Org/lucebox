@@ -58,7 +58,7 @@ TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
     // Tight VRAM -> budget binds below the cap, still well under max_ctx/2.
     budget.free_bytes = 2LL * 1024 * 1024 * 1024;          // 2 GiB free
     const int tight = kvflash_pool_from_env(max_ctx, KvFlashConfig{}, true, budget);
-    REQUIRE(tight > 0 && tight <= 16384);
+    REQUIRE(tight == 6656);   // (2 GiB free - 1 GiB reserve) / 2 / 80 KiB = 6553 tokens, rounded up to 256
 
     std::printf("OK test_kvflash_pool_sizing\n");
 }

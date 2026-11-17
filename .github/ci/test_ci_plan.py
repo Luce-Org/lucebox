@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
         (["server/src/qwen35/a.cpp", "server/src/common/dspark_head.cpp"], ALL),
         (["server/src/qwen35/gguf_target_loader.cpp"], ALL),
         (["server/src/qwen35moe/qwen35moe_ffn.h"], ALL),
+        (["server/src/deepseek4_extra.cpp"], ALL),
         (["server/src/laguna/laguna_internal.h"], ALL),
         (["server/deps/llama.cpp/ggml/src/ggml-cuda/mmq.cu"], ALL),
         (["server/CMakeLists.txt"], ALL),
@@ -40,11 +41,6 @@ REPO = Path(__file__).resolve().parents[2]
 )
 def test_plan(paths: list[str] | None, expected: frozenset[str]) -> None:
     assert plan(paths)[0] == expected
-
-
-def test_a_directory_rule_needs_the_whole_name() -> None:
-    assert plan(["server/src/qwen35moe/x.cpp"])[0] == ALL
-    assert plan(["server/src/deepseek4_extra.cpp"])[0] == ALL
 
 
 @pytest.mark.parametrize("pattern", [rule[0] for rule in RULES if not rule[0].startswith("*")])

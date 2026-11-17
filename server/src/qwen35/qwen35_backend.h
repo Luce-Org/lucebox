@@ -176,7 +176,7 @@ public:
 
     CompressResult compress(const CompressRequest & req) override;
     std::vector<CompressResult> compress_batch(
-        const std::vector<CompressRequest> & requests) override;
+        const std::vector<CompressRequest> & requests);
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
