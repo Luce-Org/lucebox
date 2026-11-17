@@ -594,7 +594,6 @@ add_library(luce_common STATIC
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
-    src/pflash/anchor_scan.cpp
     src/pflash/pflash_selection.cpp
     src/pflash/pflash_fold.cpp
     src/pflash/pflash_request_probe.cpp
@@ -2763,7 +2762,6 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
             test/unit/test_ddtree_tau.cpp
-            test/unit/test_anchor_transitive.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp
             test/pflash/test_pflash_fold.cpp
@@ -2812,8 +2810,7 @@ if(LUCE_TESTS)
             src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
-            src/server/prompt_normalize.cpp
-            src/pflash/anchor_scan.cpp)
+            src/server/prompt_normalize.cpp)
         target_include_directories(test_server_unit PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
