@@ -487,6 +487,7 @@ public:
                          first, last, last - first + 1, budget, cfg_.sink_chunks);
         }
         span_lo_ = protect ? first : INT_MAX;
+        span_hi_ = last;
         const struct Clear { int & lo; ~Clear() { lo = INT_MAX; } } clear{span_lo_};   // also on an exception
         for (int i = 0; i < n_tok; ++i) {
             if (slot_for(kv_start + i) < 0) {
@@ -821,7 +822,7 @@ public:
     // Resident, and not sink, tail window, pinned or inside the span being allocated: what an eviction may take.
     bool evictable_(int c) const {
         return c >= 0 && c < (int)chunks_.size() && chunks_[c].block >= 0 && c >= cfg_.sink_chunks &&
-               c <= cur_chunk_ - 1 - cfg_.tail_window_chunks && c < span_lo_ && !is_pinned(c);
+               c <= cur_chunk_ - 1 - cfg_.tail_window_chunks && !(c >= span_lo_ && c <= span_hi_) && !is_pinned(c);
     }
     // Up to n eviction victims, worst first: evictable chunks ordered by score
     // (score_hook, lowest first) or by oldest use (LRU fallback); ties go to
@@ -1477,6 +1478,7 @@ private:
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
     int span_lo_ = INT_MAX;   // first chunk of the alloc_span in progress (INT_MAX: none)
+    int span_hi_ = 0;         // its last chunk (read only while span_lo_ is set)
     bool span_warned_ = false;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;

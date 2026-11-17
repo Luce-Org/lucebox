@@ -401,6 +401,18 @@ TEST_CASE(KvflashPagerTruncateFixture, alloc_span_protection_is_cleared_when_a_s
     CHECK(p.evictable_(8));
 }
 
+// Only the span's own chunks are protected, not everything above its start: re-allocating a paged-out chunk far behind
+// the head must still find a victim (an old chunk outside the span), as it did before the protection existed.
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_behind_the_head_evicts_outside_the_span) {
+    TestPager p;
+    must(p.attach(logic_cfg(24), {}, {}));
+    fill(p, 101 * kChunk);   // head at chunk 100: residents are the sink and the newest chunks
+    CHECK(!p.is_resident(50));
+    CHECK(p.alloc_span(50 * kChunk, 1));
+    CHECK(p.is_resident(50));
+    CHECK(p.is_resident(0));
+}
+
 // The documented limit: a span that cannot sit in the pool beside the sink is not protected (its early chunks stay
 // evictable, as for bulk bookkeeping callers), so a forward that big is not possible. Pinned here so a change to it
 // is a decision.
