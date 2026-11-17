@@ -297,6 +297,9 @@ struct Qwen4ExpSnapshot {
     // and PLE conv state, the MTP carry row), and a restore takes the K/V, QSA and MTP K/V rows from a deeper
     // whole snapshot of a prompt that extends this one.
     bool state_only = false;
+    // KVFlash past the pool: `strips` is the point state alone and the rows stay in the live pager, which a restore
+    // truncates to `cur_pos`. Valid only while the live cache extends `tokens` (the backend checks); no disk form.
+    bool rows_in_pager = false;
     int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
     int64_t kv_bucket_base = 0;
     std::vector<int32_t> ple_prev, tokens;

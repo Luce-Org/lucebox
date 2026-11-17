@@ -562,8 +562,8 @@ static void memory(ggml_backend_t backend) {
 
 // KVFlash: a pooled cache's rows, masks and snapshots. While the context fits the pool the rows are the plain cache's;
 // past it, positions page out least recently used first (the sink chunk stays), a forward's own rows all stay
-// resident, masks follow the position each slot holds, and a relocated prefix publishes no snapshot while a restore
-// lands identity-mapped.
+// resident, masks follow the position each slot holds, a relocated prefix publishes a point-state snapshot whose
+// restore truncates the live pager, and a whole snapshot's restore lands identity-mapped.
 static void kvflash(ggml_backend_t backend) {
     constexpr int pool = 512;
     Qwen4ExpCache c;
@@ -624,8 +624,22 @@ static void kvflash(ggml_backend_t backend) {
         const int32_t pos = c.kvflash_slot_pos[slot];
         CHECK((m[slot] == ggml_fp32_to_fp16(0.0f)) == (pos >= 0 && pos <= 2100));
     }
-    CHECK(!save_qwen4exp_snapshot(backend, backend, c, relocated));
+    // Past the pool the rows stay in the pager: the snapshot is the point state, and a restore truncates the live
+    // pager back to its position (the backend checks the live tokens extend the snapshot's). No disk form.
+    ggml_backend_tensor_memset(c.ssm_state[0], 0x11, 0, ggml_nbytes(c.ssm_state[0]));
+    CHECK(save_qwen4exp_snapshot(backend, backend, c, relocated));
+    CHECK(relocated.rows_in_pager && relocated.strips.size() == 2 && relocated.cur_pos == 2300);
+    CHECK(export_qwen4exp_snapshot("layout", relocated).empty());
+    for (int p = 2300; p < 2600; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+    c.cur_pos = 2600;
+    ggml_backend_tensor_memset(c.ssm_state[0], 0x22, 0, ggml_nbytes(c.ssm_state[0]));
+    CHECK(restore_qwen4exp_snapshot(backend, relocated, c));
+    CHECK(c.cur_pos == 2300 && qwen4exp_kv_row(c, 0) == 0 && qwen4exp_kv_row(c, 2299) >= 0);
+    for (int p = 2304; p < 2600; ++p) CHECK(qwen4exp_kv_row(c, p) < 0);   // 2300..2303 share the kept chunk, zeroed
+    for (auto [live, copy] : relocated.strips) CHECK(bytes(live) == bytes(copy));
     CHECK(restore_qwen4exp_snapshot(backend, s, c));
+    CHECK(!restore_qwen4exp_snapshot(backend, relocated, c));   // a shorter live cache lacks its rows
+    free_qwen4exp_snapshot(relocated);
     CHECK(c.cur_pos == 300 && c.kvflash->is_identity() && c.kvflash->stats().host_bytes == 0);
     for (int p = 0; p < 300; ++p) CHECK(qwen4exp_kv_row(c, p) == p);
     for (auto [live, copy] : s.strips) CHECK(bytes(live) == bytes(copy));
@@ -634,7 +648,7 @@ static void kvflash(ggml_backend_t backend) {
     free_qwen4exp_snapshot(s);
     free_qwen4exp_cache(c);
     CHECK(!c.kvflash);
-    std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, snapshot guard");
+    std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, pager-held snapshot past the pool");
 }
 
 // expert_gpu >= 0 runs split mode (the routed experts on that GPU), with the hot experts of `placement` if given.

@@ -1403,6 +1403,14 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
         // A state-only backup takes its rows from the deeper snapshot the request names; without it, recompute.
         const int kv = req.restore_kv_slot;
         const Qwen4ExpSnapshot * rows = kv >= 0 && kv < kMaxSlots && kv != slot ? &snapshots_[kv] : nullptr;
+        // Pager-held rows are the live cache's: only a live cache that extends the snapshot's tokens has them.
+        // ponytail: otherwise cold; falling back to the deepest whole snapshot needs the server to know, add if
+        // interleaved sessions on a pooled cache matter.
+        const auto & snap = snapshots_[slot];
+        if (snap.rows_in_pager && (tokens_.size() < snap.tokens.size() ||
+                                   !std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin()))) {
+            return generate_impl(req, io);
+        }
         if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
