@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cerrno>
 #include <cstdlib>
 #include <numeric>
 #include <vector>
@@ -50,9 +51,21 @@ inline std::vector<int> q4_recall_top(const std::vector<float> & scores, int n) 
     return idx;
 }
 
-// LUCE_Q4_RECALL_TAIL: unset = kQ4RecallTailDefault, else the integer (0 or less = no two-pass tail).
-constexpr int kQ4RecallTailDefault = 2048;
-inline int q4_recall_tail_from_env(const char * v) { return v ? std::max(0, std::atoi(v)) : kQ4RecallTailDefault; }
+// An integer env value: the whole string, within [lo, hi]. Unset or empty is `def` without complaint; anything else
+// invalid is `def` with `refused` set, for the caller to name the variable and the value used.
+struct Q4EnvInt { int value; bool refused; };
+inline Q4EnvInt q4_parse_env_int(const char * v, int lo, int hi, int def) {
+    if (!v || !*v) return {def, false};
+    char * end = nullptr;
+    errno = 0;
+    const long n = std::strtol(v, &end, 10);
+    const bool digits = (*v >= '0' && *v <= '9') || ((*v == '-' || *v == '+') && v[1] >= '0' && v[1] <= '9');
+    if (!digits || *end || errno == ERANGE || n < lo || n > hi) return {def, true};
+    return {(int) n, false};
+}
+
+// LUCE_Q4_RECALL_TAIL: tokens, 0 = no two-pass tail; contexts stay below 2^24.
+constexpr int kQ4RecallTailDefault = 2048, kQ4RecallTailMax = (1 << 24) - 1;
 
 // Where the two-pass tail starts, or -1 for a single pass. The prompt's last `tail` tokens (no earlier than `pos`, the
 // restored prefix) are prefilled twice, so the tail must start past the pool: a prompt that fits it pages nothing.

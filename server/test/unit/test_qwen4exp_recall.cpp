@@ -77,9 +77,28 @@ int main() {
     assert(st.mode == 1 && st.why == nullptr);
     st = q4_recall_settle(0, 3, false);                         // off stays off, silently
     assert(st.mode == 0 && st.why == nullptr);
-    // LUCE_Q4_RECALL_TAIL: unset = 2048, 0 = off, junk and negatives = off.
-    assert(q4_recall_tail_from_env(nullptr) == 2048 && q4_recall_tail_from_env("512") == 512);
-    assert(q4_recall_tail_from_env("0") == 0 && q4_recall_tail_from_env("-5") == 0 && q4_recall_tail_from_env("x") == 0);
+    // Env integers: the whole string, in range; unset or empty is the default without complaint, anything else the
+    // default and a refusal for the caller to name.
+    auto e = q4_parse_env_int(nullptr, 0, 2, 0);
+    assert(e.value == 0 && !e.refused);
+    e = q4_parse_env_int("", 2, 256, 64);
+    assert(e.value == 64 && !e.refused);
+    e = q4_parse_env_int("128", 2, 256, 64);
+    assert(e.value == 128 && !e.refused);
+    e = q4_parse_env_int("2", 2, 256, 64);                      // both bounds are in range
+    assert(e.value == 2 && !e.refused);
+    e = q4_parse_env_int("256", 2, 256, 64);
+    assert(e.value == 256 && !e.refused);
+    for (const char * bad : {"2048junk", " 5", "5 ", "x", "-", "+", "1.5", "0x10", "1", "257", "-5", "99999999999999999999",
+                             "2147483648", "-99999999999999999999"}) {
+        e = q4_parse_env_int(bad, 2, 256, 64);
+        assert(e.value == 64 && e.refused);
+    }
+    e = q4_parse_env_int("-5", -10, 10, 0);                     // a sign is fine when the range allows it
+    assert(e.value == -5 && !e.refused);
+    // LUCE_Q4_RECALL_TAIL: 0 = off, up to the largest context (2^24 - 1) the cache accepts.
+    assert(q4_parse_env_int("0", 0, kQ4RecallTailMax, kQ4RecallTailDefault).value == 0);
+    assert(q4_parse_env_int("16777216", 0, kQ4RecallTailMax, kQ4RecallTailDefault).refused);
 
     // Empty inputs.
     assert(q4_recall_chunk_votes({}, 0, 0, 0, 4, 0).empty());

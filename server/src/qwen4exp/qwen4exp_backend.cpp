@@ -649,12 +649,19 @@ void Qwen4ExpBackend::size_kvflash_pool() {
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
 }
 
-// LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall) and LUCE_Q4_RECALL_QUERIES. A refused flag falls back to 0.
+// LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall), LUCE_Q4_RECALL_QUERIES and LUCE_Q4_RECALL_TAIL. An invalid value
+// falls back to its default with one line; a refused mode runs as 0.
 void Qwen4ExpBackend::resolve_indexer_recall() {
-    const char * m = std::getenv("LUCE_Q4_INDEXER_RECALL"), * q = std::getenv("LUCE_Q4_RECALL_QUERIES");
-    recall_mode_ = std::clamp(m ? std::atoi(m) : 0, 0, 2);
-    recall_queries_ = std::clamp(q ? std::atoi(q) : 64, 2, 256);
-    recall_tail_ = q4_recall_tail_from_env(std::getenv("LUCE_Q4_RECALL_TAIL"));
+    const auto env_int = [](const char * name, int lo, int hi, int def) {
+        const char * v = std::getenv(name);
+        const Q4EnvInt r = q4_parse_env_int(v, lo, hi, def);
+        if (r.refused)
+            std::fprintf(stderr, "[q4-recall] %s=\"%s\" is not an integer in [%d, %d]; using %d\n", name, v, lo, hi, r.value);
+        return r.value;
+    };
+    recall_mode_ = env_int("LUCE_Q4_INDEXER_RECALL", 0, 2, 0);
+    recall_queries_ = env_int("LUCE_Q4_RECALL_QUERIES", 2, 256, 64);
+    recall_tail_ = env_int("LUCE_Q4_RECALL_TAIL", 0, kQ4RecallTailMax, kQ4RecallTailDefault);
     if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
                      "running with 0\n", recall_mode_, cfg_.max_concurrency);
