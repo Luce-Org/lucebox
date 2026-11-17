@@ -1,6 +1,7 @@
 #include "qwen4exp_backend.h"
 #include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
+#include "qwen4exp_recall.h"
 
 #include "common/moe_hybrid_routing_stats.h"
 #include "common/peer_access.h"
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -450,6 +452,7 @@ bool Qwen4ExpBackend::load_target() {
     }
     load_qwen4exp_output_tail(weights_, backend_);
     size_kvflash_pool();
+    resolve_indexer_recall();
     if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
@@ -623,7 +626,7 @@ bool Qwen4ExpBackend::create_main_cache() {
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
             cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
             slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
-            take_kept_remote(0)))
+            take_kept_remote(0), recall_mode_ > 0 ? recall_queries_ : 0))
         return false;
     disk_layout_ = qwen4exp_disk_layout(cache_);
     return true;
@@ -643,6 +646,87 @@ void Qwen4ExpBackend::size_kvflash_pool() {
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+}
+
+// LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall) and LUCE_Q4_RECALL_QUERIES. A refused flag falls back to 0.
+void Qwen4ExpBackend::resolve_indexer_recall() {
+    const char * m = std::getenv("LUCE_Q4_INDEXER_RECALL"), * q = std::getenv("LUCE_Q4_RECALL_QUERIES");
+    recall_mode_ = std::clamp(m ? std::atoi(m) : 0, 0, 2);
+    recall_queries_ = std::clamp(q ? std::atoi(q) : 64, 2, 256);
+    if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
+                     "running with 0\n", recall_mode_, cfg_.max_concurrency);
+        recall_mode_ = 0;
+    }
+    if (recall_mode_ > 0 && !weights_.qsa) {
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused: this model has no QSA indexer; running with 0\n",
+                     recall_mode_);
+        recall_mode_ = 0;
+    }
+    if (recall_mode_ == 2 && kvflash_pool_for(cfg_.device.max_ctx) == 0) {
+        std::fprintf(stderr, "[q4-recall] mode 2 needs a KVFlash pool smaller than the context (--kvflash); running mode 1\n");
+        recall_mode_ = 1;
+    }
+}
+
+// After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.
+void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) {
+    const auto t0 = std::chrono::steady_clock::now();
+    KvFlashPager * pager = cache_.kvflash.get();
+    const int n_pos = cache_.cur_pos;
+    const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
+    const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
+    if (pager && n_pos <= pager->pool_tokens()) return;   // nothing paged out: nothing to recall
+    if (cache_.remote_layers > 0) {
+        std::fprintf(stderr, "[q4-recall] refused: %d full-attention layers are on the expert device; skipping\n", cache_.remote_layers);
+        return;
+    }
+    Qwen4ExpRecallPicks picks;
+    if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
+        std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
+        return;
+    }
+    const int bpc = chunk_tokens / picks.ratio, n_chunks = (n_pos + chunk_tokens - 1) / chunk_tokens;
+    if (chunk_tokens % picks.ratio != 0) {
+        std::fprintf(stderr, "[q4-recall] chunk of %d tokens is not a multiple of the %d-token block; skipping\n",
+                     chunk_tokens, picks.ratio);
+        return;
+    }
+    std::vector<int> visible((size_t) picks.queries);   // query t sees the blocks complete at its own position
+    for (int t = 0; t < picks.queries; ++t) visible[(size_t) t] = (picks.pos0 + t + 1) / picks.ratio;
+    const std::vector<float> votes = q4_recall_chunk_votes(picks.ids, picks.layers, picks.queries, picks.budget, bpc,
+                                                           n_chunks, &visible);
+    const std::vector<float> scores = q4_recall_chunk_scores(votes);
+    double total = 0;
+    for (float v : votes) total += v;
+    const std::vector<int> top = q4_recall_top(scores, pool_chunks > 0 ? pool_chunks : 8);
+    std::string top_s;
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%s%d:%d", i ? "," : "", top[i], (int) votes[(size_t) top[i]]);
+        top_s += b;
+    }
+    int nonres = 0;
+    for (int c : top) nonres += !(pager && pager->is_resident(c));
+    char resid[48] = "n/a";
+    if (pager) std::snprintf(resid, sizeof resid, "%d/%d", nonres, pool_chunks);
+    const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
+    std::fprintf(stderr, "[q4-recall] n_chunks=%d pool_chunks=%d top=[%s] nonresident_in_top=%s votes_total=%.0f ms=%.1f\n",
+                 n_chunks, pool_chunks, top_s.c_str(), resid, total, ms());
+    if (recall_mode_ < 2 || !pager) return;
+
+    // Mode 2: rank every chunk (resident or paged out) by votes. Chunks past the prompt (generated ones) outrank every
+    // prompt chunk so the decode's evictions take prompt chunks first. The hook stays for this request's decode.
+    keep.emplace(*pager);
+    pager->score_hook = [scores](int c) { return c < (int) scores.size() ? scores[(size_t) c] : 1e6f + (float) c; };
+    // ponytail: the newest chunks (the last turn) are protected by widening reselect's tail to the captured queries' span.
+    const int tail = std::min(4 + (picks.queries + chunk_tokens - 1) / chunk_tokens, pool_chunks / 2);
+    std::vector<uint8_t> was(n_chunks);
+    for (int c = 0; c < n_chunks; ++c) was[(size_t) c] = pager->is_resident(c);
+    const int events = pager->reselect(tail);
+    int page_ins = 0;
+    for (int c = 0; c < n_chunks; ++c) page_ins += !was[(size_t) c] && pager->is_resident(c);
+    std::fprintf(stderr, "[q4-recall] reselect tail=%d page_ins=%d page_events=%d ms=%.1f\n", tail, page_ins, events, ms());
 }
 
 // A pool that holds the whole context pages nothing: such a context keeps one row per position (and QSA).
@@ -959,6 +1043,11 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     std::vector<float> logits = logits_;
     const int chunk = chunk_;
     int pos = restored;
+    // LUCE_Q4_INDEXER_RECALL: the forwards of the prompt's last recall_queries_ tokens append their indexer queries
+    // to recall_q; a cut starts a forward exactly there.
+    const bool recall = recall_mode_ > 0 && cache_.recall_queries > 0 && cache_.remote_layers == 0;
+    cache_.recall_q_n = 0;
+    std::optional<ScopedScoreHook> recall_hook;
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
@@ -978,6 +1067,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // Capture cuts are restore points too, including a one-token interval.
     std::vector<int> cuts = req.restore_points;
     if (req.snap_slot >= 0 && req.snap_pos > 0) cuts.push_back(req.snap_pos);
+    if (recall && (int) req.prompt.size() - recall_queries_ > pos) cuts.push_back((int) req.prompt.size() - recall_queries_);
     std::sort(cuts.begin(), cuts.end());
     auto capture = [&]() {
         if (req.snap_slot >= 0 && req.snap_pos == pos) snapshot_save_replacing(req.snap_slot, restore_slot);
@@ -1011,12 +1101,24 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         std::future<Qwen4ExpInputs> pending;
         if (end < (int) req.prompt.size()) pending = std::async(std::launch::async, prepare, end);
         const bool mtp_prefill = mtp && n > 1;
+        // Every forward inside the last recall_queries_ tokens appends its queries: restore points (the prefix
+        // snapshot sits before the reply template) split that span, and its last forward alone holds ~6 template
+        // tokens. A one-row forward (no capture path) restarts the run so the captured positions stay contiguous.
+        const bool in_tail = recall && pos >= (int) req.prompt.size() - recall_queries_;
+        if (in_tail && n == 1) cache_.recall_q_n = 0;
+        cache_.recall_capture = in_tail && n > 1;
+        const bool captured = cache_.recall_capture;
         const Qwen4ExpForwardResult r = qwen4exp_forward(
             backend_, weights_, cache_, req.prompt.data() + pos, n, pos, logits, mtp ? &hidden : nullptr,
             false, mtp_prefill, &inputs);
+        cache_.recall_capture = false;
         if (!r.ok) {
             result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
             return result;
+        }
+        if (captured) {
+            if (cache_.recall_q_n == 0) cache_.recall_q_pos0 = pos;
+            cache_.recall_q_n += n;
         }
         if (mtp_prefill) {
             mtp_pending.h.swap(hidden);
@@ -1048,6 +1150,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         result.succeed();
         return result;
     }
+
+    if (recall && !recall_hook) run_indexer_recall(recall_hook);
 
     std::mt19937_64 rng(request_rng_seed(req.sampler));
     std::vector<int32_t> history = req.prompt;

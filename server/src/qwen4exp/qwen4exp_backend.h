@@ -124,6 +124,10 @@ private:
     size_t snapshot_bytes(int tokens, bool rows) const;
     bool create_main_cache();
     void size_kvflash_pool();
+    void resolve_indexer_recall();
+    // LUCE_Q4_INDEXER_RECALL after the prompt (see qwen4exp_recall.h): score the chunks with the QSA indexer and log
+    // (mode 1) or also reselect the pool by those scores (mode 2, which keeps the hook in `keep` for the request).
+    void run_indexer_recall(std::optional<ScopedScoreHook> & keep);
     int kvflash_pool_for(int ctx) const;
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
@@ -156,6 +160,8 @@ private:
     ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
     int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
+    int recall_mode_ = 0;      // LUCE_Q4_INDEXER_RECALL after refusals (0 off, 1 score only, 2 recall)
+    int recall_queries_ = 64;  // LUCE_Q4_RECALL_QUERIES
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.

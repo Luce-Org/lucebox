@@ -820,19 +820,38 @@ static Qwen4ExpQsaRow qsa_rows_all(ggml_context * c, const Qwen4ExpDecodeWorkspa
              (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4) };
 }
 
+// The QSA indexer's queries of `cur` [n_embd, T]: [idim, nih, T], normed and M-RoPE'd (contiguous).
+static ggml_tensor * qsa_indexer_queries(ggml_context * c, ggml_tensor * cur, const Qwen4ExpLayer & L,
+        const Qwen4ExpWeights & w, ggml_tensor * positions) {
+    const int64_t T = cur->ne[1];
+    int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
+    ggml_tensor * qi = mm(c, L.indexer_q_proj, cur);              // [idim*nih, T]
+    qi = ggml_reshape_3d(c, qi, w.indexer_head_size, w.indexer_n_head, T);
+    qi = ggml_mul(c, ggml_rms_norm(c, qi, w.rms_eps), L.indexer_q_norm);
+    qi = ggml_rope_multi(c, qi, positions, nullptr, w.rope_dimension_count, sections,
+        GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    return ggml_is_contiguous(qi) ? qi : ggml_cont(c, qi);
+}
+
+// Every head weighs 1.0: the loaded ones constant, or the same values built in the graph. [nih, T] f32.
+static ggml_tensor * qsa_head_weights(ggml_context * c, const Qwen4ExpWeights & w, int64_t T) {
+    const int64_t nih = w.indexer_n_head;
+    return w.qsa_ones && w.qsa_ones->ne[0] == nih && T <= w.qsa_ones->ne[1]
+        ? ggml_view_2d(c, w.qsa_ones, nih, T, w.qsa_ones->nb[1], 0)
+        : ggml_reshape_2d(c, ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f),
+                                             0.0f, 1.0f), nih, T);
+}
+
 static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         ggml_tensor * Q, ggml_tensor * Kf, ggml_tensor * Vf,
         const Qwen4ExpLayer & L, const Qwen4ExpWeights & w, int64_t ratio,
         ggml_tensor * positions, int64_t kv_start,
         ggml_tensor * pooled, int64_t nb, bool packed, const Qwen4ExpQsaRow * ws = nullptr) {
     const int64_t idim   = w.indexer_head_size;
-    const int64_t nih    = w.indexer_n_head;
     const int64_t r      = ratio;
     const int64_t T      = cur->ne[1];
     const int64_t budget = w.indexer_top_k / r;
-    const float   eps    = w.rms_eps;
     const float   qscale = 1.0f / std::sqrt((float) w.n_embd_head_k);
-    int sections[4] = { w.rope_sections[0], w.rope_sections[1], w.rope_sections[2], w.rope_sections[3] };
 
     ggml_tensor * blocks;
     if (nb <= budget) {
@@ -844,12 +863,7 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
         blocks = ggml_cast(c, ggml_repeat_4d(c, ggml_arange(c, 0.0f, (float) count, 1.0f),
             count, T, 1, 1), GGML_TYPE_I32);
     } else {
-        ggml_tensor * qi = mm(c, L.indexer_q_proj, cur);              // [idim*nih, T]
-        qi = ggml_reshape_3d(c, qi, idim, nih, T);
-        qi = ggml_mul(c, ggml_rms_norm(c, qi, eps), L.indexer_q_norm);
-        qi = ggml_rope_multi(c, qi, positions, nullptr, w.rope_dimension_count, sections,
-            GGML_ROPE_TYPE_MROPE, 0, w.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (!ggml_is_contiguous(qi)) qi = ggml_cont(c, qi);
+        ggml_tensor * qi = qsa_indexer_queries(c, cur, L, w, positions);   // [idim, nih, T]
 
         // Every caller passes packed rows (a view of the cache's pooled keys, or this graph's): the cast reads them
         // in place. A ggml_cont first copied every pooled key of the context once more per layer and step (9 MB and
@@ -860,10 +874,7 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
             : ggml_reshape_2d(c, ggml_cont(c, pooled), idim, nb);
         ggml_tensor * comp16 = ggml_cast(c, keys, GGML_TYPE_F16);
         // Every head weighs 1.0: the loaded ones constant, or the same values built in the graph.
-        ggml_tensor * hw = w.qsa_ones && w.qsa_ones->ne[0] == nih && T <= w.qsa_ones->ne[1]
-            ? ggml_view_2d(c, w.qsa_ones, nih, T, w.qsa_ones->nb[1], 0)
-            : ggml_reshape_2d(c, ggml_scale_bias(c, ggml_scale(c, ggml_arange(c, 0.0f, (float) (nih * T), 1.0f), 0.0f),
-                                                 0.0f, 1.0f), nih, T);
+        ggml_tensor * hw = qsa_head_weights(c, w, T);
         ggml_tensor * summed = ws
             ? ggml_ds4_indexer_score_tokenwise(c, qi, hw, comp16, ws->visibility, (int) r)
             : ggml_ds4_indexer_score(c, qi, hw, comp16, (int) kv_start, (int) r);
@@ -905,7 +916,8 @@ enum Qwen4ExpQsaMode { QSA_DENSE = 0, QSA_PREFILL = 1, QSA_DECODE = 2 };
 static Qwen4ExpQsaMode qsa_mode(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, int64_t T, int64_t pos0,
                                 bool enabled) {
     const int64_t r = qsa_ratio(w);
-    if (!enabled || r <= 1 || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
+    // A KVFlash pool attends densely even when LUCE_Q4_INDEXER_RECALL gave it indexer rows (slots are not position order).
+    if (!enabled || r <= 1 || cache.kvflash || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
     if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 || w.indexer_top_k % r != 0) return QSA_DENSE;
     const int64_t budget = w.indexer_top_k / r;
     if (budget * r + (r - 1) > 2560 || w.n_head != 12 * w.n_head_kv) return QSA_DENSE;
@@ -962,7 +974,10 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
                               int64_t n_pooled, Qwen4ExpQsaMode qsa,
                               const std::vector<Qwen4ExpAttnRow> * rows = nullptr,
                               const Qwen4ExpDecodeWorkspace * qsa_ws = nullptr, bool kv_only = false,
-                              bool last_only = false, int draft_window = 0) {
+                              bool last_only = false, int draft_window = 0,
+                              // LUCE_Q4_INDEXER_RECALL: write the raw indexer keys by position (`positions`) rather than
+                              // by kv_row, and copy this forward's indexer queries into `recall_q` ([idim, nih, >= T]).
+                              bool raw_by_pos = false, ggml_tensor * recall_q = nullptr) {
     const int64_t D      = w.n_embd_head_k;   // 256
     const int64_t Hq     = w.n_head;          // 24
     const int64_t Hk     = w.n_head_kv;       // 2
@@ -1027,12 +1042,19 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
     ggml_tensor * kraw = nullptr;
     if (indexer_raw) {
         kraw = mm(c, L.indexer_k_proj, cur);   // [idim, T]
-        ggml_tensor * raw_write = kv_row
-            ? ggml_set_rows(c, indexer_raw, kraw, kv_row)
+        GGML_ASSERT(!raw_by_pos || (positions && positions->ne[0] == 4 * T));
+        ggml_tensor * raw_rows = raw_by_pos ? ggml_view_1d(c, positions, T, 0) : kv_row;   // section 0 = the positions
+        ggml_tensor * raw_write = raw_rows
+            ? ggml_set_rows(c, indexer_raw, kraw, raw_rows)
             : ggml_cpy(c, kraw, ggml_view_2d(c, indexer_raw, kraw->ne[0], T, indexer_raw->nb[1],
                                              (size_t) pos0 * indexer_raw->nb[1]));
         ggml_build_forward_expand(gf, raw_write);
         if (qsa_ws) indexer_raw = raw_write;
+    }
+    if (recall_q) {
+        GGML_ASSERT(T > 1 && T <= recall_q->ne[2] && recall_q->ne[0] == w.indexer_head_size && !last_only);
+        ggml_build_forward_expand(gf, ggml_cpy(c, qsa_indexer_queries(c, cur, L, w, positions),
+            ggml_view_3d(c, recall_q, recall_q->ne[0], recall_q->ne[1], T, recall_q->nb[1], recall_q->nb[2], 0)));
     }
     ggml_tensor * attn = nullptr;
     if (rows) {
@@ -1391,6 +1413,8 @@ static ggml_tensor * build_full_attn_slots(ggml_context * c, ggml_cgraph * gf,
     // Like dense solo, retain raw keys and leave pooling/indexer_blocks lazy until QSA runs.
     ggml_tensor * keys = indexer && caches[0]->indexer_raw[(size_t) fi]
         ? mm(c, L.indexer_k_proj, cur) : nullptr;
+    // ponytail: indexer recall is serial-only; a pool's indexer rows are position-indexed, these writes are slot-indexed.
+    GGML_ASSERT(!keys || !caches[0]->kvflash);
     const Qwen4ExpAttnQkv qkv = attn_qkv(c, L, w, qfull, kraw, vraw, positions);
     ggml_tensor * q = qkv.q, * gate = qkv.gate, * k = qkv.k, * v = qkv.v;
     ggml_tensor * qfa = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));   // [D, S, Hq]
@@ -1704,7 +1728,15 @@ struct Qwen4ExpLayerBuilder {
                                        w.qsa ? cache.indexer_raw[fi] : nullptr,
                                        b.positions, b.mask, b.kv_row, b.kv_len, b.pos0,
                                        il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                       b.n_pooled, b.qsa, rows, qsa_ws);
+                                       b.n_pooled, b.qsa, rows, qsa_ws, false, false, 0,
+                                       /*raw_by_pos=*/cache.kvflash != nullptr,
+                                       cache.recall_capture  // append after the rows earlier tail forwards wrote
+                                           ? ggml_view_3d(ctx, cache.recall_q[fi], cache.recall_q[fi]->ne[0],
+                                                          cache.recall_q[fi]->ne[1],
+                                                          cache.recall_q[fi]->ne[2] - cache.recall_q_n,
+                                                          cache.recall_q[fi]->nb[1], cache.recall_q[fi]->nb[2],
+                                                          (size_t) cache.recall_q_n * cache.recall_q[fi]->nb[2])
+                                           : nullptr);
             });
         }
         const int li = lin_idx[il];
@@ -2251,6 +2283,53 @@ static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights &
     }
     cache.indexer_blocks = pos0 / 4;
     return true;
+}
+
+// LUCE_Q4_INDEXER_RECALL: score the captured prompt-tail queries (cache.recall_q) against every complete block of
+// the context and read back each (layer, query)'s top indexer_top_k / ratio picks, as QSA would select them. First
+// pools the blocks [cache.indexer_blocks, cur_pos / ratio) from indexer_raw (the same function QSA and the decode
+// bootstrap use) and advances cache.indexer_blocks. One graph over all full-attention layers on the target.
+// ponytail: serial, all layers in one graph; needs every layer on the target (no remote rows).
+bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                           Qwen4ExpRecallPicks & out) {
+    const int64_t r = qsa_ratio(w);
+    const int T = cache.recall_q_n, nb = r > 0 ? cache.cur_pos / (int) r : 0;
+    const int budget = r > 0 ? (int) (w.indexer_top_k / r) : 0;
+    const size_t n_full = cache.full_layer_ids.size();
+    if (T <= 0 || nb <= budget || budget <= 0 || cache.remote_layers > 0 || cache.recall_q.size() != n_full) return false;
+    ggml_context * bc = ggml_init({16 * 1024 * 1024, nullptr, true});
+    if (!bc) return false;
+    ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
+    std::vector<ggml_tensor *> tops;
+    const int pooled = std::min(cache.indexer_blocks, nb);
+    for (size_t fi = 0; fi < n_full; ++fi) {
+        if (!cache.indexer_raw[fi] || !cache.recall_q[fi]) continue;
+        const auto & L = w.layers[cache.full_layer_ids[fi]];
+        // Every complete block lies below pos0 = nb * r, so the pooling reads indexer_raw alone (no `kraw`).
+        ggml_tensor * keys = ggml_reshape_2d(bc, qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi],
+                                                                 nullptr, nb * r, r, pooled, nb), w.indexer_head_size, nb);
+        ggml_tensor * qi = ggml_view_3d(bc, cache.recall_q[fi], w.indexer_head_size, w.indexer_n_head, T,
+                                        cache.recall_q[fi]->nb[1], cache.recall_q[fi]->nb[2], 0);
+        ggml_tensor * summed = ggml_ds4_indexer_score(bc, qi, qsa_head_weights(bc, w, T), ggml_cast(bc, keys, GGML_TYPE_F16),
+                                                      cache.recall_q_pos0, (int) r);
+        ggml_tensor * top = ggml_top_k(bc, summed, budget);   // [budget, T] i32
+        ggml_set_output(top);
+        ggml_build_forward_expand(bg, top);
+        tops.push_back(top);
+    }
+    ggml_gallocr_t ba = tops.empty() ? nullptr : ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) && ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        out.layers = (int) tops.size(); out.queries = T; out.budget = budget; out.blocks = nb; out.pos0 = cache.recall_q_pos0; out.ratio = (int) r;
+        out.ids.assign((size_t) out.layers * T * budget, 0);
+        for (size_t i = 0; i < tops.size(); ++i)
+            ggml_backend_tensor_get(tops[i], out.ids.data() + i * (size_t) T * budget, 0, sizeof(int32_t) * (size_t) T * budget);
+        cache.indexer_blocks = nb;
+    }
+    ggml_backend_cuda_graph_invalidate_range(backend, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
+    if (ba) ggml_gallocr_free(ba);
+    ggml_free(bc);
+    return ok;
 }
 
 // The graph's metadata context: a decode or verify workspace's own (`pool`), reset for a rebuild, or a fresh one.

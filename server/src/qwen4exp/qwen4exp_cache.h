@@ -164,6 +164,15 @@ struct Qwen4ExpCache {
     // holds (-1: none) as qwen4exp_kvflash_reserve left the map.
     std::unique_ptr<KvFlashPager> kvflash;
     std::vector<int32_t> kvflash_slot_pos;
+
+    // LUCE_Q4_INDEXER_RECALL: the QSA indexer as the KVFlash residency scorer. Under a pool indexer_raw/indexer_k are
+    // then allocated too (raw keys position-indexed, attention stays dense). `recall_q` holds the post-RoPE indexer
+    // queries [idim, nih, recall_queries] f32 of the last prompt forward, per full-attention layer (the forward sets
+    // `recall_capture`; recall_q_n/recall_q_pos0 are what it captured). recall_queries == 0: off.
+    std::vector<ggml_tensor *> recall_q;
+    int  recall_queries = 0;
+    bool recall_capture = false;
+    int  recall_q_n = 0, recall_q_pos0 = 0;
     ggml_tensor * mtp_k = nullptr;      // MTP draft layer, same layout; null unless created with `mtp`
     ggml_tensor * mtp_v = nullptr;
     ggml_tensor * mtp_prev_hidden = nullptr; // one pending trunk row, for the next prefill chunk's first pair
@@ -252,7 +261,9 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int remote_layers = 0, int kvflash_pool = 0,
                            // A reinstate after a release of the target device: the expert device's K/V
                            // buffer this cache had, kept there; the remote rows are placed back in it.
-                           ggml_backend_buffer_t reuse_remote_buf = nullptr);
+                           ggml_backend_buffer_t reuse_remote_buf = nullptr,
+                           // LUCE_Q4_INDEXER_RECALL: query capacity (0 = off; see Qwen4ExpCache::recall_q).
+                           int recall_queries = 0);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 
