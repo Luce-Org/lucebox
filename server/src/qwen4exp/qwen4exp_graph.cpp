@@ -2298,7 +2298,7 @@ bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
     const size_t n_full = cache.full_layer_ids.size();
     if (T <= 0 || nb <= budget || budget <= 0 || cache.remote_layers > 0 || cache.recall_q.size() != n_full) return false;
     ggml_context * bc = ggml_init({16 * 1024 * 1024, nullptr, true});
-    if (!bc) return false;
+    if (!bc) { out.graph_failed = true; return false; }
     ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
     std::vector<ggml_tensor *> tops;
     const int pooled = std::min(cache.indexer_blocks, nb);
@@ -2319,6 +2319,7 @@ bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
     }
     ggml_gallocr_t ba = tops.empty() ? nullptr : ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) && ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
+    out.graph_failed = !ok && !tops.empty();
     if (ok) {
         out.layers = (int) tops.size(); out.queries = T; out.budget = budget; out.blocks = nb; out.pos0 = cache.recall_q_pos0; out.ratio = (int) r;
         out.ids.assign((size_t) out.layers * T * budget, 0);

@@ -141,10 +141,11 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
 // LUCE_Q4_INDEXER_RECALL: the QSA indexer's top-k block picks for the queries a prompt forward captured
 // (Qwen4ExpCache::recall_q), ids [layer][query][budget]; each query sits at position pos0 + its index. Pools the
 // context's blocks first (advancing cache.indexer_blocks). False: nothing captured, too few blocks to select among,
-// remote layers, or the graph failed.
+// or remote layers (false, graph_failed unset), or the graph failed (false, graph_failed set).
 struct Qwen4ExpRecallPicks {
     std::vector<int32_t> ids;
     int layers = 0, queries = 0, budget = 0, blocks = 0, pos0 = 0, ratio = 0;   // blocks: complete, of `ratio` tokens
+    bool graph_failed = false;   // the preconditions held but the graph did not allocate or compute
 };
 bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                            Qwen4ExpRecallPicks & out);

@@ -699,7 +699,8 @@ void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) 
     if (pager && n_pos <= pager->pool_tokens()) return;   // nothing paged out: nothing to recall
     Qwen4ExpRecallPicks picks;
     if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
-        std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
+        if (picks.graph_failed) std::fprintf(stderr, "[q4-recall] FAILED: the pick graph did not allocate or compute (%d positions)\n", n_pos);
+        else std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
         return;
     }
     const int bpc = chunk_tokens / picks.ratio, n_chunks = (n_pos + chunk_tokens - 1) / chunk_tokens;
@@ -1219,8 +1220,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         }
         if (pending.valid()) inputs = pending.get();
     }
-    // A failed rewind leaves the first pass's state in place: the prefill is complete, the tail replay is not.
-    if (tail_log.stage != Q4TailStage::RewindFailed) tail_log.status = "ok";
+    // A failed rewind leaves the first pass's state in place: the prefill is complete and the request goes on to
+    // generate, only the tail replay is missing.
+    tail_log.status = tail_log.stage == Q4TailStage::RewindFailed ? "no-replay" : "ok";
     const auto t_pre1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
     if (req.n_gen <= 0) {

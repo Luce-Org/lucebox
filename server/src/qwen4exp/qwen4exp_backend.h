@@ -13,6 +13,7 @@
 #include "qwen4exp_internal.h"
 #include "qwen4exp_cache.h"
 #include "qwen4exp_mtp.h"
+#include "qwen4exp_recall.h"
 #include "qwen4exp_seq_engine.h"
 
 #include "ggml.h"
@@ -163,7 +164,7 @@ private:
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     int recall_mode_ = 0;      // LUCE_Q4_INDEXER_RECALL after refusals (0 off, 1 score only, 2 recall)
     int recall_queries_ = 64;  // LUCE_Q4_RECALL_QUERIES
-    int recall_tail_ = 0;      // LUCE_Q4_RECALL_TAIL (mode 2 only)
+    int recall_tail_ = kQ4RecallTailDefault;   // LUCE_Q4_RECALL_TAIL (mode 2 only)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.
