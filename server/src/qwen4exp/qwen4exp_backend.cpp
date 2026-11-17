@@ -1113,7 +1113,8 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     int tail_pos = tail_path == Q4TailPath::TwoPass
         ? q4_recall_tail_pos(pos, (int) req.prompt.size(), recall_tail_, pool_tokens) : -1;
     Qwen4ExpSnapshot tail_snap;
-    struct TailSnapFree { Qwen4ExpSnapshot & s; ~TailSnapFree() { free_qwen4exp_snapshot(s); } } tail_free{tail_snap};
+    const auto drop_tail = [&] { free_qwen4exp_snapshot(tail_snap); tail_snap_bytes_ = 0; };
+    struct TailSnapFree { const decltype(drop_tail) & drop; ~TailSnapFree() { drop(); } } tail_free{drop_tail};
     Qwen4ExpMtpPending tail_mtp;
     // One [q4-tail] line per mode-2 request, written when it leaves: the path that ran and how the prefill ended.
     struct TailLog {
@@ -1181,12 +1182,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         tail_log.recalled = recall_hook.has_value();
         if (!recall_hook) {   // the pool is as the first pass left it: the replay would reproduce that pass exactly
             tail_log.stage = Q4TailStage::NothingRecalled;
-            free_qwen4exp_snapshot(tail_snap);
+            drop_tail();
             return false;
         }
         const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
         tail_log.stage = ok ? Q4TailStage::Rewound : Q4TailStage::RewindFailed;
-        free_qwen4exp_snapshot(tail_snap);
+        drop_tail();
         if (!ok) return false;
         pos = tail_pos;
         tail_pos = -1;
@@ -1203,8 +1204,13 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             return result;
         }
         if (pos == tail_pos && !tail_snap.buf) {
-            if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) tail_mtp = mtp_pending;
-            else {
+            if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) {
+                tail_mtp = mtp_pending;
+                // Past the pool it holds the point state alone. On a GPU with its own memory (LUCE_Q4_SNAPSHOT_DEVICE)
+                // captures leave it room while it lives, so it never takes memory the allowance promised them.
+                tail_snap_bytes_ = snap_host_ && snap_backend_ == backend_
+                                 ? ggml_backend_buffer_get_size(tail_snap.buf) : 0;
+            } else {
                 tail_pos = -1;
                 tail_log.stage = Q4TailStage::SnapFailed;
             }
@@ -1592,7 +1598,8 @@ bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
                                      : snapshots_[i].state_only || snapshots_[i].rows_in_pager;
         return snapshot_bytes(live ? cache_.cur_pos : snapshots_[i].cur_pos, /*rows=*/!point_only);
     };
-    size_t remaining = snapshot_budget_;
+    if (tail_snap_bytes_ > snapshot_budget_) return false;
+    size_t remaining = snapshot_budget_ - tail_snap_bytes_;
     for (int i = 0; i < kMaxSlots; ++i) {
         if (i == slot || i == replaced || !snapshot_used(i)) continue;
         const size_t bytes = charge(i);

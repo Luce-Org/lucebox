@@ -171,6 +171,7 @@ private:
     int recall_queries_ = 64;  // LUCE_Q4_RECALL_QUERIES
     int recall_tail_ = kQ4RecallTailDefault;   // LUCE_Q4_RECALL_TAIL (mode 2 only)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
+    size_t tail_snap_bytes_ = 0;        // a live two-pass recall tail snapshot inside that allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.
     std::array<Qwen4ExpSnapshot, kMaxSlots> displaced_;
