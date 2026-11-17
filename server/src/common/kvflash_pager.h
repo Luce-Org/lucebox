@@ -478,7 +478,7 @@ public:
     bool alloc_span(int kv_start, int n_tok) {
         const int first = (int)(kv_start / cfg_.chunk_tokens);
         const int last = (int)((kv_start + n_tok - 1) / cfg_.chunk_tokens);
-        const int budget = n_blocks_ - cfg_.sink_chunks;
+        const int budget = n_blocks_ - std::min(cfg_.sink_chunks, first);   // sink chunks inside the span need no slot beside it
         const bool protect = n_tok > 0 && last - first + 1 <= budget;
         if (n_tok > 0 && !protect && !span_warned_) {
             span_warned_ = true;
