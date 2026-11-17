@@ -455,7 +455,7 @@ struct PreFixModel {
     std::vector<uint8_t> res;
     std::vector<uint64_t> use;
     std::function<float(int)> score;
-    bool evicted_touched = false, evicted_untouched = false;   // a victim inside the span: already written / not yet
+    bool evicted_touched = false, evicted_untouched = false;   // a victim among the span's chunks: already written / not yet
     PreFixModel(int b, int max_chunks) : blocks(b), res((size_t)max_chunks, 0), use((size_t)max_chunks, 0) {}
 
     int victim() const {
@@ -468,14 +468,14 @@ struct PreFixModel {
         }
         return best;
     }
-    int slot_for(int pos, int span_first) {
+    int slot_for(int pos, int span_first, int span_last) {
         const int c = pos / kChunk, prev = cur;
         cur = std::max(cur, c);
         if (!res[(size_t)c]) {
             if (resident == blocks) {
                 const int v = victim();
                 if (v < 0) { cur = prev; return -1; }
-                (v < c ? evicted_touched : evicted_untouched) |= v >= span_first;
+                (v < c ? evicted_touched : evicted_untouched) |= v >= span_first && v <= span_last;
                 res[(size_t)v] = 0;
                 resident--;
             }
@@ -486,7 +486,7 @@ struct PreFixModel {
         return 0;
     }
     bool alloc_span(int start, int n) {
-        for (int i = 0; i < n; i++) if (slot_for(start + i, start / kChunk) < 0) return false;
+        for (int i = 0; i < n; i++) if (slot_for(start + i, start / kChunk, (start + n - 1) / kChunk) < 0) return false;
         return true;
     }
 };
@@ -495,9 +495,10 @@ struct PreFixModel {
 
 // Evidence that the span protection leaves every other KVFlash caller alone: random forwards that fit the pool (appends
 // with an unaligned restart, and re-forwards of older rows), run on the pager and on the pre-fix rules, keep the same
-// resident set and the same result. A run ends at the first forward where the pre-fix rules would have taken a victim
-// inside the forward's own span. For an append that is only a chunk already written (the bug the fix is for, only with
-// a scorer: LRU ranks a forward's chunks newest). A re-forward over resident rows far behind the head can also lose a
+// resident set and the same result, including re-forwards of paged-out chunks behind the head (victims outside the span,
+// above or below it, are compared like any other). A run ends at the first forward where the pre-fix rules would have
+// taken a victim among the forward's own chunks [first, last]. For an append that is only a
+// chunk already written (the bug the fix is for, only with a scorer: LRU ranks a forward's chunks newest). A re-forward over resident rows far behind the head can also lose a
 // chunk it has not reached yet under the pre-fix rules (it would page back in); the fix keeps it, the one intended
 // difference.
 TEST_CASE(KvflashPagerTruncateFixture, alloc_span_victims_match_the_pre_fix_selection_for_normal_forwards) {
