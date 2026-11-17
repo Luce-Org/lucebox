@@ -62,11 +62,13 @@ int main() {
     using S = Q4TailStage;
     assert(std::string(q4_tail_outcome(P::FitsPool, S::Planned)) == q4_tail_outcome(P::FitsPool, S::Rewound));
     const std::string two[] = {q4_tail_outcome(P::TwoPass, S::Planned), q4_tail_outcome(P::TwoPass, S::SnapFailed),
-                               q4_tail_outcome(P::TwoPass, S::RewindFailed), q4_tail_outcome(P::TwoPass, S::Rewound)};
-    for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j) assert(two[i] != two[j]);
+                               q4_tail_outcome(P::TwoPass, S::RewindFailed), q4_tail_outcome(P::TwoPass, S::Rewound),
+                               q4_tail_outcome(P::TwoPass, S::NothingRecalled)};
+    for (int i = 0; i < 5; ++i) for (int j = i + 1; j < 5; ++j) assert(two[i] != two[j]);
     assert(two[1].find("single pass") == 0);                              // a failed tail snapshot runs a single pass
     assert(two[2].find("prefilled twice") == std::string::npos);          // a failed rewind never replayed the tail
     assert(two[3].find("rewound") != std::string::npos);
+    assert(two[4].find("replay") != std::string::npos && two[4].find("prefilled twice") == std::string::npos);   // pass 1 recalled nothing: no rewind
     // The mode after context fitting settled the layout: attention on the expert device refuses recall, no pool left
     // downgrades recall to score only, and each change carries the one startup line's reason.
     auto st = q4_recall_settle(2, 0, true);

@@ -1134,6 +1134,11 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         if (!tail_snap.buf) return false;
         run_indexer_recall(recall_hook);
         tail_log.recalled = recall_hook.has_value();
+        if (!recall_hook) {   // the pool is as the first pass left it: the replay would reproduce that pass exactly
+            tail_log.stage = Q4TailStage::NothingRecalled;
+            free_qwen4exp_snapshot(tail_snap);
+            return false;
+        }
         const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
         tail_log.stage = ok ? Q4TailStage::Rewound : Q4TailStage::RewindFailed;
         free_qwen4exp_snapshot(tail_snap);
@@ -1218,7 +1223,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         return result;
     }
 
-    if (recall && !recall_hook) run_indexer_recall(recall_hook);
+    if (recall && !recall_hook && tail_log.stage != Q4TailStage::NothingRecalled) run_indexer_recall(recall_hook);
     tail_log.recalled = recall_hook.has_value();
 
     std::mt19937_64 rng(request_rng_seed(req.sampler));

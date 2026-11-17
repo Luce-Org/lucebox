@@ -98,7 +98,7 @@ inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int poo
     return Q4TailPath::TwoPass;
 }
 // How far a planned two-pass run got; other paths ignore it.
-enum class Q4TailStage { Planned, SnapFailed, RewindFailed, Rewound };
+enum class Q4TailStage { Planned, SnapFailed, NothingRecalled, RewindFailed, Rewound };
 inline const char * q4_tail_outcome(Q4TailPath p, Q4TailStage s) {
     switch (p) {
         case Q4TailPath::Off:        return "single pass: LUCE_Q4_RECALL_TAIL=0, recall after the prefill";
@@ -107,10 +107,11 @@ inline const char * q4_tail_outcome(Q4TailPath p, Q4TailStage s) {
         case Q4TailPath::NoForward:  return "single pass: the whole prompt was restored, no prefill forward runs, no queries to recall from";
         case Q4TailPath::TwoPass:
             switch (s) {
-                case Q4TailStage::Planned:      return "two-pass: stopped before the rewind";
-                case Q4TailStage::SnapFailed:   return "single pass: the tail snapshot failed, recall after the prefill";
-                case Q4TailStage::RewindFailed: return "two-pass: the rewind failed, the tail was not replayed";
-                case Q4TailStage::Rewound:      return "two-pass: rewound to the tail start, tail prefilled twice";
+                case Q4TailStage::Planned:               return "two-pass: stopped before the rewind";
+                case Q4TailStage::SnapFailed:            return "single pass: the tail snapshot failed, recall after the prefill";
+                case Q4TailStage::NothingRecalled:       return "single pass: the first pass recalled nothing, so the replay would repeat it";
+                case Q4TailStage::RewindFailed:          return "two-pass: the rewind failed, the tail was not replayed";
+                case Q4TailStage::Rewound:               return "two-pass: rewound to the tail start, tail prefilled twice";
             }
     }
     return "?";
