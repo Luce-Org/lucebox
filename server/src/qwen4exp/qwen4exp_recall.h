@@ -88,9 +88,10 @@ inline Q4RecallSettled q4_recall_settle(int mode, int remote_layers, bool pooled
 inline bool q4_recall_run_breaks(int n, int end, int prompt_len) { return n == 1 && end < prompt_len; }
 
 // The path a mode-2 request plans under a pool; q4_tail_outcome names what ran for the one [q4-tail] line.
-enum class Q4TailPath { Off, FitsPool, TailInPool, NoForward, TwoPass };
-inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int pool_tokens) {
+enum class Q4TailPath { Off, NoDecode, FitsPool, TailInPool, NoForward, TwoPass };
+inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int pool_tokens, int n_gen) {
     if (tail <= 0) return Q4TailPath::Off;
+    if (n_gen <= 0) return Q4TailPath::NoDecode;   // a prefill-only request decodes nothing the recall could serve
     if (prompt_len <= pool_tokens) return Q4TailPath::FitsPool;
     const int t = q4_recall_tail_pos(pos, prompt_len, tail, pool_tokens);
     if (t < 0) return Q4TailPath::TailInPool;
@@ -102,6 +103,7 @@ enum class Q4TailStage { Planned, SnapFailed, NothingRecalled, RewindFailed, Rew
 inline const char * q4_tail_outcome(Q4TailPath p, Q4TailStage s) {
     switch (p) {
         case Q4TailPath::Off:        return "single pass: LUCE_Q4_RECALL_TAIL=0, recall after the prefill";
+        case Q4TailPath::NoDecode:   return "single pass: no tokens to generate, no recall";
         case Q4TailPath::FitsPool:   return "single pass: the prompt fits the pool, nothing paged out";
         case Q4TailPath::TailInPool: return "single pass: the tail would start inside the pool (pool < prompt <= pool + tail), recall after the prefill";
         case Q4TailPath::NoForward:  return "single pass: the whole prompt was restored, no prefill forward runs, no queries to recall from";

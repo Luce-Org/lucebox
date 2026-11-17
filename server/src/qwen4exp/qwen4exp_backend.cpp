@@ -1061,8 +1061,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // LUCE_Q4_RECALL_TAIL (mode 2, past the pool): prefill the prompt's last recall_tail_ tokens twice. The first pass
     // captures the queries recall ranks the chunks by; the state then rolls back to the tail's start, and the second
     // pass attends to the recalled chunks, which the decode keeps.
-    int tail_pos = recall && recall_mode_ == 2 && cache_.kvflash
-        ? q4_recall_tail_pos(pos, (int) req.prompt.size(), recall_tail_, cache_.kvflash->pool_tokens()) : -1;
+    const bool tail_armed = recall && recall_mode_ == 2 && cache_.kvflash;
+    const int pool_tokens = tail_armed ? cache_.kvflash->pool_tokens() : 0;
+    const Q4TailPath tail_path = tail_armed
+        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, pool_tokens, req.n_gen) : Q4TailPath::Off;
+    int tail_pos = tail_path == Q4TailPath::TwoPass
+        ? q4_recall_tail_pos(pos, (int) req.prompt.size(), recall_tail_, pool_tokens) : -1;
     Qwen4ExpSnapshot tail_snap;
     struct TailSnapFree { Qwen4ExpSnapshot & s; ~TailSnapFree() { free_qwen4exp_snapshot(s); } } tail_free{tail_snap};
     Qwen4ExpMtpPending tail_mtp;
@@ -1080,10 +1084,6 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
                              q4_tail_outcome(path, stage), status, (int) recalled, prompt, restored, pool, tail);
         }
     };
-    const bool tail_armed = recall && recall_mode_ == 2 && cache_.kvflash;
-    const int pool_tokens = tail_armed ? cache_.kvflash->pool_tokens() : 0;
-    const Q4TailPath tail_path = tail_armed
-        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, pool_tokens) : Q4TailPath::Off;
     TailLog tail_log{tail_armed, tail_path, Q4TailStage::Planned, "failed", false,
                      (int) req.prompt.size(), pos, pool_tokens, recall_tail_};
 

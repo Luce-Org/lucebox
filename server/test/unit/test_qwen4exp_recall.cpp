@@ -50,14 +50,17 @@ int main() {
     assert(q4_recall_tail_pos(0, 100, 2048, 4096) == -1);            // tail longer than the prompt
     // The path a mode-2 request takes, as the one [q4-tail] line names it.
     using P = Q4TailPath;
-    assert(q4_recall_tail_path(0, 10000, 0, 4096) == P::Off);
-    assert(q4_recall_tail_path(0, 3000, 2048, 4096) == P::FitsPool);       // nothing is paged out
-    assert(q4_recall_tail_path(0, 4096, 2048, 4096) == P::FitsPool);
-    assert(q4_recall_tail_path(0, 6000, 2048, 4096) == P::TailInPool);     // pool < P <= pool + tail: recall after prefill
-    assert(q4_recall_tail_path(0, 10000, 2048, 4096) == P::TwoPass);
-    assert(q4_recall_tail_path(9990, 10000, 2048, 4096) == P::TwoPass);    // a restored prefix shortens the tail
-    assert(q4_recall_tail_path(9999, 10000, 2048, 4096) == P::TwoPass);     // a one-token tail still recalls from the earlier rows
-    assert(q4_recall_tail_path(10000, 10000, 2048, 4096) == P::NoForward);   // exact repeat: no forward at all
+    assert(q4_recall_tail_path(0, 10000, 0, 4096, 1) == P::Off);
+    assert(q4_recall_tail_path(0, 3000, 2048, 4096, 1) == P::FitsPool);       // nothing is paged out
+    assert(q4_recall_tail_path(0, 4096, 2048, 4096, 1) == P::FitsPool);
+    assert(q4_recall_tail_path(0, 6000, 2048, 4096, 1) == P::TailInPool);     // pool < P <= pool + tail: recall after prefill
+    assert(q4_recall_tail_path(0, 10000, 2048, 4096, 1) == P::TwoPass);
+    assert(q4_recall_tail_path(9990, 10000, 2048, 4096, 1) == P::TwoPass);    // a restored prefix shortens the tail
+    assert(q4_recall_tail_path(9999, 10000, 2048, 4096, 1) == P::TwoPass);     // a one-token tail still recalls from the earlier rows
+    assert(q4_recall_tail_path(0, 10000, 2048, 4096, 0) == P::NoDecode);     // nothing to generate: no two-pass tail
+    assert(q4_recall_tail_path(0, 10000, 2048, 4096, -1) == P::NoDecode);
+    assert(q4_recall_tail_path(0, 10000, 0, 4096, 0) == P::Off);
+    assert(q4_recall_tail_path(10000, 10000, 2048, 4096, 1) == P::NoForward);   // exact repeat: no forward at all
     // The [q4-tail] line names what ran: a planned two-pass run reports how far it got, every other path is itself.
     using S = Q4TailStage;
     assert(std::string(q4_tail_outcome(P::FitsPool, S::Planned)) == q4_tail_outcome(P::FitsPool, S::Rewound));
