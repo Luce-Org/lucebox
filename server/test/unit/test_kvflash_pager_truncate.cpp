@@ -366,3 +366,67 @@ TEST_CASE(KvflashPagerTruncateFixture, tail_forwards_under_a_scorer_keep_every_i
         }
     }
 }
+
+// A tensor-less pager of `blocks` chunks (default sink and tail window), filled to its head with LRU appends.
+namespace {
+KvFlashConfig logic_cfg(int blocks) {
+    KvFlashConfig cfg;
+    cfg.pool_tokens = blocks * kChunk;
+    return cfg;
+}
+// Append [0, tokens) one chunk per forward, as a prompt prefill does.
+void fill(TestPager & p, int tokens) {
+    for (int pos = 0; pos < tokens; pos += kChunk) must(p.alloc_span(pos, std::min(kChunk, tokens - pos)));
+}
+}
+
+// The protection is scoped: a scorer that throws mid-allocation must not leave the span's chunks unevictable.
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_protection_is_cleared_when_a_scorer_throws) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    fill(p, 8 * kChunk);
+    bool armed = false;
+    p.score_hook = [&](int c) {
+        if (armed && p.is_resident(12) && !p.is_resident(13)) throw std::runtime_error("scorer failed");
+        return (float)c;
+    };
+    armed = true;
+    bool threw = false;
+    try { p.alloc_span(8 * kChunk, 6 * kChunk); } catch (const std::runtime_error &) { threw = true; }
+    CHECK(threw);
+    // The head sits at chunk 13, so chunk 8 is past the tail window: an eviction may take it again.
+    CHECK(p.is_resident(8));
+    CHECK(p.evictable_(8));
+}
+
+// The documented limit: a span that cannot sit in the pool beside the sink is not protected (its early chunks stay
+// evictable, as for bulk bookkeeping callers), so a forward that big is not possible. Pinned here so a change to it
+// is a decision.
+TEST_CASE(KvflashPagerTruncateFixture, oversized_span_keeps_its_early_chunks_evictable) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    fill(p, 8 * kChunk);
+    p.score_hook = [](int c) { return c >= 8 ? (float)c : 100.f + (float)c; };   // the span's chunks rank lowest
+    p.alloc_span(8 * kChunk, 8 * kChunk);   // 8 chunks + the sink do not fit 8 blocks
+    bool lost = false;
+    for (int c = 8; c < 16; c++) lost |= !p.is_resident(c);
+    CHECK(lost);
+}
+
+// qwen4exp caps a forward at pool - 2 chunks of rows (qwen4exp_max_forward_rows): even unaligned that touches at most
+// pool_blocks - 1 chunks, which sit beside the sink, so every qwen4exp span is protected.
+TEST_CASE(KvflashPagerTruncateFixture, qwen4exp_forward_row_cap_keeps_every_span_protectable) {
+    for (const int blocks : {8, 9, 16, 31, 64}) {
+        for (const int offset : {0, 1, kChunk / 2, kChunk - 1}) {
+            TestPager p;
+            must(p.attach(logic_cfg(blocks), {}, {}));
+            const int head = (blocks + 3) * kChunk;   // a pool that has been evicting
+            fill(p, head);
+            p.score_hook = [&](int c) { return c >= blocks + 3 ? (float)c : 100.f + (float)c; };
+            const int rows = (blocks - 2) * kChunk;
+            must(p.alloc_span(head + offset, rows));
+            for (int q = head + offset; q < head + offset + rows; q += kChunk) CHECK(p.slot_of(q) >= 0);
+            CHECK(p.slot_of(head + offset + rows - 1) >= 0);
+        }
+    }
+}

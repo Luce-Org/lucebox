@@ -473,21 +473,29 @@ public:
     //
     // The span's own chunks are never victims, whatever a scorer ranks them: the forward writes them next, and a
     // chunk evicted before that has no slot (its rows would land on row -1). A span too big to sit in the pool beside
-    // the sink cannot be forwarded in one piece anyway; its early chunks stay evictable (bulk bookkeeping callers).
+    // the sink cannot be forwarded in one piece anyway; its early chunks stay evictable (bulk bookkeeping callers) and
+    // the first such span warns. A forward caller caps its rows so every span it allocates fits.
     bool alloc_span(int kv_start, int n_tok) {
         const int first = (int)(kv_start / cfg_.chunk_tokens);
         const int last = (int)((kv_start + n_tok - 1) / cfg_.chunk_tokens);
-        span_lo_ = n_tok > 0 && last - first + 1 <= n_blocks_ - cfg_.sink_chunks ? first : INT_MAX;
+        const int budget = n_blocks_ - cfg_.sink_chunks;
+        const bool protect = n_tok > 0 && last - first + 1 <= budget;
+        if (n_tok > 0 && !protect && !span_warned_) {
+            span_warned_ = true;
+            std::fprintf(stderr, "[kvflash] alloc_span: span of chunks [%d,%d] (%d) does not fit the %d evictable pool "
+                                 "blocks beside %d sink chunks; its early chunks stay evictable and may lose their slot\n",
+                         first, last, last - first + 1, budget, cfg_.sink_chunks);
+        }
+        span_lo_ = protect ? first : INT_MAX;
+        const struct Clear { int & lo; ~Clear() { lo = INT_MAX; } } clear{span_lo_};   // also on an exception
         for (int i = 0; i < n_tok; ++i) {
             if (slot_for(kv_start + i) < 0) {
-                span_lo_ = INT_MAX;
                 std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
                                      "(pool %d exhausted)\n",
                              kv_start + i, cfg_.pool_tokens);
                 return false;
             }
         }
-        span_lo_ = INT_MAX;
         if (has_pending_page_in_ && !batch_submit_) synchronize_paging();   // batch: the step's one Fence waits
         return true;
     }
@@ -1469,6 +1477,7 @@ private:
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
     int span_lo_ = INT_MAX;   // first chunk of the alloc_span in progress (INT_MAX: none)
+    bool span_warned_ = false;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
 
