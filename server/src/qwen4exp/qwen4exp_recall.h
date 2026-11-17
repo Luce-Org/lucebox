@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 #include <vector>
 
@@ -47,6 +48,18 @@ inline std::vector<int> q4_recall_top(const std::vector<float> & scores, int n) 
     std::partial_sort(idx.begin(), idx.begin() + n, idx.end(), [&](int a, int b) { return scores[(size_t) a] > scores[(size_t) b]; });
     idx.resize((size_t) n);
     return idx;
+}
+
+// LUCE_Q4_RECALL_TAIL: unset = kQ4RecallTailDefault, else the integer (0 or less = no two-pass tail).
+constexpr int kQ4RecallTailDefault = 2048;
+inline int q4_recall_tail_from_env(const char * v) { return v ? std::max(0, std::atoi(v)) : kQ4RecallTailDefault; }
+
+// Where the two-pass tail starts, or -1 for a single pass. The prompt's last `tail` tokens (no earlier than `pos`, the
+// restored prefix) are prefilled twice, so the tail must start past the pool: a prompt that fits it pages nothing.
+inline int q4_recall_tail_pos(int pos, int prompt_len, int tail, int pool_tokens) {
+    if (tail <= 0) return -1;
+    const int t = std::max(pos, prompt_len - tail);
+    return t <= pool_tokens ? -1 : t;
 }
 
 }  // namespace luce::common

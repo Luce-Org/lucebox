@@ -1,5 +1,5 @@
 // Pure host checks of the QSA-indexer KVFlash recall scorer (LUCE_Q4_INDEXER_RECALL): vote aggregation, newer-chunk
-// tie-break, top list. No model, backend or GPU.
+// tie-break, top list, the two-pass tail's start and knob. No model, backend or GPU.
 #include "qwen4exp/qwen4exp_recall.h"
 #include <cassert>
 #include <cmath>
@@ -38,6 +38,18 @@ int main() {
     // Top list.
     assert((q4_recall_top(s, 3) == std::vector<int>{4, 1, 0}));
     assert(q4_recall_top(s, 99).size() == 5);
+
+    // Two-pass tail: starts `tail` tokens before the prompt's end, never before the restored prefix, and only past the pool.
+    assert(q4_recall_tail_pos(0, 10000, 2048, 4096) == 10000 - 2048);
+    assert(q4_recall_tail_pos(9500, 10000, 2048, 4096) == 9500);     // a restored prefix inside the tail: start there
+    assert(q4_recall_tail_pos(0, 6000, 2048, 4096) == -1);           // tail starts at 3952 <= pool: single pass
+    assert(q4_recall_tail_pos(0, 6144, 2048, 4096) == -1);           // tail starts exactly at the pool: nothing paged before it
+    assert(q4_recall_tail_pos(0, 6145, 2048, 4096) == 4097);
+    assert(q4_recall_tail_pos(0, 10000, 0, 4096) == -1);             // tail off
+    assert(q4_recall_tail_pos(0, 100, 2048, 4096) == -1);            // tail longer than the prompt
+    // LUCE_Q4_RECALL_TAIL: unset = 2048, 0 = off, junk and negatives = off.
+    assert(q4_recall_tail_from_env(nullptr) == 2048 && q4_recall_tail_from_env("512") == 512);
+    assert(q4_recall_tail_from_env("0") == 0 && q4_recall_tail_from_env("-5") == 0 && q4_recall_tail_from_env("x") == 0);
 
     // Empty inputs.
     assert(q4_recall_chunk_votes({}, 0, 0, 0, 4, 0).empty());

@@ -653,6 +653,7 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
     const char * m = std::getenv("LUCE_Q4_INDEXER_RECALL"), * q = std::getenv("LUCE_Q4_RECALL_QUERIES");
     recall_mode_ = std::clamp(m ? std::atoi(m) : 0, 0, 2);
     recall_queries_ = std::clamp(q ? std::atoi(q) : 64, 2, 256);
+    recall_tail_ = q4_recall_tail_from_env(std::getenv("LUCE_Q4_RECALL_TAIL"));
     if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
                      "running with 0\n", recall_mode_, cfg_.max_concurrency);
@@ -1048,6 +1049,14 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     const bool recall = recall_mode_ > 0 && cache_.recall_queries > 0 && cache_.remote_layers == 0;
     cache_.recall_q_n = 0;
     std::optional<ScopedScoreHook> recall_hook;
+    // LUCE_Q4_RECALL_TAIL (mode 2, past the pool): prefill the prompt's last recall_tail_ tokens twice. The first pass
+    // captures the queries recall ranks the chunks by; the state then rolls back to the tail's start, and the second
+    // pass attends to the recalled chunks, which the decode keeps.
+    int tail_pos = recall && recall_mode_ == 2 && cache_.kvflash
+        ? q4_recall_tail_pos(pos, (int) req.prompt.size(), recall_tail_, cache_.kvflash->pool_tokens()) : -1;
+    Qwen4ExpSnapshot tail_snap;
+    struct TailSnapFree { Qwen4ExpSnapshot & s; ~TailSnapFree() { free_qwen4exp_snapshot(s); } } tail_free{tail_snap};
+    Qwen4ExpMtpPending tail_mtp;
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
@@ -1068,6 +1077,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     std::vector<int> cuts = req.restore_points;
     if (req.snap_slot >= 0 && req.snap_pos > 0) cuts.push_back(req.snap_pos);
     if (recall && (int) req.prompt.size() - recall_queries_ > pos) cuts.push_back((int) req.prompt.size() - recall_queries_);
+    if (tail_pos > pos) cuts.push_back(tail_pos);
     std::sort(cuts.begin(), cuts.end());
     auto capture = [&]() {
         if (req.snap_slot >= 0 && req.snap_pos == pos) snapshot_save_replacing(req.snap_slot, restore_slot);
@@ -1091,10 +1101,29 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     };
     capture();
     auto inputs = pos < (int) req.prompt.size() ? prepare(pos) : Qwen4ExpInputs{};
-    while (pos < (int) req.prompt.size()) {
+    auto tail_rewind = [&]() {
+        if (!tail_snap.buf) return false;
+        run_indexer_recall(recall_hook);
+        const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
+        std::fprintf(stderr, "[q4-tail] rewind %d -> %d ok=%d\n", pos, tail_snap.cur_pos, (int) ok);
+        free_qwen4exp_snapshot(tail_snap);
+        if (!ok) return false;
+        pos = tail_pos;
+        tail_pos = -1;
+        tokens_.resize((size_t) pos);
+        mtp_pending = tail_mtp;
+        cache_.recall_q_n = 0;
+        inputs = prepare(pos);
+        return true;
+    };
+    while (pos < (int) req.prompt.size() || tail_rewind()) {
         if (io.is_cancelled()) {
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
+        }
+        if (pos == tail_pos && !tail_snap.buf) {
+            if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) tail_mtp = mtp_pending;
+            else tail_pos = -1;
         }
         const int end = chunk_end(pos);
         const int n = end - pos;
