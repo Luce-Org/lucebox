@@ -62,6 +62,14 @@ inline int q4_recall_tail_pos(int pos, int prompt_len, int tail, int pool_tokens
     return t <= pool_tokens ? -1 : t;
 }
 
+// The recall mode once context fitting has settled the pool and where attention sits. `why` names a change, else null.
+struct Q4RecallSettled { int mode; const char * why; };
+inline Q4RecallSettled q4_recall_settle(int mode, int remote_layers, bool pooled) {
+    if (mode > 0 && remote_layers > 0) return {0, "full-attention layers sit on the expert device"};
+    if (mode == 2 && !pooled) return {1, "no KVFlash pool smaller than the context is left (--kvflash); score only"};
+    return {mode, nullptr};
+}
+
 // Whether a forward of n rows ending at `end` restarts the captured query run. A one-row forward has no capture path,
 // so a later capture would leave a gap; as the prompt's last forward it leaves the rows before it contiguous.
 inline bool q4_recall_run_breaks(int n, int end, int prompt_len) { return n == 1 && end < prompt_len; }

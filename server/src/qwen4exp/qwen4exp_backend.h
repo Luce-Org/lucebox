@@ -125,6 +125,7 @@ private:
     bool create_main_cache();
     void size_kvflash_pool();
     void resolve_indexer_recall();
+    void settle_indexer_recall();
     // LUCE_Q4_INDEXER_RECALL after the prompt (see qwen4exp_recall.h): score the chunks with the QSA indexer and log
     // (mode 1) or also reselect the pool by those scores (mode 2, which keeps the hook in `keep` for the request).
     void run_indexer_recall(std::optional<ScopedScoreHook> & keep);

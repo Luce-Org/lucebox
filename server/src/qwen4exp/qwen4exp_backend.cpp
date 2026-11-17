@@ -515,6 +515,7 @@ bool Qwen4ExpBackend::load_target() {
             return false;
         }
     }
+    settle_indexer_recall();
     if (!load_hot_experts()) return false;
     if (snapshot_budget_ == 0)
         std::fprintf(stderr, "[qwen4exp] prefix snapshots disabled: memory allowance insufficient for one checkpoint\n");
@@ -626,7 +627,7 @@ bool Qwen4ExpBackend::create_main_cache() {
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
             cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
             slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
-            take_kept_remote(0), recall_mode_ > 0 ? recall_queries_ : 0))
+            take_kept_remote(0), recall_mode_ > 0 && remote_layers_ == 0 ? recall_queries_ : 0))
         return false;
     disk_layout_ = qwen4exp_disk_layout(cache_);
     return true;
@@ -664,10 +665,15 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
                      recall_mode_);
         recall_mode_ = 0;
     }
-    if (recall_mode_ == 2 && kvflash_pool_for(cfg_.device.max_ctx) == 0) {
-        std::fprintf(stderr, "[q4-recall] mode 2 needs a KVFlash pool smaller than the context (--kvflash); running mode 1\n");
-        recall_mode_ = 1;
-    }
+}
+
+// The layout context fitting settled (pool vs context, attention placement) decides what recall can do; the cache is
+// built with recall storage only where this keeps a mode, so a downgrade here never leaves unused buffers.
+void Qwen4ExpBackend::settle_indexer_recall() {
+    const Q4RecallSettled s = q4_recall_settle(recall_mode_, cache_.remote_layers, cache_.kvflash != nullptr);
+    if (s.why)
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
+    recall_mode_ = s.mode;
 }
 
 // After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.
@@ -678,10 +684,6 @@ void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) 
     const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
     const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
     if (pager && n_pos <= pager->pool_tokens()) return;   // nothing paged out: nothing to recall
-    if (cache_.remote_layers > 0) {
-        std::fprintf(stderr, "[q4-recall] refused: %d full-attention layers are on the expert device; skipping\n", cache_.remote_layers);
-        return;
-    }
     Qwen4ExpRecallPicks picks;
     if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
         std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
@@ -1046,7 +1048,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     int pos = restored;
     // LUCE_Q4_INDEXER_RECALL: the forwards of the prompt's last recall_queries_ tokens append their indexer queries
     // to recall_q; a cut starts a forward exactly there.
-    const bool recall = recall_mode_ > 0 && cache_.recall_queries > 0 && cache_.remote_layers == 0;
+    const bool recall = recall_mode_ > 0 && cache_.recall_queries > 0;
     cache_.recall_q_n = 0;
     std::optional<ScopedScoreHook> recall_hook;
     // LUCE_Q4_RECALL_TAIL (mode 2, past the pool): prefill the prompt's last recall_tail_ tokens twice. The first pass

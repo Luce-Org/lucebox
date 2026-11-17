@@ -63,6 +63,20 @@ int main() {
     assert(q4_recall_run_breaks(1, 9000, 10000));
     assert(!q4_recall_run_breaks(1, 10000, 10000));   // trailing one-token forward: the 63 captured rows stay usable
     assert(!q4_recall_run_breaks(63, 9999, 10000));   // a captured forward never breaks it
+    // The mode after context fitting settled the layout: attention on the expert device refuses recall, no pool left
+    // downgrades recall to score only, and each change carries the one startup line's reason.
+    auto st = q4_recall_settle(2, 0, true);
+    assert(st.mode == 2 && st.why == nullptr);
+    st = q4_recall_settle(2, 0, false);
+    assert(st.mode == 1 && st.why != nullptr);
+    st = q4_recall_settle(2, 3, false);
+    assert(st.mode == 0 && st.why != nullptr);
+    st = q4_recall_settle(1, 3, false);
+    assert(st.mode == 0 && st.why != nullptr);
+    st = q4_recall_settle(1, 0, false);                         // score only needs no pool
+    assert(st.mode == 1 && st.why == nullptr);
+    st = q4_recall_settle(0, 3, false);                         // off stays off, silently
+    assert(st.mode == 0 && st.why == nullptr);
     // LUCE_Q4_RECALL_TAIL: unset = 2048, 0 = off, junk and negatives = off.
     assert(q4_recall_tail_from_env(nullptr) == 2048 && q4_recall_tail_from_env("512") == 512);
     assert(q4_recall_tail_from_env("0") == 0 && q4_recall_tail_from_env("-5") == 0 && q4_recall_tail_from_env("x") == 0);
