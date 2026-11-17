@@ -1162,7 +1162,17 @@ if(LUCE_TESTS)
         test_seq_engine_contract
         test_seq_batch_plan
         test_client_send_buffer
-        test_ds4_mix_fitter)
+        test_ds4_mix_fitter
+        test_ds4v_image_assembly
+        test_ds4v_image_integration
+        test_ds4v_image_policy
+        test_ds4v_image_prompt
+        test_ds41v_image
+        test_ds41v_vision
+        test_ds4_mix_converter
+        test_deepseek4_roctx
+        test_qwen35_roctx
+        test_qwen35_image)
     set(_luce_cpu_cppunit_targets
         test_feature_gate
         test_cluster_unit
@@ -1175,7 +1185,11 @@ if(LUCE_TESTS)
         test_uma_budget
         test_mmq_tile_twin_gate
         test_gdn_single_commit
-        test_glue_fusions)
+        test_glue_fusions
+        test_ds4_engram
+        test_ds4_dmix_entry_validation
+        test_recurrent_snapshot
+        test_qwen35_split_tree_guard)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -2231,11 +2245,15 @@ if(LUCE_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
     add_test(NAME qwen4exp_mtp COMMAND test_qwen4exp_mtp)
+    set_tests_properties(qwen4exp_mtp PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_mtp)
 
     # Exercise synthetic gfx1151 MMID admission without initializing a GPU.
     add_executable(test_qwen4exp_mtp_dispatch test/unit/test_qwen4exp_mtp_dispatch.cpp)
     target_link_libraries(test_qwen4exp_mtp_dispatch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
     add_test(NAME qwen4exp_mtp_dispatch COMMAND test_qwen4exp_mtp_dispatch)
+    set_tests_properties(qwen4exp_mtp_dispatch PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_mtp_dispatch)
     add_executable(test_qwen4exp_chunk test/unit/test_qwen4exp_chunk.cpp)
     target_include_directories(test_qwen4exp_chunk PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen4exp_chunk PRIVATE ggml)
@@ -2254,6 +2272,8 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen4exp_prefix_cache PRIVATE ${LUCE_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     target_link_libraries(test_qwen4exp_prefix_cache PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    # Not `cpu`: on a CUDA build its KVFlash pager records CUDA events, which the
+    # hosted runner's driver stub refuses.
     add_test(NAME qwen4exp_prefix_cache COMMAND test_qwen4exp_prefix_cache)
     # Guards the batched verify's QSA rows: one synthetic full-attention layer (no model file), each slot's rows
     # against consecutive T=1 decode steps, bit for bit. Compiles qwen4exp_graph.cpp into the test for its builders.
@@ -3452,6 +3472,9 @@ if(LUCE_SERVER)
                     -DSERVER=$<TARGET_FILE:luce_server>
                     -DBACKEND=${LUCE_GPU_BACKEND}
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_model_names.cmake)
+            # No GPU or model needed: the hosted cpu job runs it.
+            set_tests_properties(server_cli_model_names PROPERTIES LABELS cpu)
+            list(APPEND _luce_cpu_test_targets luce_server)
         endif()
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(luce_server PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
