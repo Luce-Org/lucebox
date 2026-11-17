@@ -927,6 +927,9 @@ private:
         KvLease & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    // The chat codec shows thinking tags spelled in a message as text, and the
+    // vocabulary has the tokens (SseEmitter::set_think_tags_are_tokens).
+    bool think_tags_are_tokens() const;
     // Save the live post-generation state as an inline checkpoint of the
     // prompt plus those generated tokens that agree with `canonical` (the
     // conversation with this turn appended, as the next request renders it).

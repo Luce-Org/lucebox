@@ -19,22 +19,39 @@ std::string RenderedPrompt::text() const {
     return out;
 }
 
+namespace {
+
+std::vector<int32_t> ids_of(const Tokenizer & tokenizer, const std::vector<std::string> & tokens) {
+    std::vector<int32_t> out;
+    for (const auto & token : tokens) {
+        const int32_t id = tokenizer.token_to_id(token);
+        if (id >= 0) out.push_back(id);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<int32_t> RenderedPrompt::encode_data(const Tokenizer & tokenizer, const std::string & text) const {
+    return tokenizer.encode(text, /*match_control=*/false, ids_of(tokenizer, literal), {{0, text.size()}},
+                            ids_of(tokenizer, markup));
+}
+
 std::vector<int32_t> RenderedPrompt::tokens(const Tokenizer & tokenizer) const {
     std::vector<int32_t> ids;
-    std::vector<int32_t> literal_ids;
-    for (const auto & token : literal) {
-        const int32_t id = tokenizer.token_to_id(token);
-        if (id >= 0) literal_ids.push_back(id);
-    }
+    const std::vector<int32_t> literal_ids = ids_of(tokenizer, literal), markup_ids = ids_of(tokenizer, markup);
     std::string run;
+    std::vector<std::pair<size_t, size_t>> spans;  // the data pieces in the run
     const auto flush = [&]() {
         if (run.empty()) return;
-        const auto run_ids = tokenizer.encode(run, /*match_control=*/false, literal_ids);
+        const auto run_ids = tokenizer.encode(run, /*match_control=*/false, literal_ids, spans, markup_ids);
         ids.insert(ids.end(), run_ids.begin(), run_ids.end());
         run.clear();
+        spans.clear();
     };
     for (const auto & piece : pieces) {
         if (!piece.control && piece.ids.empty()) {
+            if (piece.data) spans.emplace_back(run.size(), run.size() + piece.text.size());
             run += piece.text;
             continue;
         }
@@ -145,7 +162,8 @@ public:
     explicit PromptWriter(RenderedPrompt & out) : out_(out) {
         for (const auto & piece : out_.pieces) {
             at_ += piece.text.size();
-            hash(piece.text, piece.control);
+            if (!piece.ids.empty()) hash_ids(piece.ids);
+            else hash(piece.text, piece.control ? Kind::control : piece.data ? Kind::data : Kind::text);
         }
     }
 
@@ -157,38 +175,42 @@ public:
     void control(const char * token) {
         out_.pieces.push_back({token, true, {}});
         at_ += std::strlen(token);
-        hash(token, true);
+        hash(token, Kind::control);
     }
-    void text(const std::string & text) {
-        if (text.empty()) return;
-        at_ += text.size();
-        hash(text, false);
-        auto * last = out_.pieces.empty() ? nullptr : &out_.pieces.back();
-        if (last && !last->control && last->ids.empty()) last->text += text;
-        else out_.pieces.push_back({text, false, {}});
-    }
+    // The template's own text.
+    void text(const std::string & text) { append(text, Kind::text); }
+    // Text taken from the request: the template's tags spelled in it stay text
+    // (RenderedPrompt::markup).
+    void data(const std::string & text) { append(text, Kind::data); }
     void tokens(const std::string & text, const std::vector<int32_t> & ids) {
         out_.pieces.push_back({text, false, ids});
         at_ += text.size();
-        hash(text, false);
+        hash_ids(ids);
     }
-    // Message text: each image marker the server put there becomes control tokens.
+    // Message text, as data: each image marker the server put there becomes
+    // control tokens.
     void content(const std::string & text, const std::string & image_marker) {
-        if (image_marker.empty()) return this->text(text);
+        if (image_marker.empty()) return data(text);
         size_t pos = 0;
         for (size_t found; (found = text.find(image_marker, pos)) != std::string::npos;
              pos = found + image_marker.size()) {
-            this->text(text.substr(pos, found - pos));
+            data(text.substr(pos, found - pos));
             out_.pieces.push_back({image_marker, true, {}});
             at_ += image_marker.size();
-            hash(image_marker, true);
+            hash(image_marker, Kind::control);
         }
-        this->text(text.substr(pos));
+        data(text.substr(pos));
     }
     // Writes message content and records where it landed.
     void content(const std::string & text, const std::string & image_marker, PromptSpan & span) {
         span.begin = at_;
         content(text, image_marker);
+        span.end = at_;
+    }
+    // A turn the model generated, as template text: its tags are its own.
+    void generated_text(const std::string & text, PromptSpan & span) {
+        span.begin = at_;
+        this->text(text);
         span.end = at_;
     }
     // A remembered turn in place of the message's render. Its content span is
@@ -199,7 +221,7 @@ public:
                    PromptSpan & span) {
         const size_t at = at_;
         tokens(turn.text, turn.tokens);
-        const size_t think = reasoning ? turn.text.find("</think>", skip) : std::string::npos;
+        const size_t think = reasoning ? turn.think_end : std::string::npos;
         const size_t from = (std::min)(think == std::string::npos ? skip : think + std::strlen("</think>"),
                                        turn.text.size());
         const std::string shown = python_strip(content);
@@ -209,13 +231,27 @@ public:
     }
 
 private:
-    // Text and control tokens hash apart, so a message that spells a control
-    // token is not the prompt with that token: "\0c" and "\0t" switch
-    // between them, and a NUL in either is "\0\0".
-    void hash(std::string_view bytes, bool control) {
-        if (control != control_) {
-            hash_.update(std::string_view(control ? "\0c" : "\0t", 2));
-            control_ = control;
+    enum class Kind { text, data, control, ids };
+
+    void append(const std::string & text, Kind kind) {
+        if (text.empty()) return;
+        at_ += text.size();
+        hash(text, kind);
+        const bool data = kind == Kind::data;
+        auto * last = out_.pieces.empty() ? nullptr : &out_.pieces.back();
+        if (last && !last->control && last->ids.empty() && last->data == data) last->text += text;
+        else out_.pieces.push_back({text, false, {}, data});
+    }
+
+    // The template's text, the request's text, control tokens and token IDs
+    // hash apart, so a message that spells a control token or a tag is not the
+    // prompt with that token: "\0t", "\0d", "\0c" and "\0i" switch between
+    // them, and a NUL in any is "\0\0".
+    void hash(std::string_view bytes, Kind kind) {
+        if (kind != kind_) {
+            static const char * const kMarks[] = {"\0t", "\0d", "\0c", "\0i"};
+            hash_.update(std::string_view(kMarks[(int) kind], 2));
+            kind_ = kind;
         }
         for (size_t pos = 0; pos < bytes.size();) {
             const size_t nul = bytes.find('\0', pos);
@@ -229,10 +265,16 @@ private:
         }
     }
 
+    // A remembered turn hashes as its token IDs: two turns with the same text
+    // can differ in which "</think>" is the token.
+    void hash_ids(const std::vector<int32_t> & ids) {
+        hash(std::string_view(reinterpret_cast<const char *>(ids.data()), ids.size() * sizeof(int32_t)), Kind::ids);
+    }
+
     RenderedPrompt & out_;
     size_t at_ = 0;
     Sha256 hash_;
-    bool control_ = false;
+    Kind kind_ = Kind::text;
 };
 
 bool starts_with(const std::string & text, const char * prefix) {
@@ -242,6 +284,19 @@ bool starts_with(const std::string & text, const char * prefix) {
 bool ends_with(const std::string & text, const char * suffix) {
     const size_t n = std::strlen(suffix);
     return text.size() >= n && text.compare(text.size() - n, n, suffix) == 0;
+}
+
+// Where the thinking closes in `text`, the decoding of `tokens`. With a
+// think_close_token in the vocabulary only that token closes it, as in the
+// emitter: a "</think>" spelled in ordinary pieces is still thinking, and npos
+// means the thinking never closed. Without one, at the first "</think>".
+size_t think_close_at(const std::string & text, const std::vector<int32_t> & tokens,
+                      const Tokenizer & tokenizer) {
+    const int32_t id = think_close_token(tokenizer);
+    if (id < 0) return text.find("</think>");
+    const auto it = std::find(tokens.begin(), tokens.end(), id);
+    if (it == tokens.end()) return std::string::npos;
+    return tokenizer.decode(std::vector<int32_t>(tokens.begin(), it)).size();
 }
 
 // Qwen3.8 (27B and Flash-Next ship the same template): Qwen/Qwen3.8-27B
@@ -280,6 +335,10 @@ public:
                         TurnMemory::Turn & turn) const override;
 
 private:
+    // parse_turn with the thinking closing at byte `close` of `turn`.
+    bool parse_turn(const std::string & turn, size_t close, const nlohmann::json & tools,
+                    ChatMessage & out) const;
+
     QwenVersion version_;
     std::string id_;
 };
@@ -314,6 +373,7 @@ bool QwenCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
     }
     const auto & messages = *input.messages;
     out.messages.assign(messages.size(), MessageLayout());
+    out.markup = {"<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"};
     PromptWriter w(out);
     const auto open = [&](const std::string & role) {
         w.control("<|im_start|>");
@@ -358,7 +418,8 @@ bool QwenCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
         if (!instructions.empty()) w.text(instructions + "\n\n");
         w.text(kQwenToolsHeader);
         for (const auto & tool : openai_tool_definitions(*input.tools)) {
-            w.text("\n" + python_json_dumps(tool));
+            w.text("\n");
+            w.data(python_json_dumps(tool));
         }
         w.text(kQwenToolsFooter);
         out.tools.end = w.at();
@@ -383,12 +444,17 @@ bool QwenCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
         if (system_layout) system_layout->turn = {begin, w.at()};
     }
 
+    // A user message that is only a tool response, which the template reads
+    // as one: its outer tags are the template's.
+    const auto wrapped_tool_response = [](const std::string & content) {
+        return starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>");
+    };
     // The last user message that is not only a wrapped tool response.
     size_t last_query = messages.size();
     for (size_t i = messages.size(); i-- > 0;) {
         if (role(i) != "user") continue;
         const std::string content = python_strip(messages[i].content);
-        if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
+        if (!wrapped_tool_response(content)) {
             last_query = i;
             break;
         }
@@ -405,12 +471,22 @@ bool QwenCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
         layout.turn.begin = w.at();
         if (role(i) == "user") {
             open("user\n");
-            w.content(python_strip(message.content), input.image_marker, layout.content);
+            const std::string content = python_strip(message.content);
+            if (wrapped_tool_response(content)) {
+                const size_t open_tag = std::strlen("<tool_response>"), close_tag = std::strlen("</tool_response>");
+                layout.content.begin = w.at();
+                w.text("<tool_response>");
+                w.content(content.substr(open_tag, content.size() - open_tag - close_tag), input.image_marker);
+                w.text("</tool_response>");
+                layout.content.end = w.at();
+            } else {
+                w.content(content, input.image_marker, layout.content);
+            }
             close();
         } else if (message.role == "assistant" && message.tool_calls_replayed) {
             // Tool memory: the turn exactly as the model generated it.
             open("assistant\n");
-            w.content(message.content, input.image_marker, layout.content);
+            w.generated_text(message.content, layout.content);
             close();
         } else if (message.role == "assistant") {
             // Qwen3.8 and Qwen3.5 keep earlier thinking unless the request turns it off; Qwen3.6
@@ -444,26 +520,31 @@ bool QwenCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
             }
             open("assistant\n");
             if (shows_thinking) {
-                w.text("<think>\n" + python_strip(reasoning) + "\n</think>\n\n");
+                w.text("<think>\n");
+                w.data(python_strip(reasoning));
+                w.text("\n</think>\n\n");
             }
             w.content(content, input.image_marker, layout.content);
             for (size_t c = 0; c < message.tool_calls.size(); ++c) {
                 const auto & call = message.tool_calls[c];
                 w.text(c != 0 ? "\n<tool_call>\n<function=" :
                        !python_strip(content).empty() ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
-                w.text(call.name + ">\n");
+                w.data(call.name);
+                w.text(">\n");
                 if (call.arguments.is_object()) {
                     for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
-                        w.text("<parameter=" + it.key() + ">\n");
+                        w.text("<parameter=");
+                        w.data(it.key());
+                        w.text(">\n");
                         const auto & value = it.value();
                         if (value.is_string()) {
-                            w.text(value.get<std::string>());
+                            w.data(value.get<std::string>());
                         } else if (version_ == QwenVersion::k35 && value.is_boolean()) {
                             w.text(value.get<bool>() ? "True" : "False");  // str(True)
                         } else if (version_ == QwenVersion::k35 && value.is_null()) {
                             w.text("None");
                         } else {
-                            w.text(python_json_dumps(value));  // str() of a number is its JSON
+                            w.data(python_json_dumps(value));  // str() of a number is its JSON
                         }
                         w.text("\n</parameter>\n");
                     }
@@ -734,18 +815,28 @@ bool QwenCodec::generated_turn(const std::string & rendered, const std::vector<i
     turn.tokens.insert(turn.tokens.end(), generated.begin(), generated.end());
     turn.text = rendered.substr(role + std::strlen("<|im_start|>")) + tokenizer.decode(generated);
     if (tokenizer.decode(turn.tokens) != turn.text) return false;
-    if (!parse_turn(turn.text.substr(std::strlen("assistant\n")), tools, message)) return false;
+    const size_t role_line = std::strlen("assistant\n");
+    const size_t close = think_close_at(turn.text, turn.tokens, tokenizer);
+    turn.think_end = close;
+    if (!parse_turn(turn.text.substr(role_line), close == std::string::npos ? close : close - role_line, tools,
+                    message)) {
+        return false;
+    }
     turn.reasoning = message.reasoning_content;
     return true;
 }
 
 bool QwenCodec::parse_turn(const std::string & turn, const nlohmann::json & tools,
                              ChatMessage & out) const {
+    return parse_turn(turn, turn.find("</think>"), tools, out);
+}
+
+bool QwenCodec::parse_turn(const std::string & turn, size_t close, const nlohmann::json & tools,
+                             ChatMessage & out) const {
     out = {};
     out.role = "assistant";
     std::string rest = turn;
     if (starts_with(turn, "<think>\n")) {
-        const size_t close = turn.find("</think>");
         if (close == std::string::npos) return false;
         out.reasoning_content = python_strip(turn.substr(8, close - 8));
         rest = turn.substr(close + 8);
@@ -858,6 +949,10 @@ public:
                         TurnMemory::Turn & turn) const override;
 
 private:
+    // parse_turn with the thinking closing at byte `close` of `turn`.
+    bool parse_turn(const std::string & turn, size_t close, const nlohmann::json & tools,
+                    ChatMessage & out) const;
+
     const DeepSeekDialect & d;
     std::string id_;
 };
@@ -934,6 +1029,7 @@ bool DeepSeekCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
     // The turn markers are user-defined tokens in the V4 and V4.1 vocabularies: typed
     // in a message they stay text, as control tokens do.
     out.literal = {kDsUser, kDsAssistant, kDsSystem, "<｜latest_reminder｜>"};
+    out.markup = {"<think>", "</think>", "<tool_result>", "</tool_result>"};
     if (!input.messages || input.messages->empty()) {
         error = "No messages provided.";
         return false;
@@ -1101,13 +1197,16 @@ bool DeepSeekCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
             const bool shows_thinking = thinking && (!drop_thinking || after_last_user(i, false));
             TurnMemory::Turn generated;
             if (message.tool_calls_replayed) {
-                w.content(message.content, input.image_marker, layout.content);
+                w.generated_text(message.content, layout.content);
             } else if (input.memory && input.memory->lookup(message, w.context(), generated) &&
                        generated.thinking == shows_thinking) {
                 // The turn exactly as the model generated it.
                 w.generated(generated, message.content, 0, generated.thinking, layout.content);
             } else {
-                if (shows_thinking) w.text(message.reasoning_content + "</think>");
+                if (shows_thinking) {
+                    w.data(message.reasoning_content);
+                    w.text("</think>");
+                }
                 w.content(message.content, input.image_marker, layout.content);
                 if (!message.tool_calls.empty()) {
                     std::string calls;
@@ -1222,13 +1321,17 @@ bool DeepSeekCodec::parse_tool_calls(const std::string & block, const nlohmann::
 
 bool DeepSeekCodec::parse_turn(const std::string & turn, const nlohmann::json & tools,
                                  ChatMessage & out) const {
+    return parse_turn(turn, turn.find("</think>"), tools, out);
+}
+
+bool DeepSeekCodec::parse_turn(const std::string & turn, size_t close, const nlohmann::json & tools,
+                                 ChatMessage & out) const {
     out = {};
     out.role = "assistant";
     std::string rest = turn;
-    const size_t think_end = turn.find("</think>");
-    if (think_end != std::string::npos) {
-        out.reasoning_content = turn.substr(0, think_end);
-        rest = turn.substr(think_end + std::strlen("</think>"));
+    if (close != std::string::npos) {
+        out.reasoning_content = turn.substr(0, close);
+        rest = turn.substr(close + std::strlen("</think>"));
     }
     const size_t calls = rest.find(std::string("\n\n") + d.calls_open);
     out.content = rest.substr(0, calls);
@@ -1246,7 +1349,9 @@ bool DeepSeekCodec::generated_turn(const std::string & rendered, const std::vect
     turn.tokens = generated;
     turn.text = tokenizer.decode(generated);
     turn.thinking = thinking;
-    if (thinking && turn.text.find("</think>") == std::string::npos) return false;
+    const size_t think_end = think_close_at(turn.text, turn.tokens, tokenizer);
+    if (thinking && think_end == std::string::npos) return false;
+    if (thinking) turn.think_end = think_end;
     if (!thinking) {
         // Read without thinking: "</think>" in the reply is content.
         message = {};
@@ -1257,7 +1362,7 @@ bool DeepSeekCodec::generated_turn(const std::string & rendered, const std::vect
             !parse_deepseek_calls(d, turn.text, calls + 2, tools, message.tool_calls)) {
             return false;
         }
-    } else if (!parse_turn(turn.text, tools, message)) {
+    } else if (!parse_turn(turn.text, think_end, tools, message)) {
         return false;
     }
     turn.reasoning = message.reasoning_content;
@@ -1265,6 +1370,11 @@ bool DeepSeekCodec::generated_turn(const std::string & rendered, const std::vect
 }
 
 }  // namespace
+
+int32_t think_close_token(const Tokenizer & tokenizer) {
+    const int32_t id = tokenizer.token_to_id("</think>");
+    return id >= 0 && tokenizer.is_added_token(id) ? id : -1;
+}
 
 std::string lucebox_effort_tier(const std::string & word) {
     if (word == "minimal" || word == "low") return "low";

@@ -50,6 +50,9 @@ public:
         // until the output has closed it with this text (`</think>`); what
         // follows it in the same token is constrained.
         std::string wait_for;
+        // With a thinking-boundary token, only it ends the wait: the text
+        // spelled in ordinary pieces stays thinking, as the emitter reads it.
+        int32_t wait_for_token = -1;
         // Openers of the tool-call syntax. Once the output (after leading
         // whitespace) starts with one, the request is calling a tool and the
         // constraint lets go; the grammar admits them for that hand-over.
