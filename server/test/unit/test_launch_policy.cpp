@@ -239,6 +239,25 @@ struct LaunchPolicyFixture : CommonFixture {
         return dims;
     }
 
+    // Auto placement charges what attach_rollback_storage() attaches: with a
+    // KVFlash pool and no explicit --fast-rollback that is exact restore, the
+    // two snapshots only, and those are also there with --no-fast-rollback.
+    void test_rollback_charge_follows_the_resolved_rollback_mode() {
+        using luce::common::spec_rollback_checkpoints;
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  /*fast_rollback=*/true,  /*explicit_optin=*/false, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  /*fast_rollback=*/true,  /*explicit_optin=*/true,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/true,  /*explicit_optin=*/false, /*tree=*/false));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/false, /*explicit_optin=*/false, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/false, /*explicit_optin=*/false, /*tree=*/true));
+
+        const RollbackCacheDims dims = qwen38_27b_dims();
+        // 48 layers x (128 x 128 x 48 state + 3 x 10240 conv taps) floats.
+        const uint64_t snapshots = rollback_cache_bytes(dims, 8, true, false, /*checkpoints=*/false);
+        CHECK(snapshots == 48ull * (128 * 128 * 48 + 3 * 10240) * 4);
+        CHECK(snapshots == 156893184ull);
+        CHECK(rollback_cache_bytes(dims, 8, true, false, /*checkpoints=*/true) == 1386479616ull);
+    }
+
     void test_rollback_cache_bytes_match_the_backend_allocation() {
         const RollbackCacheDims dims = qwen38_27b_dims();
         // The size a T4 refused for this model with its 8-token DFlash 2
@@ -944,6 +963,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_auto_placement_splits_only_what_one_discrete_gpu_cannot_hold();
     test_auto_placement_never_uses_exhausted_devices();
     test_rollback_cache_bytes_match_the_backend_allocation();
+    test_rollback_charge_follows_the_resolved_rollback_mode();
     test_auto_placement_moves_a_drafter_that_does_not_fit_beside_the_target();
     test_auto_placement_keeps_a_drafter_that_fits_beside_the_target();
     test_auto_placement_moves_a_drafter_only_to_a_gpu_that_holds_it();

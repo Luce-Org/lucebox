@@ -1414,16 +1414,24 @@ static void auto_drafter_bytes(const ModelOptions & model,
     // block, or a DDTree's nodes.
     // --specla turns DDTree on during backend planning, after this runs.
     const bool tree = args.ddtree_mode || args.specla_mode;
-    if (!args.fast_rollback && !tree) return;
     int block = args.draft_block_size > 0 ? args.draft_block_size
                                           : (int) gguf_draft_block_size(*args.draft_path);
     if (block <= 0) block = LUCE_DRAFT_BLOCK_SIZE;
     const int max_verify_tokens = tree ? std::max(block, args.ddtree_budget + 1) : block;
-    const bool kvflash = !model.kvflash_pool.empty() || std::getenv("LUCE_KVFLASH") != nullptr;
+    const char * env_pool = std::getenv("LUCE_KVFLASH");
+    const bool kvflash = !model.kvflash_pool.empty() || env_pool != nullptr;
+    // Under the pager fast rollback is opt-in (spec_fast_rollback_enabled), and
+    // exact restore attaches the two snapshots only. Only a fixed pool is known
+    // here to give a pager: "auto" can size to none, so it is charged the
+    // checkpoints, the larger of the two.
+    const bool pager = luce::common::kvflash_fixed_pool_requested(
+        model.kvflash_pool.empty() ? env_pool : model.kvflash_pool.c_str());
     rollback_bytes = gguf_rollback_cache_bytes(
         args.model_path, max_verify_tokens,
         luce::common::resolve_chain_rollback_policy().checkpoint_f32,
-        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash);
+        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash,
+        /*checkpoints=*/luce::common::spec_rollback_checkpoints(
+            pager, args.fast_rollback, args.fast_rollback_explicit, tree));
 }
 
 // --target-device auto: bind the model block to the placement the policy picks.
