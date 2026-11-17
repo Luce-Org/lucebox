@@ -655,57 +655,80 @@ bool tool_declared(const nlohmann::json & tools, const std::string & name) {
     return false;
 }
 
+// Where a raw value from `pos` ends: at the first `close` that `next` or
+// `last` follows. With `quoted`, the first such close outside a call the
+// value quotes, or the first one when every one is inside (a value that
+// quotes an opener alone). npos: none.
+size_t raw_value_end(const std::string & text, size_t pos, const std::string & close, const std::string & next,
+                     const std::string & last, QuotedCall * quoted) {
+    size_t plain = std::string::npos;
+    for (size_t end = text.find(close, pos); end != std::string::npos; end = text.find(close, end + 1)) {
+        const size_t after = end + close.size();
+        if (text.compare(after, next.size(), next) != 0 && text.compare(after, last.size(), last) != 0) continue;
+        if (!quoted || !quoted->open_before(end)) return end;
+        if (plain == std::string::npos) plain = end;
+    }
+    return plain;
+}
+
 // Calls in the template's format from `pos`: "<tool_call>\n<function=NAME>\n",
 // then "<parameter=KEY>\nVALUE\n</parameter>\n" per argument, then
 // "</function>\n</tool_call>", calls joined by "\n". Whitespace may follow.
-bool parse_qwen_calls(const std::string & text, size_t pos, const nlohmann::json & tools,
+// A value ends at the first "\n</parameter>\n" the next argument or the end
+// of the call follows. A value is raw text and may hold these tags itself (a
+// command that writes a test of this reader): when that reading fails, a
+// second one skips the closes inside a call the value quotes (more
+// "<function=" than "</function>" before them), and takes the first close for
+// a value that quotes an opener alone. Both readings take the first close
+// they accept and never look back, so a value cannot stretch over the next
+// call, and a reply neither reads goes to the heuristic reader.
+bool parse_qwen_calls(const std::string & text, size_t start, const nlohmann::json & tools,
                       bool python, std::vector<ChatToolCall> & calls) {
     static const std::string kOpen = "<tool_call>\n<function=", kParam = "<parameter=",
                              kParamEnd = "\n</parameter>\n", kClose = "</function>\n</tool_call>";
-    const auto at = [&](const std::string & token) { return text.compare(pos, token.size(), token) == 0; };
-    // A function name or argument key: the text up to ">\n", on one line.
-    const auto read_name = [&](std::string & name) {
-        const size_t end = text.find(">\n", pos);
-        if (end == std::string::npos || end == pos) return false;
-        name = text.substr(pos, end - pos);
-        if (name.find('\n') != std::string::npos) return false;
-        pos = end + 2;
-        return true;
-    };
-    calls.clear();
-    while (true) {
-        if (!at(kOpen)) return false;
-        pos += kOpen.size();
-        ChatToolCall call;
-        if (!read_name(call.name) || !tool_declared(tools, call.name)) return false;
-        const nlohmann::json properties = tool_parameter_properties(tools, call.name);
-        call.arguments = nlohmann::ordered_json::object();
-        while (at(kParam)) {
-            pos += kParam.size();
-            std::string key;
-            if (!read_name(key) || call.arguments.contains(key)) return false;
-            // The value ends at the first "\n</parameter>\n" the next argument or the end follows.
-            size_t end = pos;
-            while (true) {
-                end = text.find(kParamEnd, end);
+    const auto read = [&](bool skip_quoted) {
+        size_t pos = start;
+        const auto at = [&](size_t p, const std::string & token) { return text.compare(p, token.size(), token) == 0; };
+        // A function name or argument key: the text up to ">\n", on one line.
+        const auto read_name = [&](std::string & name) {
+            const size_t end = text.find(">\n", pos);
+            if (end == std::string::npos || end == pos) return false;
+            name = text.substr(pos, end - pos);
+            if (name.find('\n') != std::string::npos) return false;
+            pos = end + 2;
+            return true;
+        };
+        calls.clear();
+        while (true) {
+            if (!at(pos, kOpen)) return false;
+            pos += kOpen.size();
+            ChatToolCall call;
+            if (!read_name(call.name) || !tool_declared(tools, call.name)) return false;
+            const nlohmann::json properties = tool_parameter_properties(tools, call.name);
+            call.arguments = nlohmann::ordered_json::object();
+            while (at(pos, kParam)) {
+                pos += kParam.size();
+                std::string key;
+                if (!read_name(key) || call.arguments.contains(key)) return false;
+                QuotedCall quoted(text, pos, "<function=", "</function>");
+                const size_t end = raw_value_end(text, pos, kParamEnd, kParam, kClose, skip_quoted ? &quoted : nullptr);
                 if (end == std::string::npos) return false;
-                const size_t next = end + kParamEnd.size();
-                if (text.compare(next, kParam.size(), kParam) == 0 ||
-                    text.compare(next, kClose.size(), kClose) == 0) break;
-                ++end;
+                call.arguments[key] = qwen_parameter_value(text.substr(pos, end - pos), properties, key, python);
+                pos = end + kParamEnd.size();
             }
-            call.arguments[key] = qwen_parameter_value(text.substr(pos, end - pos), properties, key, python);
-            pos = end + kParamEnd.size();
+            if (!at(pos, kClose)) return false;
+            pos += kClose.size();
+            calls.push_back(std::move(call));
+            if (at(pos, "\n<tool_call>")) {
+                ++pos;
+                continue;
+            }
+            return python_strip(text.substr(pos)).empty();
         }
-        if (!at(kClose)) return false;
-        pos += kClose.size();
-        calls.push_back(std::move(call));
-        if (at("\n<tool_call>")) {
-            ++pos;
-            continue;
-        }
-        return python_strip(text.substr(pos)).empty();
-    }
+    };
+    if (read(false) || read(true)) return true;
+    calls.clear();
+    return false;
 }
 
 bool QwenCodec::parse_tool_calls(const std::string & block, const nlohmann::json & tools,
@@ -1142,71 +1165,71 @@ bool DeepSeekCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
 // The calls block from `pos`: "<｜DSML｜ calls>\n", invokes joined by "\n",
 // each "<｜DSML｜ invoke name=\"NAME\">\n" + parameters joined by "\n" +
 // "\n</｜DSML｜ invoke>", then "\n</｜DSML｜ calls>". Whitespace may follow.
-bool parse_deepseek_calls(const DeepSeekDialect & d, const std::string & text, size_t pos,
+// A value ends at the first close the next parameter or the end of the
+// invoke follows; when that reading fails, a second one skips the closes
+// inside an invoke the value quotes, as in parse_qwen_calls.
+bool parse_deepseek_calls(const DeepSeekDialect & d, const std::string & text, size_t start,
                          const nlohmann::json & tools, std::vector<ChatToolCall> & calls) {
-    const auto at = [&](const std::string & token) { return text.compare(pos, token.size(), token) == 0; };
-    const auto take = [&](const std::string & token) {
-        if (!at(token)) return false;
-        pos += token.size();
-        return true;
-    };
-    // An attribute value: the text up to the closing quote, on one line.
-    const auto read_quoted = [&](std::string & value) {
-        const size_t end = text.find('"', pos);
-        if (end == std::string::npos || end == pos) return false;
-        value = text.substr(pos, end - pos);
-        if (value.find('\n') != std::string::npos) return false;
-        pos = end + 1;
-        return true;
-    };
-    calls.clear();
-    if (!take(std::string(d.calls_open) + "\n")) return false;
-    while (true) {
-        ChatToolCall call;
-        if (!take(d.invoke_open) || !read_quoted(call.name) || !take(">\n") ||
-            !tool_declared(tools, call.name)) {
-            return false;
-        }
-        call.arguments = nlohmann::ordered_json::object();
-        const std::string invoke_end = std::string("\n") + d.invoke_close;
-        for (bool first = true; !at(invoke_end); first = false) {
-            if (!first && !take("\n")) return false;
-            std::string key, is_string;
-            if (!take(d.param_open) || !read_quoted(key) || !take(" string=\"") ||
-                !read_quoted(is_string) || !take(">") || call.arguments.contains(key)) {
+    const std::string invoke_end = std::string("\n") + d.invoke_close, next_param = std::string("\n") + d.param_open,
+                      close = d.param_close;
+    const auto read = [&](bool skip_quoted) {
+        size_t pos = start;
+        const auto at = [&](size_t p, const std::string & token) { return text.compare(p, token.size(), token) == 0; };
+        const auto take = [&](const std::string & token) {
+            if (!at(pos, token)) return false;
+            pos += token.size();
+            return true;
+        };
+        // An attribute value: the text up to the closing quote, on one line.
+        const auto read_quoted = [&](std::string & value) {
+            const size_t end = text.find('"', pos);
+            if (end == std::string::npos || end == pos) return false;
+            value = text.substr(pos, end - pos);
+            if (value.find('\n') != std::string::npos) return false;
+            pos = end + 1;
+            return true;
+        };
+        calls.clear();
+        if (!take(std::string(d.calls_open) + "\n")) return false;
+        while (true) {
+            ChatToolCall call;
+            if (!take(d.invoke_open) || !read_quoted(call.name) || !take(">\n") ||
+                !tool_declared(tools, call.name)) {
                 return false;
             }
-            // The value ends at the first close the next parameter or the end of the call follows.
-            size_t end = pos;
-            const std::string close = d.param_close;
-            while (true) {
-                end = text.find(close, end);
-                if (end == std::string::npos) return false;
-                const size_t next = end + close.size();
-                if (text.compare(next, 1 + std::strlen(d.param_open), std::string("\n") + d.param_open) == 0 ||
-                    text.compare(next, 1 + std::strlen(d.invoke_close), std::string("\n") + d.invoke_close) == 0) {
-                    break;
+            call.arguments = nlohmann::ordered_json::object();
+            for (bool first = true; !at(pos, invoke_end); first = false) {
+                if (!first && !take("\n")) return false;
+                std::string key, is_string;
+                if (!take(d.param_open) || !read_quoted(key) || !take(" string=\"") ||
+                    !read_quoted(is_string) || !take(">") || call.arguments.contains(key)) {
+                    return false;
                 }
-                ++end;
+                QuotedCall quoted(text, pos, d.invoke_open, d.invoke_close);
+                const size_t end = raw_value_end(text, pos, close, next_param, invoke_end, skip_quoted ? &quoted : nullptr);
+                if (end == std::string::npos) return false;
+                const std::string value = text.substr(pos, end - pos);
+                if (is_string == "true") {
+                    call.arguments[key] = value;
+                } else if (is_string == "false") {
+                    const auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
+                    if (parsed.is_discarded()) return false;
+                    call.arguments[key] = parsed;
+                } else {
+                    return false;
+                }
+                pos = end + close.size();
             }
-            const std::string value = text.substr(pos, end - pos);
-            if (is_string == "true") {
-                call.arguments[key] = value;
-            } else if (is_string == "false") {
-                const auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
-                if (parsed.is_discarded()) return false;
-                call.arguments[key] = parsed;
-            } else {
-                return false;
-            }
-            pos = end + close.size();
+            if (!take(invoke_end)) return false;
+            calls.push_back(std::move(call));
+            if (take(std::string("\n") + d.calls_close)) break;
+            if (!take("\n")) return false;
         }
-        if (!take(std::string("\n") + d.invoke_close)) return false;
-        calls.push_back(std::move(call));
-        if (take(std::string("\n") + d.calls_close)) break;
-        if (!take("\n")) return false;
-    }
-    return python_strip(text.substr(pos)).empty();
+        return python_strip(text.substr(pos)).empty();
+    };
+    if (read(false) || read(true)) return true;
+    calls.clear();
+    return false;
 }
 
 bool DeepSeekCodec::parse_tool_calls(const std::string & block, const nlohmann::json & tools,
