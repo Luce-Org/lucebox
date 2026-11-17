@@ -451,8 +451,8 @@ bool Qwen4ExpBackend::load_target() {
         return false;
     }
     load_qwen4exp_output_tail(weights_, backend_);
+    resolve_indexer_recall();   // before the pool is sized: recall's rows come out of the auto budget
     size_kvflash_pool();
-    resolve_indexer_recall();
     if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
@@ -637,13 +637,19 @@ bool Qwen4ExpBackend::create_main_cache() {
 // memory). It holds the full-attention layers' F16 K/V; the MTP draft layer keeps one row per position.
 void Qwen4ExpBackend::size_kvflash_pool() {
     const Qwen4ExpWeights & w = weights_;
-    int64_t n_full = 0;
-    for (int il = 0; il < w.n_layer; ++il) n_full += w.layers[il].is_full_attention;
+    int64_t n_full = 0, recall_bytes = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        n_full += w.layers[il].is_full_attention;
+        if (recall_mode_ > 0 && w.layers[il].is_full_attention)
+            recall_bytes += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size,
+                                                  il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0);
+    }
     KvFlashAutoBudget budget;
     budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
     // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
-    // No cache yet: the drafter's per-token room is counted at the configured context.
-    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
+    // No cache yet: the drafter's per-token room is counted at the configured context. recall_bytes: the indexer rows
+    // a recall mode keeps at the full context beside the pool (settling may still drop them; the pool then just stays smaller).
+    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx) + recall_bytes;
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);

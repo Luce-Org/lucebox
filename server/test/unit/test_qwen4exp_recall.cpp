@@ -61,6 +61,9 @@ int main() {
     assert(q4_recall_tail_path(0, 10000, 2048, 4096, -1) == P::NoDecode);
     assert(q4_recall_tail_path(0, 10000, 0, 4096, 0) == P::Off);
     assert(q4_recall_tail_path(10000, 10000, 2048, 4096, 1) == P::NoForward);   // exact repeat: no forward at all
+    // Recall storage per full-attention layer: 640 B per position at the 4-token block (512 raw + 128 pooled), plus one block.
+    assert(q4_recall_layer_bytes(131072, 128, 4) == 640LL * 131072 + 512);
+    assert(q4_recall_layer_bytes(131072, 128, 0) == 0 && q4_recall_layer_bytes(131072, 0, 4) == 0);   // no indexer
     // The [q4-tail] line names what ran: a planned two-pass run reports how far it got, every other path is itself.
     using S = Q4TailStage;
     assert(std::string(q4_tail_outcome(P::FitsPool, S::Planned)) == q4_tail_outcome(P::FitsPool, S::Rewound));

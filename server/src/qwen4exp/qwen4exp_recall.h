@@ -67,6 +67,12 @@ inline Q4EnvInt q4_parse_env_int(const char * v, int lo, int hi, int def) {
 // LUCE_Q4_RECALL_TAIL: tokens, 0 = no two-pass tail; contexts stay below 2^24.
 constexpr int kQ4RecallTailDefault = 2048, kQ4RecallTailMax = (1 << 24) - 1;
 
+// Bytes of one full-attention layer's recall storage (F32 raw indexer keys per position, pooled keys per block of
+// `ratio`), which a pool allocates at the full max_ctx; 0 for a layer without an indexer.
+inline int64_t q4_recall_layer_bytes(int64_t max_ctx, int64_t head_size, int64_t ratio) {
+    return head_size > 0 && ratio > 0 ? head_size * 4 * (max_ctx + (max_ctx + ratio - 1) / ratio + 1) : 0;
+}
+
 // Where the two-pass tail starts, or -1 for a single pass. The prompt's last `tail` tokens (no earlier than `pos`, the
 // restored prefix) are prefilled twice, so the tail must start past the pool: a prompt that fits it pages nothing.
 inline int q4_recall_tail_pos(int pos, int prompt_len, int tail, int pool_tokens) {
