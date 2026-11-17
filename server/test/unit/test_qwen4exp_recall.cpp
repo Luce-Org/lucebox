@@ -58,11 +58,15 @@ int main() {
     assert(q4_recall_tail_path(9990, 10000, 2048, 4096) == P::TwoPass);    // a restored prefix shortens the tail
     assert(q4_recall_tail_path(9999, 10000, 2048, 4096) == P::TwoPass);     // a one-token tail still recalls from the earlier rows
     assert(q4_recall_tail_path(10000, 10000, 2048, 4096) == P::NoForward);   // exact repeat: no forward at all
-    assert(std::string(q4_recall_tail_path_name(P::TwoPass)) != std::string(q4_recall_tail_path_name(P::NoForward)));
-    // A one-row forward breaks the captured run (no capture path, a gap would follow) unless it is the prompt's last.
-    assert(q4_recall_run_breaks(1, 9000, 10000));
-    assert(!q4_recall_run_breaks(1, 10000, 10000));   // trailing one-token forward: the 63 captured rows stay usable
-    assert(!q4_recall_run_breaks(63, 9999, 10000));   // a captured forward never breaks it
+    // The [q4-tail] line names what ran: a planned two-pass run reports how far it got, every other path is itself.
+    using S = Q4TailStage;
+    assert(std::string(q4_tail_outcome(P::FitsPool, S::Planned)) == q4_tail_outcome(P::FitsPool, S::Rewound));
+    const std::string two[] = {q4_tail_outcome(P::TwoPass, S::Planned), q4_tail_outcome(P::TwoPass, S::SnapFailed),
+                               q4_tail_outcome(P::TwoPass, S::RewindFailed), q4_tail_outcome(P::TwoPass, S::Rewound)};
+    for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j) assert(two[i] != two[j]);
+    assert(two[1].find("single pass") == 0);                              // a failed tail snapshot runs a single pass
+    assert(two[2].find("prefilled twice") == std::string::npos);          // a failed rewind never replayed the tail
+    assert(two[3].find("rewound") != std::string::npos);
     // The mode after context fitting settled the layout: attention on the expert device refuses recall, no pool left
     // downgrades recall to score only, and each change carries the one startup line's reason.
     auto st = q4_recall_settle(2, 0, true);

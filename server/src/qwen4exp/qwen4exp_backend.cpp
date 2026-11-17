@@ -1066,12 +1066,26 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     Qwen4ExpSnapshot tail_snap;
     struct TailSnapFree { Qwen4ExpSnapshot & s; ~TailSnapFree() { free_qwen4exp_snapshot(s); } } tail_free{tail_snap};
     Qwen4ExpMtpPending tail_mtp;
-    // One [q4-tail] line per mode-2 request names the path: here for a single pass, at the rewind for a two-pass run.
-    const Q4TailPath tail_path = recall && recall_mode_ == 2 && cache_.kvflash
-        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, cache_.kvflash->pool_tokens()) : Q4TailPath::Off;
-    if (recall && recall_mode_ == 2 && cache_.kvflash && tail_path != Q4TailPath::TwoPass)
-        std::fprintf(stderr, "[q4-tail] %s (prompt=%d restored=%d pool=%d tail=%d)\n", q4_recall_tail_path_name(tail_path),
-                     (int) req.prompt.size(), pos, cache_.kvflash->pool_tokens(), recall_tail_);
+    // One [q4-tail] line per mode-2 request, written when it leaves: the path that ran and how the prefill ended.
+    struct TailLog {
+        bool armed;
+        Q4TailPath path;
+        Q4TailStage stage = Q4TailStage::Planned;
+        const char * status = "failed";
+        bool recalled = false;
+        int prompt, restored, pool, tail;
+        ~TailLog() {
+            if (armed)
+                std::fprintf(stderr, "[q4-tail] %s status=%s recalled=%d (prompt=%d restored=%d pool=%d tail=%d)\n",
+                             q4_tail_outcome(path, stage), status, (int) recalled, prompt, restored, pool, tail);
+        }
+    };
+    const bool tail_armed = recall && recall_mode_ == 2 && cache_.kvflash;
+    const int pool_tokens = tail_armed ? cache_.kvflash->pool_tokens() : 0;
+    const Q4TailPath tail_path = tail_armed
+        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, pool_tokens) : Q4TailPath::Off;
+    TailLog tail_log{tail_armed, tail_path, Q4TailStage::Planned, "failed", false,
+                     (int) req.prompt.size(), pos, pool_tokens, recall_tail_};
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
@@ -1119,10 +1133,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     auto tail_rewind = [&]() {
         if (!tail_snap.buf) return false;
         run_indexer_recall(recall_hook);
+        tail_log.recalled = recall_hook.has_value();
         const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
-        if (tail_path == Q4TailPath::TwoPass)
-            std::fprintf(stderr, "[q4-tail] two-pass: tail [%d,%d) prefilled twice, rewind %d -> %d ok=%d\n", tail_pos,
-                         (int) req.prompt.size(), pos, tail_snap.cur_pos, (int) ok);
+        tail_log.stage = ok ? Q4TailStage::Rewound : Q4TailStage::RewindFailed;
         free_qwen4exp_snapshot(tail_snap);
         if (!ok) return false;
         pos = tail_pos;
@@ -1135,6 +1148,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     };
     while (pos < (int) req.prompt.size() || tail_rewind()) {
         if (io.is_cancelled()) {
+            tail_log.status = "cancelled";
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
         }
@@ -1142,8 +1156,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
             if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) tail_mtp = mtp_pending;
             else {
                 tail_pos = -1;
-                if (tail_path == Q4TailPath::TwoPass)
-                    std::fprintf(stderr, "[q4-tail] single pass: the tail snapshot failed, recall after the prefill\n");
+                tail_log.stage = Q4TailStage::SnapFailed;
             }
         }
         const int end = chunk_end(pos);
@@ -1189,11 +1202,14 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         logits_ = logits;
         capture();
         if (io.is_cancelled()) {
+            tail_log.status = "cancelled";
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
         }
         if (pending.valid()) inputs = pending.get();
     }
+    // A failed rewind leaves the first pass's state in place: the prefill is complete, the tail replay is not.
+    if (tail_log.stage != Q4TailStage::RewindFailed) tail_log.status = "ok";
     const auto t_pre1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
     if (req.n_gen <= 0) {
@@ -1203,6 +1219,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     }
 
     if (recall && !recall_hook) run_indexer_recall(recall_hook);
+    tail_log.recalled = recall_hook.has_value();
 
     std::mt19937_64 rng(request_rng_seed(req.sampler));
     std::vector<int32_t> history = req.prompt;

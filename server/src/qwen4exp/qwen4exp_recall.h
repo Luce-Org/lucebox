@@ -87,7 +87,7 @@ inline Q4RecallSettled q4_recall_settle(int mode, int remote_layers, bool pooled
 // so a later capture would leave a gap; as the prompt's last forward it leaves the rows before it contiguous.
 inline bool q4_recall_run_breaks(int n, int end, int prompt_len) { return n == 1 && end < prompt_len; }
 
-// The path a mode-2 request takes under a pool, for the one [q4-tail] log line (no behaviour hangs on it).
+// The path a mode-2 request plans under a pool; q4_tail_outcome names what ran for the one [q4-tail] line.
 enum class Q4TailPath { Off, FitsPool, TailInPool, NoForward, TwoPass };
 inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int pool_tokens) {
     if (tail <= 0) return Q4TailPath::Off;
@@ -97,13 +97,21 @@ inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int poo
     if (t >= prompt_len) return Q4TailPath::NoForward;
     return Q4TailPath::TwoPass;
 }
-inline const char * q4_recall_tail_path_name(Q4TailPath p) {
+// How far a planned two-pass run got; other paths ignore it.
+enum class Q4TailStage { Planned, SnapFailed, RewindFailed, Rewound };
+inline const char * q4_tail_outcome(Q4TailPath p, Q4TailStage s) {
     switch (p) {
-        case Q4TailPath::Off:         return "single pass: LUCE_Q4_RECALL_TAIL=0, recall after the prefill";
-        case Q4TailPath::FitsPool:    return "single pass: the prompt fits the pool, nothing paged out";
-        case Q4TailPath::TailInPool:  return "single pass: the tail would start inside the pool (pool < prompt <= pool + tail), recall after the prefill";
-        case Q4TailPath::NoForward:   return "single pass: the whole prompt was restored, no prefill forward runs, no queries to recall from";
-        case Q4TailPath::TwoPass:     return "two-pass";
+        case Q4TailPath::Off:        return "single pass: LUCE_Q4_RECALL_TAIL=0, recall after the prefill";
+        case Q4TailPath::FitsPool:   return "single pass: the prompt fits the pool, nothing paged out";
+        case Q4TailPath::TailInPool: return "single pass: the tail would start inside the pool (pool < prompt <= pool + tail), recall after the prefill";
+        case Q4TailPath::NoForward:  return "single pass: the whole prompt was restored, no prefill forward runs, no queries to recall from";
+        case Q4TailPath::TwoPass:
+            switch (s) {
+                case Q4TailStage::Planned:      return "two-pass: stopped before the rewind";
+                case Q4TailStage::SnapFailed:   return "single pass: the tail snapshot failed, recall after the prefill";
+                case Q4TailStage::RewindFailed: return "two-pass: the rewind failed, the tail was not replayed";
+                case Q4TailStage::Rewound:      return "two-pass: rewound to the tail start, tail prefilled twice";
+            }
     }
     return "?";
 }
