@@ -416,9 +416,15 @@ bool Qwen4ExpBackend::init() {
         return false;
     }
     // Prefix snapshots stay in the gfx1151 iGPU's memory, which is the system's. Beside a GPU with its own memory
-    // they go to system memory (create_snapshot_backend), which leaves that memory to the KV caches.
-    snap_backend_ = ggml_backend_cuda_qwen4exp_supported(backend_) ? backend_ : create_snapshot_backend(backend_);
-    if (!snap_backend_) return false;
+    // they live in system memory (create_snapshot_backend); LUCE_Q4_SNAPSHOT_DEVICE=1 lets load_target move them
+    // onto the target when they fit.
+    if (!ggml_backend_cuda_qwen4exp_supported(backend_) && !(snap_host_ = create_snapshot_backend(backend_)))
+        return false;
+    const char * dev_env = std::getenv("LUCE_Q4_SNAPSHOT_DEVICE");
+    const int dev_flag = qwen4exp_snapshot_device_from_env(dev_env);
+    snapshots_device_ = dev_flag == 1;
+    if (dev_flag < 0)
+        std::fprintf(stderr, "[qwen4exp] LUCE_Q4_SNAPSHOT_DEVICE=%s refused (use 1, or unset/0 for off)\n", dev_env);
     if (!cfg_.expert_placement_path.empty() && !cfg_.expert_device) {
         std::fprintf(stderr, "[qwen4exp] --expert-placement needs --expert-device\n");
         return false;
@@ -444,6 +450,7 @@ bool Qwen4ExpBackend::init() {
 }
 
 bool Qwen4ExpBackend::load_target() {
+    snap_backend_ = snap_host_ ? snap_host_ : backend_;
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
@@ -516,13 +523,41 @@ bool Qwen4ExpBackend::load_target() {
         }
     }
     settle_indexer_recall();
+    // Beside a GPU with its own memory the fit above counted no snapshots, so the context is what it would be with
+    // them in system memory. On request they take the target only from what it leaves: the planner's whole
+    // allowance must fit, and the prompt chunk must stay as wide.
+    Qwen4ExpChunkPlan room;
+    if (snap_host_ && snapshots_device_ && cfg_.chunk <= 0) plan_chunk(&room);
+    const size_t allowance = snapshot_count() * snapshot_bytes_estimate(cache_.max_ctx);
+    Qwen4ExpSnapshotPlacement home = qwen4exp_place_snapshots(!snap_host_, snapshots_device_, cfg_.chunk > 0,
+                                                              room.required, room.available, allowance);
+    // The server budgets the whole allowance (sized for the target's own buffers once they live there): a part of it
+    // would make alternating prefixes evict each other.
+    const auto whole = [this] { return snapshot_budget_ >= snapshot_count() * snapshot_bytes_estimate(cache_.max_ctx); };
+    if (snap_host_ && home.on_device) {
+        const int host_chunk = chunk_;
+        snap_backend_ = backend_;
+        chunk_ = plan_chunk(&room);   // reserves the allowance beside the chunk
+        if (chunk_ < host_chunk || !whole()) {
+            snap_backend_ = snap_host_;
+            chunk_ = plan_chunk();
+            home = {false, "the whole allowance does not fit beside the full prompt chunk"};
+        }
+    }
+    if (snap_host_)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots %s: %s\n",
+                     home.on_device ? "on the target GPU" : "in system memory", home.reason);
     if (!load_hot_experts()) return false;
+    if (snap_host_ && snap_backend_ == backend_ && !whole()) {   // the hot experts' re-plan cut the allowance
+        snap_backend_ = snap_host_;
+        chunk_ = plan_chunk();
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots back in system memory: the hot experts' re-plan cut the "
+                     "allowance\n");
+    }
     if (snapshot_budget_ == 0)
         std::fprintf(stderr, "[qwen4exp] prefix snapshots disabled: memory allowance insufficient for one checkpoint\n");
     else if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
-    else if (snap_backend_ != backend_)
-        std::fprintf(stderr, "[qwen4exp] prefix snapshots in system memory\n");
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
@@ -548,7 +583,7 @@ bool Qwen4ExpBackend::load_target() {
 // Split mode, one sequence, with --expert-placement: hot expert slots on the target for decode and verify steps (a
 // prompt chunk keeps every pick on the expert device), started from the placement and then following the served
 // picks (Qwen4ExpHotSet). They take the memory the fitted context and the prompt chunk leave, at most
-// LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick on the expert device, so a
+// LUCE_EXPERT_BUDGET_MB, so they shrink neither (nor the snapshot allowance LUCE_Q4_SNAPSHOT_DEVICE=1 puts there). Concurrent serving keeps every pick on the expert device, so a
 // request computes the same alone and beside other requests: no hot copies. The expert device's read-ahead (no
 // effect on the output) is built either way.
 bool Qwen4ExpBackend::load_hot_experts() {
@@ -596,7 +631,7 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
     // head, the server's concurrent prefix budget. One sequence keeps three.
     const int slots = cfg_.max_concurrency;
     const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
-                                          allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan,
+                                          allowance(snapshot_count()), plan,
                                           snapshot_bytes_estimate(cache_.max_ctx),
                                           pflash_reserve(backend_),
                                           restore_point_spacing());
@@ -851,7 +886,8 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
 // everything else on the target. A release of the target device keeps the stacks where they are, so bringing the
 // model back uploads only the target's part (7 GiB) and rebuilds the caches. The layout found at first load (the
 // fitted context, the slots, the attention layers moved to the expert device) is reused as it is, and the prefix
-// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release.
+// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release (with
+// LUCE_Q4_SNAPSHOT_DEVICE=1 putting them on the target, residency() refuses the release).
 
 ModelBackend::Residency Qwen4ExpBackend::residency() const {
     Residency r;
@@ -859,6 +895,8 @@ ModelBackend::Residency Qwen4ExpBackend::residency() const {
     if (expert_gpu() >= 0) r.gpus.push_back(expert_gpu());
     if (cache_.kvflash || kvflash_pool_ > 0) {
         r.reason = "qwen4exp: --kvflash pages KV rows the release would drop";
+    } else if (snap_host_ && snap_backend_ == backend_) {
+        r.reason = "qwen4exp: prefix snapshots on the target GPU (LUCE_Q4_SNAPSHOT_DEVICE=1) would not survive the release";
     } else if (!backend_) {
         r.reason = "qwen4exp: not loaded";
     } else {
@@ -1662,8 +1700,8 @@ void Qwen4ExpBackend::shutdown() {
     free_drafter();
     free_kept_remote_bufs();
     if (backend_) release_target();
-    free_snapshot_backend(snap_backend_, backend_);
-    snap_backend_ = nullptr;
+    free_snapshot_backend(snap_host_, backend_);
+    snap_host_ = snap_backend_ = nullptr;
     if (weights_.expert_backend) {
         ggml_backend_free(weights_.expert_backend);
         weights_.expert_backend = nullptr;

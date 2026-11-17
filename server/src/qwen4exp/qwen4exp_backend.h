@@ -159,7 +159,12 @@ private:
     bool load_target();
     bool load_hot_experts();
     void release_target();
-    ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or system memory (see init)
+    ggml_backend_t snap_backend_ = nullptr; // prefix snapshot storage: the target, or snap_host_ (see load_target)
+    ggml_backend_t snap_host_ = nullptr;    // system memory beside a GPU with its own; null on gfx1151
+    bool snapshots_device_ = false;         // LUCE_Q4_SNAPSHOT_DEVICE=1: snapshots may take the target (load_target)
+    // Snapshots the planner reserves: each concurrent slot's restore point and capture in flight plus a shared head;
+    // one sequence keeps three.
+    size_t snapshot_count() const { return cfg_.max_concurrency > 1 ? 2 * (size_t) cfg_.max_concurrency + 1 : 3; }
     int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     int recall_mode_ = 0;      // LUCE_Q4_INDEXER_RECALL after refusals (0 off, 1 score only, 2 recall)
