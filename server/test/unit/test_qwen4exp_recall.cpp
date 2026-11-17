@@ -61,6 +61,10 @@ int main() {
     assert(q4_recall_tail_path(0, 10000, 2048, 4096, -1) == P::NoDecode);
     assert(q4_recall_tail_path(0, 10000, 0, 4096, 0) == P::Off);
     assert(q4_recall_tail_path(10000, 10000, 2048, 4096, 1) == P::NoForward);   // exact repeat: no forward at all
+    // A one-row forward restarts the captured query run, unless it is the prompt's last (the rows before it stay).
+    assert(q4_recall_run_breaks(1, 150, 200));
+    assert(!q4_recall_run_breaks(1, 200, 200));
+    assert(!q4_recall_run_breaks(2, 150, 200) && !q4_recall_run_breaks(64, 150, 200));
     // Recall storage per full-attention layer: 640 B per position at the 4-token block (512 raw + 128 pooled), plus one block.
     assert(q4_recall_layer_bytes(131072, 128, 4) == 640LL * 131072 + 512);
     assert(q4_recall_layer_bytes(131072, 128, 0) == 0 && q4_recall_layer_bytes(131072, 0, 4) == 0);   // no indexer
