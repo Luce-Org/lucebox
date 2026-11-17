@@ -313,3 +313,56 @@ TEST_CASE(KvflashPagerTruncateFixture, refill_keeps_protected_chunks_resident_un
     // sink 0 + tail window 7..11, then the two best discretionary chunks (1, 2).
     CHECK(resident == (std::vector<int>{0, 1, 2, 7, 8, 9, 10, 11}));
 }
+
+// A forward's own span must survive the allocation of the span: with a scorer installed (the recall hook of a
+// two-pass tail prefill) the earlier chunks of the same alloc_span call are the lowest scored, and must not be
+// evicted to make room for the later ones (their slot would be -1: rows written to row -1, keys masked).
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_never_evicts_a_chunk_of_its_own_span) {
+    for (const int span_chunks : {2, 4, 6}) {
+        Harness A;
+        TestPager pa;
+        must(pa.attach(make_cfg(), A.k, A.v));
+        append(A, pa, 0, 20 * kChunk);
+        // Recalled chunks (the old ones) outrank every chunk the forward is about to write.
+        pa.score_hook = [](int c) { return c < 12 ? 100.f + (float)c : 1.f + (float)c * 1e-3f; };
+        pa.reselect(2);
+        pa.truncate(12 * kChunk);
+        pa.synchronize_paging();
+        const int from = 12 * kChunk;
+        must(pa.alloc_span(from, span_chunks * kChunk));
+        for (int c = 12; c < 12 + span_chunks; c++) {
+            CHECK(pa.is_resident(c));
+            CHECK(pa.slot_of(c * kChunk) >= 0);
+        }
+        // The next forward of the same prefill: its predecessors are old now, and may be victims again.
+        must(pa.alloc_span(from + span_chunks * kChunk, span_chunks * kChunk));
+        for (int c = 12 + span_chunks; c < 12 + 2 * span_chunks; c++) CHECK(pa.slot_of(c * kChunk) >= 0);
+    }
+}
+
+// The two-pass tail's second prefill at serving scale (tensor-less pager, logic only): LRU first pass over the whole
+// prompt, the recall scorer and reselect, a rollback to the tail's start, then the tail in forwards of 4..31 chunks
+// with the scorer still installed and one poorly voted tail chunk. No chunk of a forward may lose its slot.
+TEST_CASE(KvflashPagerTruncateFixture, tail_forwards_under_a_scorer_keep_every_inflight_chunk) {
+    constexpr int pool_chunks = 256, n_chunks = 900, tail_chunks = 32;
+    for (const int fwd : {4, 8, 16, 31}) {
+        KvFlashConfig cfg;
+        cfg.pool_tokens = pool_chunks * kChunk;
+        TestPager p;
+        must(p.attach(cfg, {}, {}));
+        const int P = n_chunks * kChunk, tail_pos = P - tail_chunks * kChunk;
+        for (int pos = 0; pos < P; pos += fwd * kChunk) must(p.alloc_span(pos, std::min(fwd * kChunk, P - pos)));
+        std::vector<float> score(n_chunks);
+        for (int c = 0; c < n_chunks; ++c) score[(size_t)c] = (float)((c * 7919) % 500);
+        for (int c = n_chunks - tail_chunks; c < n_chunks; ++c) score[(size_t)c] = 400;
+        score[(size_t)(n_chunks - tail_chunks + 3)] = 1;
+        p.score_hook = [&](int c) { return c < n_chunks ? score[(size_t)c] : 1e6f + (float)c; };
+        p.reselect(5);
+        p.truncate(tail_pos);
+        for (int pos = tail_pos; pos < P; pos += fwd * kChunk) {
+            const int n = std::min(fwd * kChunk, P - pos);
+            must(p.alloc_span(pos, n));
+            for (int q = pos; q < pos + n; q += kChunk) CHECK(p.slot_of(q) >= 0);
+        }
+    }
+}

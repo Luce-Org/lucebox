@@ -61,6 +61,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <climits>
 #include <limits>
 #include <string>
 #include <vector>
@@ -469,15 +470,24 @@ public:
     // queued on page_stream_ and left running.  If any page-in (H2D) was
     // issued, page_stream_ is synchronised here so that recalled KV data is
     // resident before the next attention forward.
+    //
+    // The span's own chunks are never victims, whatever a scorer ranks them: the forward writes them next, and a
+    // chunk evicted before that has no slot (its rows would land on row -1). A span too big to sit in the pool beside
+    // the sink cannot be forwarded in one piece anyway; its early chunks stay evictable (bulk bookkeeping callers).
     bool alloc_span(int kv_start, int n_tok) {
+        const int first = (int)(kv_start / cfg_.chunk_tokens);
+        const int last = (int)((kv_start + n_tok - 1) / cfg_.chunk_tokens);
+        span_lo_ = n_tok > 0 && last - first + 1 <= n_blocks_ - cfg_.sink_chunks ? first : INT_MAX;
         for (int i = 0; i < n_tok; ++i) {
             if (slot_for(kv_start + i) < 0) {
+                span_lo_ = INT_MAX;
                 std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
                                      "(pool %d exhausted)\n",
                              kv_start + i, cfg_.pool_tokens);
                 return false;
             }
         }
+        span_lo_ = INT_MAX;
         if (has_pending_page_in_ && !batch_submit_) synchronize_paging();   // batch: the step's one Fence waits
         return true;
     }
@@ -800,10 +810,10 @@ public:
         return events;
     }
 
-    // Resident, and not sink, tail window or pinned: what an eviction may take.
+    // Resident, and not sink, tail window, pinned or inside the span being allocated: what an eviction may take.
     bool evictable_(int c) const {
         return c >= 0 && c < (int)chunks_.size() && chunks_[c].block >= 0 && c >= cfg_.sink_chunks &&
-               c <= cur_chunk_ - 1 - cfg_.tail_window_chunks && !is_pinned(c);
+               c <= cur_chunk_ - 1 - cfg_.tail_window_chunks && c < span_lo_ && !is_pinned(c);
     }
     // Up to n eviction victims, worst first: evictable chunks ordered by score
     // (score_hook, lowest first) or by oldest use (LRU fallback); ties go to
@@ -1458,6 +1468,7 @@ private:
     KvFlashStats stats_;
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
+    int span_lo_ = INT_MAX;   // first chunk of the alloc_span in progress (INT_MAX: none)
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
 
