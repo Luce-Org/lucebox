@@ -1144,9 +1144,10 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         const bool mtp_prefill = mtp && n > 1;
         // Every forward inside the last recall_queries_ tokens appends its queries: restore points (the prefix
         // snapshot sits before the reply template) split that span, and its last forward alone holds ~6 template
-        // tokens. A one-row forward (no capture path) restarts the run so the captured positions stay contiguous.
+        // tokens. A one-row forward (no capture path) restarts the run so the captured positions stay contiguous,
+        // unless it is the last: the rows before it stay.
         const bool in_tail = recall && pos >= (int) req.prompt.size() - recall_queries_;
-        if (in_tail && n == 1) cache_.recall_q_n = 0;
+        if (in_tail && q4_recall_run_breaks(n, end, (int) req.prompt.size())) cache_.recall_q_n = 0;
         cache_.recall_capture = in_tail && n > 1;
         const bool captured = cache_.recall_capture;
         const Qwen4ExpForwardResult r = qwen4exp_forward(

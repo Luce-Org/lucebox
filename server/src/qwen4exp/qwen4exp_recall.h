@@ -62,15 +62,19 @@ inline int q4_recall_tail_pos(int pos, int prompt_len, int tail, int pool_tokens
     return t <= pool_tokens ? -1 : t;
 }
 
+// Whether a forward of n rows ending at `end` restarts the captured query run. A one-row forward has no capture path,
+// so a later capture would leave a gap; as the prompt's last forward it leaves the rows before it contiguous.
+inline bool q4_recall_run_breaks(int n, int end, int prompt_len) { return n == 1 && end < prompt_len; }
+
 // The path a mode-2 request takes under a pool, for the one [q4-tail] log line (no behaviour hangs on it).
-enum class Q4TailPath { Off, FitsPool, TailInPool, NoForward, SingleToken, TwoPass };
+enum class Q4TailPath { Off, FitsPool, TailInPool, NoForward, TwoPass };
 inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int pool_tokens) {
     if (tail <= 0) return Q4TailPath::Off;
     if (prompt_len <= pool_tokens) return Q4TailPath::FitsPool;
     const int t = q4_recall_tail_pos(pos, prompt_len, tail, pool_tokens);
     if (t < 0) return Q4TailPath::TailInPool;
     if (t >= prompt_len) return Q4TailPath::NoForward;
-    return prompt_len - t == 1 ? Q4TailPath::SingleToken : Q4TailPath::TwoPass;
+    return Q4TailPath::TwoPass;
 }
 inline const char * q4_recall_tail_path_name(Q4TailPath p) {
     switch (p) {
@@ -78,7 +82,6 @@ inline const char * q4_recall_tail_path_name(Q4TailPath p) {
         case Q4TailPath::FitsPool:    return "single pass: the prompt fits the pool, nothing paged out";
         case Q4TailPath::TailInPool:  return "single pass: the tail would start inside the pool (pool < prompt <= pool + tail), recall after the prefill";
         case Q4TailPath::NoForward:   return "single pass: the whole prompt was restored, no prefill forward runs, no queries to recall from";
-        case Q4TailPath::SingleToken: return "two-pass snapshot and rewind still run, but the tail is one token: no queries captured, nothing to recall from";
         case Q4TailPath::TwoPass:     return "two-pass";
     }
     return "?";

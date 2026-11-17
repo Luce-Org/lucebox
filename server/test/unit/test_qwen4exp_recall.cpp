@@ -56,9 +56,13 @@ int main() {
     assert(q4_recall_tail_path(0, 6000, 2048, 4096) == P::TailInPool);     // pool < P <= pool + tail: recall after prefill
     assert(q4_recall_tail_path(0, 10000, 2048, 4096) == P::TwoPass);
     assert(q4_recall_tail_path(9990, 10000, 2048, 4096) == P::TwoPass);    // a restored prefix shortens the tail
-    assert(q4_recall_tail_path(9999, 10000, 2048, 4096) == P::SingleToken);  // the final one-token forward captures nothing
+    assert(q4_recall_tail_path(9999, 10000, 2048, 4096) == P::TwoPass);     // a one-token tail still recalls from the earlier rows
     assert(q4_recall_tail_path(10000, 10000, 2048, 4096) == P::NoForward);   // exact repeat: no forward at all
     assert(std::string(q4_recall_tail_path_name(P::TwoPass)) != std::string(q4_recall_tail_path_name(P::NoForward)));
+    // A one-row forward breaks the captured run (no capture path, a gap would follow) unless it is the prompt's last.
+    assert(q4_recall_run_breaks(1, 9000, 10000));
+    assert(!q4_recall_run_breaks(1, 10000, 10000));   // trailing one-token forward: the 63 captured rows stay usable
+    assert(!q4_recall_run_breaks(63, 9999, 10000));   // a captured forward never breaks it
     // LUCE_Q4_RECALL_TAIL: unset = 2048, 0 = off, junk and negatives = off.
     assert(q4_recall_tail_from_env(nullptr) == 2048 && q4_recall_tail_from_env("512") == 512);
     assert(q4_recall_tail_from_env("0") == 0 && q4_recall_tail_from_env("-5") == 0 && q4_recall_tail_from_env("x") == 0);
