@@ -1057,6 +1057,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     Qwen4ExpSnapshot tail_snap;
     struct TailSnapFree { Qwen4ExpSnapshot & s; ~TailSnapFree() { free_qwen4exp_snapshot(s); } } tail_free{tail_snap};
     Qwen4ExpMtpPending tail_mtp;
+    // One [q4-tail] line per mode-2 request names the path: here for a single pass, at the rewind for a two-pass run.
+    const Q4TailPath tail_path = recall && recall_mode_ == 2 && cache_.kvflash
+        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, cache_.kvflash->pool_tokens()) : Q4TailPath::Off;
+    if (recall && recall_mode_ == 2 && cache_.kvflash && tail_path != Q4TailPath::TwoPass)
+        std::fprintf(stderr, "[q4-tail] %s (prompt=%d restored=%d pool=%d tail=%d)\n", q4_recall_tail_path_name(tail_path),
+                     (int) req.prompt.size(), pos, cache_.kvflash->pool_tokens(), recall_tail_);
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
@@ -1105,7 +1111,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         if (!tail_snap.buf) return false;
         run_indexer_recall(recall_hook);
         const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
-        std::fprintf(stderr, "[q4-tail] rewind %d -> %d ok=%d\n", pos, tail_snap.cur_pos, (int) ok);
+        if (tail_path == Q4TailPath::TwoPass)
+            std::fprintf(stderr, "[q4-tail] two-pass: tail [%d,%d) prefilled twice, rewind %d -> %d ok=%d\n", tail_pos,
+                         (int) req.prompt.size(), pos, tail_snap.cur_pos, (int) ok);
         free_qwen4exp_snapshot(tail_snap);
         if (!ok) return false;
         pos = tail_pos;
@@ -1123,7 +1131,11 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         }
         if (pos == tail_pos && !tail_snap.buf) {
             if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) tail_mtp = mtp_pending;
-            else tail_pos = -1;
+            else {
+                tail_pos = -1;
+                if (tail_path == Q4TailPath::TwoPass)
+                    std::fprintf(stderr, "[q4-tail] single pass: the tail snapshot failed, recall after the prefill\n");
+            }
         }
         const int end = chunk_end(pos);
         const int n = end - pos;

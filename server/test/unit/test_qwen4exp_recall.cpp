@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <string>
 using namespace luce::common;
 int main() {
     // 2 layers x 2 queries x budget 3, 4 blocks per chunk, 3 chunks (blocks 0..11).
@@ -47,6 +48,17 @@ int main() {
     assert(q4_recall_tail_pos(0, 6145, 2048, 4096) == 4097);
     assert(q4_recall_tail_pos(0, 10000, 0, 4096) == -1);             // tail off
     assert(q4_recall_tail_pos(0, 100, 2048, 4096) == -1);            // tail longer than the prompt
+    // The path a mode-2 request takes, as the one [q4-tail] line names it.
+    using P = Q4TailPath;
+    assert(q4_recall_tail_path(0, 10000, 0, 4096) == P::Off);
+    assert(q4_recall_tail_path(0, 3000, 2048, 4096) == P::FitsPool);       // nothing is paged out
+    assert(q4_recall_tail_path(0, 4096, 2048, 4096) == P::FitsPool);
+    assert(q4_recall_tail_path(0, 6000, 2048, 4096) == P::TailInPool);     // pool < P <= pool + tail: recall after prefill
+    assert(q4_recall_tail_path(0, 10000, 2048, 4096) == P::TwoPass);
+    assert(q4_recall_tail_path(9990, 10000, 2048, 4096) == P::TwoPass);    // a restored prefix shortens the tail
+    assert(q4_recall_tail_path(9999, 10000, 2048, 4096) == P::SingleToken);  // the final one-token forward captures nothing
+    assert(q4_recall_tail_path(10000, 10000, 2048, 4096) == P::NoForward);   // exact repeat: no forward at all
+    assert(std::string(q4_recall_tail_path_name(P::TwoPass)) != std::string(q4_recall_tail_path_name(P::NoForward)));
     // LUCE_Q4_RECALL_TAIL: unset = 2048, 0 = off, junk and negatives = off.
     assert(q4_recall_tail_from_env(nullptr) == 2048 && q4_recall_tail_from_env("512") == 512);
     assert(q4_recall_tail_from_env("0") == 0 && q4_recall_tail_from_env("-5") == 0 && q4_recall_tail_from_env("x") == 0);
