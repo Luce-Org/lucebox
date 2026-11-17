@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <random>
 #include <stdexcept>
+#include <unistd.h>
 #include <vector>
 
 using namespace luce::common;
@@ -425,6 +427,28 @@ TEST_CASE(KvflashPagerTruncateFixture, oversized_span_keeps_its_early_chunks_evi
     bool lost = false;
     for (int c = 8; c < 16; c++) lost |= !p.is_resident(c);
     CHECK(lost);
+}
+
+// A span that contains the sink chunks (alloc_span(0, n) on an identity pager) needs no slot beside them: filling the
+// pool from chunk 0 fits, nothing is evicted, and the one-time "cannot be protected" warning must not fire.
+TEST_CASE(KvflashPagerTruncateFixture, span_holding_the_sink_chunks_fills_the_pool_without_warning) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    std::fflush(stderr);
+    const int saved = dup(2);
+    std::FILE * cap = std::tmpfile();
+    dup2(fileno(cap), 2);
+    const bool ok = p.alloc_span(0, 8 * kChunk);
+    std::fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    std::rewind(cap);
+    char line[256];
+    const bool warned = std::fgets(line, sizeof line, cap) != nullptr;
+    std::fclose(cap);
+    CHECK(ok);
+    CHECK(!warned);
+    for (int c = 0; c < 8; c++) CHECK(p.is_resident(c));
 }
 
 // qwen4exp caps a forward at pool - 2 chunks of rows (qwen4exp_max_forward_rows): even unaligned that touches at most
