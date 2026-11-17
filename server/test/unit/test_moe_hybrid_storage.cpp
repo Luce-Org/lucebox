@@ -10,6 +10,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace luce::common;
 
@@ -276,3 +280,140 @@ TEST_CASE(MoeHybridStorageFixture, expert_slot_stride_divides_every_shared_type)
     const size_t down_stride = moe_expert_slot_stride(down_largest, down);
     for (size_t ts : down) CHECK(down_stride % ts == 0);
 }
+
+#if !defined(_WIN32)
+namespace {
+
+// A one-layer model file of three F32 expert stacks (gate, up, down), each
+// expert's bytes set to a value naming its stack and expert.
+struct TinyExpertFile {
+    static constexpr int kExperts = 4;
+    static constexpr int kIn = 4, kOut = 8;
+    static constexpr size_t kExpertBytes = sizeof(float) * kIn * kOut;
+    static constexpr size_t kStackBytes = kExpertBytes * kExperts;
+    std::string path;
+    void * mapping = nullptr;
+    size_t size = 3 * kStackBytes;
+
+    static uint8_t value(int stack, int expert) { return (uint8_t) (16 * (stack + 1) + expert); }
+
+    bool create() {
+        char name[] = "/tmp/luce_moe_hot_XXXXXX";
+        const int fd = ::mkstemp(name);
+        if (fd < 0) return false;
+        path = name;
+        std::vector<uint8_t> bytes(size);
+        for (int stack = 0; stack < 3; ++stack) {
+            for (int e = 0; e < kExperts; ++e) {
+                std::fill_n(bytes.begin() + (ptrdiff_t) (stack * kStackBytes + e * kExpertBytes),
+                            kExpertBytes, value(stack, e));
+            }
+        }
+        const bool written = ::write(fd, bytes.data(), bytes.size()) == (ssize_t) bytes.size();
+        mapping = written ? ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+        ::close(fd);
+        if (mapping == MAP_FAILED) mapping = nullptr;
+        return mapping != nullptr;
+    }
+    ~TinyExpertFile() {
+        if (!path.empty()) ::unlink(path.c_str());
+    }
+    ExpertTensorFileData stack(int i) const {
+        return {static_cast<const uint8_t *>(mapping) + i * kStackBytes, kStackBytes};
+    }
+};
+
+// Every expert of `stack` holds the bytes of the file's experts `ids`, in order.
+bool stack_holds(ggml_tensor * stack, int file_stack, const std::vector<int32_t> & ids) {
+    if (!stack) return false;
+    std::vector<uint8_t> got(TinyExpertFile::kExpertBytes);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ggml_backend_tensor_get(stack, got.data(), i * TinyExpertFile::kExpertBytes, got.size());
+        const uint8_t want = TinyExpertFile::value(file_stack, ids[i]);
+        if (!std::all_of(got.begin(), got.end(), [want](uint8_t b) { return b == want; })) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE(MoeHybridStorageFixture, hot_experts_come_back_after_a_release_and_the_cold_stack_stays) {
+    TinyExpertFile file;
+    REQUIRE(file.create());
+    auto backend = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>(
+        ggml_backend_cpu_init(), ggml_backend_free);
+    auto meta = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+        ggml_init({1u << 16, nullptr, true}), ggml_free);
+    REQUIRE(backend && meta);
+    MoeLayerDesc desc;
+    desc.ffn_gate_exps = ggml_new_tensor_3d(meta.get(), GGML_TYPE_F32, TinyExpertFile::kIn, TinyExpertFile::kOut, 4);
+    desc.ffn_up_exps = ggml_new_tensor_3d(meta.get(), GGML_TYPE_F32, TinyExpertFile::kIn, TinyExpertFile::kOut, 4);
+    desc.ffn_down_exps = ggml_new_tensor_3d(meta.get(), GGML_TYPE_F32, TinyExpertFile::kIn, TinyExpertFile::kOut, 4);
+    MoeHybridConfig cfg;
+    cfg.n_embd = TinyExpertFile::kIn;
+    cfg.n_ff_exp = TinyExpertFile::kOut;
+    cfg.n_expert = TinyExpertFile::kExperts;
+    cfg.n_expert_used = 2;
+    cfg.n_layer = 1;
+    MoeHybridPlacement placement;
+    placement.n_layer = 1;
+    placement.n_expert = TinyExpertFile::kExperts;
+    placement.n_expert_used = 2;
+    placement.hot_counts = {2};
+    placement.hot_expert_ids = {{3, 1}};
+    placement.total_hot = 2;
+    std::vector<LayerExpertFileData> file_data(1);
+    file_data[0].gate_exps = file.stack(0);
+    file_data[0].up_exps = file.stack(1);
+    file_data[0].down_exps = file.stack(2);
+
+    MoeHybridStorage storage;
+    std::string err;
+    REQUIRE(build_moe_hybrid_storage_from_file_with_mmap(cfg, backend.get(), placement, {desc}, file_data,
+                                                         file.mapping, file.size, storage, &err,
+                                                         /*cache_slots=*/1));
+    file.mapping = nullptr;  // the storage owns the mapping now
+    MoeHybridLayerStorage & layer = storage.layers[0];
+    REQUIRE((layer.cold_expert_ids == std::vector<int32_t>{0, 2}));
+    REQUIRE(stack_holds(layer.gate_hot, 0, {3, 1}));
+    REQUIRE(stack_holds(layer.down_cold, 2, {0, 2}));
+    // Cold expert 0 swapped into the spare slot, after the two placed ones.
+    REQUIRE(layer.cache_slots == 1);
+    REQUIRE(moe_hybrid_cache_swap_in(layer, 0, backend.get()) == 2);
+    ggml_backend_synchronize(backend.get());
+    REQUIRE(stack_holds(layer.gate_hot, 0, {3, 1, 0}));
+
+    ggml_backend_buffer_t cold_buf = layer.cold_buf;
+    storage.release_hot_experts();
+    CHECK(layer.hot_buf == nullptr);
+    CHECK(layer.gate_hot == nullptr);
+    CHECK(!layer.is_expert_hot(3));
+    CHECK(layer.hot_local_by_global[3] == 0);  // the maps stay for the reload
+    CHECK(layer.hot_local_by_global[0] == -1);  // the swapped-in expert went with the stack
+    CHECK(layer.spare_global[0] == -1);
+    CHECK(layer.cold_buf == cold_buf);
+    CHECK(stack_holds(layer.up_cold, 1, {0, 2}));
+
+    // Back from the retained mapping: copied out of it, then read from the
+    // file on the reader's threads.
+    REQUIRE(rematerialize_moe_hybrid_hot_experts(backend.get(), {desc}, storage, &err));
+    CHECK(stack_holds(layer.gate_hot, 0, {3, 1}));
+    CHECK(stack_holds(layer.up_hot, 1, {3, 1}));
+    CHECK(stack_holds(layer.down_hot, 2, {3, 1}));
+    CHECK(layer.is_expert_hot(3) && layer.is_expert_hot(1) && !layer.is_expert_hot(0));
+    // Swapped in again, it is copied again rather than read from a stale slot.
+    REQUIRE(moe_hybrid_cache_swap_in(layer, 0, backend.get()) == 2);
+    ggml_backend_synchronize(backend.get());
+    CHECK(stack_holds(layer.gate_hot, 0, {3, 1, 0}));
+    CHECK(!rematerialize_moe_hybrid_hot_experts(backend.get(), {desc}, storage, &err));  // already resident
+
+    storage.release_hot_experts();
+    TensorFileReader reader;
+    REQUIRE(reader.open(file.path, &err, TensorFileReader::Mode::Buffered));
+    REQUIRE(rematerialize_moe_hybrid_hot_experts(backend.get(), {desc}, storage, &err, &reader));
+    CHECK(stack_holds(layer.gate_hot, 0, {3, 1}));
+    CHECK(stack_holds(layer.down_hot, 2, {3, 1}));
+    CHECK(layer.cold_buf == cold_buf);
+    CHECK(stack_holds(layer.gate_cold, 0, {0, 2}));
+}
+#endif

@@ -282,6 +282,15 @@ struct MoeHybridStorage {
     // Decode/verify graph arenas are shape caches, not model state. Release
     // them before a new bulk prefill needs substantially larger workspaces.
     void release_graph_caches();
+    // Frees the long-prefill routing, hot and cold arenas.
+    void release_prefill_arenas();
+
+    // Frees the hot expert stacks with every cached graph and prefill arena,
+    // keeping the cold stacks, the expert maps, the file mapping and its
+    // regions, so the hot stacks come back on the same placement with
+    // rematerialize_moe_hybrid_hot_experts(). Lets a model give back the GPU
+    // that holds its hot experts while its cold tier stays on another.
+    void release_hot_experts();
 };
 
 // Expert tensor file data for split loading (one entry per expert tensor).
@@ -336,6 +345,17 @@ bool build_moe_hybrid_storage_from_file(
     size_t readonly_file_mmap_size = 0,
     int readonly_file_fd = -1,
     const TensorFileReader * reader = nullptr);
+
+// Brings back the hot stacks release_hot_experts() freed, allocated on
+// `gpu_backend` and read from the storage's retained file mapping (on several
+// threads with `reader`, which must read the same file). `layer_descs` gives
+// the expert tensor shapes, as at the first build. On failure the storage may
+// hold some hot stacks: free it.
+bool rematerialize_moe_hybrid_hot_experts(ggml_backend_t gpu_backend,
+                                          const std::vector<MoeLayerDesc> & layer_descs,
+                                          MoeHybridStorage & storage,
+                                          std::string * err = nullptr,
+                                          const TensorFileReader * reader = nullptr);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);

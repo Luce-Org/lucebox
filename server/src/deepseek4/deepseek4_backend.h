@@ -276,8 +276,21 @@ private:
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
-    void release_target_state(bool keep_snapshots);
-    bool released_ = false;   // residency: every GPU released for another model
+    void release_target_state(bool keep_snapshots, bool keep_expert_tier = false);
+    // Residency: released for another model, every GPU or, with the expert
+    // tier kept, every GPU but the expert device.
+    bool released_ = false;
+    // The expert device: the cold expert stacks' own GPU backend, -1 without.
+    int expert_gpu_ = -1;
+    // The expert device runs in this build's runtime (its device index is ours).
+    bool expert_gpu_same_runtime_ = false;
+    // A release of the target device can keep the expert tier (the cold
+    // stacks with their locked host spill and the streamed expert cache) on
+    // the expert device; expert_tier_kept() while it holds only that tier.
+    bool expert_tier_keepable() const;
+    bool expert_tier_kept() const { return parked_ && moe_hybrid_ != nullptr; }
+    size_t expert_tier_bytes() const;
+    bool reload_target_beside_expert_tier();
     // Residency: the devices besides the target that the model has used (expert, drafter, vision). Kept when
     // their backends are freed, so a released model still reports them.
     std::vector<int> used_gpus_;
@@ -446,8 +459,10 @@ private:
     bool load_model();
     bool init_hybrid_model();
     bool init_streamed_expert_tier();
-    bool check_device_headroom() const;
-    bool log_device_memory(const char * when) const;
+    // `expert_tier_serving`: the expert device kept its tier through a release
+    // and is checked as a serving device, not a loading one.
+    bool check_device_headroom(bool expert_tier_serving = false) const;
+    bool log_device_memory(const char * when, bool expert_tier_serving = false) const;
     bool size_hybrid_prefill_chunk();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;

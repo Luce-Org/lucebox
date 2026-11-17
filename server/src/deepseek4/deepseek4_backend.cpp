@@ -3276,8 +3276,12 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
 // At load (`when` null) every device must keep the whole headroom free; while
 // serving, the prefill chunk may spend half of it (size_hybrid_prefill_chunk)
 // and the decode/verify graphs the rest, so a phase only warns below half.
+// A reinstate beside a kept expert tier loads nothing new on the expert
+// device, which has been serving all along: it gets the serving limit there.
+// On an integrated GPU that matters, since its free memory is the system's,
+// which the model that ran meanwhile may have taken some of.
 // False when a device is below its limit.
-bool DeepSeek4Backend::log_device_memory(const char * when) const {
+bool DeepSeek4Backend::log_device_memory(const char * when, bool expert_tier_serving) const {
     std::vector<int> devices = {cfg_.device.gpu};
     if (stream_cache_device_ >= 0 && stream_cache_device_ != cfg_.device.gpu) {
         devices.push_back(stream_cache_device_);
@@ -3287,7 +3291,8 @@ bool DeepSeek4Backend::log_device_memory(const char * when) const {
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_room(device, &free_b, &total_b);
         const size_t headroom = ds4_device_headroom_bytes(device);
-        const size_t need = when ? headroom / 2 : headroom;
+        const bool serving = when || (expert_tier_serving && device == expert_gpu_ && device != cfg_.device.gpu);
+        const size_t need = serving ? headroom / 2 : headroom;
         std::fprintf(stderr, "[deepseek4] device %d memory%s%s: %.2f of %.2f GiB used, %.2f GiB free "
                      "(headroom %.2f GiB)%s\n", device, when ? " " : "", when ? when : "",
                      (total_b - free_b) / 1073741824.0,
@@ -3302,13 +3307,14 @@ bool DeepSeek4Backend::log_device_memory(const char * when) const {
 // Logs every device's memory once everything persistent is allocated and
 // refuses a configuration that leaves less than the device's headroom, rather
 // than let the driver overcommit it at the first request.
-bool DeepSeek4Backend::check_device_headroom() const {
-    bool ok = log_device_memory(nullptr);
+bool DeepSeek4Backend::check_device_headroom(bool expert_tier_serving) const {
+    bool ok = log_device_memory(nullptr, expert_tier_serving);
     // Locked host memory cannot be reclaimed: the host keeps the OS reserve free.
     const size_t locked = stream_cache_device_ >= 0 ? ggml_backend_cuda_host_spill_bytes(stream_cache_device_) : 0;
     if (locked > 0) {
         const uint64_t avail = host_available_bytes();
-        const uint64_t need = 4ULL << 30;
+        // Beside a kept tier nothing new is locked: the serving limit, as on the device.
+        const uint64_t need = expert_tier_serving ? 2ULL << 30 : 4ULL << 30;
         std::fprintf(stderr, "[deepseek4] host memory: %.2f GiB available beside %.2f GiB of locked experts "
                      "(headroom %.2f GiB)%s\n", avail / 1073741824.0, locked / 1073741824.0,
                      need / 1073741824.0, avail < need ? ": does not fit" : "");
@@ -3765,7 +3771,36 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     return true;
 }
 
+// Seconds per stage of a load, logged on one line: "dense 2.10, hot experts 3.02".
+namespace {
+struct Ds4StageClock {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    std::string line;
+    void lap(const char * stage) {
+        const auto now = std::chrono::steady_clock::now();
+        char part[64];
+        std::snprintf(part, sizeof(part), "%s%s %.2f", line.empty() ? "" : ", ", stage,
+                      std::chrono::duration<double>(now - t).count());
+        line += part;
+        t = now;
+    }
+};
+}  // namespace
+
+// The largest expert (gate, up and down) of any layer: what the streaming
+// engine stages at once.
+static size_t ds4_largest_expert_bytes(const MoeHybridStorage & hybrid) {
+    size_t largest = 0;
+    for (const auto & layer : hybrid.layers) {
+        largest = std::max(largest, layer.fused_gate_up
+            ? layer.gate_up_expert_bytes + layer.down_expert_bytes
+            : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes);
+    }
+    return largest;
+}
+
 bool DeepSeek4Backend::init_hybrid_model() {
+    if (expert_tier_kept()) return reload_target_beside_expert_tier();
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
@@ -3822,6 +3857,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
     }
     const bool same_runtime_tp = inprocess_tp && tp.backend_valid &&
         tp.secondary_backend == local_kind;
+    expert_gpu_same_runtime_ = same_runtime_tp;
 
     // Mix qtypes need a learned decode table for every resident tensor. The
     // same-runtime GPU path registers the matching expert subset after it
@@ -3911,7 +3947,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
                          placement_backend_name(expert_kind), expert_gpu);
         }
         expert_backend_ = init_placement_backend(expert_kind, expert_gpu, &err);
-        if (expert_backend_) note_used_gpu(expert_gpu);
+        if (expert_backend_) {
+            note_used_gpu(expert_gpu);
+            expert_gpu_ = expert_gpu;
+        }
         if (!expert_backend_) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] failed to initialize in-process "
@@ -4091,13 +4130,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "to the duplicated secondary stack\n");
     }
     if (hybrid->has_mmap() && hybrid->streams_cold_experts()) {
-        size_t max_expert_bytes = 0;
-        for (const auto & layer : hybrid->layers) {
-            const size_t per_expert_bytes = layer.fused_gate_up
-                ? layer.gate_up_expert_bytes + layer.down_expert_bytes
-                : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes;
-            max_expert_bytes = std::max(max_expert_bytes, per_expert_bytes);
-        }
+        const size_t max_expert_bytes = ds4_largest_expert_bytes(*hybrid);
         if (max_expert_bytes == 0) {
             std::fprintf(stderr, "[deepseek4] failed to compute streaming expert size\n");
             return fail_hybrid_init();
@@ -4144,6 +4177,65 @@ bool DeepSeek4Backend::init_hybrid_model() {
     return true;
 }
 
+// Reinstate with the expert tier kept: loads what lives on the target (dense
+// weights, the vision encoder, the hot expert stacks) on the placement fixed at
+// first load, and reattaches the streaming engine. The cold stacks, their host
+// spill and the streamed expert cache never left the expert device. unpark()
+// rebuilds the rest (routing tables, Engram, the cache, the drafter) as after
+// any reload.
+bool DeepSeek4Backend::reload_target_beside_expert_tier() {
+    Ds4StageClock clock;
+    TargetLoadPlan plan;
+    plan.skip_expert_tensors = true;
+    plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
+    if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
+        std::fprintf(stderr, "[deepseek4] reinstate: dense weights failed to load: %s (%s)\n",
+                     cfg_.model_path.c_str(), luce_last_error());
+        return false;
+    }
+    clock.lap("dense");
+    if (!load_vision()) return false;
+    clock.lap("vision");
+    MoeHybridStorage & hybrid = *moe_hybrid_;
+    std::string err;
+    if (!rematerialize_deepseek4_moe_hybrid_hot_experts(cfg_.model_path, backend_, w_, hybrid, &err)) {
+        std::fprintf(stderr, "[deepseek4] reinstate: hot experts failed to load: %s\n", err.c_str());
+        return false;
+    }
+    clock.lap("hot experts");
+    // The registry puts each decode table on the device that owns its tensor,
+    // and takes the current device for a tensor in host memory: the cold stacks
+    // spilled to locked memory belong to the expert device, but the hot-stack
+    // upload left the target current. An expert device in the other runtime
+    // has no tables here (the first load registers none for it either).
+    if (expert_gpu_same_runtime_) {
+        int prev_device = -1;
+        if (cudaGetDevice(&prev_device) != cudaSuccess || cudaSetDevice(expert_gpu_) != cudaSuccess) {
+            std::fprintf(stderr, "[deepseek4] reinstate: cannot select expert device %d\n", expert_gpu_);
+            return false;
+        }
+        const bool tables = register_deepseek4_moe_hybrid_mix_tables(cfg_.model_path, w_, hybrid, &err);
+        (void) cudaSetDevice(prev_device);
+        if (!tables) {
+            std::fprintf(stderr, "[deepseek4] reinstate: expert decode tables failed: %s\n", err.c_str());
+            return false;
+        }
+    }
+    clock.lap("decode tables");
+    if (hybrid.has_mmap() && hybrid.streams_cold_experts()) {
+        if (!stream_engine_.init(backend_, ds4_largest_expert_bytes(hybrid), &err)) {
+            std::fprintf(stderr, "[deepseek4] reinstate: cold-expert stream engine failed: %s\n", err.c_str());
+            return false;
+        }
+        hybrid.stream_engine = &stream_engine_;
+    }
+    clock.lap("stream engine");
+    w_.moe_hybrid = true;
+    w_.mixed_mmq_policy = hybrid.mixed_mmq_policy;
+    std::fprintf(stderr, "[deepseek4] target reload stages (s): %s\n", clock.line.c_str());
+    return true;
+}
+
 void DeepSeek4Backend::print_ready_banner() const {
     std::printf("[deepseek4-daemon] ready layers=%d ctx=%d experts=%d/%d\n",
                 w_.n_layer,
@@ -4154,18 +4246,14 @@ void DeepSeek4Backend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
-static bool luce_gpu_overlap_empty(const std::vector<int> & a, const std::vector<int> & b) {
-    for (int g : a) {
-        if (std::find(b.begin(), b.end(), g) != b.end()) return false;
-    }
-    return true;
-}
-
 // Frees the target model's device state: cache, weights, expert tiers and
 // their backends. Prefix snapshots live in system memory; a park drops them,
 // a release for model switching keeps them (the cache geometry they need is
 // configured, not derived from the expert placement a reload recomputes).
-void DeepSeek4Backend::release_target_state(bool keep_snapshots) {
+// With `keep_expert_tier` the expert device keeps its tier: the cold stacks
+// with their locked host spill, the streamed expert cache, the expert maps and
+// the file mapping they read, and the placement all of them were sized for.
+void DeepSeek4Backend::release_target_state(bool keep_snapshots, bool keep_expert_tier) {
     maybe_save_routing_stats();
     if (!keep_snapshots) {
         for (int i = 0; i < PREFIX_SLOTS; ++i) {
@@ -4176,23 +4264,54 @@ void DeepSeek4Backend::release_target_state(bool keep_snapshots) {
     last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
-    expert_cache_.destroy();
+    if (!keep_expert_tier) expert_cache_.destroy();
     stream_engine_.destroy();
-    moe_hybrid_.reset();
-    if (expert_backend_) {
-        ggml_backend_free(expert_backend_);
-        expert_backend_ = nullptr;
+    if (keep_expert_tier) {
+        moe_hybrid_->stream_engine = nullptr;
+        moe_hybrid_->release_hot_experts();
+    } else {
+        moe_hybrid_.reset();
+        if (expert_backend_) {
+            ggml_backend_free(expert_backend_);
+            expert_backend_ = nullptr;
+        }
+        moe_placement_ = {};
+        moe_decode_placement_ = {};
     }
-    moe_placement_ = {};
-    moe_decode_placement_ = {};
     release_vision();
     free_deepseek4_weights(w_);
     parked_ = true;
 }
 
 // ── Residency (model switching) ─────────────────────────────────────────
-// One request at a time (no paged serving): every GPU is released and the
-// model comes back through unpark(). The prefix snapshots stay.
+// One request at a time (no paged serving). With its experts split between
+// the target and an expert device (R9700 + Strix Halo), a release of the
+// target keeps the expert tier where it is, so a reinstate uploads only the
+// target's part; a release that names the expert device frees everything.
+// The prefix snapshots stay in system memory either way.
+
+bool DeepSeek4Backend::expert_tier_keepable() const {
+    // A cluster rank's placement is agreed with its peers at load.
+    if (!moe_hybrid_ || !expert_backend_ || cluster_) return false;
+    const MoeHybridStorage & hybrid = *moe_hybrid_;
+    return expert_gpu_ >= 0 && expert_gpu_ != cfg_.device.gpu &&
+           hybrid.cold_backend == expert_backend_ &&
+           hybrid.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+           hybrid.materialized_cold_experts && hybrid.materialized_hot_experts && hybrid.has_mmap() &&
+           (stream_cache_device_ < 0 || stream_cache_device_ == expert_gpu_);
+}
+
+// The expert tier's buffers: the cold stacks (with their locked host spill) and
+// the streamed expert cache.
+size_t DeepSeek4Backend::expert_tier_bytes() const {
+    if (!moe_hybrid_) return 0;
+    size_t bytes = 0;
+    for (const MoeHybridLayerStorage & layer : moe_hybrid_->layers) {
+        if (layer.cold_buf) bytes += ggml_backend_buffer_get_size(layer.cold_buf);
+    }
+    if (expert_cache_.ready()) bytes += (size_t) expert_cache_.n_slots() * expert_cache_.slot_bytes();
+    return bytes;
+}
 
 ModelBackend::Residency DeepSeek4Backend::residency() const {
     Residency r;
@@ -4204,20 +4323,29 @@ ModelBackend::Residency DeepSeek4Backend::residency() const {
     // The expert, drafter and vision devices, kept through a release: a
     // reinstate takes them back, so peers must free them first.
     for (int gpu : used_gpus_) add(gpu);
+    const bool keepable = expert_tier_keepable();
     if (cfg_.paged_attention) {
-        r.reason = "deepseek4: paged serving is not supported";
+        r.reason = "deepseek4: needs --max-concurrency 1 (paged serving does not release)";
     } else if (!backend_) {
         r.reason = "deepseek4: not loaded";
     } else {
         r.supported = true;
+        if (keepable) r.keepable.push_back(expert_gpu_);
     }
-    if (released_) r.released = r.gpus;
+    const bool kept = released_ && expert_tier_kept();
+    for (int gpu : r.gpus) {
+        if (released_ && !(kept && gpu == expert_gpu_)) r.released.push_back(gpu);
+    }
     r.bytes.assign(r.gpus.size(), 0);
     if (!released_) {
         const MemoryReport m = memory_report();
         if (!m.cache.host) {
             r.bytes[0] = m.cache.kv_bytes + m.cache.recurrent_bytes + m.cache.other_bytes;
         }
+    }
+    if (keepable && (!released_ || kept)) {
+        const size_t i = (size_t) (std::find(r.gpus.begin(), r.gpus.end(), expert_gpu_) - r.gpus.begin());
+        r.bytes[i] += expert_tier_bytes();
     }
     return r;
 }
@@ -4228,17 +4356,40 @@ bool DeepSeek4Backend::release_gpus(const std::vector<int> & gpus, std::string &
         error = r.reason;
         return false;
     }
-    if (released_) return true;
-    if (!gpus.empty() && luce_gpu_overlap_empty(gpus, r.gpus)) return true;
+    auto named = [&](int gpu) { return gpus.empty() || std::find(gpus.begin(), gpus.end(), gpu) != gpus.end(); };
+    const bool keepable = expert_tier_keepable();
+    const bool tier_named = keepable && named(expert_gpu_);
+    bool target_named = false;
+    for (int gpu : r.gpus) {
+        if ((!keepable || gpu != expert_gpu_) && named(gpu)) target_named = true;
+    }
     const auto t0 = std::chrono::steady_clock::now();
+    const auto seconds = [&t0] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    };
+    // A release only reduces what is held: everything, then the expert tier,
+    // then nothing. GPUs the model holds nothing on are a no-op.
+    if (released_) {
+        if (!expert_tier_kept() || !tier_named) return true;
+        ggml_backend_synchronize(expert_backend_);
+        release_target_state(/*keep_snapshots=*/true);
+        ggml_backend_cuda_trim_pool(backend_);
+        std::printf("[residency] deepseek4 released its expert tier in %.2f s\n", seconds());
+        std::fflush(stdout);
+        return true;
+    }
+    if (!target_named && !tier_named) return true;
     ggml_backend_synchronize(backend_);
+    if (expert_backend_) ggml_backend_synchronize(expert_backend_);
     if (spec_drafter_) release_spec_drafter(/*mark_parked=*/true);
     if (pflash_drafter_loaded_) release_pflash_drafter();
-    if (!parked_) release_target_state(/*keep_snapshots=*/true);
-    ggml_backend_cuda_trim_pool(backend_);
+    const bool keep_tier = keepable && !tier_named && !parked_;
+    if (!parked_) release_target_state(/*keep_snapshots=*/true, keep_tier);
+    // A kept tier's graph caches and prefill arenas on the expert device went too.
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
     released_ = true;
-    std::printf("[residency] deepseek4 released its GPUs in %.2f s\n",
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::printf("[residency] deepseek4 released %s in %.2f s\n",
+                keep_tier ? "its target GPU, keeping the expert tier," : "its GPUs", seconds());
     std::fflush(stdout);
     return true;
 }
@@ -4246,17 +4397,19 @@ bool DeepSeek4Backend::release_gpus(const std::vector<int> & gpus, std::string &
 bool DeepSeek4Backend::reinstate(std::string & error) {
     if (!released_) return true;
     const auto t0 = std::chrono::steady_clock::now();
+    const bool kept = expert_tier_kept();
     if (!unpark(ParkTarget::All)) {
         error = "deepseek4: reload failed";
-        // unpark() may have restored the drafter or the target before a later
-        // check failed: free both, so the model holds nothing while released.
+        // unpark() may have restored the drafter or the target, or kept the
+        // expert tier, before a later check failed: free all of it, so the
+        // model holds nothing while released.
         if (spec_drafter_) release_spec_drafter(/*mark_parked=*/true);
-        if (!parked_) release_target_state(/*keep_snapshots=*/true);
+        if (!parked_ || moe_hybrid_) release_target_state(/*keep_snapshots=*/true);
         ggml_backend_cuda_trim_pool(backend_);
         return false;
     }
     released_ = false;
-    std::printf("[residency] deepseek4 reinstated in %.2f s\n",
+    std::printf("[residency] deepseek4 reinstated%s in %.2f s\n", kept ? " beside its expert tier" : "",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::fflush(stdout);
     return true;
@@ -4298,9 +4451,13 @@ bool DeepSeek4Backend::park(ParkTarget target) {
 bool DeepSeek4Backend::unpark(ParkTarget target) {
     const bool want_draft = park_target_includes_draft_model(target);
     const bool want_target_model = park_target_includes_target_model(target);
+    const bool tier_kept = expert_tier_kept();
+    Ds4StageClock clock;
 
     if (want_target_model && parked_) {
-        if (!load_model() || !apply_routing_adjustments() || !init_engram()) {
+        const bool loaded = load_model();
+        clock.lap("model");
+        if (!loaded || !apply_routing_adjustments() || !init_engram()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             release_vision();
             free_deepseek4_weights(w_);
@@ -4316,6 +4473,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
 
+        clock.lap("routing+engram");
         const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
         if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
             std::fprintf(stderr,
@@ -4355,6 +4513,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
         }
 
         parked_ = false;
+        clock.lap("cache");
         std::printf("[deepseek4] target unparked (VRAM restored)\n");
         std::fflush(stdout);
     }
@@ -4380,12 +4539,15 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
     }
+    clock.lap("drafter");
     // A restored target sizes its streamed expert tier last again.
     if (moe_hybrid_ && !expert_cache_.ready() && !init_streamed_expert_tier()) return false;
     // The same post-load checks as init(): a restore that no longer fits fails.
-    if (moe_hybrid_ && (!check_device_headroom() || !size_hybrid_prefill_chunk())) return false;
+    if (moe_hybrid_ && (!check_device_headroom(tier_kept) || !size_hybrid_prefill_chunk())) return false;
     if (!draft_swap_.host && !setup_draft_swap()) return false;
     cache_.prefill_mode = cfg_.prefill_mode;
+    clock.lap("checks");
+    std::fprintf(stderr, "[deepseek4] unpark stages (s): %s\n", clock.line.c_str());
     return true;
 }
 
