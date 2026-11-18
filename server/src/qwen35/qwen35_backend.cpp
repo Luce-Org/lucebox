@@ -3215,7 +3215,10 @@ bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
                                            const std::vector<int32_t> & prompt) {
     const int ct = kvflash_pager_.chunk_tokens();
     if (!kvflash_active() || ct <= 0 || snap.kvflash_blob.empty()) return false;
-    if (!kvflash_pager_.deserialize(snap.kvflash_blob.data(), snap.kvflash_blob.size())) {
+    const bool ok = kvflash_pager_.deserialize(snap.kvflash_blob.data(), snap.kvflash_blob.size());
+    // deserialize() resets the pager inside (a refused header leaves it as it was; dropping then only costs a re-upload).
+    if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive();
+    if (!ok) {
         std::fprintf(stderr, "[kvflash] pager deserialize failed\n");
         return false;
     }
@@ -3526,7 +3529,7 @@ bool Qwen35Backend::kvflash_exact_scores(int sealed, const std::vector<const flo
     return ok;
 }
 
-// Every pager reset goes through here: the GPU scorer's device archive holds K of the old chunks, stale from now on.
+// Every pager reset goes through here (kvflash_restore_pooled, whose reset is inside deserialize(), drops it itself): the GPU scorer's device archive holds K of the old chunks, stale from now on.
 void Qwen35Backend::kvflash_reset_pager() {
     kvflash_pager_.reset();
     if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive();
