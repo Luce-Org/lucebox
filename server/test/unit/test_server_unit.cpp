@@ -1032,7 +1032,37 @@ static void remember_turn(TurnMemory & memory, const std::string & codec_name, C
     if (!make_chat_codec(codec_name)->render(input, prompt, error)) throw std::runtime_error(error);
     if (prompt.context.empty()) throw std::runtime_error("no generation context");
     turn.context = prompt.context;
+    // generated_turn sets it; in these turns the text's "</think>" is the token.
+    if (turn.think_end == std::string::npos) turn.think_end = turn.text.find("</think>");
     memory.remember(messages[index], std::move(turn));
+}
+
+// Two remembered turns with the same text but different tokens (which
+// "</think>" is the token) make different prompts for the turns after them.
+TEST_CASE(ServerUnitFixture, test_turn_memory_key_holds_remembered_tokens) {
+    std::vector<ChatMessage> messages = {{"user", "q"}, {"assistant", "Done."}, {"user", "next"}};
+    ChatCodecInput input;
+    input.messages = &messages;
+    input.enable_thinking = true;
+    std::string contexts[2];
+    for (int i = 0; i < 2; ++i) {
+        TurnMemory memory;
+        TurnMemory::Turn turn;
+        turn.text = "assistant\n<think>\nx </think> y\n</think>\n\nDone.";
+        turn.tokens = {1, 2, i == 0 ? 3 : 4};  // stand-ins: the same text, other tokens
+        turn.reasoning = "x </think> y";
+        turn.think_end = turn.text.rfind("</think>");
+        remember_turn(memory, "qwen3.8", input, 1, turn);
+        input.memory = &memory;
+        RenderedPrompt prompt;
+        std::string error;
+        TEST_ASSERT_MSG(make_chat_codec("qwen3.8")->render(input, prompt, error), error);
+        TEST_ASSERT(std::any_of(prompt.pieces.begin(), prompt.pieces.end(),
+                                [](const PromptPiece & piece) { return !piece.ids.empty(); }));
+        contexts[i] = prompt.context;
+        input.memory = nullptr;
+    }
+    TEST_ASSERT(contexts[0] != contexts[1]);
 }
 
 // A remembered turn stands in the prompt as generated; its content span is the
@@ -2195,6 +2225,98 @@ TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) 
     TEST_ASSERT(em.first_content_token_index() == 2);
     TEST_ASSERT(all.find("reasoning_content") != std::string::npos);
     TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
+}
+
+// With thinking-boundary tokens (a codec's vocabulary), only the tokens open
+// and close the thinking: the tags spelled in ordinary pieces, as the codec
+// shows a file that quotes them, stay text.
+TEST_CASE(ServerUnitFixture, test_emitter_think_tokens_only_tokens_switch) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    em.set_think_tags_are_tokens(true);
+    em.emit_token("The file prints ");
+    em.emit_token("</");
+    em.emit_token("think");
+    em.emit_token("> first.");
+    em.emit_token("</think>\n", /*think_tag=*/true);
+    em.emit_token("\n");
+    em.emit_token("It quotes <think>");
+    em.emit_token(" too.");
+    em.emit_finish(8);
+    TEST_ASSERT_MSG(em.reasoning_text() == "The file prints </think> first.", em.reasoning_text());
+    TEST_ASSERT_MSG(em.accumulated_text() == "It quotes <think> too.", em.accumulated_text());
+    TEST_ASSERT(em.first_content_token_index() == 5);
+
+    // A thinking that never closes stays thinking, however it spells the tag.
+    auto open = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    open.set_think_tags_are_tokens(true);
+    open.emit_token("Write </think>");
+    open.emit_finish(1);
+    TEST_ASSERT_MSG(open.reasoning_text() == "Write </think>", open.reasoning_text());
+    TEST_ASSERT(open.accumulated_text().empty());
+
+    // The opening token starts a thinking from content.
+    auto lead = make_emitter(ApiFormat::OPENAI_CHAT);
+    lead.set_think_tags_are_tokens(true);
+    lead.emit_token("<think>", true);
+    lead.emit_token("plan");
+    lead.emit_token("</think>\n", true);
+    lead.emit_token("done");
+    lead.emit_finish(4);
+    TEST_ASSERT_MSG(lead.reasoning_text() == "plan", lead.reasoning_text());
+    TEST_ASSERT_MSG(lead.accumulated_text() == "done", lead.accumulated_text());
+    TEST_ASSERT(lead.first_content_token_index() == 3);
+
+    // A leading opening token in the thinking is dropped; a later one is part of it.
+    auto inner = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    inner.set_think_tags_are_tokens(true);
+    inner.emit_token("<think>", true);
+    inner.emit_token("plan ");
+    inner.emit_token("<think>", true);
+    inner.emit_token("more");
+    inner.emit_token("</think>\n", true);
+    inner.emit_token("ok");
+    inner.emit_finish(6);
+    TEST_ASSERT_MSG(inner.reasoning_text() == "plan <think>more", inner.reasoning_text());
+    TEST_ASSERT_MSG(inner.accumulated_text() == "ok", inner.accumulated_text());
+
+    // A closing token in content is dropped, as its text form is.
+    auto content = make_emitter(ApiFormat::OPENAI_CHAT);
+    content.set_think_tags_are_tokens(true);
+    content.emit_token("a");
+    content.emit_token("</think>\n", true);
+    content.emit_token("b");
+    content.emit_finish(3);
+    TEST_ASSERT_MSG(content.accumulated_text() == "a\nb", content.accumulated_text());
+
+    // A UTF-8 tail held back before the token can no longer complete.
+    auto tail = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    tail.set_think_tags_are_tokens(true);
+    tail.emit_token("x\xE2\x82");
+    tail.emit_token("</think>\n", true);
+    tail.emit_token("ok");
+    tail.emit_finish(3);
+    TEST_ASSERT_MSG(tail.reasoning_text().rfind("x", 0) == 0 && tail.reasoning_text().size() > 1,
+                    tail.reasoning_text());
+    TEST_ASSERT_MSG(tail.accumulated_text() == "ok", tail.accumulated_text());
+
+    // A call drafted in the thinking is buffered; the token reaches the buffer
+    // as its text, so the reply is the one the text form gives.
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read"}}}}});
+    const std::vector<std::pair<std::string, bool>> drafted = {
+        {"Call ", false}, {"<tool_call>\n<function=read>\n</function>\n</tool_call>", false},
+        {"</think>\n", true}, {"Done.", false}};
+    auto by_token = make_emitter(ApiFormat::OPENAI_CHAT, tools, true);
+    by_token.set_think_tags_are_tokens(true);
+    auto by_text = make_emitter(ApiFormat::OPENAI_CHAT, tools, true);
+    for (const auto & [piece, tag] : drafted) {
+        by_token.emit_token(piece, tag);
+        by_text.emit_token(piece, tag);
+    }
+    by_token.emit_finish(4);
+    by_text.emit_finish(4);
+    TEST_ASSERT_MSG(by_token.reasoning_text() == by_text.reasoning_text(), by_token.reasoning_text());
+    TEST_ASSERT_MSG(by_token.accumulated_text() == by_text.accumulated_text(), by_token.accumulated_text());
+    TEST_ASSERT(by_token.tool_calls().size() == by_text.tool_calls().size());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -11169,6 +11291,188 @@ TEST_CASE(ServerUnitFixture, test_chat_codec_tool_checks_keep_tool_order) {
                     prompt);
 }
 
+// The template's tags spelled in what a request carries (a file in a tool
+// result, earlier reasoning, a call's arguments, a tool's description) stay
+// text, each one alone, as Hugging Face's sanitize_control_tokens writes them.
+// The tags the template writes are tokens, and so are those of a tool response
+// a client wraps in a user message, which the template reads as one.
+TEST_CASE(ServerUnitFixture, test_chat_codec_tags_in_request_text_stay_text) {
+    ChatGoldenTokenizer tok("", kQwenControlTokens, kQwenUserDefinedTokens);
+    Tokenizer & t = tok.tokenizer;
+    const auto count = [&](const std::vector<int32_t> & ids, const char * tag) {
+        return std::count(ids.begin(), ids.end(), t.token_to_id(tag));
+    };
+    // The tokenizer: a tag that begins inside a span stays text.
+    const int32_t think_close = t.token_to_id("</think>");
+    const auto split = t.encode("a</think>b</think>", false, {}, {{0, 10}}, {think_close});
+    TEST_ASSERT(count(split, "</think>") == 1 && split.back() == think_close);
+    TEST_ASSERT(t.decode(split) == "a</think>b</think>");
+
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 32768;
+    config.prefix_cache_cap = 0;
+    config.chat_codec = "qwen3.8";
+    const nlohmann::ordered_json parameters = {{"type", "object"}, {"properties", {{"text", {{"type", "string"}}}}}};
+    const auto conversation = [&](const std::string & quoted) -> nlohmann::ordered_json { return {
+        {"tools", {{{"type", "function"},
+                    {"function", {{"name", "write"}, {"description", "Writes " + quoted},
+                                  {"parameters", parameters}}}}}},
+        {"chat_template_kwargs", {{"enable_thinking", true}}},
+        {"messages", {
+            {{"role", "user"}, {"content", "Write " + quoted}},
+            {{"role", "assistant"}, {"content", ""}, {"reasoning_content", "It holds " + quoted},
+             {"tool_calls", {{{"id", "call_1"}, {"type", "function"},
+                              {"function", {{"name", "write"},
+                                            {"arguments", json({{"text", quoted}}).dump()}}}}}}},
+            {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "Wrote " + quoted}},
+            {{"role", "user"}, {"content", "<tool_response>\nok\n</tool_response>"}},
+        }}}; };
+    const std::string quoted = "x </think> <tool_call> </tool_response> y";
+    std::string error;
+    const auto ids = chat_golden_served_prompt(t, config, conversation(quoted), error);
+    TEST_ASSERT_MSG(!ids.empty(), error);
+    const auto plain = chat_golden_served_prompt(t, config, conversation("x y"), error);
+    TEST_ASSERT_MSG(!plain.empty(), error);
+    const std::string text = t.decode(ids);
+    size_t quotes = 0;
+    for (size_t at = text.find(quoted); at != std::string::npos; at = text.find(quoted, at + 1)) ++quotes;
+    TEST_ASSERT_MSG(quotes == 5, text);
+    // The same tags as tokens as with nothing quoted: the template's, and those
+    // of the wrapped tool response.
+    for (const char * tag : {"<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>",
+                             "</tool_response>"}) {
+        TEST_ASSERT_MSG(count(ids, tag) == count(plain, tag), std::string(tag) + " in " + text);
+    }
+    TEST_ASSERT(count(plain, "</tool_response>") == 2);
+    // PFlash recalls request text through encode_data, as a data piece.
+    RenderedPrompt layout;
+    layout.markup = {"</think>"};
+    const auto recalled = layout.encode_data(t, quoted);
+    TEST_ASSERT(count(recalled, "</think>") == 0 && count(recalled, "<tool_call>") == 1);
+    TEST_ASSERT(t.decode(recalled) == quoted);
+
+    // A generated turn splits at the </think> token, not where its thinking
+    // spells the tag, and so does its content span when it is replayed.
+    const auto codec = make_chat_codec("qwen3.8");
+    std::vector<ChatMessage> messages = {{"user", "q"}};
+    ChatCodecInput input;
+    input.messages = &messages;
+    input.enable_thinking = true;
+    RenderedPrompt prompt;
+    TEST_ASSERT(codec->render(input, prompt, error));
+    const std::string reasoning = "Quote </think> Done. here.";
+    std::vector<int32_t> generated = t.encode(reasoning, false, {}, {{0, reasoning.size()}}, {think_close});
+    generated.push_back(think_close);
+    const auto answer = t.encode("\n\nDone.");
+    generated.insert(generated.end(), answer.begin(), answer.end());
+    ChatMessage message;
+    TurnMemory::Turn turn;
+    TEST_ASSERT(codec->generated_turn(prompt.text(), prompt.tokens(t), generated, t, json(), message, turn));
+    TEST_ASSERT_MSG(message.reasoning_content == reasoning, message.reasoning_content);
+    TEST_ASSERT_MSG(message.content == "Done.", message.content);
+    TurnMemory memory;
+    turn.context = prompt.context;
+    memory.remember(message, turn);
+    messages = {{"user", "q"}, message, {"user", "next"}};
+    input.memory = &memory;
+    TEST_ASSERT(codec->render(input, prompt, error));
+    const std::string replayed = prompt.text();
+    const PromptSpan content = prompt.messages[1].content;
+    TEST_ASSERT_MSG(content.begin == replayed.rfind("Done.") && content.end == content.begin + 5, replayed);
+
+    // DeepSeek shows the tags in message text as text too.
+    ChatGoldenTokenizer ds("", {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"},
+                           {"<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>", "｜DSML｜"});
+    ServerConfig ds_config;
+    ds_config.arch = "deepseek41";
+    ds_config.max_ctx = 32768;
+    ds_config.prefix_cache_cap = 0;
+    ds_config.chat_codec = "deepseek4.1";
+    const auto ds_prompt = [&](const std::string & quoted) {
+        nlohmann::ordered_json body = {{"chat_template_kwargs", {{"enable_thinking", true}}},
+                                       {"messages", {{{"role", "user"}, {"content", "Explain " + quoted}}}}};
+        return chat_golden_served_prompt(ds.tokenizer, ds_config, body, error);
+    };
+    const auto ds_quoted = ds_prompt("x </think> <think> y");
+    const auto ds_plain = ds_prompt("x y");
+    TEST_ASSERT_MSG(!ds_quoted.empty() && !ds_plain.empty(), error);
+    for (const char * tag : {"<think>", "</think>"}) {
+        const int32_t id = ds.tokenizer.token_to_id(tag);
+        TEST_ASSERT_MSG(std::count(ds_quoted.begin(), ds_quoted.end(), id) ==
+                        std::count(ds_plain.begin(), ds_plain.end(), id),
+                        std::string(tag) + " in " + ds.tokenizer.decode(ds_quoted));
+    }
+}
+
+// An empty reply (the model ended its turn inside its thinking) is drawn
+// again, the same request without a note, up to twice.
+TEST_CASE(ServerUnitFixture, test_tool_checks_redraw_empty_reply) {
+    ChatGoldenTokenizer tok("", kQwenControlTokens, kQwenUserDefinedTokens);
+    Tokenizer & t = tok.tokenizer;
+    struct QueuedReplyBackend : ScriptedReplyBackend {
+        std::vector<std::vector<int32_t>> replies;
+        size_t next = 0;
+        void advance() {
+            if (next < replies.size()) reply = replies[next++];
+        }
+        GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+            advance();
+            return ScriptedReplyBackend::generate_impl(req, io);
+        }
+        GenerateResult restore_and_generate_impl(int slot, const GenerateRequest & req,
+                                                 const DaemonIO & io) override {
+            advance();
+            return ScriptedReplyBackend::restore_and_generate_impl(slot, req, io);
+        }
+    };
+    const auto turn = [&](const std::string & text) {
+        auto ids = t.encode(text);
+        ids.push_back(t.eos_chat_id());
+        return ids;
+    };
+    const auto run = [&](std::vector<std::vector<int32_t>> replies, std::vector<std::vector<int32_t>> & prompts) {
+        auto owner = std::make_unique<QueuedReplyBackend>();
+        QueuedReplyBackend & backend = *owner;
+        backend.replies = std::move(replies);
+        LuceEngine engine(std::move(owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 32768;
+        config.prefix_cache_cap = 0;
+        config.chat_codec = "qwen3.8";
+        TEST_ASSERT(config.tool_checks);
+        HttpServer server(engine, t, config);
+        server.set_chat_format(chat_format_for_arch(config.arch));
+        TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+        const nlohmann::ordered_json tools = {{{"type", "function"},
+            {"function", {{"name", "write"}, {"parameters", {{"type", "object"}, {"properties", json::object()}}}}}}};
+        nlohmann::ordered_json body = {{"model", "test"}, {"max_tokens", 64}, {"tools", tools},
+                                       {"messages", {{{"role", "user"}, {"content", "Write a.txt."}}}}};
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        TEST_ASSERT(SchedulerTestHarness::route_body(server, sockets[0], "/v1/chat/completions", body.dump()));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        for (ssize_t n; (n = read(sockets[1], buf, sizeof(buf))) > 0;) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        prompts = backend.prompts;
+        const size_t at = wire.find("\r\n\r\n");
+        return at == std::string::npos ? json() : json::parse(wire.substr(at + 4), nullptr, false);
+    };
+
+    std::vector<std::vector<int32_t>> prompts;
+    json response = run({turn("I'll write it."), turn("\n</think>\n\nDone.")}, prompts);
+    TEST_ASSERT_MSG(prompts.size() == 2 && prompts[0] == prompts[1], response.dump());
+    TEST_ASSERT_MSG(response["choices"][0]["message"]["content"] == "Done.", response.dump());
+
+    response = run({turn("I'll write it."), turn("Still thinking."), turn("And more."), turn("\n</think>\n\nLate.")},
+                   prompts);
+    TEST_ASSERT_MSG(prompts.size() == 3, response.dump());
+    TEST_ASSERT_MSG(tool_checks::empty_reply(response), response.dump());
+}
+
 // The same with the deepseek4.1 codec: the reply in DSML, its reasoning ending in spaces. The
 // encoder keeps every character, so only the reasoning exactly as the server sent it matches.
 TEST_CASE(ServerUnitFixture, test_chat_codec_turn_memory_deepseek41) {
@@ -18676,6 +18980,29 @@ TEST_CASE(ServerUnitFixture, test_degenerate_decode_finishes_as_length) {
             TEST_ASSERT_MSG(wire.find("response.incomplete") != std::string::npos, wire);
         }
     }
+}
+
+// finish_details.close_kind: "open" for a reply that ended inside its
+// thinking, "natural" once the thinking closed, "hard" when the budget closed it.
+TEST_CASE(ServerUnitFixture, test_close_kind_open_when_reply_ends_in_thinking) {
+    const GenTimings timings{};
+    CompletionTokenCounts counts;
+    counts.total = counts.reasoning = 1;
+    ParsedRequest req;
+    req.format = ApiFormat::OPENAI_CHAT;
+    req.thinking_opt_in = true;
+    const auto close_kind = [&](const char * text, bool forced) {
+        GenerateResult result;
+        result.budget_forced_close = forced;
+        auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), /*started_in_thinking=*/true);
+        em.emit_start();
+        em.emit_token(text);
+        return build_non_streaming_response(req, result, 100, timings, counts, em)["choices"][0]
+            ["finish_details"].value("close_kind", "");
+    };
+    TEST_ASSERT(close_kind("still thinking", false) == "open");
+    TEST_ASSERT(close_kind("thought</think>answer", false) == "natural");
+    TEST_ASSERT(close_kind("still thinking", true) == "hard");
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_anthropic_streaming) {
