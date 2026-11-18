@@ -118,6 +118,19 @@ inline Q4RecallSettled q4_recall_settle(int mode, int remote_layers, bool pooled
 // so a later capture would leave a gap; as the prompt's last forward it leaves the rows before it contiguous.
 inline bool q4_recall_run_breaks(int n, int end, int prompt_len) { return n == 1 && end < prompt_len; }
 
+// Recall ranks paged-out chunks, and a pool that holds the whole prompt has none (run_indexer_recall returns early):
+// such a prefill captures no queries and adds no query cut. No pool (mode 1 scores virtual spans): always.
+inline bool q4_recall_pages(int prompt_len, int pool_tokens) { return pool_tokens <= 0 || prompt_len > pool_tokens; }
+
+// Where the prefill's forwards start: the restore points, then the prefix snapshot, the query span's start and the tail
+// start when past `pos` (-1: none). The replay passes -1 for the last two: its queries are taken.
+inline std::vector<int> q4_prefill_cuts(std::vector<int> cuts, int pos, int snap_pos, int query_pos, int tail_pos) {
+    for (int c : {snap_pos, query_pos, tail_pos})
+        if (c > pos) cuts.push_back(c);
+    std::sort(cuts.begin(), cuts.end());
+    return cuts;
+}
+
 // The path a mode-2 request plans under a pool; q4_tail_outcome names what ran for the one [q4-tail] line.
 enum class Q4TailPath { Off, NoDecode, FitsPool, TailInPool, NoForward, TwoPass };
 inline Q4TailPath q4_recall_tail_path(int pos, int prompt_len, int tail, int pool_tokens, int n_gen) {

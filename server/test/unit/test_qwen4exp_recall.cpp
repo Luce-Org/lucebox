@@ -65,6 +65,14 @@ int main() {
     assert(q4_recall_run_breaks(1, 150, 200));
     assert(!q4_recall_run_breaks(1, 200, 200));
     assert(!q4_recall_run_breaks(2, 150, 200) && !q4_recall_run_breaks(64, 150, 200));
+    // Recall pages out-of-pool chunks only: a prompt the pool holds needs no queries. No pool (mode 1): always.
+    assert(q4_recall_pages(40000, 32768) && q4_recall_pages(100, 0));
+    assert(!q4_recall_pages(32768, 32768) && !q4_recall_pages(1000, 32768));
+    // Forward starts: restore points, the snapshot, the query span and the tail start, past pos. The replay passes -1
+    // for the query and tail cuts (its queries are taken), so the tail runs in as few forwards as the snapshot allows.
+    assert((q4_prefill_cuts({500, 900}, 400, 994, 936, 600) == std::vector<int>{500, 600, 900, 936, 994}));
+    assert((q4_prefill_cuts({500, 900}, 600, 994, -1, -1) == std::vector<int>{500, 900, 994}));
+    assert((q4_prefill_cuts({}, 950, -1, 936, 600) == std::vector<int>{}));   // cuts at or before pos add nothing
     // Recall storage per full-attention layer: 640 B per position at the 4-token block (512 raw + 128 pooled), plus one block.
     assert(q4_recall_layer_bytes(131072, 128, 4) == 640LL * 131072 + 512);
     assert(q4_recall_layer_bytes(131072, 128, 0) == 0 && q4_recall_layer_bytes(131072, 0, 4) == 0);   // no indexer

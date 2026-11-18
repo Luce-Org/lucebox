@@ -742,7 +742,7 @@ void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) 
     const int n_pos = cache_.cur_pos;
     const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
     const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
-    if (pager && n_pos <= pager->pool_tokens()) return;   // nothing paged out: nothing to recall
+    if (pager && !q4_recall_pages(n_pos, pager->pool_tokens())) return;   // nothing paged out: nothing to recall
     Qwen4ExpRecallPicks picks;
     if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
         if (picks.graph_failed) std::fprintf(stderr, "[q4-recall] FAILED: the pick graph did not allocate or compute (%d positions)\n", n_pos);
@@ -1111,14 +1111,15 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     int pos = restored;
     // LUCE_Q4_INDEXER_RECALL: the forwards of the prompt's last recall_queries_ tokens append their indexer queries
     // to recall_q; a cut starts a forward exactly there.
-    const bool recall = recall_mode_ > 0 && cache_.recall_queries > 0;
+    const bool recall_on = recall_mode_ > 0 && cache_.recall_queries > 0;
+    const int pool_tokens = cache_.kvflash ? cache_.kvflash->pool_tokens() : 0;
+    const bool recall = recall_on && q4_recall_pages((int) req.prompt.size(), pool_tokens);
     cache_.recall_q_n = 0;
     std::optional<ScopedScoreHook> recall_hook;
     // LUCE_Q4_RECALL_TAIL (mode 2, past the pool): prefill the prompt's last recall_tail_ tokens twice. The first pass
     // captures the queries recall ranks the chunks by; the state then rolls back to the tail's start, and the second
     // pass attends to the recalled chunks, which the decode keeps.
-    const bool tail_armed = recall && recall_mode_ == 2 && cache_.kvflash;
-    const int pool_tokens = tail_armed ? cache_.kvflash->pool_tokens() : 0;
+    const bool tail_armed = recall_on && recall_mode_ == 2 && cache_.kvflash;
     const Q4TailPath tail_path = tail_armed
         ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, pool_tokens, req.n_gen) : Q4TailPath::Off;
     int tail_pos = tail_path == Q4TailPath::TwoPass
@@ -1160,11 +1161,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
 
     // Each restore point starts a chunk in both cold and resumed requests.
     // Capture cuts are restore points too, including a one-token interval.
-    std::vector<int> cuts = req.restore_points;
-    if (req.snap_slot >= 0 && req.snap_pos > 0) cuts.push_back(req.snap_pos);
-    if (recall && (int) req.prompt.size() - recall_queries_ > pos) cuts.push_back((int) req.prompt.size() - recall_queries_);
-    if (tail_pos > pos) cuts.push_back(tail_pos);
-    std::sort(cuts.begin(), cuts.end());
+    const int snap_cut = req.snap_slot >= 0 ? req.snap_pos : -1;
+    std::vector<int> cuts = q4_prefill_cuts(req.restore_points, pos, snap_cut,
+                                            recall ? (int) req.prompt.size() - recall_queries_ : -1, tail_pos);
     auto capture = [&]() {
         if (req.snap_slot >= 0 && req.snap_pos == pos) snapshot_save_replacing(req.snap_slot, restore_slot);
     };
@@ -1202,6 +1201,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         if (!ok) return false;
         pos = tail_pos;
         tail_pos = -1;
+        cuts = q4_prefill_cuts(req.restore_points, pos, snap_cut, -1, -1);
         tokens_.resize((size_t) pos);
         mtp_pending = tail_mtp;
         cache_.recall_q_n = 0;
@@ -1235,7 +1235,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         // snapshot sits before the reply template) split that span, and its last forward alone holds ~6 template
         // tokens. A one-row forward (no capture path) restarts the run so the captured positions stay contiguous,
         // unless it is the last: the rows before it stay.
-        const bool in_tail = recall && pos >= (int) req.prompt.size() - recall_queries_;
+        const bool in_tail = recall && !recall_hook && pos >= (int) req.prompt.size() - recall_queries_;
         if (in_tail && q4_recall_run_breaks(n, end, (int) req.prompt.size())) cache_.recall_q_n = 0;
         cache_.recall_capture = in_tail && n > 1;
         const bool captured = cache_.recall_capture;
