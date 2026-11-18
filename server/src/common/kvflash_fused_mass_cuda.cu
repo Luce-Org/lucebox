@@ -294,6 +294,7 @@ bool device_has_wmma() {
 bool ck(cudaError_t e, const char * what, std::string * err) {
     if (e == cudaSuccess) return true;
     if (err) *err = std::string(what) + ": " + cudaGetErrorString(e);
+    (void)cudaGetLastError();   // clear the sticky error: the caller falls back to ggml-cuda, whose next launch check would abort on it
     return false;
 }
 

@@ -263,6 +263,26 @@ TEST_CASE(KvflashFusedMassFixture, dp4a_impl_matches_and_wmma_impl_is_refused_of
 #endif
 }
 
+// A failed run (here a 256 GiB cudaMalloc) must not leave the runtime's sticky error set: the next launch check, the fused kernel's
+// own or ggml-cuda's in the logits-graph fallback, would read it and fail or abort.
+TEST_CASE(KvflashFusedMassFixture, device_failed_run_leaves_no_cuda_error_behind) {
+    ggml_backend_t be = ggml_backend_cuda_init(0);
+    if (!be) SKIP("no CUDA/HIP device");
+    KvFlashFusedGeom g; g.L = 1; g.HK = 1; g.Hq = 1; g.D = 256; g.ct = 64; g.C = 1; g.nq = 1 << 30;
+    KvFlashFusedK k; k.pool = {nullptr}; k.src = {0};
+    KvFlashFusedWs * ws = kvflash_fused_ws_new();
+    int8_t q8 = 0; float qd = 0, o = 0;   // never read: the query buffer allocation fails first
+    std::string err;
+    CHECK(!kvflash_fused_run(ws, g, k, &q8, &qd, (size_t)1 << 30, &o, &o, &o, nullptr, &err));
+    CHECK(err.find("cudaMalloc") != std::string::npos);
+    kvflash_fused_ws_free(ws);
+    ggml_backend_free(be);
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 3, 6, 2, 64, 41, 16, 5, 9);
+    const double w = fused_gpu_worst(s, (size_t)1 << 30, 1e-8, nullptr);
+    CHECK(w >= 0); CHECK(w <= 1e-5);
+}
+
 // Timing probe, off unless LUCE_FUSED_BENCH=<chunks> is set: random q8_0 K on the device, 128 queries, qwen35 shape.
 TEST_CASE(KvflashFusedMassFixture, bench_device_kernel_when_asked) {
     const char * env = std::getenv("LUCE_FUSED_BENCH");
