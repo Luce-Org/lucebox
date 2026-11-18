@@ -15,28 +15,24 @@ struct KvflashPrefillReselectFixture {};
 std::vector<float> ramp(int n) { std::vector<float> s((size_t)n); for (int i = 0; i < n; i++) s[(size_t)i] = (float)((i * 37) % 101); return s; }
 }
 
-// ---- the mode gate: only 0, 4 and 5 exist -----------------------------------------------------------------
+// ---- the mode gate: only 0 and 4 exist -----------------------------------------------------------------
 
 TEST_CASE(KvflashPrefillReselectFixture, modes_one_to_three_are_off) {
     std::string why;
-    for (int m : {1, 2, 3, 6, -1, 100}) {
+    for (int m : {1, 2, 3, 5, 6, -1, 100}) {
         CHECK(kvflash_reselect_mode(m, true, "exact", &why) == 0);
         CHECK(kvflash_reselect_mode(m, true, "pflash2", &why) == 0);
     }
     CHECK(kvflash_reselect_mode(0, true, "exact", &why) == 0);
 }
-TEST_CASE(KvflashPrefillReselectFixture, modes_four_and_five_need_the_qk_policy_and_their_scorer) {
+TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy_and_the_exact_scorer) {
     std::string why;
     CHECK(kvflash_reselect_mode(4, true, "exact", &why) == 4);
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(5, true, "pflash2", &why) == 5);
     CHECK(why.empty());
     CHECK(kvflash_reselect_mode(4, false, "exact", &why) == 0);   // LRU policy: no recall, and nothing to complain about
     CHECK(why.empty());
     CHECK(kvflash_reselect_mode(4, true, "pflash2", &why) == 0);  // the scorer must match the mode
     CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact");
-    CHECK(kvflash_reselect_mode(5, true, nullptr, &why) == 0);
-    CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=5 needs LUCE_KVFLASH_RESELECT_SCORER=pflash2");
     CHECK(kvflash_reselect_mode(4, true, "cosine", nullptr) == 0);   // the cosine scorer is gone
 }
 
@@ -46,8 +42,6 @@ TEST_CASE(KvflashPrefillReselectFixture, recall_plan_keeps_features_for_one_devi
     CHECK(one.reselect_mode == 4 && one.uq_queries == 64 && one.why.empty());
     const KvflashFeaturePlan two = kvflash_recall_features(2, profile);   // TP > 1: recall and UQ off
     CHECK(two.reselect_mode == 0 && two.uq_queries == 0 && !two.why.empty());
-    const KvflashFeaturePlan mode5 = kvflash_recall_features(4, {5, 0});
-    CHECK(mode5.reselect_mode == 0 && !mode5.why.empty());
     const KvflashFeaturePlan uq_only = kvflash_recall_features(2, {0, 16});
     CHECK(uq_only.uq_queries == 0 && !uq_only.why.empty());
 }
@@ -274,14 +268,4 @@ TEST_CASE(KvflashPrefillReselectFixture, gpu_scorer_failures_that_are_not_the_sc
     CHECK(!kvflash_gpu_failure_latches("needs 900 MiB (+256 MiB margin) but 400 MiB are free"));
     CHECK(kvflash_gpu_failure_latches("graph compute failed"));
     CHECK(kvflash_gpu_failure_latches("unexpected pool K tensor shape or type"));
-}
-
-// ---- the victim tier ---------------------------------------------------------------------------------------
-
-TEST_CASE(KvflashPrefillReselectFixture, victim_tier_default_is_mode_five_only_and_its_bytes_are_budgeted) {
-    CHECK(kvflash_victim_blocks_default(5, 256) == 512);
-    for (int m : {0, 4}) CHECK(kvflash_victim_blocks_default(m, 256) == 0);
-    CHECK(kvflash_pool_density_factor(5) == 3);   // pool + 2x tier
-    CHECK(kvflash_pool_density_factor(4) == 1);
-    CHECK(kvflash_pool_density_factor(0) == 1);
 }

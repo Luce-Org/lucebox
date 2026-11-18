@@ -32,7 +32,6 @@
 #include "pflash/pflash_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
-#include "pflash/kvflash_drafter_scorer.h"  // KvFlashPFlash2Scorer (mode 5)
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 #include "kvflash_prefill_reselect.h"
 #include "kvflash_m4_reuse.h"
@@ -299,9 +298,9 @@ protected:
     int                     spec_early_stop_repairs_ = 0;  // spec steps repaired after EOS/cancel inside a block
     // Pool keys for every chunk sealed before `committed` not pooled yet.
     void kvflash_qk_pool_to(int committed);
-    // LUCE_KVFLASH_PREFILL_RESELECT=4|5: reselect the pool by exact attention mass (4) or the
-    // drafter's scores (5) at the last user turn (pooled prefill, qk policy only).
-    int                     kvflash_prefill_reselect_ = 0;   // 0 off, 4 exact scorer, 5 drafter scorer
+    // LUCE_KVFLASH_PREFILL_RESELECT=4: reselect the pool by exact attention mass at the last
+    // user turn (pooled prefill, qk policy only).
+    int                     kvflash_prefill_reselect_ = 0;   // 0 off, 4 exact scorer
     // One request, prefill through decode: whatever score_hook and score ledger
     // the prefill reselect installs is undone on every exit, so the next request
     // (possibly another user) starts from the arm's policy hook, not this query's.
@@ -312,7 +311,6 @@ protected:
             : hook(p), scores(s) {}
         ~ReselectRequestScope() { scores.clear(); }
     };
-    std::unique_ptr<KvFlashPFlash2Scorer> kvflash_pflash2_;  // borrows drafter_ctx_
     int                     kvflash_recall_blocks_ = 0;      // LUCE_KVFLASH_RECALL_BLOCKS (R-LRU)
     int                     kvflash_select_queries_ = 0;     // queries kept per prefill (kQueryCaptureTokens in mode 4, else 0): selector v2, 0 = v1
     int                     kvflash_select_unit_ = luce::common::kKvFlashRecallUnit;   // LUCE_KVFLASH_SELECT_UNIT: chunks per recall unit; budget stays 10 * k chunks
@@ -341,9 +339,6 @@ protected:
     // Same contract as kvflash_exact_scores with planes (selector v2); false = unavailable, the CPU scorer must run.
     bool kvflash_exact_scores_gpu(int sealed, const std::vector<const float *> & qs,
                                   std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes);
-    // Mode 5: chunk scores of `ids` (the whole prompt) from the drafter's PFlash 2.0 request path; loads the
-    // drafter on first use. False = unavailable (the turn stays LRU).
-    bool kvflash_pflash2_scores(const std::vector<int32_t> & ids, int chunk_tokens, std::vector<float> & out, double & ms);
     // Exact attention mass of each query over all sealed chunks (resident
     // chunks read from the pool, host-backed ones from the pager's host copy).
     // planes: also the per-chunk top/max plane aggregates (fast scorer only).
@@ -355,9 +350,9 @@ protected:
     // do_prefill's recall decisions before its batch loop (see the definition).
     struct KvflashRecallSetup {
         luce::common::KvFlashMode4Plan rw;   // rw.run: mode 4 rewinds the pass over [rw.r, end)
-        int    m5_r = -1;                     // single pass (mode 5, or mode 4 on a continuing turn): apply the pick when the prefill reaches this position
+        int    m5_r = -1;                     // single pass (mode 4 on a continuing turn): apply the pick when the prefill reaches this position
         double m5_ms = 0.0;
-        const char * apply_note = "; pflash2";
+        const char * apply_note = "";
         bool   m4_track = false;              // mode 4: keep this prefill's tail queries and prompt for the next request (kvflash_m4_last_)
         luce::common::KvFlashUqPlan uqp;
         bool   uq_capturing = false;

@@ -13,19 +13,17 @@
 
 namespace luce::common {
 
-// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass, 5 by the drafter's scores. Both need the
-// qk policy and the scorer that matches them; any other value (the retired modes 1-3 included) is off. A mismatch
-// is reported in *why (cleared first).
+// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass. Mode 4 needs the qk policy and the exact
+// scorer; any other value (the retired modes 1-3 and 5 included) is off. A mismatch is reported in *why (cleared first).
 inline int kvflash_reselect_mode(int env_mode, bool qk_policy, const char * scorer, std::string * why) {
     if (why) why->clear();
-    if (!qk_policy || (env_mode != 4 && env_mode != 5)) return 0;
-    const char * want = env_mode == 4 ? "exact" : "pflash2";
-    if (scorer && std::string(scorer) == want) return env_mode;
-    if (why) *why = "LUCE_KVFLASH_PREFILL_RESELECT=" + std::to_string(env_mode) + " needs LUCE_KVFLASH_RESELECT_SCORER=" + want;
+    if (!qk_policy || env_mode != 4) return 0;
+    if (scorer && std::string(scorer) == "exact") return env_mode;
+    if (why) *why = "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact";
     return 0;
 }
 
-// Which recall features stay on. Recall (mode 4/5) and the user-question queries need the per-token query capture
+// Which recall features stay on. Recall (mode 4) and the user-question queries need the per-token query capture
 // (TargetCache::q_cap_all). That tensor has no split in the tensor-parallel layout, so with tp_degree > 1 both are
 // off; the pool, the pin and the rest of KVFlash are untouched. `why` is empty when nothing the request asked for was turned off.
 struct KvflashFeatureAsk { int reselect_mode = 0; int uq_queries = 0; };
@@ -86,14 +84,13 @@ inline bool kvflash_pool_fits(int end, int chunk_tokens, int reserve_chunks, int
     return (end + chunk_tokens - 1) / chunk_tokens + reserve_chunks <= n_pool_blocks;
 }
 
-// The score the pager's eviction hook reads for chunk `c`. The ledger can cover the whole prompt (mode 5 scores it
-// before the 27B runs), but only the first `committed_chunks` are written; the others belong to the batch being
+// The score the pager's eviction hook reads for chunk `c`. The ledger can cover the whole prompt (a scorer may cover it), but only the first `committed_chunks` are written; the others belong to the batch being
 // allocated and must never be picked as victims, so they rank as pinned.
 inline float kvflash_hook_score(const std::vector<float> & scores, int committed_chunks, int c) {
     return c < std::min((int)scores.size(), committed_chunks) ? scores[(size_t)c] : 1e30f;
 }
 
-// Why a request's recall (mode 4 rewind or mode 5 drafter pick) does not run.
+// Why a request's recall (mode 4) does not run.
 enum class KvFlashRecallSkip { None, NoSealedChunk, Fits, PoolTooSmall };
 struct KvFlashRecallGate { KvFlashRecallSkip skip = KvFlashRecallSkip::None; int reserve = 0; };
 
@@ -115,11 +112,6 @@ inline KvFlashRecallGate kvflash_recall_gate(bool turn_found, int r, int end, in
 inline bool kvflash_gpu_failure_latches(const std::string & why) {
     return why != "no sealed chunks" && why.rfind("needs ", 0) != 0;
 }
-
-// Victim tier (paged-out chunks kept on the device): only mode 5 recalls enough to pay for it.
-inline int kvflash_victim_blocks_default(int reselect_mode, int pool_blocks) { return reselect_mode == 5 ? 2 * pool_blocks : 0; }
-// Device bytes per pool token the auto pool budget must reserve: the pool plus its victim tier.
-inline int kvflash_pool_density_factor(int reselect_mode) { return 1 + kvflash_victim_blocks_default(reselect_mode, 1); }
 
 // Sorted copy of `cuts` with r inserted; unchanged if r < 0 or already present.
 inline std::vector<int> kvflash_cuts_with(const std::vector<int> & cuts, int r) {
