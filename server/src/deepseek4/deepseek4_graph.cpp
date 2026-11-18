@@ -29,6 +29,7 @@
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
+#include "../common/moe_overlap.h"
 #include "../common/pinned_stage.h"
 #include "../common/host_stream_flag.h"
 
@@ -8123,8 +8124,14 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
+    // The routing and owner arenas persist from 512 rows, and for every
+    // pipelined layer-major part (max(LUCE_DS4_PREFILL_PIPELINE, 2) per caller
+    // band, so often fewer rows):
+    // freeing a per-call cold arena takes milliseconds and sits between one
+    // part's cold owner and the next, which drive the cold device in turn.
+    const bool pipelined_part = device_outputs && device_outputs->defer;
     const bool persistent_owner_alloc =
-        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+        (n_tokens >= 512 || pipelined_part) && device_ffn_input && persistent_owner_requested;
     if (persistent_owner_alloc) {
         static bool logged_persistent_owner_alloc = false;
         if (!logged_persistent_owner_alloc) {
@@ -9652,6 +9659,10 @@ bool DeepSeek4PrefillPass::begin(ggml_backend_t backend, int device, const DeepS
     const auto fail_early = [&](const char * why) { error = why; return false; };
     if (!backend || seqs.empty() || w.moe_hybrid || !ds4_backend_is_gpu(backend))
         return fail_early("shared prefill needs a full model on one GPU");
+    // The pass applies V4's plain pre-mix and no Engram: a V4.1 model stages
+    // through the single-request sparse prefill instead.
+    if (w.hc_staggered_pre || w.engram_runtime)
+        return fail_early("shared prefill does not implement the staggered pre-mix or Engram");
     int total = 0;
     for (const auto & s : seqs) {
         if (!s.cache || !s.embed || !s.token_ids || s.n_tokens < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS || s.kv_start < 0 ||
@@ -9880,13 +9891,12 @@ bool DeepSeek4PrefillPass::run_layers(int count, std::string & error) {
         }
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return fail("compute failed", il); }
         ggml_free(ctx);
-        const int ratio = (int) w.compress_ratios[(size_t) il];
+        // The same counter rule as every other prefill path: only a layer
+        // that owns compressed rows counts them, and index rows advance
+        // wherever the layer has them (V4.1 indexes ratio-2 layers too).
         for (const auto & s : seqs_) {
-            if (ratio <= 0) continue;
-            DeepSeek4LayerCache & lc = s.cache->layers[(size_t) il];
-            const int next_pos = s.kv_start + s.n_tokens;
-            lc.n_comp = std::max(lc.n_comp, next_pos / ratio);
-            if (ratio == 4) lc.n_index_comp = std::max(lc.n_index_comp, next_pos / ratio);
+            ds4_advance_comp_counters(w, il, s.cache->layers[(size_t) il],
+                                      s.kv_start + s.n_tokens);
         }
         std::swap(state_in_, state_out_);
     }
@@ -12761,7 +12771,41 @@ bool deepseek4_step_layer_range(
     return true;
 }
 
-// ─── Cache management ───────────────────────────────────────────────────
+// ─── Layer-major prefill ────────────────────────────────────────────────
+
+static bool ds4_layer_major_device_residual_requested() {
+    static const bool requested = ds4_env_flag("LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL");
+    return requested;
+}
+
+size_t deepseek4_layer_major_residual_rows(size_t free_b, size_t row_bytes) {
+    // The most rows with rows * row_bytes + headroom < free_b.
+    if (row_bytes == 0 || free_b <= DS4_LAYER_MAJOR_RESIDUAL_HEADROOM) return 0;
+    return (free_b - DS4_LAYER_MAJOR_RESIDUAL_HEADROOM - 1) / row_bytes;
+}
+
+int deepseek4_layer_major_device_rows(int device, const DeepSeek4Weights & w) {
+    if (!ds4_layer_major_device_residual_requested() || device < 0) return 0;
+    size_t free_b = 0, total_b = 0;
+    ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
+    const size_t rows = deepseek4_layer_major_residual_rows(
+        free_b, (size_t) w.n_hc * (size_t) w.n_embd * sizeof(float));
+    return (int) std::min<size_t>(rows, (size_t) std::numeric_limits<int>::max());
+}
+
+int deepseek4_layer_major_pass_bands(const std::vector<int> & bands, int tail_rows, long long device_rows) {
+    const int n = (int) bands.size();
+    if (device_rows <= 0 || n <= 2) return n;
+    long long rows = tail_rows;
+    for (int count : bands) rows += count;
+    if (rows <= device_rows) return n;
+    // A pass that stops before the last band leaves the tail to a later one.
+    rows = (long long) bands[0] + bands[1];
+    if (rows > device_rows) return n;
+    int k = 2;
+    while (k < n - 1 && rows + bands[k] <= device_rows) rows += bands[k++];
+    return k;
+}
 
 bool deepseek4_prefill_layer_major(
         ggml_backend_t backend, int device, const DeepSeek4Weights & w, DeepSeek4Cache & cache,
@@ -12783,18 +12827,16 @@ bool deepseek4_prefill_layer_major(
     // The residual copies of every position between layers, and each token's
     // staggered pre-mix (one-hot copy 0 before the first layer).
     // LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL=1 keeps the residual between layers
-    // on the target device when it fits next to 1.5 GiB of headroom; else host.
+    // on the target device when it fits next to DS4_LAYER_MAJOR_RESIDUAL_HEADROOM
+    // of free memory; else host.
     ggml_context * resid_ctx = nullptr;
     ggml_backend_buffer_t resid_buf = nullptr;
     ggml_tensor * device_residual = nullptr;
-    static const bool device_residual_requested =
-        ds4_env_flag("LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL");
-    if (device_residual_requested && device >= 0) {
-        constexpr size_t kResidualHeadroom = (size_t) 1536 << 20;
+    if (ds4_layer_major_device_residual_requested() && device >= 0) {
         const size_t bytes = (size_t) n_tokens * hc_dim * sizeof(float);
         size_t free_b = 0, total_b = 0;
         ggml_backend_cuda_get_device_memory(device, &free_b, &total_b);
-        if (free_b > bytes + kResidualHeadroom) {
+        if ((size_t) n_tokens <= deepseek4_layer_major_residual_rows(free_b, hc_dim * sizeof(float))) {
             ggml_init_params p{};
             p.mem_size = 2 * ggml_tensor_overhead();
             p.no_alloc = true;
@@ -12805,8 +12847,9 @@ bool deepseek4_prefill_layer_major(
                 if (!resid_buf) device_residual = nullptr;
             }
         }
+        // The first placement, and every pass that falls back to the host.
         static bool logged = false;
-        if (!logged) {
+        if (!logged || !device_residual) {
             logged = true;
             std::fprintf(stderr, "[deepseek4] layer-major residual on %s (%.1f MiB, free %.1f MiB)\n",
                          device_residual ? "device" : "host", bytes / 1048576.0, free_b / 1048576.0);
@@ -12978,6 +13021,8 @@ std::vector<DeepSeek4LayerGeometry> deepseek4_layer_geometries(const DeepSeek4We
     for (int il = 0; il < w.n_layer; ++il) out.push_back(deepseek4_layer_geometry(w, il));
     return out;
 }
+
+// ─── Cache management ───────────────────────────────────────────────────
 
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,

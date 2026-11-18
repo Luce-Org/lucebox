@@ -30,85 +30,10 @@
 #include "output_constraint.h"
 #include "image_prompt.h"
 #include "concurrency/seq_engine.h"
+#include "owned_snapshot.h"
 #include "placement/draft_residency.h"
 
 namespace luce::common {
-
-// A snapshot payload taken out of a backend slot: owns its tensor context and
-// buffer and frees both when destroyed. Move-only. The disk cache writes it
-// in the background after a RAM eviction (see DiskPrefixCache::save_async).
-class OwnedSnapshot {
-public:
-    OwnedSnapshot() = default;
-    OwnedSnapshot(ggml_context * ctx, ggml_backend_buffer_t buf,
-                  int cur_pos, int32_t last_tok)
-        : ctx_(ctx), buf_(buf), cur_pos_(cur_pos), last_tok_(last_tok) {}
-    ~OwnedSnapshot() { reset(); }
-    OwnedSnapshot(const OwnedSnapshot &) = delete;
-    OwnedSnapshot & operator=(const OwnedSnapshot &) = delete;
-    OwnedSnapshot(OwnedSnapshot && o) noexcept { *this = std::move(o); }
-    OwnedSnapshot & operator=(OwnedSnapshot && o) noexcept {
-        if (this != &o) {
-            reset();
-            ctx_ = o.ctx_; buf_ = o.buf_;
-            cur_pos_ = o.cur_pos_; last_tok_ = o.last_tok_;
-            o.ctx_ = nullptr; o.buf_ = nullptr;
-        }
-        return *this;
-    }
-    void reset() {
-        if (buf_) ggml_backend_buffer_free(buf_);
-        if (ctx_) ggml_free(ctx_);
-        ctx_ = nullptr; buf_ = nullptr;
-    }
-    // Hand ctx and buf to a new owner (e.g. ModelBackend::snapshot_adopt).
-    void release() { ctx_ = nullptr; buf_ = nullptr; }
-    bool empty() const { return ctx_ == nullptr; }
-    ggml_context * ctx() const { return ctx_; }
-    ggml_backend_buffer_t buf() const { return buf_; }
-    int cur_pos() const { return cur_pos_; }
-    int32_t last_tok() const { return last_tok_; }
-    uint64_t bytes() const {
-        uint64_t n = 0;
-        for (ggml_tensor * t = ctx_ ? ggml_get_first_tensor(ctx_) : nullptr; t;
-             t = ggml_get_next_tensor(ctx_, t)) n += ggml_nbytes(t);
-        return n;
-    }
-
-    // Copy every tensor of `ctx` into a fresh host (CPU) buffer.
-    static OwnedSnapshot clone_to_host(ggml_context * ctx, int cur_pos,
-                                       int32_t last_tok) {
-        if (!ctx) return {};
-        int n = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t;
-             t = ggml_get_next_tensor(ctx, t)) ++n;
-        ggml_init_params ip{};
-        ip.mem_size = ggml_tensor_overhead() * (size_t)(n + 4) + 4096;
-        ip.no_alloc = true;
-        ggml_context * out = ggml_init(ip);
-        if (!out) return {};
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t;
-             t = ggml_get_next_tensor(ctx, t)) {
-            ggml_tensor * c = ggml_new_tensor(out, t->type, GGML_MAX_DIMS, t->ne);
-            ggml_set_name(c, t->name);
-        }
-        ggml_backend_buffer_t buf =
-            ggml_backend_alloc_ctx_tensors_from_buft(out, ggml_backend_cpu_buffer_type());
-        if (!buf) { ggml_free(out); return {}; }
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx),
-                         * c = ggml_get_first_tensor(out);
-             t && c; t = ggml_get_next_tensor(ctx, t), c = ggml_get_next_tensor(out, c)) {
-            ggml_backend_tensor_get(t, c->data, 0, ggml_nbytes(t));
-        }
-        return OwnedSnapshot(out, buf, cur_pos, last_tok);
-    }
-
-private:
-    ggml_context *        ctx_ = nullptr;
-    ggml_backend_buffer_t buf_ = nullptr;
-    int                   cur_pos_ = 0;
-    int32_t               last_tok_ = -1;
-};
 
 enum class ParkTarget {
     // NOTE: Empty preserves Qwen3's existing no-target park/unpark behavior.
@@ -252,6 +177,42 @@ struct ModelBackend {
     virtual bool unpark(ParkTarget target) = 0;
     virtual bool is_target_parked() const = 0;
 
+    // ── Residency (model switching) ──────────────────────────────────
+    // Lets models that share a GPU take turns on it without a restart. Unlike
+    // park(), which a backend uses for its own drafter juggling, a release
+    // keeps every prefix snapshot and checkpoint in system memory, and
+    // reinstate() rebuilds the layout fixed at first load (context, slots, KV
+    // placement), never one re-derived from the memory free at that moment,
+    // so the snapshots restore afterwards. The server calls both only while
+    // no request runs.
+    struct Residency {
+        bool supported = false;
+        std::string reason;           // why not, when unsupported
+        std::vector<int> gpus;        // every GPU the model uses
+        std::vector<int> released;    // GPUs it holds nothing on now
+        std::vector<int> keepable;    // GPUs it can keep while releasing the others
+        std::vector<size_t> bytes;    // per entry of `gpus`: device memory it holds now
+    };
+    virtual Residency residency() const {
+        Residency r;
+        r.reason = "this backend cannot release its GPUs";
+        return r;
+    }
+    // Frees everything the model holds on `gpus` (empty: every GPU). A backend
+    // may free more than asked (residency().released says what it holds
+    // nothing on afterwards). False leaves the model as it was, or fully
+    // released with `error` saying so.
+    virtual bool release_gpus(const std::vector<int> & gpus, std::string & error) {
+        (void) gpus;
+        error = residency().reason;
+        return false;
+    }
+    // Brings back what release_gpus() freed. False leaves the model released.
+    virtual bool reinstate(std::string & error) {
+        error = residency().reason;
+        return false;
+    }
+
     // ── Generation ───────────────────────────────────────────────────
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).
@@ -377,6 +338,20 @@ struct ModelBackend {
         return 0;
     }
 
+    // State-only snapshots. A snapshot of a prompt that a deeper resident
+    // snapshot extends repeats that one's attention rows; snapshot_drop_kv()
+    // frees them and keeps what the position alone determines (recurrent
+    // state, decode seed). Restoring it takes the rows from the deeper
+    // snapshot named by GenerateRequest::restore_kv_slot. The estimate is the
+    // system-memory bytes one holds; 0 when the backend takes none, and then
+    // snapshot_drop_kv() always fails and leaves the snapshot as it was.
+    virtual size_t snapshot_state_bytes_estimate(int tokens) const {
+        (void)tokens;
+        return 0;
+    }
+    virtual bool snapshot_drop_kv(int slot) { (void)slot; return false; }
+    virtual bool snapshot_state_only(int slot) const { (void)slot; return false; }
+
     // Snapshot bytes the backend admits when it enforces its own allowance
     // (SIZE_MAX: no allowance). The prefix cache's automatic resident limit
     // stays within it, so the cache evicts before the backend refuses a capture.
@@ -480,6 +455,20 @@ struct ModelBackend {
         return out;
     }
 
+    // A host copy of a slot's snapshot for the disk writer; the slot keeps
+    // its own. The default copies snapshot_ref(); empty when the slot has
+    // none or the backend exports nothing (or a pooled snapshot).
+    virtual OwnedSnapshot snapshot_copy(int slot) const {
+        const SnapshotRef ref = snapshot_ref(slot);
+        return ref.ctx && !ref.pooled
+            ? OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok)
+            : OwnedSnapshot{};
+    }
+    // The backend packs its snapshots for the disk itself (snapshot_copy,
+    // snapshot_detach and snapshot_adopt) and exports no SnapshotRef: the
+    // disk cache does not take a missing SnapshotRef for memory-only then.
+    virtual bool snapshot_exports() const { return false; }
+
     // Concurrent (paged) checkpoints: the payload a capture replaced in
     // `slot`, kept aside instead of freed so the scheduler can write its
     // evicted entry to disk. Empty when nothing was displaced. Every capture
@@ -488,6 +477,9 @@ struct ModelBackend {
         (void)slot;
         return {};
     }
+    // The same payload freed unwritten (the disk cache is off, or its entry
+    // is not worth keeping); the default takes it and lets it go.
+    virtual void snapshot_drop_displaced(int slot) { snapshot_take_displaced(slot); }
 
     // ── Compress (pflash) ────────────────────────────────────────────
     // Backend owns the DrafterContext lifecycle and park/unpark policy.
@@ -569,20 +561,6 @@ struct ModelBackend {
     // Typed compress API (preferred for in-process callers).
     virtual CompressResult compress(const CompressRequest & req);
 
-    // Compress several independent prompt spans under one backend residency
-    // window. The default preserves existing behavior; backends that park
-    // large target/draft weights can override this to park once for the whole
-    // batch instead of once per span.
-    virtual std::vector<CompressResult> compress_batch(
-        const std::vector<CompressRequest> & requests) {
-        std::vector<CompressResult> results;
-        results.reserve(requests.size());
-        for (const auto & request : requests) {
-            results.push_back(compress(request));
-        }
-        return results;
-    }
-
     // Legacy string-based compress (for daemon_loop stdin protocol).
     // `line` is the full "compress ..." command line.
     virtual bool handle_compress(const std::string & line,
@@ -622,11 +600,6 @@ struct ModelBackend {
     // the DFlash feature boundary keep the default false and are rejected by
     // the server before startup.
     virtual bool supports_remote_draft() const { return false; }
-
-    // Layer-split capability introspection. Non layer-split backends keep the
-    // default false; LayerSplitBackend proxies model-adapter support.
-    virtual bool supports_kvflash() const { return false; }
-    virtual bool supports_mixed_backend_layer_split() const { return false; }
 
     // compress() returns the trained head's per-candidate scores
     // (CompressResult::candidate_lifts), which PFlash's view pages with.

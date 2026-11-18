@@ -1,6 +1,6 @@
 // Glue fusions on the Qwen3.5/3.6/3.8 target graph (qwen35_target_graph.cpp):
-// which nodes each one replaces on a given path, and why it stays inert where
-// it does. Pure decisions, so test_glue_fusions checks them without a GPU;
+// which nodes each one replaces on a given path. Pure decisions, so
+// test_glue_fusions checks them without a GPU;
 // the graph builder supplies the facts. Both are always on and
 // byte-identical.
 //
@@ -60,7 +60,6 @@ inline void set_fusions_for_test(const Fusions & f) { detail::fusions_storage() 
 
 // One DeltaNet segment of build_delta_net_block, as the parent would build it.
 struct StridedGdnFacts {
-    bool on = false;               // the fusion is on
     bool stacked_ba = false;       // beta/alpha are row slices of the ssm_beta|alpha stack
     bool ba_copy = false;          // the parent copies those slices (non-contiguous, T > 1)
     bool fused_chain = false;      // dense single-sequence chain on the fused sequential CUDA
@@ -76,12 +75,11 @@ struct StridedGdnFacts {
 struct StridedGdnPlan {
     bool gates = false;                // beta/alpha: views + ggml_gated_delta_net_shared_gates
     bool z = false;                    // z: view into the fused silu*mul
-    const char * inert_why = nullptr;  // set: the fusion is on and a copy stays
 };
 
+// Called only with the fusion on (strided_gates_on()).
 inline StridedGdnPlan strided_gdn_plan(const StridedGdnFacts & f) {
     StridedGdnPlan p;
-    if (!f.on) return p;
     // The copies this segment's parent graph makes (the mapped verify
     // already reads beta/alpha through views, so it has no gate copies).
     const bool ba_copied = f.stacked_ba && f.ba_copy && !f.mapped_verify;
@@ -90,20 +88,9 @@ inline StridedGdnPlan strided_gdn_plan(const StridedGdnFacts & f) {
     // The concurrent mapped verify's GDN output is the same contiguous
     // [d_inner, T] rows as the chain's, so the fused silu*mul reads its z in
     // place too.
+    // The z rewrite needs the fused CUDA/HIP silu*mul kernel: the unfused silu
+    // needs a contiguous input.
     p.z = z_copied && (f.fused_chain || f.mapped_verify) && f.cuda_backend && f.fusion_enabled;
-    if (!(ba_copied && !p.gates) && !(z_copied && !p.z)) return p;
-    if (!f.cuda_backend) {
-        p.inert_why = "copies stay: not a CUDA/HIP backend";
-    } else if (!f.fused_chain && !f.mapped_verify) {
-        p.inert_why = "copies stay: only the dense single-sequence chain (single-request prefill and "
-                      "capture verify on the fused kernels) and the concurrent mapped verify read the "
-                      "stacks in place; tree verify, compact multi-sequence decode, ragged prefill, "
-                      "chunked, SpecLA and LUCE_QWEN35_NO_FUSED_KERNELS keep them";
-    } else if (ba_copied && !p.gates) {
-        p.inert_why = "beta/alpha copies stay: no raw-gate kernel on this layer (ssm_gate_ba missing)";
-    } else {
-        p.inert_why = "z copy stays: a test turned the CUDA fusions off (the unfused silu needs a contiguous input)";
-    }
     return p;
 }
 
@@ -111,27 +98,19 @@ inline StridedGdnPlan strided_gdn_plan(const StridedGdnFacts & f) {
 
 // One dense SwiGLU FFN of a graph build.
 struct GateUpFacts {
-    bool on = false;                         // the fusion is on
     bool stacked = false;                    // the loader built ffn_gate|ffn_up (same type, adjacent)
-    bool unit_scales = false;                // no NVFP4 per-tensor scale on gate or up
+    bool unit_scales = false;                // no NVFP4 per-tensor scale on gate or up (scales apply per GEMM)
     const char * backend_inexact = nullptr;  // ggml_backend_cuda_row_stack_inexact, or a reason
 };
 
 struct GateUpPlan {
     bool stack = false;                // one GEMM over the stack, split by views
-    const char * inert_why = nullptr;  // set: the fusion is on and the two GEMMs stay
 };
 
+// Called only with the fusion on (gate_up_stack_on()).
 inline GateUpPlan gate_up_plan(const GateUpFacts & f) {
     GateUpPlan p;
-    if (!f.on || !f.stacked) return p;   // layers whose gate and up differ in type: silent
-    if (!f.unit_scales) {
-        p.inert_why = "gate/up carry per-tensor scales (applied per GEMM)";
-    } else if (f.backend_inexact != nullptr) {
-        p.inert_why = f.backend_inexact;
-    } else {
-        p.stack = true;
-    }
+    p.stack = f.stacked && f.unit_scales && f.backend_inexact == nullptr;
     return p;
 }
 

@@ -76,6 +76,8 @@ public:
                                   const SamplerCfg & sampler,
                                   const PrefixStorePlan & plan) override;
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
+    size_t estimate_prefix_state_bytes(int tokens) const override;
+    bool drop_prefix_kv(PrefixStoreRef checkpoint) override;
 
 private:
     AdmitResult admit_slot(uint64_t request_id, const std::vector<int32_t> & prompt,
@@ -88,7 +90,8 @@ private:
     bool stage_text_prompt(uint64_t request_id, int slot,
                            const std::vector<int32_t> & prompt,
                            const std::vector<int> & restore_points,
-                           const DeepSeek4Snapshot * from = nullptr);
+                           const DeepSeek4Snapshot * from = nullptr,
+                           const DeepSeek4Snapshot * rows_from = nullptr);
     bool set_block(int slot, int logical, int32_t physical);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                       const std::string & error);

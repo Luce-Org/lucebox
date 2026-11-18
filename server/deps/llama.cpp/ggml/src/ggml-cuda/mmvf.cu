@@ -590,6 +590,21 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
         return;
     }
 
+    // Batch-invariant products wider than MMVF_MAX_BATCH_SIZE (ggml_backend_cuda_set_mmvq_invariant_max_ncols):
+    // consecutive launches of at most MMVF_MAX_BATCH_SIZE columns, every column's sums unchanged.
+    if (ncols_dst > MMVF_MAX_BATCH_SIZE) {
+        GGML_ASSERT(ggml_cuda_mmvq_batch_invariant() && ncols_dst <= ggml_cuda_mmvq_invariant_max_ncols());
+        for (int64_t j0 = 0; j0 < ncols_dst; j0 += MMVF_MAX_BATCH_SIZE) {
+            mul_mat_vec_f_cuda_switch_ncols_dst<T, type_acc>
+                (x, y + j0*stride_col_y, ids, fusion, dst + j0*stride_col_dst, ncols, nrows,
+                 std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ncols_dst - j0), stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 ids_stride, stream);
+        }
+        return;
+    }
+
     switch (ncols_dst) {
         case 1:
             launch_mul_mat_vec_f_cuda<T, type_acc, 1>
@@ -983,8 +998,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
 
     // Batch-invariant products (ggml_backend_cuda_set_mmvq_batch_invariant)
     // keep each column on the single-column accumulation order, which MMVF
-    // preserves through MMVF_MAX_BATCH_SIZE columns.
-    if (ggml_cuda_mmvq_batch_invariant() && ne11 <= MMVF_MAX_BATCH_SIZE &&
+    // preserves through MMVF_MAX_BATCH_SIZE columns per launch (wider ones
+    // run as consecutive launches, mul_mat_vec_f_cuda_switch_ncols_dst).
+    if (ggml_cuda_mmvq_batch_invariant() && ne11 <= ggml_cuda_mmvq_invariant_max_ncols() &&
         (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
         return true;
     }

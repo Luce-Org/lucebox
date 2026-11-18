@@ -12,10 +12,12 @@
 // One catalog per token identity (tokenizer and chat template) and cache
 // directory, shared by every model of the process with that identity
 // (PrefixPins::open): <kv-cache-dir>/pins/<identity>.json, written
-// atomically and fsynced, holding the pins and the ring. A pin keeps one
-// disk file per model layout. Caps: max_pins and max_bytes, the least
-// recently hit pin dropped first; a pin with no hit for unpin_after seconds
-// is dropped too, and its files fall under the normal TTL again.
+// atomically and fsynced, holding the pins and the ring. Servers of one
+// identity on a directory each write their whole catalog; the last write
+// wins. A pin keeps one disk file per model layout. Caps: max_pins and
+// max_bytes, the least recently hit pin dropped first; a pin with no hit
+// for unpin_after seconds is dropped too, and its files fall under the
+// normal TTL again.
 // Thread-safe (HTTP threads list and delete pins).
 
 #pragma once

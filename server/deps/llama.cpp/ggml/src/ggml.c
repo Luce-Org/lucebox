@@ -5939,6 +5939,21 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_sparse_mask(
+        struct ggml_tensor * a,
+        bool                 sparse) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(!ggml_flash_attn_ext_is_ds4(a)); // slot 12 holds the DS4 inverse RoPE's attn_factor
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM, sparse ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_sparse_mask(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return !ggml_flash_attn_ext_is_ds4(a) &&
+           ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_SPARSE_MASK_PARAM) != 0;
+}
+
 // ggml_flash_attn_sparse
 
 struct ggml_tensor * ggml_flash_attn_sparse(
@@ -9528,6 +9543,58 @@ struct ggml_tensor * ggml_moe_fused_wake_hold(
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_WAKE_HOLD);
     ggml_set_op_params_i32(result, 1, slot);
     ggml_set_op_params_i32(result, 2, max_us);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_hot_routes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * hot_lut,
+        struct ggml_tensor  * hist,
+        int                   n_lanes,
+        bool                  hot_slots) {
+    GGML_ASSERT(sel != NULL && sel->type == GGML_TYPE_I32 && sel->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(sel->ne[2] == 1 && sel->ne[3] == 1);
+    GGML_ASSERT(hot_lut != NULL && hot_lut->type == GGML_TYPE_I32 && ggml_is_contiguous(hot_lut));
+    GGML_ASSERT((n_lanes >= 1 || (n_lanes == 0 && !hot_slots && hist != NULL)) && n_lanes <= sel->ne[0]);
+    GGML_ASSERT(hist == NULL || (!hot_slots && hist->type == GGML_TYPE_I32 && ggml_is_contiguous(hist) &&
+                                 ggml_nelements(hist) == ggml_nelements(hot_lut)));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, hot_slots ? n_lanes : sel->ne[0], sel->ne[1]);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = sel;
+    result->src[1] = hot_lut;
+    result->src[2] = hist;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HOT_ROUTES);
+    ggml_set_op_params_i32(result, 1, n_lanes);
+    ggml_set_op_params_i32(result, 2, hot_slots ? 1 : 0);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_combine_lanes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * lanes,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * routes) {
+    GGML_ASSERT(down != NULL && down->type == GGML_TYPE_F32 && down->nb[0] == sizeof(float));
+    GGML_ASSERT(down->ne[0] % 4 == 0 && down->ne[3] == 1);
+    GGML_ASSERT(lanes != NULL && lanes->type == GGML_TYPE_F32 && lanes->nb[0] == sizeof(float));
+    GGML_ASSERT(lanes->ne[0] == down->ne[0] && lanes->ne[1] <= down->ne[1] && lanes->ne[2] == down->ne[2]);
+    GGML_ASSERT(weights != NULL && weights->type == GGML_TYPE_F32 && weights->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->ne[0] == down->ne[1] && weights->ne[1] == down->ne[2]);
+    GGML_ASSERT(routes != NULL && routes->type == GGML_TYPE_I32 && routes->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(routes->ne[0] == down->ne[1] && routes->ne[1] == down->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, down->ne[0], down->ne[2]);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = down;
+    result->src[1] = lanes;
+    result->src[2] = weights;
+    result->src[3] = routes;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_COMBINE_LANES);
 
     return result;
 }

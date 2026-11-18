@@ -70,17 +70,12 @@ def prefill_cache_server(server_bin, spawn_luce_server):
 
 
 class TestPrefillCache:
-    """Both tests share one dedicated server."""
-
-    def test_full_cache_props(self, prefill_cache_server):
-        props = prefill_cache_server.client.get("/props", timeout=5)
-        full_cache = props.get("full_cache", {})
+    def test_full_cache_hit_and_speedup(self, prefill_cache_server):
+        client = prefill_cache_server.client
+        full_cache = client.get("/props", timeout=5).get("full_cache", {})
         assert full_cache.get("enabled"), f"full cache not enabled: {full_cache}"
         assert full_cache.get("capacity") == 2, \
             f"unexpected full-cache capacity: {full_cache}"
-
-    def test_full_cache_hit_and_speedup(self, prefill_cache_server):
-        client = prefill_cache_server.client
 
         filler = (
             "The repository contains an inference server, a benchmark harness, "

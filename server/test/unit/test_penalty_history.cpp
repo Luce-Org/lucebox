@@ -49,6 +49,7 @@ TEST_CASE(PenaltyHistoryFixture, prompt_only_token_is_not_presence_penalized) {
     const SeqSlot s = slot_with(prompt, generated, cfg);
 
     CHECK(s.penalty_history() == generated);   // what single-lane passes
+    CHECK(slot_with(prompt, {}, cfg).penalty_history().empty());
     CHECK(greedy_after_penalties(logits, cfg, s.penalty_history()) == 5);
     // The whole slot history would have penalized the prompt token.
     CHECK(greedy_after_penalties(logits, cfg, s.sample_history) == 11);
@@ -58,13 +59,6 @@ TEST_CASE(PenaltyHistoryFixture, prompt_only_token_is_not_presence_penalized) {
     std::vector<float> l2(kVocab, 0.0f);
     l2[5] = 1.2f; l2[7] = 1.0f; l2[9] = 0.9f;
     CHECK(greedy_after_penalties(l2, cfg, s2.penalty_history()) == 9);
-}
-
-TEST_CASE(PenaltyHistoryFixture, fresh_slot_has_empty_history) {
-    SamplerCfg cfg;
-    cfg.freq_pen = 1.0f;
-    const SeqSlot s = slot_with({4, 4, 4}, {}, cfg);
-    CHECK(s.penalty_history().empty());
 }
 
 TEST_CASE(PenaltyHistoryFixture, window_matches_the_full_generated_suffix) {

@@ -241,6 +241,14 @@ public:
 
     // Release engine-owned payload without touching server policy metadata.
     virtual void discard_prefix_store(PrefixStoreRef) {}
+    // State-only checkpoints. A checkpoint that a deeper one extends repeats
+    // its attention rows: drop_prefix_kv() frees them and keeps what the
+    // position alone determines, and a restore of it names the deeper
+    // checkpoint in PrefixStorePlan::restore_kv. The estimate is the bytes
+    // one holds; 0 when the engine takes none, and then drop_prefix_kv()
+    // always fails and leaves the checkpoint whole.
+    virtual size_t estimate_prefix_state_bytes(int) const { return 0; }
+    virtual bool drop_prefix_kv(PrefixStoreRef) { return false; }
 
     struct StepInput {
         int     slot  = -1;

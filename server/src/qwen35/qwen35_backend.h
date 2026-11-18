@@ -136,6 +136,9 @@ public:
     void print_ready_banner() const override;
 
     bool park(ParkTarget target) override;
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return target_parked_; }
 
@@ -158,6 +161,9 @@ public:
     // (kQwen35OffGridLeadTokens), so a closer restore point starts no chunk.
     int  snapshot_granularity() const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
     MemoryReport memory_report() const override;
     // memory_report() for an explicit cache and snapshot array.
     static MemoryReport memory_report_for(const TargetCache & cache,
@@ -177,7 +183,7 @@ public:
 
     CompressResult compress(const CompressRequest & req) override;
     std::vector<CompressResult> compress_batch(
-        const std::vector<CompressRequest> & requests) override;
+        const std::vector<CompressRequest> & requests);
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -247,7 +253,8 @@ protected:
     std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
     bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
     std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
-    bool restore_target_cache_from_snapshot(int slot);
+    // `kv_slot`: the deeper snapshot a state-only one takes its rows from.
+    bool restore_target_cache_from_snapshot(int slot, int kv_slot = -1);
 
     // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
     DraftWeights & draft_weights() { return dw_; }
@@ -426,6 +433,12 @@ private:
     // Copies a deferred live snapshot into its slot before the live state
     // changes; a no-op otherwise.
     void materialize_live_snapshot();
+    // Single-sequence snapshots whose rows are their own tensors: the K/V of
+    // one is a prefix of a deeper one's.
+    bool state_only_snapshots() const;
+    // The dense snapshot `kv_slot` whose rows a state-only `slot` restores
+    // with; nullptr when `slot` needs none, or `kv_slot` cannot serve.
+    const PrefixSnapshot * snapshot_kv_source(int slot, int kv_slot) const;
     std::unique_ptr<Qwen35TensorParallelContext> tensor_parallel_;
     bool           split_gpus_     = false;
 
@@ -532,6 +545,14 @@ private:
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
 
+    // Residency: the cache arguments init() chose, replayed by reinstate().
+    int  layout_max_verify_tokens_ = 0;
+    int  layout_ctx_alloc_ = 0;
+    int  layout_feat_cap_ = 0;
+    bool layout_fixed_chain_ = false;
+    bool released_ = false;
+    void init_feature_mirror(bool fixed_chain_enabled);
+
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
@@ -547,6 +568,10 @@ private:
                    const Qwen35ImageRows * images = nullptr,
                    const std::vector<int> & restore_points = {},
                    const std::vector<int32_t> * full_prompt = nullptr);
+
+    // Returns the legacy (non-VMM) device pools' cached blocks to the driver
+    // when spec decode hands over to plain decode.
+    void trim_pools_at_ar_handoff(const char * reason);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // The generation's controller observes every emitted token, including the

@@ -201,6 +201,117 @@ static __device__ __forceinline__ void multi_vec_dot_kq_q8_0(
     }
 }
 
+// Targets where the q8_0 decode kernels fetch K and V rows one step ahead of
+// their use. On each, every decode kernel was checked to keep the occupancy
+// the runtime reports for it, which sets the partition counts and so the
+// output bits. Elsewhere the kernels load each row where it is used.
+#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3_5))
+static constexpr bool PAGED_ATTN_FETCH_AHEAD = true;
+#else
+static constexpr bool PAGED_ATTN_FETCH_AHEAD = false;
+#endif // defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3_5))
+
+// A 4-byte word of Q8_0 quants, which are only 2-byte aligned in the 34-byte
+// block. On AMD GPUs the builtin compiles to one load and keeps the word in
+// one register; 2-byte copies would leave two halves to rejoin at every use.
+// MSVC-hosted nvcc has no __builtin_memcpy.
+static __device__ __forceinline__ int paged_attn_q8_0_load_word(const int8_t * src) {
+    int word;
+#if defined(_MSC_VER) && !defined(__clang__)
+    memcpy(&word, src, sizeof(word));
+#else
+    __builtin_memcpy(&word, src, sizeof(word));
+#endif // defined(_MSC_VER) && !defined(__clang__)
+    return word;
+}
+
+// The fetched rows: these hold one lane's share of a row as stored, so loading
+// and computing can happen in different iterations. They mirror
+// multi_vec_dot_kq_q8_0 and dequantize_V_q8_0<float, 4> operation for
+// operation.
+
+// Four Q8_0 quants and the scale of their block. Separate fields keep each
+// scale in a register of its own.
+struct paged_attn_q8_0_word {
+    int  qs;
+    half d;
+};
+
+// A lane's words of a K row, as multi_vec_dot_kq_q8_0 reads them.
+template<int D>
+struct paged_attn_q8_0_k_row {
+    static constexpr int n = D/(sizeof(int)*WARP_SIZE);
+
+    paged_attn_q8_0_word w[n];
+
+    __device__ __forceinline__ void load(const char * __restrict__ K_c) {
+        const block_q8_0 * K_q8_0 = (const block_q8_0 *) K_c;
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            const int k_KQ = i*WARP_SIZE + threadIdx.x;
+            const int ib   = k_KQ / QI8_0;
+            const int iqs  = k_KQ % QI8_0;
+            w[i].qs = paged_attn_q8_0_load_word(K_q8_0[ib].qs + 4*iqs);
+            w[i].d = K_q8_0[ib].d;
+        }
+    }
+
+    // multi_vec_dot_kq_q8_0 on the loaded words.
+    template<int nbh>
+    __device__ __forceinline__ void dot(
+            const int    (&Q_q8)[nbh][n],
+            const float2 (&Q_ds)[nbh][n],
+            float (&sum)[nbh]) const {
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            const float K_d = __half2float(w[i].d);
+
+#pragma unroll
+            for (int h = 0; h < nbh; ++h) {
+                const int sumi = ggml_cuda_dp4a(w[i].qs, Q_q8[h][i], 0);
+                sum[h] += K_d * Q_ds[h][i].x * sumi;
+            }
+        }
+    }
+};
+
+// A lane's four values of one V row segment, as dequantize_V_q8_0<float, 4>
+// reads them.
+struct paged_attn_q8_0_v_word {
+    int  qs;
+    half d;
+
+    __device__ __forceinline__ void load(const char * __restrict__ v_row, int i0) {
+        const block_q8_0 * x = (const block_q8_0 *) v_row;
+        qs = paged_attn_q8_0_load_word(x[i0 / QK8_0].qs + i0 % QK8_0);
+        d = x[i0 / QK8_0].d;
+    }
+
+    // dequantize_V_q8_0<float, 4> on the loaded word.
+    __device__ __forceinline__ void dequantize(float (&dst)[4]) const {
+        const int8_t * q8 = (const int8_t *) &qs;
+        const float df = d;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            dst[l] = df * q8[l];
+        }
+    }
+};
+
+// Loads a lane's words of the V row of pool token phys. A token without a
+// row (phys < 0) loads row 0 instead, which keeps the load in bounds; its
+// values are never used.
+template<int D>
+static __device__ __forceinline__ void paged_attn_load_v_q8_0(
+        paged_attn_q8_0_v_word (&words)[D/(WARP_SIZE*4)],
+        const char * __restrict__ v_head, int64_t v_nb1, int32_t phys) {
+    const char * v_row = v_head + (int64_t) (phys >= 0 ? phys : 0) * v_nb1;
+#pragma unroll
+    for (int segment = 0; segment < D/(WARP_SIZE*4); ++segment) {
+        words[segment].load(v_row, (segment*WARP_SIZE + threadIdx.x) * 4);
+    }
+}
+
 // Tokens whose K·Q partial sums are reduced together, see
 // paged_attn_reduce_group.
 static constexpr int PAGED_ATTN_SCORE_GROUP = 2;
@@ -440,6 +551,15 @@ static __global__ void paged_attn_decode(
 
     constexpr dequantize_V_t dequantize_v =
         get_dequantize_V<type_V, float, values_per_load>();
+    // With the q8_0 cache the token loops fetch K one score group and V one
+    // token ahead, so the loads overlap the arithmetic of the current group or
+    // token. With the other cache types several kernels would lose a wave per
+    // SIMD to the rows held ahead, so they load each row where it is used.
+    constexpr bool fetch_ahead = PAGED_ATTN_FETCH_AHEAD &&
+        type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0;
+    static_assert(!fetch_ahead || values_per_load == 4,
+                  "a fetched V word holds one values_per_load segment");
+    constexpr int v_segments = D / (nthreads * values_per_load);
 
     float acc[n_batch_heads][values_per_lane] = {{0.0f}};
     float qk_max[n_batch_heads];
@@ -511,7 +631,30 @@ static __global__ void paged_attn_decode(
             score_mine[h] = -FLT_MAX;
         }
 
+        // Fetching ahead, group c+1's K rows are requested before group c's
+        // dots. Lanes past the tile hold -1, like unmapped tokens: their row
+        // 0 loads go unused. The last group re-requests its own rows.
+        paged_attn_q8_0_k_row<D> k_next[group_size];
+        if constexpr (fetch_ahead) {
+#pragma unroll
+            for (int u = 0; u < group_size; ++u) {
+                const int32_t phys_u = paged_attn_lane_value(phys_mine, n_groups*u);
+                k_next[u].load(k + (int64_t) (phys_u >= 0 ? phys_u : 0) * k_nb1 + (int64_t) kv_head * k_nb2);
+            }
+        }
+
         for (int c = 0; c < n_groups && c < tile_len; ++c) {
+            paged_attn_q8_0_k_row<D> k_cur[group_size];
+            if constexpr (fetch_ahead) {
+                const int c_next = c + 1 < n_groups && c + 1 < tile_len ? c + 1 : c;
+#pragma unroll
+                for (int u = 0; u < group_size; ++u) {
+                    k_cur[u] = k_next[u];
+                    const int32_t phys_u = paged_attn_lane_value(phys_mine, c_next + n_groups*u);
+                    k_next[u].load(k + (int64_t) (phys_u >= 0 ? phys_u : 0) * k_nb1 + (int64_t) kv_head * k_nb2);
+                }
+            }
+
             float sums[n_batch_heads][group_size];
 #pragma unroll
             for (int u = 0; u < group_size; ++u) {
@@ -521,7 +664,9 @@ static __global__ void paged_attn_decode(
                 if (phys_j >= 0) {
                     const char * k_row =
                         k + (int64_t) phys_j * k_nb1 + (int64_t) kv_head * k_nb2;
-                    if constexpr (type_K == GGML_TYPE_F16) {
+                    if constexpr (fetch_ahead) {
+                        k_cur[u].dot(q_i32, q_ds, token_sums);
+                    } else if constexpr (type_K == GGML_TYPE_F16) {
                         multi_vec_dot_kq_f16<D, n_batch_heads>(k_row, q_reg, token_sums);
                     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
                         multi_vec_dot_kq_q4_0<D, n_batch_heads>(k_row, q_i32, q_ds, token_sums);
@@ -541,6 +686,14 @@ static __global__ void paged_attn_decode(
                 const float score = paged_attn_reduce_group<group_size>(sums[h]);
                 score_mine[h] = lane % n_groups == c ? score : score_mine[h];
             }
+        }
+
+        // Fetching ahead, the tile's first V row is requested now, so its load
+        // overlaps the softmax update below.
+        paged_attn_q8_0_v_word v_next[v_segments];
+        if constexpr (fetch_ahead) {
+            paged_attn_load_v_q8_0<D>(v_next, v + (int64_t) kv_head * v_nb2, v_nb1,
+                paged_attn_lane_value(phys_mine, 0));
         }
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
@@ -569,8 +722,19 @@ static __global__ void paged_attn_decode(
             qk_sum[h] += paged_attn_warp_sum(w_mine[h]);
         }
 
+        // Fetching ahead, token j+1's V row is requested before token j's
+        // FMAs; the last token re-requests its own row.
         for (int j = 0; j < tile_len; ++j) {
             const int32_t phys_j = paged_attn_lane_value(phys_mine, j);
+            paged_attn_q8_0_v_word v_cur[v_segments];
+            if constexpr (fetch_ahead) {
+#pragma unroll
+                for (int segment = 0; segment < v_segments; ++segment) {
+                    v_cur[segment] = v_next[segment];
+                }
+                paged_attn_load_v_q8_0<D>(v_next, v + (int64_t) kv_head * v_nb2, v_nb1,
+                    paged_attn_lane_value(phys_mine, j + 1 < tile_len ? j + 1 : j));
+            }
             if (phys_j < 0) {
                 continue;
             }
@@ -584,14 +748,16 @@ static __global__ void paged_attn_decode(
             }
 
 #pragma unroll
-            for (int segment = 0;
-                 segment < D / (nthreads * values_per_load);
-                 ++segment) {
+            for (int segment = 0; segment < v_segments; ++segment) {
                 float values[values_per_load];
-                const int value0 =
-                    segment * nthreads * values_per_load +
-                    lane * values_per_load;
-                dequantize_v(v_row, values, value0);
+                if constexpr (fetch_ahead) {
+                    v_cur[segment].dequantize(values);
+                } else {
+                    const int value0 =
+                        segment * nthreads * values_per_load +
+                        lane * values_per_load;
+                    dequantize_v(v_row, values, value0);
+                }
 #pragma unroll
                 for (int i = 0; i < values_per_load; ++i) {
                     const int ai = segment * values_per_load + i;
@@ -796,6 +962,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     if (q->ne[0] != PAGED_ATTN_HEAD_DIM ||
         q->ne[0] != k->ne[0] ||
         q->ne[0] != v->ne[0] ||
+        k->ne[1] <= 0 ||
         k->ne[1] != v->ne[1] ||
         k->ne[2] <= 0 ||
         k->ne[2] != v->ne[2] ||

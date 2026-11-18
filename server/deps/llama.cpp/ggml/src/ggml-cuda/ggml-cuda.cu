@@ -130,6 +130,7 @@ static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
 static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+static thread_local int ggml_cuda_mmvq_invariant_max_ncols_value = 0;
 
 static thread_local ggml_cuda_qwen4exp_profile qwen4exp_profile = GGML_CUDA_QWEN4EXP_OFF;
 
@@ -197,8 +198,25 @@ extern "C" void ggml_backend_cuda_mul_mat_whole_row_lanes(ggml_tensor * mul_mat)
     ggml_set_op_params_i32(mul_mat, 1, GGML_CUDA_WHOLE_ROW_LANES);
 }
 
+extern "C" void ggml_backend_cuda_mul_mat_id_grouped(ggml_tensor * mul_mat_id) {
+    GGML_ASSERT(mul_mat_id != nullptr && mul_mat_id->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(mul_mat_id, 1, GGML_CUDA_MMID_GROUPED);
+}
+
 bool ggml_cuda_mmvq_batch_invariant() {
     return ggml_cuda_mmvq_batch_invariant_enabled;
+}
+
+extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
+    GGML_ASSERT(max_ncols == 0 || (max_ncols >= MMVQ_MAX_BATCH_SIZE && max_ncols <= MMVQ_INVARIANT_MAX_BATCH_SIZE));
+    const int previous = ggml_cuda_mmvq_invariant_max_ncols_value;
+    ggml_cuda_mmvq_invariant_max_ncols_value = max_ncols;
+    return previous;
+}
+
+int ggml_cuda_mmvq_invariant_max_ncols() {
+    return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
+                                                        : MMVQ_MAX_BATCH_SIZE;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -882,14 +900,29 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     // Free buffers keyed by size. alloc() takes the smallest cached buffer
-    // that fits, the same best-fit choice the original linear scan made, and
-    // free() returns a buffer to the cache; both are O(log n). A DeepSeek4
+    // that fits when it is not much larger than the request (serves() below),
+    // and free() returns a buffer to the cache; both are O(log n). A DeepSeek4
     // gathered graph that packs prompt rows memoizes thousands of q8_1
     // activations per evaluation (LUCE_Q8_MEMO keeps one per quantized
     // matmul), so the original per-operation scan of the whole pool and its
     // cudaFree fallback on a full pool (which serializes the stream) both
     // showed up in the round time. 8192 (upstream 256) bounds the cache.
     static const int MAX_BUFFERS = 8192;
+
+    // A cached buffer serves a request only when it is at most twice the
+    // request plus this slack. Without the bound the best-fit choice hands a
+    // buffer of any size to any smaller request, and a request that stays
+    // allocated then keeps that buffer out of the cache: the q8_1 activation
+    // memos live until the next graph evaluation, so a few KiB of memo could
+    // hold a context-sized buffer (the F16 K or V copy a flash-attention
+    // kernel had just returned). The next attention layer found neither copy
+    // cached and allocated two more, and one evaluation ended up owning two
+    // such buffers per attention layer instead of two in all.
+    static constexpr size_t REUSE_SLACK = 1024 * 1024;
+
+    static bool serves(size_t buffer_size, size_t size) {
+        return buffer_size - size <= size + REUSE_SLACK;
+    }
 
     int device;
     std::multimap<size_t, void *> free_buffers;
@@ -910,8 +943,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        // The smallest cached buffer that fits; every other one that fits is
+        // larger, so if this one is too large for the request none serves it.
         auto it = free_buffers.lower_bound(size);
-        if (it != free_buffers.end()) {
+        if (it != free_buffers.end() && serves(it->first, size)) {
             void * ptr = it->second;
             *actual_size = it->first;
             free_buffers.erase(it);
@@ -922,17 +957,25 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-        if (err != cudaSuccess && !free_buffers.empty()) {
-            // The cached blocks are all smaller than this request (a long DeepSeek4
-            // prompt after another long one asks for a little more than the last
-            // left behind), yet they hold the memory it needs: give them back,
-            // then try once more before failing.
-            (void) cudaGetLastError();
-            const size_t cached = trim();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            GGML_LOG_WARN("%s: device %d: %.1f MiB did not fit; returned %.1f MiB of cached blocks, retry %s\n",
-                          __func__, device, look_ahead_size / 1048576.0, cached / 1048576.0,
-                          err == cudaSuccess ? "succeeded" : "failed");
+        if (err != cudaSuccess) {
+            const size_t owned = pool_size;
+            const bool   retry = !free_buffers.empty();
+            size_t       cached = 0;
+            if (retry) {
+                // The cached blocks are all smaller than this request (a long
+                // DeepSeek4 prompt after another long one asks for a little more
+                // than the last left behind), yet they hold the memory it needs:
+                // give them back, then try once more before failing.
+                (void) cudaGetLastError();
+                cached = trim();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            }
+            // What this pool held says where the memory went: blocks in use
+            // cannot be returned, cached ones just were.
+            GGML_LOG_WARN("%s: device %d: %.1f MiB did not fit; pool had %.1f MiB in use, returned %.1f MiB of cached blocks, "
+                          "retry %s\n",
+                          __func__, device, look_ahead_size / 1048576.0, (owned - cached) / 1048576.0,
+                          cached / 1048576.0, !retry ? "skipped" : err == cudaSuccess ? "succeeded" : "failed");
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
@@ -3164,7 +3207,7 @@ static int ggml_cuda_mmvq_max_ncols() {
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
     if (ggml_cuda_mmvq_batch_invariant_enabled) {
-        return MMVQ_MAX_BATCH_SIZE;
+        return ggml_cuda_mmvq_invariant_max_ncols();
     }
     return ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override : configured;
@@ -3238,8 +3281,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, dst->ne[2], dst->ne[1]*dst->ne[2])) {
+    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_for(tensor, cc)) {
         return false;
     }
     if (cc <= GGML_CUDA_CC_PASCAL) {
@@ -3335,8 +3377,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 #endif
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
+    if (ids && (ggml_cuda_mmvq_mmid_grouped_for(up, cc) || ggml_cuda_mmvq_mmid_grouped_for(gate, cc))) {
         return false;
     }
 
@@ -5038,7 +5079,7 @@ static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
 // then copies the usual way.
 // A contiguous same-size copy between two CUDA backends on different devices,
 // each tensor in a CUDA buffer on its backend's device: the copies below
-// qualify only then, as ggml_backend_cuda_cpy_tensor_async's peer path does.
+// qualify only then.
 static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                           const ggml_tensor * src, const ggml_tensor * dst) {
 #ifdef GGML_CUDA_NO_PEER_COPY
@@ -5186,8 +5227,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                     ggml_cuda_flush_peer_copy_batch("peer-pair-change");
                 }
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                if (ggml_cuda_peer_copy_kernel_enabled() &&
-                    ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+                // The kernel copies exactly what cudaMemcpyPeerAsync below would, ggml_nbytes(dst) bytes from
+                // src->data, so a strided copy joins the batch too (a verify's top-k ids, a view of the router's
+                // sorted rows). A hop whose copies all join leaves as the producer graph's tail instead of a copy
+                // kernel, a runtime blit and a second copy kernel, each followed by a launch gap.
+                if (ggml_cuda_peer_copy_kernel_enabled()) {
                     if (batch.n_descs == ggml_cuda_copy_batch_max) {
                         ggml_cuda_backend_entry(cuda_ctx_src);
                         ggml_cuda_set_device(cuda_ctx_src->device);

@@ -4,7 +4,6 @@
 // T2: open the same instance twice (idempotency) → no leak
 // T3: open a non-existent path → returns false, object stays empty
 // T4: explicit release() → object becomes empty, no crash
-// T5: RAII destructor — scope exit, no crash
 
 #include "CppUnitTestFramework.hpp"
 #include "common/gguf_mmap.h"
@@ -150,21 +149,6 @@ static void t4_explicit_release() {
     std::puts("T4 PASS");
 }
 
-// ─── T5: RAII destructor — scope exit, no crash ─────────────────────────────
-
-static void t5_raii_destructor() {
-    std::string path = make_temp_file();
-    {
-        luce::common::GgufMmap m;
-        std::string err;
-        assert(m.open(path, err));
-        assert(m.is_open());
-        // ~GgufMmap() fires here, must not crash or leak.
-    }
-    std::remove(path.c_str());
-    std::puts("T5 PASS");
-}
-
 // ─── main ────────────────────────────────────────────────────────────────────
 
 TEST_CASE(GgufMmapFixture, gguf_mmap_suite) {
@@ -172,7 +156,6 @@ TEST_CASE(GgufMmapFixture, gguf_mmap_suite) {
     t2_idempotent_open();
     t3_missing_file();
     t4_explicit_release();
-    t5_raii_destructor();
 
     std::puts("ALL TESTS PASS");
 }

@@ -17,6 +17,7 @@
 #include "admission.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
+#include "luce.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "cluster/cluster_config.h"
@@ -41,6 +42,7 @@
 #include "placement/kfd_topology.h"
 #include "kvflash_pager.h"
 #include "kv_quant.h"
+#include "swap_group.h"
 #ifdef LUCE_MOSS_IMAGE
 #include "moss_image/image_server.h"
 #include "moss_image/pipeline.h"
@@ -151,6 +153,12 @@ static void print_usage(const char * prog) {
         "                       wait in host memory and the server gives its GPU memory\n"
         "                       back on request (POST /memory/release, /memory/load)\n"
         "  --port <N>           Listen port (default: 8080)\n"
+        "  --swap-group <dir>   Take turns on shared GPUs with the other servers started\n"
+        "                       with this directory: a request to this model asks the\n"
+        "                       servers holding its GPUs to release them, then loads it\n"
+        "                       back (GET/POST /v1/residency; docs/specs/model-swap.md)\n"
+        "  --swap-start <released|resident>  With --swap-group: release the GPUs a peer\n"
+        "                       may need once loaded (default: resident)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
         "                       trained context, lowered to what the devices hold\n"
@@ -584,6 +592,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.mmproj_device = vision_device;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--swap-group") == 0 && i + 1 < argc) {
+            sconfig.swap_group_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--swap-start") == 0 && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value != "released" && value != "resident") {
+                std::fprintf(stderr, "[server] --swap-start must be released or resident\n");
+                return 2;
+            }
+            sconfig.swap_start_released = value == "released";
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             sconfig.host = argv[++i];
         } else if (std::strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
@@ -1342,11 +1359,15 @@ static uint64_t model_kv_cache_bytes(const ModelOptions & model) {
 static AutoPlacement plan_auto_placement(const std::vector<GpuDeviceInfo> & devices,
                                          const BackendArgs & args,
                                          uint64_t model_bytes, uint64_t kv_bytes,
-                                         bool allow_multi_gpu) {
+                                         bool allow_multi_gpu,
+                                         uint64_t draft_bytes = 0,
+                                         uint64_t rollback_bytes = 0) {
     const std::string arch = inspect_gguf_model_info(args.model_path.c_str()).arch;
     AutoPlacementRequest request;
     request.model_bytes = model_bytes;
     request.kv_bytes = kv_bytes;
+    request.draft_bytes = draft_bytes;
+    request.rollback_bytes = rollback_bytes;
     request.technique = allow_multi_gpu ? auto_multi_gpu_technique(arch, args)
                                         : MultiGpuTechnique::None;
     request.can_offload = arch_has_expert_offload(arch);
@@ -1361,6 +1382,45 @@ static std::string auto_placement_devices(const AutoPlacement & placement) {
         out += std::string(out.empty() ? "" : ",") + backend + ":" + std::to_string(gpu);
     }
     return out;
+}
+
+// The decode drafter `--target-device auto` places with the target, and what
+// the two cost beside each other: the drafter's weights, and the rollback
+// checkpoints the target allocates at its first speculative request
+// (migrate_prefill_cache). Only the single-sequence Qwen3.5/3.6/3.8 hybrid with
+// an in-process drafter on no device of its own. Left alone: a profile (a
+// recipe qualified for one topology), concurrent serving (it keeps the drafter
+// on the target's GPU) and PFlash (its drafter follows the decode drafter, and
+// parking is sized for it beside the target). Both 0: auto ignores the drafter.
+static void auto_drafter_bytes(const ModelOptions & model,
+                               uint64_t & draft_bytes, uint64_t & rollback_bytes) {
+    draft_bytes = 0;
+    rollback_bytes = 0;
+    const BackendArgs & args = model.bargs;
+    if (!args.draft_path || model.draft_device_set || model.profile ||
+        args.remote_draft.enabled() || args.paged_attention || args.max_concurrency > 1 ||
+        model.sconfig.pflash ||
+        inspect_gguf_model_info(args.model_path.c_str()).arch != "qwen35") {
+        return;
+    }
+    draft_bytes = gguf_model_bytes(*args.draft_path);
+    if (draft_bytes == 0) return;
+
+    // The verify width the backend sizes the checkpoints for (the
+    // max_verify_tokens it passes to migrate_prefill_cache): the drafter's
+    // block, or a DDTree's nodes.
+    // --specla turns DDTree on during backend planning, after this runs.
+    const bool tree = args.ddtree_mode || args.specla_mode;
+    if (!args.fast_rollback && !tree) return;
+    int block = args.draft_block_size > 0 ? args.draft_block_size
+                                          : (int) gguf_draft_block_size(*args.draft_path);
+    if (block <= 0) block = LUCE_DRAFT_BLOCK_SIZE;
+    const int max_verify_tokens = tree ? std::max(block, args.ddtree_budget + 1) : block;
+    const bool kvflash = !model.kvflash_pool.empty() || std::getenv("LUCE_KVFLASH") != nullptr;
+    rollback_bytes = gguf_rollback_cache_bytes(
+        args.model_path, max_verify_tokens,
+        luce::common::resolve_chain_rollback_policy().checkpoint_f32,
+        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash);
 }
 
 // --target-device auto: bind the model block to the placement the policy picks.
@@ -1382,9 +1442,11 @@ static bool resolve_auto_target_device(ModelOptions & model) {
             device.name.c_str(), device.arch.c_str(), bytes_to_gib(auto_device_capacity(device)),
             device.busy ? ", busy: " : "", device.busy_by.c_str());
     }
+    uint64_t draft_bytes = 0, rollback_bytes = 0;
+    auto_drafter_bytes(model, draft_bytes, rollback_bytes);
     const AutoPlacement placement = plan_auto_placement(
         devices, model.bargs, model_bytes, kv_bytes,
-        /*allow_multi_gpu=*/!model.profile);
+        /*allow_multi_gpu=*/!model.profile, draft_bytes, rollback_bytes);
     if (placement.gpus.empty()) {
         std::fprintf(stderr, "[server] --target-device auto: %s (%.1f GiB model + %.1f GiB KV)\n",
                      placement.reason.c_str(), bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes));
@@ -1412,6 +1474,18 @@ static bool resolve_auto_target_device(ModelOptions & model) {
         multi_gpu_technique_name(placement.technique), auto_placement_devices(placement).c_str(),
         bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes), target.max_ctx,
         placement.reason.c_str());
+    if (placement.draft_gpu >= 0) {
+        // An explicit placement from here on: resolve_draft_placement() keeps it.
+        model.bargs.draft_device.backend = backend;
+        model.bargs.draft_device.gpu = placement.draft_gpu;
+        model.draft_device_set = true;
+        std::fprintf(stderr,
+            "[server] --target-device auto: drafter on %s:%d: beside the model on %s:%d its %.1f GiB "
+            "and the %.1f GiB of rollback checkpoints do not fit\n",
+            placement_backend_name(backend), placement.draft_gpu,
+            placement_backend_name(backend), target.gpu,
+            bytes_to_gib(draft_bytes), bytes_to_gib(rollback_bytes));
+    }
     return true;
 }
 
@@ -2439,6 +2513,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             "[server] --prefix-cache-max-mib has no effect with concurrent "
             "serving; use --concurrent-prefix-cache-max-mib\n");
     }
+    sconfig.prefix_cache_budget_auto = prefix_ram.automatic;
     // Store the resolved value: auto depends on the memory available now,
     // and the budget printed here must be the one the server enforces.
     if (!sconfig.concurrent_prefix_cache) {
@@ -3067,6 +3142,49 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // --swap-group: join before loading, so the GPUs this model loads onto are
+    // free; the group's lock is held until the server is ready.
+    std::unique_ptr<luce::server::SwapGroup> swap_group;
+    if (!options.front().sconfig.swap_group_dir.empty()) {
+        const ModelOptions & option = options.front();
+        if (load_balancing || options.size() > 1) {
+            std::fprintf(stderr, "[server] --swap-group serves one model per server\n");
+            return 2;
+        }
+        if (option.target_device_auto) {
+            std::fprintf(stderr, "[server] --swap-group needs an explicit --target-device\n");
+            return 2;
+        }
+        std::string error;
+        swap_group = luce::server::SwapGroup::open(option.sconfig.swap_group_dir, option.sconfig.port, error);
+        if (!swap_group || !swap_group->lock(nullptr, luce::server::kSwapLockTimeoutS, error)) {
+            std::fprintf(stderr, "[server] swap group: %s\n", error.c_str());
+            return 1;
+        }
+        std::vector<int> gpus;
+        auto add = [&gpus](const DevicePlacement & d) {
+            const std::vector<int> ids = d.is_multi_device() ? d.layer_split_gpus : std::vector<int>{d.gpu};
+            for (int g : ids) {
+                if (std::find(gpus.begin(), gpus.end(), g) == gpus.end()) gpus.push_back(g);
+            }
+        };
+        add(option.bargs.device);
+        if (option.draft_device_set) add(option.bargs.draft_device);
+        if (option.bargs.expert_device) add(*option.bargs.expert_device);
+        if (option.bargs.mmproj_device) add(*option.bargs.mmproj_device);
+        if (option.pflash_drafter_device) add(*option.pflash_drafter_device);
+        for (const luce::server::SwapMember & peer : swap_group->peers()) {
+            const std::vector<int> overlap = luce::server::gpu_overlap(peer.held(), gpus);
+            if (overlap.empty()) continue;
+            std::fprintf(stderr, "[swap] asking %s (port %d) to release its GPUs before loading\n",
+                         peer.model.c_str(), peer.port);
+            if (!luce::server::SwapGroup::ask_release(peer, overlap, luce::server::kSwapReleaseTimeoutS, error)) {
+                std::fprintf(stderr, "[server] swap group: %s\n", error.c_str());
+                return 1;
+            }
+        }
+    }
+
     std::vector<std::unique_ptr<LoadedModel>> loaded;
     std::vector<HttpServer *> servers;
     // All initialization (including backend environment defaults) finishes
@@ -3082,6 +3200,7 @@ int main(int argc, char ** argv) {
         loaded.push_back(std::move(model));
     }
     g_server = servers.front();
+    if (swap_group) g_server->attach_swap_group(std::move(swap_group));
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
     const int ret = load_balancing ? g_server->run(servers) : g_server->run();

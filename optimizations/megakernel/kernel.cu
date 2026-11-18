@@ -787,6 +787,13 @@ __device__ void deltanet_layer(
 // LM Head: vocab projection + argmax
 // =============================================================================
 
+__device__ __forceinline__ bool argmax_better(float value, int index,
+                                             float best, int best_index)
+{
+    return index >= 0 && (best_index < 0 || value > best ||
+                         (isnan(value) && !isnan(best)));
+}
+
 __global__ void lm_head_kernel(
     const float *__restrict__ hidden,
     const half_t *__restrict__ weight,   // [VOCAB, HIDDEN] bf16
@@ -820,7 +827,7 @@ __global__ void lm_head_kernel(
         if (lane_id == 0 && repetition_penalty > 1.0f && seen_token_mask && seen_token_mask[m] > 0.0f) {
             sum = (sum > 0.0f) ? (sum / repetition_penalty) : (sum * repetition_penalty);
         }
-        if (lane_id == 0 && sum > local_max) { local_max = sum; local_max_idx = m; }
+        if (lane_id == 0 && argmax_better(sum, m, local_max, local_max_idx)) { local_max = sum; local_max_idx = m; }
     }
     local_max = SHFL_SYNC(0xffffffff, local_max, 0);
     local_max_idx = SHFL_SYNC(0xffffffff, local_max_idx, 0);
@@ -834,7 +841,7 @@ __global__ void lm_head_kernel(
         for (int o = WARP_SIZE/2; o > 0; o /= 2) {
             float ov = SHFL_DOWN_SYNC(0xffffffff, mv, o);
             int oi = SHFL_DOWN_SYNC(0xffffffff, mi, o);
-            if (ov > mv) { mv = ov; mi = oi; }
+            if (argmax_better(ov, oi, mv, mi)) { mv = ov; mi = oi; }
         }
         if (lane_id == 0) { block_max_vals[blockIdx.x] = mv; block_max_idxs[blockIdx.x] = mi; }
     }
@@ -844,10 +851,10 @@ __global__ void lm_head_kernel(
         if (threadIdx.x == 0) { volatile unsigned int *vc = (volatile unsigned int *)sync_counter; while (*vc < (unsigned int)gridDim.x) {} __threadfence(); }
         __syncthreads();
         int tid = threadIdx.x; float bv = -INFINITY; int bi = -1;
-        for (int i = tid; i < gridDim.x; i += LM_BLOCK_SIZE) { float v = block_max_vals[i]; if (v > bv) { bv = v; bi = block_max_idxs[i]; } }
+        for (int i = tid; i < gridDim.x; i += LM_BLOCK_SIZE) { float v = block_max_vals[i]; if (argmax_better(v, block_max_idxs[i], bv, bi)) { bv = v; bi = block_max_idxs[i]; } }
         __shared__ float sv[256]; __shared__ int si[256];
         sv[tid] = bv; si[tid] = bi; __syncthreads();
-        for (int s = LM_BLOCK_SIZE/2; s > 0; s >>= 1) { if (tid < s && sv[tid+s] > sv[tid]) { sv[tid] = sv[tid+s]; si[tid] = si[tid+s]; } __syncthreads(); }
+        for (int s = LM_BLOCK_SIZE/2; s > 0; s >>= 1) { if (tid < s && argmax_better(sv[tid+s], si[tid+s], sv[tid], si[tid])) { sv[tid] = sv[tid+s]; si[tid] = si[tid+s]; } __syncthreads(); }
         if (tid == 0) *output_token = si[0];
     }
 }

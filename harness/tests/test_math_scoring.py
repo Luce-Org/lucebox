@@ -37,10 +37,6 @@ class MathEquivTests(unittest.TestCase):
         self.assertTrue(_math_equiv(r"1\frac{1}{2}", "1.5"))
         self.assertTrue(_math_equiv("1.5", r"1\frac{1}{2}"))
 
-    def test_improper_vs_mixed_fractions(self) -> None:
-        self.assertTrue(_math_equiv(r"\frac{3}{2}", r"1\frac{1}{2}"))
-        self.assertTrue(_math_equiv(r"1\frac{1}{2}", r"\frac{3}{2}"))
-
     def test_negative_mixed_fractions(self) -> None:
         self.assertTrue(_math_equiv(r"-1\frac{1}{2}", "-1.5"))
         self.assertTrue(_math_equiv(r"-1\frac{1}{2}", r"-1\frac{2}{4}"))

@@ -65,6 +65,10 @@ public:
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
 
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
 
@@ -75,6 +79,17 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
+    // The disk session cache: snapshots in their disk form (export_qwen4exp_snapshot).
+    bool snapshot_exports() const override { return true; }
+    OwnedSnapshot snapshot_copy(int slot) const override;
+    OwnedSnapshot snapshot_detach(int slot) override;
+    bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
+    OwnedSnapshot snapshot_take_displaced(int slot) override;
+    void snapshot_drop_displaced(int slot) override;
     // Prompt forwards end at every restore point (see run()); 4096-token
     // spacing keeps them long enough for the expert reads to pay off.
     int restore_point_spacing() const override { return 4096; }
@@ -89,7 +104,7 @@ public:
     // memory a park frees (pflash_window.h).
     CompressResult compress(const CompressRequest & req) override;
     std::vector<CompressResult> compress_batch(
-        const std::vector<CompressRequest> & requests) override;
+        const std::vector<CompressRequest> & requests);
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -105,12 +120,32 @@ private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored, int restore_slot = -1);
     bool snapshot_save_replacing(int slot, int source);
     bool snapshot_fits(int slot, int replaced = -1) const;
+    // Bytes of a snapshot of `tokens` positions, with or without its per-position rows.
+    size_t snapshot_bytes(int tokens, bool rows) const;
     bool create_main_cache();
     void size_kvflash_pool();
     int kvflash_pool_for(int ctx) const;
     int plan_chunk(Qwen4ExpChunkPlan * plan = nullptr);
     int remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t missing) const;
     bool start_seq_engine(); // no-op at --max-concurrency 1
+    bool create_seq_caches();
+    // Residency: what the model holds on its GPUs. `experts` is the split mode's release of the target device only,
+    // which keeps the routed expert stacks on the expert device.
+    enum class Held { all, experts, none };   // in decreasing order of what is held
+    Held held_ = Held::all;
+    void release_device_state(bool keep_experts);
+    // A release of the target device keeps each cache's expert-device K/V buffer (0: the main cache, then the
+    // concurrency slots); the reinstate places the rows back in them.
+    std::vector<ggml_backend_buffer_t> kept_remote_bufs_;
+    ggml_backend_buffer_t take_kept_remote(size_t i) {
+        if (i >= kept_remote_bufs_.size()) return nullptr;
+        ggml_backend_buffer_t b = kept_remote_bufs_[i];
+        kept_remote_bufs_[i] = nullptr;
+        return b;
+    }
+    void free_kept_remote_bufs();
+    int target_gpu() const { return cfg_.device.gpu; }
+    int expert_gpu() const { return cfg_.expert_device ? cfg_.expert_device->gpu : -1; }
     // ctx < 0: the cache's context (none before the cache exists).
     size_t pflash_reserve(ggml_backend_t device, int ctx = -1) const;
     // Weights, caches, hot experts, the prefill chunk and the prefix allowance, then the slot engine: init and
@@ -123,6 +158,10 @@ private:
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
+    // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.
+    std::array<Qwen4ExpSnapshot, kMaxSlots> displaced_;
+    // The snapshots' disk layout (qwen4exp_disk_layout), taken when the cache is made: they outlive a released cache.
+    std::string disk_layout_;
     int live_slot_ = -1;
     std::vector<int32_t> tokens_;
     std::vector<float> logits_;

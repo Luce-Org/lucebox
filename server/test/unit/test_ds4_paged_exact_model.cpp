@@ -14,7 +14,9 @@
 // first raw ring pass and slot 0 past it, a sequence alone in slot 3 while the
 // other slots hold different text, and prompts that arrive while others
 // decode; each case checks that its sequences hold the slots it names. The
-// hybrid tier runs one row per sequence, so a step holds at most six rows.
+// hybrid tier runs one row per sequence, so a step holds at most six rows, and
+// the rows of a step share their routed-expert products (one grouped product
+// per projection on each GPU, moe_overlap.h): the cases must run them.
 //
 // The launch is the server's (server_main.cpp: the profile's environment with
 // paged V4.1's leave-out list, the profile's device flags, --expert-device's
@@ -36,6 +38,7 @@
 #include "server/tokenizer.h"
 
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -422,6 +425,9 @@ int main(int argc, char ** argv) {
     }
 
     int failures = 0, checked = 0;
+    // Grouped expert products per GPU: the hybrid tier's two owners must both take them.
+    const int n_devices = std::min(ggml_backend_cuda_get_device_count(), 2);
+    std::vector<size_t> grouped_launches((size_t) n_devices, 0);
     try {
         // Each prompt alone in an otherwise idle engine.
         std::vector<std::vector<int32_t>> reference;
@@ -431,6 +437,10 @@ int main(int argc, char ** argv) {
             reference.push_back(r.seqs()[0].tokens);
             std::printf("reference: prompt %d, %zu prompt tokens, slot %d\n", p, prompts[(size_t) p].size(),
                         r.seqs()[0].slot);
+        }
+        std::vector<size_t> grouped_before((size_t) n_devices);
+        for (int d = 0; d < n_devices; ++d) {
+            grouped_before[(size_t) d] = ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count_on(d);
         }
         for (const Case & c : kCases) {
             Run r(*engine, prompts);
@@ -454,12 +464,30 @@ int main(int argc, char ** argv) {
             std::printf("%s: %s (prompt@slot:%s)\n", bad ? "FAIL" : "PASS", c.name, slots.c_str());
             failures += bad;
         }
+        for (int d = 0; d < n_devices; ++d) {
+            grouped_launches[(size_t) d] =
+                ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count_on(d) - grouped_before[(size_t) d];
+        }
     } catch (const std::exception & e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;
     }
+    size_t grouped_total = 0;
+    bool grouped_everywhere = n_devices > 0;
+    std::string grouped_per_device;
+    for (int d = 0; d < n_devices; ++d) {
+        grouped_total += grouped_launches[(size_t) d];
+        grouped_everywhere = grouped_everywhere && grouped_launches[(size_t) d] > 0;
+        grouped_per_device += " gpu" + std::to_string(d) + "=" + std::to_string(grouped_launches[(size_t) d]);
+    }
+    std::printf("grouped expert products: %zu launches (%s)\n", grouped_total,
+                grouped_per_device.empty() ? "" : grouped_per_device.c_str() + 1);
     if (failures) {
         std::printf("FAIL: %d of %d sequences changed with the sequences beside them\n", failures, checked);
+        return 1;
+    }
+    if (!grouped_everywhere) {
+        std::printf("FAIL: the steps of several rows did not share their expert products on every GPU\n");
         return 1;
     }
     std::printf("PASS: %d sequences, %d greedy tokens each, identical alone and beside others\n",

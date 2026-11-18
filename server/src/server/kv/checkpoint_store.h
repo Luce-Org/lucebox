@@ -33,6 +33,12 @@ public:
     // System-memory bytes a checkpoint of the first `tokens` positions
     // holds; 0 when the store cannot tell.
     virtual size_t estimate_bytes(int tokens) const = 0;
+    // State-only checkpoints (ModelBackend::snapshot_drop_kv): the bytes one
+    // holds (0: the store takes none), turning a checkpoint into one, and
+    // whether it is one.
+    virtual size_t estimate_state_bytes(int tokens) const { (void)tokens; return 0; }
+    virtual bool drop_kv(Checkpoint checkpoint) { (void)checkpoint; return false; }
+    virtual bool state_only(Checkpoint checkpoint) const { (void)checkpoint; return false; }
 
     virtual bool used(Checkpoint checkpoint) const = 0;
     // The positions (KV rows) the checkpoint holds; 0 when unused.
@@ -42,13 +48,19 @@ public:
     // No prefix-index entry ever lives there.
     virtual Checkpoint staging() const = 0;
 
-    // The disk boundary. `ref` reads the payload in place (layout, digest,
-    // a copy for the writer); `detach` hands it to a new owner and leaves the
-    // checkpoint empty; `adopt` takes a payload read from disk, and leaves it
-    // with `snapshot` when it fails.
+    // The disk boundary. `ref` reads the payload in place (layout, digest);
+    // `copy` is a host copy for the writer, the checkpoint keeping its own;
+    // `detach` hands it to a new owner and leaves the checkpoint empty;
+    // `adopt` takes a payload read from disk, and leaves it with `snapshot`
+    // when it fails.
     virtual ModelBackend::SnapshotRef ref(Checkpoint checkpoint) const = 0;
+    virtual OwnedSnapshot copy(Checkpoint checkpoint) const = 0;
     virtual OwnedSnapshot detach(Checkpoint checkpoint) = 0;
     virtual bool adopt(Checkpoint checkpoint, OwnedSnapshot & snapshot) = 0;
+    // The store packs its payloads for the disk itself and gives no `ref`
+    // (ModelBackend::snapshot_exports): an empty `ref` of a used checkpoint
+    // does not mean memory-only then.
+    virtual bool exports() const { return false; }
 };
 
 // Checkpoints in the backend's snapshot slots.
@@ -60,13 +72,18 @@ public:
     int restore_point_spacing() const override;
     bool prefill_cuts_at_restore_points() const override;
     size_t estimate_bytes(int tokens) const override;
+    size_t estimate_state_bytes(int tokens) const override;
+    bool drop_kv(Checkpoint checkpoint) override;
+    bool state_only(Checkpoint checkpoint) const override;
     bool used(Checkpoint checkpoint) const override;
     int position(Checkpoint checkpoint) const override;
     void free(Checkpoint checkpoint) override;
     Checkpoint staging() const override;
     ModelBackend::SnapshotRef ref(Checkpoint checkpoint) const override;
+    OwnedSnapshot copy(Checkpoint checkpoint) const override;
     OwnedSnapshot detach(Checkpoint checkpoint) override;
     bool adopt(Checkpoint checkpoint, OwnedSnapshot & snapshot) override;
+    bool exports() const override;
 
     // Generation, for the single-sequence path. A request saves at most one
     // checkpoint during its prefill: `bind_capture` names it and its
@@ -93,8 +110,10 @@ public:
     bool save_deferred(Checkpoint checkpoint);
     void flush_deferred();
 
-    // A concurrent capture's replaced payload (ModelBackend::snapshot_take_displaced).
+    // A concurrent capture's replaced payload (ModelBackend::snapshot_take_displaced),
+    // or freed unwritten (snapshot_drop_displaced).
     OwnedSnapshot take_displaced(Checkpoint checkpoint);
+    void drop_displaced(Checkpoint checkpoint);
 
 private:
     ModelBackend & backend_;
@@ -113,6 +132,10 @@ public:
     // cache can write and read them (slots()).
     bool in_backend_slots() const;
     size_t estimate_bytes(int tokens) const;
+    // State-only checkpoints: SeqEngine::estimate_prefix_state_bytes and
+    // drop_prefix_kv.
+    size_t estimate_state_bytes(int tokens) const;
+    bool drop_kv(Checkpoint checkpoint, int tokens);
 
     static PrefixStoreRef ref(Checkpoint checkpoint, int tokens) {
         return {checkpoint.id, tokens};

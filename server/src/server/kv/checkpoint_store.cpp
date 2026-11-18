@@ -28,6 +28,18 @@ size_t BackendCheckpoints::estimate_bytes(int tokens) const {
     return backend_.snapshot_bytes_estimate(tokens);
 }
 
+size_t BackendCheckpoints::estimate_state_bytes(int tokens) const {
+    return backend_.snapshot_state_bytes_estimate(tokens);
+}
+
+bool BackendCheckpoints::drop_kv(Checkpoint checkpoint) {
+    return checkpoint.valid() && backend_.snapshot_drop_kv(checkpoint.cache_slot());
+}
+
+bool BackendCheckpoints::state_only(Checkpoint checkpoint) const {
+    return checkpoint.valid() && backend_.snapshot_state_only(checkpoint.cache_slot());
+}
+
 bool BackendCheckpoints::used(Checkpoint checkpoint) const {
     return checkpoint.valid() && backend_.snapshot_used(checkpoint.cache_slot());
 }
@@ -54,8 +66,18 @@ OwnedSnapshot BackendCheckpoints::detach(Checkpoint checkpoint) {
                               : OwnedSnapshot{};
 }
 
+OwnedSnapshot BackendCheckpoints::copy(Checkpoint checkpoint) const {
+    return checkpoint.valid() ? backend_.snapshot_copy(checkpoint.cache_slot())
+                              : OwnedSnapshot{};
+}
+
+bool BackendCheckpoints::exports() const {
+    return backend_.snapshot_exports();
+}
+
 bool BackendCheckpoints::adopt(Checkpoint checkpoint, OwnedSnapshot & snapshot) {
-    if (!checkpoint.valid() || snapshot.empty()) return false;
+    // The backend takes one context and one buffer.
+    if (!checkpoint.valid() || snapshot.empty() || !snapshot.single_buffer()) return false;
     if (!backend_.snapshot_adopt(checkpoint.cache_slot(), snapshot.ctx(),
                                  snapshot.buf(), snapshot.cur_pos(),
                                  snapshot.last_tok())) {
@@ -114,6 +136,10 @@ OwnedSnapshot BackendCheckpoints::take_displaced(Checkpoint checkpoint) {
                               : OwnedSnapshot{};
 }
 
+void BackendCheckpoints::drop_displaced(Checkpoint checkpoint) {
+    if (checkpoint.valid()) backend_.snapshot_drop_displaced(checkpoint.cache_slot());
+}
+
 bool EngineCheckpoints::supported() const {
     return engine_.supports_prefix_store();
 }
@@ -124,6 +150,14 @@ bool EngineCheckpoints::in_backend_slots() const {
 
 size_t EngineCheckpoints::estimate_bytes(int tokens) const {
     return engine_.estimate_prefix_store_bytes(tokens);
+}
+
+size_t EngineCheckpoints::estimate_state_bytes(int tokens) const {
+    return engine_.estimate_prefix_state_bytes(tokens);
+}
+
+bool EngineCheckpoints::drop_kv(Checkpoint checkpoint, int tokens) {
+    return engine_.drop_prefix_kv(ref(checkpoint, tokens));
 }
 
 void EngineCheckpoints::discard(PrefixStoreRef ref) {

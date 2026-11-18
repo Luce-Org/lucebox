@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <system_error>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -113,6 +114,13 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 #endif
 
 namespace luce::common {
+
+// JSON for the wire. A string cut mid-character, or bytes a client sent that
+// are not UTF-8, become U+FFFD instead of an exception: valid text is unchanged.
+template <class Json>
+static std::string wire_json(const Json & value) {
+    return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
 
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
@@ -1089,7 +1097,7 @@ static bool curl_forward(const std::string & url,
     CURL * curl = curl_easy_init();
     if (!curl) return false;
 
-    std::string body_str = body.dump();
+    std::string body_str = wire_json(body);
 
     struct curl_slist * headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -1963,6 +1971,11 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     // Commits prune the snapshots they supersede: single-sequence serving in
     // KvCache::trim_after_commit, the concurrent scheduler as each capture lands.
     prefix_cache_.set_prunes_superseded(true);
+    // Where the backend can drop a snapshot's attention rows, the turns a
+    // commit supersedes stay as state-only backups (0: it cannot, and they
+    // are freed as before). Concurrent serving asks its engine instead.
+    prefix_cache_.set_state_backup_bytes(
+        checkpoints_.estimate_state_bytes(config.max_ctx));
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -2328,6 +2341,7 @@ void HttpServer::shutdown() {
         listen_fd_ = kInvalidSocket;
     }
     engine_.stop_serving();
+    cancel_queued_residency_ops();
 
     // Close SSE client connections.
     {
@@ -2357,6 +2371,7 @@ void HttpServer::shutdown() {
 }
 
 bool HttpServer::start_worker() {
+    refresh_residency();
     // LuceEngine owns the serving thread: a backend-provided sequence engine
     // replaces the one-request worker with the concurrent scheduler.
     // Upstream forwarding stays on the classic path even when the local
@@ -2540,13 +2555,36 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
-        std::thread([this, client_fd]() {
-            handle_client(client_fd);
+        const auto client_done = [this]() {
             // Publish completion under the same lock used by run()'s wait.
             // Once it observes zero, no detached handler may touch this object.
             std::lock_guard<std::mutex> lk(clients_mu_);
             if (active_clients_.fetch_sub(1) == 1) clients_cv_.notify_all();
-        }).detach();
+        };
+        try {
+            std::thread([this, client_fd, client_done]() {
+                // One request must never end the server: what its handler
+                // throws stops that request only. The handler closes the
+                // socket, or hands it to the status stream, as the last thing
+                // before it returns, so one that threw left it open: it is
+                // closed here, or each such request would leak a descriptor.
+                try {
+                    handle_client(client_fd);
+                } catch (const std::exception & e) {
+                    std::fprintf(stderr, "[server] request failed: %s\n", e.what());
+                    socket_close(client_fd);
+                } catch (...) {
+                    std::fprintf(stderr, "[server] request failed: unknown error\n");
+                    socket_close(client_fd);
+                }
+                client_done();
+            }).detach();
+        } catch (const std::system_error & e) {
+            // No thread for this connection (too many open): drop it, keep serving.
+            std::fprintf(stderr, "[server] could not start a request thread: %s\n", e.what());
+            socket_close(client_fd);
+            client_done();
+        }
     }
 
     auto stop_worker = [](HttpServer * server) {
@@ -2558,6 +2596,8 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     for (auto & model : models_) stop_worker(model.server);
     engine_.stop_serving();
     for (auto & model : models_) model.server->engine_.stop_serving();
+    // The serving thread is gone: residency operations still queued never run.
+    cancel_queued_residency_ops();
 
     // Every handler borrows a model context. Do not destroy those contexts
     // after an arbitrary grace period. Reads poll stopping_; workers have
@@ -2603,6 +2643,14 @@ void HttpServer::handle_client(SocketHandle fd) {
         return;
     }
 
+    // Model switching: what the model holds on its GPUs, and releasing or
+    // reinstating them (residency.cpp, docs/specs/model-swap.md).
+    if (hr.path == "/v1/residency" && (hr.method == "GET" || hr.method == "POST")) {
+        handle_residency_request(fd, hr.method, hr.body);
+        socket_close(fd);
+        return;
+    }
+
     if (!models_.empty() && hr.method == "GET") {
         if (hr.path == "/props" || hr.path == "/status/json") {
             json body = hr.path == "/props"
@@ -2622,7 +2670,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 }
             }
             body.update(model_routing_status());
-            send_response(fd, 200, "application/json", body.dump() + "\n");
+            send_response(fd, 200, "application/json", wire_json(body) + "\n");
             socket_close(fd);
             return;
         }
@@ -2646,7 +2694,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 body["pflash"]["unified"] = std::move(unified);
             }
         }
-        send_response(fd, 200, "application/json", body.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(body) + "\n");
         socket_close(fd);
         return;
     }
@@ -2719,7 +2767,7 @@ void HttpServer::handle_client(SocketHandle fd) {
             }
         }
         send_response(fd, 200, "application/json",
-                      json{{"object", "list"}, {"data", data}}.dump() + "\n");
+                      wire_json(json{{"object", "list"}, {"data", data}}) + "\n");
         socket_close(fd);
         return;
     }
@@ -2731,7 +2779,7 @@ void HttpServer::handle_client(SocketHandle fd) {
         }
         if (removed) {
             send_response(fd, 200, "application/json",
-                          json{{"id", id}, {"object", "shared_prefix"}, {"deleted", true}}.dump() + "\n");
+                          wire_json(json{{"id", id}, {"object", "shared_prefix"}, {"deleted", true}}) + "\n");
         } else {
             send_error(fd, 404, "no shared prefix " + id);
         }
@@ -2749,7 +2797,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 if (i != 0) response[key].push_back(model_list(cfg, codex_schema)[key][0]);
             }
         }
-        send_response(fd, 200, "application/json", response.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(response) + "\n");
         socket_close(fd);
         return;
     }
@@ -2934,6 +2982,17 @@ bool output_format_schema(const nlohmann::ordered_json & format,
     }
     const std::string type = string_member(format, "type");
     if (type.empty() || type == "text") return true;
+    if (type == "grammar") {
+        if (format.contains("schema") || format.contains("json_schema")) {
+            error = "cannot specify schema with type grammar in response_format";
+            return false;
+        }
+        if (!format.contains("grammar") || !format["grammar"].is_string()) {
+            error = "response_format grammar must be a string";
+            return false;
+        }
+        return true;
+    }
     if (type == "json_object") {
         // A schema beside json_object narrows it, as in llama-server.
         schema = format.contains("schema") ? format["schema"]
@@ -2945,7 +3004,7 @@ bool output_format_schema(const nlohmann::ordered_json & format,
         schema = holder.is_object() && holder.contains("schema")
             ? holder["schema"] : nlohmann::ordered_json::object();
     } else {
-        error = "response_format type must be text, json_object or json_schema, not '" +
+        error = "response_format type must be text, json_object, json_schema or grammar, not '" +
                 type + "'";
         return false;
     }
@@ -3027,26 +3086,56 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         send_error(fd, 400, error);
         return false;
     }
+
+    bool has_custom = req.has_custom_grammar;
+    std::string custom_grammar = req.custom_grammar;
+    if (!has_custom && !req.output_format.is_null() && req.output_format.is_object()) {
+        const std::string type = http_detail::string_member(req.output_format, "type");
+        if (type == "grammar" && req.output_format.contains("grammar") &&
+            req.output_format["grammar"].is_string()) {
+            custom_grammar = req.output_format["grammar"].get<std::string>();
+            has_custom = true;
+        }
+    }
+
+    if (has_custom && !schema.is_null()) {
+        send_error(fd, 400, "cannot specify both grammar and response_format schema");
+        return false;
+    }
+
     const bool tools_off = tool_checks::tool_choice_is_none(req.tool_choice);
     const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
     const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
-    if (schema.is_null() && !must_call) return true;
+
+    if (has_custom && must_call) {
+        send_error(fd, 400, "cannot specify custom grammar with required tool_choice");
+        return false;
+    }
+
+    if (!has_custom && schema.is_null() && !must_call) return true;
 
     // With tools the reply may call one first; a forced call must. A codec
     // allows only its template's call format.
     std::vector<std::string> openers;
     if (has_tools) openers = chat_codec_ ? chat_codec_->tool_call_openers() : tool_call_openers(req.tools);
+
+    const bool is_custom = has_custom && !must_call;
     std::string grammar;
-    try {
-        grammar = http_detail::output_constraint_grammar(
-            must_call ? nlohmann::ordered_json() : schema, openers);
-    } catch (const std::exception & e) {
-        send_error(fd, 400, std::string("response_format: ") + e.what());
-        return false;
+    if (is_custom) {
+        grammar = std::move(custom_grammar);
+    } else {
+        try {
+            grammar = http_detail::output_constraint_grammar(
+                must_call ? nlohmann::ordered_json() : schema, openers);
+        } catch (const std::exception & e) {
+            send_error(fd, 400, std::string("response_format: ") + e.what());
+            return false;
+        }
     }
+
     auto matcher = gbnf::Matcher::compile(grammar, "root", error);
     if (!matcher) {
-        send_error(fd, 400, "response_format: " + error);
+        send_error(fd, 400, (is_custom ? "grammar: " : "response_format: ") + error);
         return false;
     }
     OutputConstraint::Options options;
@@ -3054,6 +3143,7 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         options.wait_for = config_.think_marker_token_ids.empty()
             ? std::string("</think>")
             : tokenizer_.decode(config_.think_marker_token_ids);
+        if (think_tags_are_tokens()) options.wait_for_token = think_close_token(tokenizer_);
     }
     options.release_prefixes = std::move(openers);
     options.calls_only = must_call;
@@ -3071,6 +3161,12 @@ bool HttpServer::parse_common_request_fields(
     req.stream = body.value("stream", false);
     req.model = config_.model_name;
     req.disk_cache_policy = config_.disk_cache_policy;
+
+    std::string grammar_error;
+    if (!parse_grammar_from_body(body, req.custom_grammar, req.has_custom_grammar, grammar_error)) {
+        send_error(fd, 400, grammar_error);
+        return false;
+    }
 
     // Accept the output-token names used by each supported API dialect.
     // Default when the client omits all three: --default-max-tokens, so
@@ -3724,7 +3820,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             const json response = {
                 {"input_tokens", (int) req.prompt_tokens.size()},
             };
-            send_response(fd, 200, "application/json", response.dump() + "\n");
+            send_response(fd, 200, "application/json", wire_json(response) + "\n");
             return true;
         }
         if (!attach_output_constraint(fd, req)) return true;
@@ -3947,8 +4043,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     };
     if (!admission) open_stream();
 
-    // A pass that fails leaves the reply it would have replaced.
-    auto pass = [&](const json & body, json & response, bool * dropped = nullptr) {
+    // A pass that fails leaves the reply it would have replaced. A note pass
+    // (the default) keeps no checkpoint or turn of its own.
+    auto pass = [&](const json & body, json & response, bool * dropped = nullptr,
+                    bool note_pass = true) {
         if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
             return false;
         }
@@ -3956,7 +4054,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true, &req.ordered_tools, req.client) ||
+                                   note_pass, &req.ordered_tools, req.client) ||
             status != 200) {
             return false;
         }
@@ -3986,6 +4084,23 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         return true;
     }
     open_stream();
+
+    // An empty reply (the model ended its turn with no text and no call, often
+    // inside its thinking) gives the agent nothing to run, and agents take it
+    // as the final answer. Draw it again: the same request, no note, so the
+    // conversation and its cache are those of the first pass. A dropped call
+    // also leaves the reply empty; its own check below handles it.
+    int draws = 0;
+    while (draws < tc::kEmptyRedraws && !dropped_call && tc::empty_reply(response)) {
+        json again;
+        bool again_dropped = false;  // a pass that fails can still set it
+        if (!pass(tc::redraw(request, ++draws), again, &again_dropped, /*note_pass=*/false)) break;
+        response = std::move(again);
+        reply = tc::reply_message(response);
+        dropped_call = again_dropped;
+    }
+    const char * empty = draws == 0 ? "-"
+                       : dropped_call || !tc::empty_reply(response) ? "redrawn" : "kept";
 
     // If the model calls a tool when tool_choice is "none", retry
     // once with a note that tools are unavailable. If the retry still
@@ -4063,8 +4178,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         }
     }
     std::fprintf(stderr,
-                 "[tool-checks] %s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), tool_free, dropped, replan,
+                 "[tool-checks] %s empty=%s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), empty, tool_free, dropped, replan,
                  final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
@@ -4074,7 +4189,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         const std::string events = tc::as_sse(response);
         send_all(fd, events.data(), events.size());
     } else {
-        send_response(fd, 200, "application/json", response.dump() + "\n");
+        send_response(fd, 200, "application/json", wire_json(response) + "\n");
     }
     return true;
 }
@@ -5030,6 +5145,8 @@ std::string HttpServer::apply_unified_view(
         return (int) std::ceil((double) prompt_tokens * (double) drafter_tokens / (double) input);
     };
     const auto encode_len = [&] (const std::string & piece) { return (int) tokenizer_.encode(piece).size(); };
+    // Request text recalled into the prompt: counted as it is emitted, with encode_data.
+    const auto data_len = [&] (const std::string & piece) { return (int) layout.encode_data(tokenizer_, piece).size(); };
     const auto & pins = request.required_instruction_spans;
     const int query_end = request.score_query_end;
     const int query_begin = request.score_query_end - request.score_query_tokens;
@@ -5732,12 +5849,12 @@ std::string HttpServer::apply_unified_view(
                     if (region.lines.escaped) {
                         const size_t from = region.layout.cuts[(size_t) u];
                         const size_t to = region.layout.cuts[(size_t) u + 1];
-                        rc.unit_cost[(size_t) u] = encode_len(pu::json_unescape(text, from, to));
+                        rc.unit_cost[(size_t) u] = data_len(pu::json_unescape(text, from, to));
                     } else {
                         rc.unit_cost[(size_t) u] = region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
                     }
                 }
-                rc.label_cost = encode_len(pu::recall_label_text(region.kind, region.brief) + "\n") + encode_len("\n");
+                rc.label_cost = data_len(pu::recall_label_text(region.kind, region.brief) + "\n") + encode_len("\n");
                 region_caps[ri] = widened_cap(region.cap, region.droppable);
                 rc.cap = region_caps[ri] - (ri == largest ? wrapper : 0);
                 orders[ri] = pu::rank_units(rc.score, rc.held);
@@ -5796,8 +5913,8 @@ std::string HttpServer::apply_unified_view(
                     std::vector<int> cost((size_t) region.layout.units());
                     for (int u = 0; u < region.layout.units(); ++u) {
                         cost[(size_t) u] = region.lines.escaped
-                            ? encode_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
-                                                           region.layout.cuts[(size_t) u + 1]))
+                            ? data_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
+                                                         region.layout.cuts[(size_t) u + 1]))
                             : region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
                     }
                     regions_trace.push_back({{"region", ri}, {"cb", region.cb}, {"held", region.held},
@@ -5877,9 +5994,11 @@ std::string HttpServer::apply_unified_view(
                         const bool lead = !body.empty() && body.front() == '\n';
                         if (!first) add(tokenizer_.encode(trail ? "\n" : "\n\n"), "recall_wrapper");
                         first = false;
-                        add(tokenizer_.encode(label + (lead ? "" : "\n")), "recall_label");
+                        // The label names the request's call, and the body is
+                        // its text: both encode as the codec encodes message text.
+                        add(layout.encode_data(tokenizer_, label + (lead ? "" : "\n")), "recall_label");
                         if (region.lines.escaped) {
-                            add(tokenizer_.encode(body), "recall_text");
+                            add(layout.encode_data(tokenizer_, body), "recall_text");
                         } else {
                             add(std::vector<int32_t>(raw.begin() + region.unit_tb[(size_t) u],
                                                      raw.begin() + region.unit_te[(size_t) b]),
@@ -6613,6 +6732,10 @@ json HttpServer::memory_json() const {
     return out;
 }
 
+bool HttpServer::think_tags_are_tokens() const {
+    return chat_codec_ && think_close_token(tokenizer_) >= 0;
+}
+
 bool HttpServer::save_generated_turn(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & generated,
@@ -6848,6 +6971,8 @@ void HttpServer::remember_agent_turn(
     int source_pos = 0;
     auto consider_source = [&](int slot) {
         if (slot < 0 || !checkpoints_.used(checkpoint_of(slot))) return;
+        // A state-only backup is not a whole state to prefill from.
+        if (checkpoints_.state_only(checkpoint_of(slot))) return;
         const int pos = checkpoints_.position(checkpoint_of(slot));
         if (pos <= source_pos ||
             !http_detail::canonical_turn_matches_checkpoint(
@@ -6940,6 +7065,7 @@ void HttpServer::prepare_generation_inputs(
     // drafts against it decode autoregressively.
     inputs.request.force_ar_decode =
         req.sampler.constraint != nullptr && !backend_.speculates_under_constraint();
+    inputs.request.ignore_eos = request_ignores_eos(req);
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -7044,7 +7170,7 @@ void HttpServer::configure_generation_io(
         }
         if (!req.stream || text.empty()) return true;
 
-        for (const auto & chunk : emitter.emit_token(text)) {
+        for (const auto & chunk : emitter.emit_token(text, delivery == TokenDelivery::kThinkTag)) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 output.client_disconnected = true;
                 return false;
@@ -7072,7 +7198,7 @@ bool HttpServer::deliver_generation_token(
     // streaming still has no frame to send for an empty string.
     if (text.empty() && req.stream) return true;
 
-    const auto chunks = emitter.emit_token(text);
+    const auto chunks = emitter.emit_token(text, delivery == TokenDelivery::kThinkTag);
     if (req.stream && !chunks.empty()) {
         // Disable silent-prefill heartbeats only once there is a real frame
         // to buffer. Complete a partial comment ahead of that frame.
@@ -7119,7 +7245,7 @@ void HttpServer::send_nonstream_response(
         *req.dropped_tool_call_out = true;
     }
 
-    const std::string body = response.dump() + "\n";
+    const std::string body = wire_json(response) + "\n";
     if (send_buffer) {
         send_buffer->append(
             format_http_response(200, "application/json", body));
@@ -7173,7 +7299,7 @@ void HttpServer::process_job(ServerJob * job) {
     }
     // Store messages JSON for request inspection (truncate to avoid huge payloads).
     if (!req.messages.is_null()) {
-        std::string msg_str = req.messages.dump();
+        std::string msg_str = wire_json(req.messages);
         if (msg_str.size() > 4096) msg_str.resize(4096);
         status_.set_messages(msg_str);
     }
@@ -7214,6 +7340,7 @@ void HttpServer::process_job(ServerJob * job) {
                        tool_checks::tool_calls_allowed(req.tool_choice,
                                                        req.tool_checks_pass));
     emitter.set_chat_codec(chat_codec_.get());
+    emitter.set_think_tags_are_tokens(think_tags_are_tokens());
 
     // Emit initial SSE events only for local generation. The upstream owns
     // the proxied event sequence.
@@ -7252,7 +7379,7 @@ void HttpServer::process_job(ServerJob * job) {
             const json body = build_error_response(
                 req.format, error, req.response_id);
             send_response(fd, response_error_http_status(error),
-                          "application/json", body.dump() + "\n");
+                          "application/json", wire_json(body) + "\n");
         }
         finish_job();
     };
@@ -7312,6 +7439,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     GenerateResult result;
     if (using_restore) {
+        gen_req.restore_kv_slot = cache.restore_kv.cache_slot();
         result = checkpoints_.restore_and_generate(restore_from, gen_req, io);
     } else {
         result = backend_.generate(gen_req, io);
@@ -7412,7 +7540,7 @@ void HttpServer::process_job(ServerJob * job) {
                     req.format, error, req.response_id);
                 sock_set_block(fd);
                 send_response(fd, response_error_http_status(error),
-                              "application/json", body.dump() + "\n");
+                              "application/json", wire_json(body) + "\n");
             }
         }
         log_done();
@@ -7499,7 +7627,7 @@ void HttpServer::process_job(ServerJob * job) {
         // writing a complete JSON response on this shared socket path.
         sock_set_block(fd);
         send_response(fd, 200, "application/json",
-                      response.dump() + "\n");
+                      wire_json(response) + "\n");
     }
 
     remember_agent_turn(
@@ -7543,36 +7671,77 @@ void HttpServer::enqueue(ServerJob * job) {
 
 bool HttpServer::has_pending_jobs() {
     std::lock_guard<std::mutex> lock(queue_mu_);
-    return queue_head_ != nullptr;
+    return queue_head_ != nullptr || residency_head_ != nullptr;
 }
 
+// The only dequeue that runs residency operations (residency.cpp) and brings a
+// released model back: the serving loops call it once nothing runs. The
+// polling dequeues below admit nothing while an operation is queued or the
+// model is released, so running requests finish first.
 ServerJob * HttpServer::dequeue() {
     std::unique_lock<std::mutex> lk(queue_mu_);
-    // Use timed wait so the worker periodically wakes to send SSE heartbeats.
-    while (!queue_head_ && !stopping_.load()) {
-        if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
-            // Send SSE heartbeat (comment line) to detect disconnected clients.
-            lk.unlock();
-            sse_heartbeat();
-            lk.lock();
+    while (true) {
+        // Use timed wait so the worker periodically wakes to send SSE heartbeats.
+        while (!queue_head_ && !residency_head_ && !stopping_.load()) {
+            if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
+                // Send SSE heartbeat (comment line) to detect disconnected clients.
+                lk.unlock();
+                sse_heartbeat();
+                lk.lock();
+            }
         }
+        if (stopping_.load()) {
+            residency_cv_.notify_all();   // queued operations give up
+            if (!queue_head_) return nullptr;
+            if (residency_released_.load(std::memory_order_acquire)) {
+                // Nothing to run it on: answer it instead of loading the model to stop.
+                ServerJob * failed = pop_job_locked();
+                lk.unlock();
+                fail_unstarted_job(failed, "server stopping");
+                lk.lock();
+                continue;
+            }
+        } else if (residency_head_) {
+            lk.unlock();
+            service_residency_ops();
+            lk.lock();
+            continue;
+        }
+        if (!queue_head_) return nullptr;
+        if (residency_released_.load(std::memory_order_acquire) && !stopping_.load()) {
+            lk.unlock();
+            std::string error;
+            if (!ensure_resident(error)) {
+                lk.lock();
+                ServerJob * failed = pop_job_locked();
+                lk.unlock();
+                if (failed) fail_unstarted_job(failed, "the model could not be loaded: " + error);
+            }
+            lk.lock();
+            continue;
+        }
+        return pop_job_locked();
     }
-    if (!queue_head_) return nullptr;
-    ServerJob * j = queue_head_;
-    queue_head_ = j->next;
-    if (!queue_head_) queue_tail_ = nullptr;
-    j->next = nullptr;
-    return j;
 }
 
-ServerJob * HttpServer::try_dequeue() {
-    std::lock_guard<std::mutex> lk(queue_mu_);
-    if (!queue_head_) return nullptr;
+ServerJob * HttpServer::pop_job_locked() {
     ServerJob * job = queue_head_;
+    if (!job) return nullptr;
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
     return job;
+}
+
+ServerJob * HttpServer::try_dequeue() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (residency_blocks_admission_locked()) return nullptr;
+    return pop_job_locked();
+}
+
+ServerJob * HttpServer::take_queued_job() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    return pop_job_locked();
 }
 
 int HttpServer::queued_shared_prefix(const std::vector<int32_t> & prompt) {
@@ -7591,31 +7760,35 @@ int HttpServer::queued_shared_prefix(const std::vector<int32_t> & prompt) {
 ServerJob * HttpServer::dequeue_for(
         std::chrono::steady_clock::duration timeout) {
     std::unique_lock<std::mutex> lk(queue_mu_);
-    if (!queue_head_ && !stopping_.load() &&
+    if (!queue_head_ && !residency_head_ && !stopping_.load() &&
         timeout > std::chrono::steady_clock::duration::zero()) {
         queue_cv_.wait_for(lk, timeout, [&] {
-            return queue_head_ != nullptr || stopping_.load();
+            return queue_head_ != nullptr || residency_head_ != nullptr || stopping_.load();
         });
     }
-    if (!queue_head_) return nullptr;
-    ServerJob * job = queue_head_;
-    queue_head_ = job->next;
-    if (!queue_head_) queue_tail_ = nullptr;
-    job->next = nullptr;
-    return job;
+    if (residency_blocks_admission_locked()) return nullptr;
+    return pop_job_locked();
 }
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
 bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
     sock_set_nonblock(fd);
+    // A client that opens a connection and then sends nothing more for this
+    // long is dropped, so idle connections cannot pile up.
+    constexpr int kIdleReadLimitMs = 60 * 1000;
     auto receive = [&](char * data, size_t size) -> ssize_t {
+        int idle_ms = 0;
         while (!stopping_.load()) {
             struct pollfd pfd{fd, POLLIN, 0};
             const int ready = poll(&pfd, 1, 100);
             if (ready < 0 && sock_is_eintr(sock_errno())) continue;
             if (ready < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return -1;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                idle_ms += 100;
+                if (idle_ms >= kIdleReadLimitMs) return -1;
+                continue;
+            }
             const ssize_t n = recv(fd, data, size, 0);
             if (n < 0 && (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno()))) continue;
             return n;
@@ -7865,7 +8038,7 @@ bool HttpServer::send_response(
 bool HttpServer::send_error(
         SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
-    return send_response(fd, status, "application/json", err.dump() + "\n");
+    return send_response(fd, status, "application/json", wire_json(err) + "\n");
 }
 
 bool HttpServer::send_sse_headers(ServerJob * job) {

@@ -1,4 +1,5 @@
 #include "CppUnitTestFramework.hpp"
+#include "../../src/common/moe_hybrid_expert_cache.h"
 #include "../../src/common/moe_hybrid_ffn_eval.h"
 #include "../../src/common/moe_hybrid_storage.h"
 #include "ggml-cpu.h"
@@ -239,4 +240,39 @@ TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch)
     REQUIRE(main_quota == 23);
 
     ggml_free(ctx);
+}
+
+// Streamed expert slots are shared by layers of different quant types, each
+// reading them through a view whose expert stride the kernels divide into
+// whole blocks: the stride must divide exactly.
+TEST_CASE(MoeHybridStorageFixture, expert_slot_stride_divides_every_shared_type) {
+    // DS4.1 gate/up experts, 2304 x 5120: IQ2_XXS, IQ2_XS and IQ3_XXS layers share the gate slots.
+    const size_t rows = 2304, blocks = 5120 / 256;
+    std::vector<size_t> sizes;
+    size_t largest = 0;
+    for (ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS}) {
+        sizes.push_back(ggml_type_size(t));
+        largest = std::max(largest, rows * blocks * ggml_type_size(t));
+    }
+    // The unrounded stride is not whole IQ2_XXS blocks.
+    REQUIRE(largest % ggml_type_size(GGML_TYPE_IQ2_XXS) != 0);
+    const size_t stride = moe_expert_slot_stride(largest, sizes);
+    CHECK(stride >= largest);
+    CHECK(stride - largest < (size_t) 2 * 2 * 3 * 7 * 7 * 11 * 37);  // < one lcm unit of slack
+    for (size_t ts : sizes) CHECK(stride % ts == 0);
+
+    // One type: the largest expert itself.
+    const size_t q2 = 5120 * 9 * ggml_type_size(GGML_TYPE_Q2_K);
+    CHECK(moe_expert_slot_stride(q2, {ggml_type_size(GGML_TYPE_Q2_K)}) == q2);
+
+    // Down experts, 5120 x 2304, five types.
+    std::vector<size_t> down;
+    size_t down_largest = 0;
+    for (ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_K,
+                        GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K}) {
+        down.push_back(ggml_type_size(t));
+        down_largest = std::max(down_largest, (size_t) 5120 * 9 * ggml_type_size(t));
+    }
+    const size_t down_stride = moe_expert_slot_stride(down_largest, down);
+    for (size_t ts : down) CHECK(down_stride % ts == 0);
 }

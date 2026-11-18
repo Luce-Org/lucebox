@@ -27,6 +27,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -103,6 +104,9 @@ public:
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -112,6 +116,12 @@ public:
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
     size_t snapshot_bytes_estimate(int tokens) const override;
+    size_t snapshot_state_bytes_estimate(int tokens) const override;
+    // Host bytes of a snapshot of `tokens` positions, with or without its
+    // compressed and index rows.
+    size_t snapshot_bytes(int tokens, bool rows) const;
+    bool snapshot_drop_kv(int slot) override;
+    bool snapshot_state_only(int slot) const override;
     MemoryReport memory_report() const override;
     // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
     // tensors carry stable names plus a meta/logits/feature sidecar, so they
@@ -127,7 +137,7 @@ public:
 
     CompressResult compress(const CompressRequest & req) override;
     std::vector<CompressResult> compress_batch(
-        const std::vector<CompressRequest> & requests) override;
+        const std::vector<CompressRequest> & requests);
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
@@ -259,12 +269,23 @@ private:
     // Snapshot slot a restored request started from (-1: fresh prompt);
     // a failed prefill restores it before its one retry.
     int                            prefill_retry_slot_ = -1;
+    int                            prefill_retry_rows_slot_ = -1;
     // Whether a retried prefill already turned the pipeline back on.
     bool                           pipeline_retry_recovered_ = false;
     int                            hybrid_long_context_chunk_ = kDs4DefaultLongContextChunk;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void release_target_state(bool keep_snapshots);
+    bool released_ = false;   // residency: every GPU released for another model
+    // Residency: the devices besides the target that the model has used (expert, drafter, vision). Kept when
+    // their backends are freed, so a released model still reports them.
+    std::vector<int> used_gpus_;
+    void note_used_gpu(int gpu) {
+        if (gpu >= 0 && std::find(used_gpus_.begin(), used_gpus_.end(), gpu) == used_gpus_.end()) {
+            used_gpus_.push_back(gpu);
+        }
+    }
     void release_pflash_drafter();
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
@@ -341,16 +362,24 @@ private:
                (!w_.moe_hybrid ||
                 (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)));
     }
-    // The shared staged pass needs the whole model on one GPU. With
-    // heterogeneous experts, a text prompt stages one bounded chunk per call
-    // through the regular sparse layer-major prefill instead.
-    bool staged_text_uses_chunks() const { return text_staging_available() && w_.moe_hybrid; }
-    // Image prompts on a heterogeneous placement stage the same way: whole
-    // image blocks per chunk, each chunk once the encoder has published the
-    // rows of the images it holds.
+    // The shared staged pass needs the whole model on one GPU and implements
+    // V4's plain pre-mix only. With heterogeneous experts, or on a model with
+    // the staggered pre-mix and Engram layers (V4.1), a prompt stages one
+    // bounded chunk per call through the regular sparse layer-major prefill
+    // instead.
+    bool staged_pass_supported() const {
+        return !w_.moe_hybrid && !w_.hc_staggered_pre && !w_.engram_runtime;
+    }
+    bool staged_chunks_available() const {
+        return !w_.moe_hybrid || (moe_hybrid_ && (expert_runtime_.compute || expert_backend_));
+    }
+    bool staged_text_uses_chunks() const {
+        return text_staging_available() && !staged_pass_supported();
+    }
+    // Image prompts stage the same way: whole image blocks per chunk, each
+    // chunk once the encoder has published the rows of the images it holds.
     bool staged_images_use_chunks() const {
-        return image_capable_ && vision_ && w_.moe_hybrid && moe_hybrid_ &&
-               (expert_runtime_.compute || expert_backend_);
+        return image_capable_ && vision_ && !staged_pass_supported() && staged_chunks_available();
     }
     // Rows the next chunk of `item` takes (whole image blocks for an image
     // prompt), 0 when the remaining prefix cannot be chunked.
@@ -366,7 +395,9 @@ private:
                               std::string & error);
     // Resets the item's staging cache, then restores `from` into it when
     // given (a text prompt's prefix checkpoint): staging continues after it.
-    bool begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from = nullptr);
+    // `rows_from`: the whole checkpoint a state-only `from` takes its rows from.
+    bool begin_staged_prefill(StagedPrefill & item, const DeepSeek4Snapshot * from = nullptr,
+                              const DeepSeek4Snapshot * rows_from = nullptr);
     // Before a staged prompt's first chunk: what a fresh prompt's first bulk
     // chunk retires before it allocates (deepseek4_step_layer_range does that
     // only for a wide chunk at position 0; a restore or a cut rules it out).
@@ -374,6 +405,9 @@ private:
     // Host bytes of a prefix checkpoint of `tokens` positions (a staging
     // cache snapshot without the single-request aux sidecar).
     size_t staged_checkpoint_bytes(int tokens) const;
+    // The same checkpoint without its compressed and index rows
+    // (deepseek4_snapshot_drop_rows).
+    size_t staged_checkpoint_state_bytes() const;
     // A finished (or failed) staged prompt: retire the staging cache's
     // prefill arenas and the device pools' cached temporaries, as the
     // single-request path does after its prefill.
@@ -399,7 +433,8 @@ private:
     GenerateResult generate_from_state(const GenerateRequest & req,
                                        const DaemonIO & io,
                                        int kv_offset);
-    bool snapshot_restore(int slot);
+    // `rows_slot`: the whole snapshot a state-only `slot` takes its rows from.
+    bool snapshot_restore(int slot, int rows_slot = -1);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,

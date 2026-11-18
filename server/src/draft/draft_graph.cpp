@@ -675,6 +675,10 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
             ggml_tensor * attn = ggml_flash_attn_ext(
                 ctx, qfa, kfa, vfa, mask,
                 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f, 0.0f);
+            // The ring spans kv_total slots, but until it wraps only the
+            // committed context and the noise columns are unmasked: the FA
+            // backend may skip the KV tiles in between (bit-identical).
+            ggml_flash_attn_ext_set_sparse_mask(attn, true);
             attn_by_lane[lane] = ggml_reshape_2d(
                 ctx, attn, q_dim, q_len);
         }

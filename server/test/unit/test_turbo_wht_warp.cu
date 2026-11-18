@@ -153,12 +153,12 @@ int main() {
     const cudaError_t device_status = cudaGetDeviceCount(&device_count);
     if (device_status == cudaErrorNoDevice) {
         std::puts("SKIP: no CUDA device");
-        return 0;
+        return 77;
     }
     TEST_CUDA_CHECK(device_status);
     if (device_count == 0) {
         std::puts("SKIP: no CUDA device");
-        return 0;
+        return 77;
     }
     TEST_CUDA_CHECK(cudaSetDevice(0));
 
@@ -176,6 +176,9 @@ int main() {
         return 1;
     }
     std::puts("ALL PASS: scalar and warp FWHT outputs are bit-identical");
+    if (std::getenv("LUCE_TEST_BENCH") == nullptr) {
+        return 0;
+    }
     for (const int64_t groups : {128LL, 384LL}) {
         const double scalar_us = benchmark_case(groups, false, 10000);
         const double warp_us = benchmark_case(groups, true, 10000);

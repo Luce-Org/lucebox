@@ -12,6 +12,7 @@ namespace luce::common {
 
 namespace {
 
+constexpr int kPflash2Lookahead = 128;  // the release PFlash2 request lookahead (score_chunks)
 constexpr int kLookahead  = 8;
 constexpr int kPoolKernel = 13;
 constexpr int kMinSegment = 4096;
@@ -127,7 +128,7 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
     out.clear();
     segments_ = 0;
     stats_ = {};
-    if (!ctx_ || !ctx_->loaded || S < kLookahead + 1 || chunk_tokens <= 0) return false;
+    if (!ctx_ || !ctx_->loaded || S < kPflash2Lookahead + 1 || chunk_tokens <= 0) return false;
 
     // The drafter shares the target's tokenizer: the ids go through unchanged.
     std::string err;
@@ -143,7 +144,7 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
     const int query_end = kvflash_message_query_end(msgs);
     if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: the last message is empty, no query\n"); return false; }
     const std::vector<int32_t> kept = drafter_score_and_compress(
-        *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/128, /*pool_kernel=*/1,
+        *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/kPflash2Lookahead, /*pool_kernel=*/1,
         query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
     const auto & lifts = pflash_last_candidate_lifts();
     if (kept.empty() || lifts.empty()) return false;

@@ -123,6 +123,7 @@ are served as before.
 | `reasoning` | object | — | Reasoning effort control (`{"effort":"medium"}`) | ✅ |
 | `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`). Jinja templates (e.g. qwen4exp) also accept `preserve_thinking` (bool): whether earlier assistant turns replay their recorded `reasoning_content` inside `<think>...</think>` (default: template's own default, typically true) | ✅ |
 | `stop` | string/array | — | Stop sequences | ✅ |
+| `ignore_eos` | bool | `false` | An end token does not stop the reply: it runs to `max_tokens`. For load tests that replay recorded reply lengths (Qwen models) | ✅ |
 | `n` | int | — | Number of completions | ❌ TODO |
 | `logprobs` | bool | — | Return log probabilities | ❌ TODO |
 | `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |

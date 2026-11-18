@@ -8,16 +8,21 @@
 // resolved from whichever shard holds it. The per_layer_token_embd lookup table
 // stays on disk behind a pread pool regardless of which shard owns it.
 
+#include "qwen4exp_carve.h"
 #include "qwen4exp_internal.h"
 #include "qwen4exp_mtp.h"
 
 #include "common/gguf_bounds.h"
 #include "common/gguf_kv.h"
 #include "common/gguf_mmap.h"
+#include "common/parallel_upload.h"
+#include "common/platform_io.h"
 
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -143,6 +148,86 @@ std::vector<std::string> discover_shard_paths(const std::string & primary) {
         paths.push_back(prefix + buf + "-of-" + total_str + ext);
     }
     return paths;
+}
+
+constexpr const char * kPleTensor = "per_layer_token_embd.weight";
+
+// Bytes of the per-layer token embedding table, which decode reads from the page cache (0: the model has none).
+uint64_t ple_table_bytes(const std::vector<ShardSource> & shards) {
+    for (const ShardSource & shard : shards) {
+        const int64_t tid = gguf_find_tensor(shard.gctx, kPleTensor);
+        if (tid >= 0) return gguf_get_tensor_size(shard.gctx, tid);
+    }
+    return 0;
+}
+
+// Split mode: the routed expert stacks' buffer on the expert device. An integrated device whose carve cannot hold
+// them beside kQwen4ExpCarveReserve takes them in allocation order up to that reserve, and the rest go to a second
+// buffer in locked host memory it reads from the same DRAM (qwen4exp_carve.h). Locking them needs
+// LimitMEMLOCK=infinity (or root).
+bool alloc_expert_buffers(Qwen4ExpWeights & out, const std::vector<Qwen4ExpExpertSpan> & spans, size_t expert_size,
+                          uint64_t ple_bytes, std::string & error) {
+    auto gib = [](uint64_t b) { return b / 1073741824.0; };
+    const int gpu = ggml_backend_cuda_get_device_id(out.expert_backend);
+    size_t device_free = 0, device_total = 0, uma_room = 0;
+    ggml_backend_cuda_get_device_memory(gpu, &device_free, &device_total);
+    const bool integrated = ggml_backend_cuda_get_uma_room(gpu, &uma_room);
+    if (!integrated || expert_size + kQwen4ExpCarveReserve <= device_free) {
+        out.expert_buf = ggml_backend_alloc_buffer(out.expert_backend, expert_size);
+        if (!out.expert_buf) {
+            error = "expert weight buffer allocation failed";
+            return false;
+        }
+        ggml_backend_buffer_set_usage(out.expert_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        return true;
+    }
+    const uint64_t host_available = host_available_bytes();
+    const Qwen4ExpCarvePlan plan = qwen4exp_plan_carve(spans, expert_size, device_free, host_available);
+    char why[512];
+    if (!plan.ok()) {
+        std::snprintf(why, sizeof(why), "the %.2f GiB of routed experts do not fit expert device %d: %.2f GiB free in "
+                      "its carve (keeping %.2f GiB), %.2f GiB of host memory available for the %.2f GiB past it "
+                      "(keeping %.2f GiB)", gib(expert_size), gpu, gib(device_free), gib(kQwen4ExpCarveReserve),
+                      gib(host_available), gib(plan.host_bytes), gib(kQwen4ExpHostKeep));
+        error = why;
+        return false;
+    }
+    out.expert_buf = ggml_backend_alloc_buffer(out.expert_backend, plan.cut);
+    if (!out.expert_buf) {
+        error = "expert weight buffer allocation failed (the carve's part)";
+        return false;
+    }
+    ggml_backend_buffer_set_usage(out.expert_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    // Only the second buffer may go to host memory: the spill is on for its allocation alone.
+    const size_t locked_before = ggml_backend_cuda_host_spill_bytes(gpu);
+    const size_t lockable = ggml_backend_cuda_set_host_spill(gpu, kQwen4ExpCarveReserve, plan.host_bytes);
+    if (lockable >= plan.host_bytes) out.expert_host_buf = ggml_backend_alloc_buffer(out.expert_backend, plan.host_bytes);
+    ggml_backend_cuda_set_host_spill(gpu, 0, 0);
+    if (!out.expert_host_buf) {
+        ggml_backend_buffer_free(out.expert_buf);
+        out.expert_buf = nullptr;
+        if (lockable < plan.host_bytes) {
+            std::snprintf(why, sizeof(why), "the routed experts past expert device %d's carve need %.2f GiB of locked "
+                          "host memory, but only %.2f GiB can be locked (RLIMIT_MEMLOCK). Run as a service with "
+                          "LimitMEMLOCK=infinity (or as root), or raise `ulimit -l`", gpu, gib(plan.host_bytes),
+                          gib(lockable));
+        } else {
+            std::snprintf(why, sizeof(why), "locking %.2f GiB of host memory for the routed experts past expert "
+                          "device %d's carve failed", gib(plan.host_bytes), gpu);
+        }
+        error = why;
+        return false;
+    }
+    ggml_backend_buffer_set_usage(out.expert_host_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::fprintf(stderr, "[qwen4exp] device %d: experts past the carve (keeping %.2f GiB free) go to locked host "
+                 "memory: %.2f GiB in the carve, %.2f GiB locked (%.2f GiB available, %.2f GiB left)\n", gpu,
+                 gib(kQwen4ExpCarveReserve), gib(plan.cut), gib(ggml_backend_cuda_host_spill_bytes(gpu) - locked_before),
+                 gib(host_available), gib(host_available - plan.host_bytes));
+    if (host_available - plan.host_bytes < kQwen4ExpHostKeep + ple_bytes) {
+        std::fprintf(stderr, "[qwen4exp] the %.2f GiB per-layer embedding table no longer fits the page cache beside "
+                     "them: decode reads part of it from the drive\n", gib(ple_bytes));
+    }
+    return true;
 }
 
 }  // namespace
@@ -308,7 +393,26 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
         }
     };
 
-    if (n_threads_ == 1 || n < 64) {
+    // A decode or verify step gathers one row per PLE head per token: up to 128 rows at Flash-Next's verify widths.
+    // Where the OS takes a read-ahead hint, hinting every row and then reading serially beat 31 spawned
+    // readers there (64 rows: 0.56 vs 0.87 ms with every row missing the page cache, 0.15 vs 0.89 ms with every row
+    // cached; 128 rows: 0.81 vs 1.0 ms). Prompt chunks keep the readers.
+#if defined(POSIX_FADV_WILLNEED)
+    constexpr int64_t kSerialRows = 128;
+#else
+    constexpr int64_t kSerialRows = 63;
+#endif
+    if (n_threads_ == 1 || n <= kSerialRows) {
+#if defined(POSIX_FADV_WILLNEED)
+        // A row the page cache misses costs one SSD read. Hinting every row first starts those reads together, so
+        // the serial reads below wait about one read instead of one per row (16 rows: 0.5 vs 2.2 to 3.3 ms); a
+        // cached row only pays the hint's system call.
+        for (const auto & p : pairs) {
+            const int64_t at = static_cast<int64_t>(base_) +
+                               static_cast<int64_t>(p.first) * static_cast<int64_t>(row_size_);
+            (void) posix_fadvise(fd_, static_cast<off_t>(at), static_cast<off_t>(row_size_), POSIX_FADV_WILLNEED);
+        }
+#endif
         // A serial fallback must cover every row. Dividing the range by the
         // configured pool size here used to process only the first 1/N chunk
         // when a T=1 decode gathered fewer rows than the pool had workers.
@@ -382,8 +486,6 @@ void Qwen4ExpDerived::free() {
 void free_qwen4exp_derived(Qwen4ExpWeights & w) {
     for (Qwen4ExpLayer & L : w.layers) L.ssm_gate_ba = L.ssm_alpha_beta = nullptr;
     w.qsa_ones = nullptr;
-    w.hot_lut.clear();
-    w.cold_lut.clear();
     w.ahead_router.clear();
     w.ahead_ids.clear();
     w.output_tail = nullptr;
@@ -468,6 +570,7 @@ static void build_qwen4exp_qsa_ones(Qwen4ExpWeights & w, ggml_backend_t backend)
 
 bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
                         Qwen4ExpWeights & out, const std::string & mtp_override, int mtp_vocab) {
+    const auto t_load_begin = std::chrono::steady_clock::now();
     out.gfx1151 = ggml_backend_cuda_qwen4exp_supported(backend);
     out.qsa = ggml_backend_cuda_qsa_supported(backend);
     // The profile also covers the expert device, so a gfx1151 that holds the experts allocates them in device memory
@@ -513,9 +616,10 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
         }
-        if (out.expert_buf) {
-            ggml_backend_buffer_free(out.expert_buf);
-            out.expert_buf = nullptr;
+        for (ggml_backend_buffer_t * b : {&out.expert_buf, &out.expert_host_buf, &out.kept_expert_buf,
+                                          &out.kept_expert_host_buf}) {
+            if (*b) ggml_backend_buffer_free(*b);
+            *b = nullptr;
         }
         out.embedder.tok_embd_owned.clear();
         out.embedder.tok_embd_bytes = nullptr;
@@ -886,16 +990,41 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     out.buf = ggml_backend_alloc_buffer(backend, allocation_size);
     if (!out.buf) return fail("weight buffer allocation failed");
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    if (expert_size > 0) {
-        out.expert_buf = ggml_backend_alloc_buffer(out.expert_backend, expert_size);
-        if (!out.expert_buf) return fail("expert weight buffer allocation failed");
-        ggml_backend_buffer_set_usage(out.expert_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<Qwen4ExpExpertSpan> expert_spans;   // in increasing offset order
+    for (const TensorAllocation & allocation : allocations) {
+        if (allocation.on_expert) {
+            expert_spans.push_back({allocation.buffer_offset,
+                                    ggml_backend_buft_get_alloc_size(expert_type, allocation.tensor)});
+        }
     }
+    // A reinstate keeps the expert stacks where they are: the same tensors get the same offsets in the same buffers.
+    const bool experts_kept = out.kept_expert_buf != nullptr;
+    if (experts_kept) {
+        const size_t carve = ggml_backend_buffer_get_size(out.kept_expert_buf);
+        const size_t host = out.kept_expert_host_buf ? ggml_backend_buffer_get_size(out.kept_expert_host_buf) : 0;
+        if (expert_size == 0 || carve + host != expert_size ||
+            !qwen4exp_carve_cut_valid(expert_spans, expert_size, carve)) {
+            return fail("the kept expert buffers do not match the expert stacks");
+        }
+        out.expert_buf = out.kept_expert_buf;
+        out.expert_host_buf = out.kept_expert_host_buf;
+        out.kept_expert_buf = nullptr;
+        out.kept_expert_host_buf = nullptr;
+    } else if (expert_size > 0) {
+        std::string error;
+        if (!alloc_expert_buffers(out, expert_spans, expert_size, ple_table_bytes(shards), error)) return fail(error);
+    }
+    // The stacks from the carve buffer's end on live in the host buffer, at their offsets less the carve's size.
+    const size_t expert_cut = out.expert_host_buf ? ggml_backend_buffer_get_size(out.expert_buf) : expert_size;
     for (const TensorAllocation & allocation : allocations) {
         ggml_backend_buffer_t buffer = allocation.on_expert ? out.expert_buf : out.buf;
+        size_t offset = allocation.buffer_offset;
+        if (allocation.on_expert && offset >= expert_cut) {
+            buffer = out.expert_host_buf;
+            offset -= expert_cut;
+        }
         char * base = static_cast<char *>(ggml_backend_buffer_get_base(buffer));
-        if (ggml_backend_tensor_alloc(buffer, allocation.tensor,
-                base + allocation.buffer_offset) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_tensor_alloc(buffer, allocation.tensor, base + offset) != GGML_STATUS_SUCCESS) {
             return fail("weight tensor allocation failed");
         }
     }
@@ -911,6 +1040,8 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             return fail(mmap_error);
         }
     }
+    const auto t_upload_begin = std::chrono::steady_clock::now();
+    std::vector<UploadPiece> pieces;
     for (const TensorAllocation & allocation : allocations) {
         const GgufMmap & mmap = mmaps[allocation.shard];
         if (allocation.file_offset + allocation.file_size < allocation.file_offset ||
@@ -919,10 +1050,19 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             out.buf = nullptr;
             return fail("truncated tensor data for " + std::string(allocation.tensor->name));
         }
-        ggml_backend_tensor_set(allocation.tensor,
-            static_cast<const uint8_t *>(mmap.data()) + allocation.file_offset,
-            0, allocation.file_size);
+        if (experts_kept && allocation.on_expert) continue;
+        append_upload_pieces(pieces, allocation.tensor,
+            static_cast<const uint8_t *>(mmap.data()) + allocation.file_offset, allocation.file_size);
     }
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t bytes = upload_pieces(pieces);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[qwen4exp] uploaded %.2f GiB in %.2f s (%.2f GB/s, up to %d threads per device)%s\n",
+                     bytes / 1073741824.0, s, s > 0 ? bytes / s / 1e9 : 0.0, upload_threads(),
+                     experts_kept ? "; the expert stacks stayed on the expert device" : "");
+    }
+    const auto t_upload_end = std::chrono::steady_clock::now();
 
     size_t token_shard = 0;
     int64_t token_tid = -1;
@@ -950,9 +1090,12 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.buf = nullptr;
         return fail("truncated token_embd.weight");
     }
-    out.embedder.tok_embd_owned.resize(token_size);
-    std::memcpy(out.embedder.tok_embd_owned.data(),
-        token_bytes + data_offset + token_relative_offset, token_size);
+    // A reinstate after a release of the target device kept the copy (system memory).
+    if (out.embedder.tok_embd_owned.size() != token_size) {
+        out.embedder.tok_embd_owned.resize(token_size);
+        std::memcpy(out.embedder.tok_embd_owned.data(),
+            token_bytes + data_offset + token_relative_offset, token_size);
+    }
     out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
     out.embedder.tok_embd_type = gguf_get_tensor_type(shards[token_shard].gctx, token_tid);
     out.embedder.n_embd = out.n_embd;
@@ -1003,25 +1146,39 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
             output_bytes = static_cast<const uint8_t *>(mmaps[a.shard].data()) + a.file_offset;
         }
         if (!output_bytes) return fail("MTP subset output source missing");
-        // Small batches bound temporary RAM and avoid thousands of tiny uploads.
+        // Gathered on several threads into host arrays, then uploaded in two copies: 256-row batches each
+        // uploaded on their own took 1-3 s of every load (500 small synchronized copies).
         const size_t rb = ggml_row_size(out.output->type, out.n_embd);
-        std::vector<uint8_t> rows(256 * rb);
-        std::vector<float> embeddings((size_t) 256 * out.n_embd);
-        for (int64_t begin = 0; begin < nv; begin += 256) {
-            const int count = (int) std::min<int64_t>(256, nv - begin);
-            for (int i = 0; i < count; ++i) std::memcpy(rows.data() + i * rb,
-                output_bytes + (size_t) out.mtp_vocab_ids[begin + i] * rb, rb);
-            if (!out.embedder.embed(out.mtp_vocab_ids.data() + begin, count, embeddings.data())) {
-                return fail("MTP subset embedding gather failed");
+        std::vector<uint8_t> rows((size_t) nv * rb);
+        std::vector<float> embeddings((size_t) nv * out.n_embd);
+        std::atomic<int64_t> next_batch{0};
+        std::atomic<bool> embed_failed{false};
+        auto gather = [&]() {
+            for (int64_t begin; (begin = next_batch.fetch_add(256)) < nv;) {
+                const int count = (int) std::min<int64_t>(256, nv - begin);
+                for (int i = 0; i < count; ++i) std::memcpy(rows.data() + (size_t) (begin + i) * rb,
+                    output_bytes + (size_t) out.mtp_vocab_ids[begin + i] * rb, rb);
+                if (!out.embedder.embed(out.mtp_vocab_ids.data() + begin, count,
+                                        embeddings.data() + (size_t) begin * out.n_embd)) {
+                    embed_failed = true;
+                }
             }
-            ggml_backend_tensor_set(out.mtp_output, rows.data(), begin * rb, count * rb);
-            ggml_backend_tensor_set(out.mtp_embd, embeddings.data(), (size_t) begin * out.n_embd * sizeof(float),
-                                    (size_t) count * out.n_embd * sizeof(float));
+        };
+        {
+            std::vector<std::thread> pool;
+            const int n = std::clamp((int) std::thread::hardware_concurrency(), 1, 16);
+            for (int t = 1; t < n; ++t) pool.emplace_back(gather);
+            gather();
+            for (std::thread & t : pool) t.join();
         }
+        if (embed_failed) return fail("MTP subset embedding gather failed");
+        ggml_backend_tensor_set(out.mtp_output, rows.data(), 0, rows.size());
+        ggml_backend_tensor_set(out.mtp_embd, embeddings.data(), 0, embeddings.size() * sizeof(float));
         std::fprintf(stderr, "[qwen4exp-mtp] subset budget=%d rows=%lld head_bytes=%zu embedding_bytes=%zu\n",
                      mtp_vocab, (long long) nv, ggml_nbytes(out.mtp_output), ggml_nbytes(out.mtp_embd));
     }
 
+    const auto t_mtp_end = std::chrono::steady_clock::now();
     build_qwen4exp_gate_ba(out, backend);
     build_qwen4exp_alpha_beta(out);
     build_qwen4exp_qsa_ones(out, backend);
@@ -1030,7 +1187,6 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     // (ISTA-DASLab isolates it in a separate shard; bartowski-style splits keep
     // it in shard 1; single-file models trivially have it in `path`).
     if (!out.ple_layer_ids.empty()) {
-        const char * const kPleTensor = "per_layer_token_embd.weight";
         std::string ple_path;
         for (const ShardSource & shard : shards) {
             if (gguf_find_tensor(shard.gctx, kPleTensor) >= 0) {
@@ -1043,7 +1199,7 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         }
         std::string reader_error;
         // A 2,048-token prefill gathers ~49k random rows of the n-gram table from disk; with 4 readers the cold
-        // preads alone took ~0.8 s of TTFT. 32 keep the NVMe queue full (decode stays serial below 64 rows).
+        // preads alone took ~0.8 s of TTFT. 32 keep the NVMe queue full (gather() reads a decode step serially).
         if (!out.ple_reader.open(ple_path, kPleTensor, 32, reader_error)) {
             return fail(reader_error);
         }
@@ -1055,6 +1211,13 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     }
     gctx = nullptr;
     meta_ctx = nullptr;  // owned by out.ctx / out.extra_meta_ctxs from here on
+    {
+        const auto t_end = std::chrono::steady_clock::now();
+        auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        std::fprintf(stderr, "[qwen4exp] load stages: metadata %.2f, upload %.2f, embeddings+mtp %.2f, "
+                     "derived+ple %.2f s\n", secs(t_load_begin, t_upload_begin), secs(t_upload_begin, t_upload_end),
+                     secs(t_upload_end, t_mtp_end), secs(t_mtp_end, t_end));
+    }
 
     char summary[512];
     std::snprintf(summary, sizeof(summary),
@@ -1078,17 +1241,29 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
     return true;
 }
 
-void free_qwen4exp_weights(Qwen4ExpWeights & w) {
+void free_qwen4exp_weights(Qwen4ExpWeights & w, bool keep_experts) {
+    w.hot.reset();   // first: its copier reads the expert stacks
     w.ple_reader.close();
     if (w.buf) {
         ggml_backend_buffer_free(w.buf);
         w.buf = nullptr;
     }
-    if (w.expert_buf) {
-        ggml_backend_buffer_free(w.expert_buf);
+    if (keep_experts && w.expert_buf && !w.kept_expert_buf) {
+        w.kept_expert_buf = w.expert_buf;
+        w.kept_expert_host_buf = w.expert_host_buf;
         w.expert_buf = nullptr;
+        w.expert_host_buf = nullptr;
     }
-    w.hot.reset();
+    for (ggml_backend_buffer_t * b : {&w.expert_buf, &w.expert_host_buf}) {
+        if (*b) ggml_backend_buffer_free(*b);
+        *b = nullptr;
+    }
+    if (!keep_experts) {
+        for (ggml_backend_buffer_t * b : {&w.kept_expert_buf, &w.kept_expert_host_buf}) {
+            if (*b) ggml_backend_buffer_free(*b);
+            *b = nullptr;
+        }
+    }
     free_qwen4exp_derived(w);
     for (ggml_context * extra : w.extra_meta_ctxs) {
         if (extra) ggml_free(extra);
@@ -1098,7 +1273,7 @@ void free_qwen4exp_weights(Qwen4ExpWeights & w) {
         ggml_free(w.ctx);
         w.ctx = nullptr;
     }
-    w.embedder.tok_embd_owned.clear();
+    if (!keep_experts) w.embedder.tok_embd_owned.clear();   // a release of the target keeps the host copy
     w.embedder.tok_embd_bytes = nullptr;
     w.layers.clear();
     w.tok_embd = nullptr;

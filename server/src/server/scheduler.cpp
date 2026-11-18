@@ -102,6 +102,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // snapshot slots go through checkpoints_.
     EngineCheckpoints engine_checkpoints(engine, checkpoints_);
     const int n_slots = engine.slot_count();
+    // State-only backups are the engine's on this path (0: it keeps none).
+    prefix_cache_.set_state_backup_bytes(
+        engine_checkpoints.supported()
+            ? engine_checkpoints.estimate_state_bytes(engine.max_context()) : 0);
     if (config_.concurrent_prefix_cache) {
         if (!engine_checkpoints.supported()) {
             prefix_cache_.disable();
@@ -306,7 +310,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
             s.send_buffer);
         s.pending_tok = tok;
-        if (!cont || engine.token_is_eos(tok) ||
+        if (!cont || (!request_ignores_eos(s.job->req) && engine.token_is_eos(tok)) ||
             (int)s.gen_tokens.size() >= s.n_gen_cap) {
             s.finished = true;
             return;
@@ -665,6 +669,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             tool_checks::tool_calls_allowed(req.tool_choice,
                                             req.tool_checks_pass));
         emitter->set_chat_codec(chat_codec_.get());
+        emitter->set_think_tags_are_tokens(think_tags_are_tokens());
         if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {
@@ -974,11 +979,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // time, once the server has been idle for a moment. A
                     // request arriving during a warm waits for its current
                     // engine step (KvCache::warm_next_on_engine).
-                    if (kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
+                    // A released model has no caches to warm (residency.cpp).
+                    const bool can_warm = !residency_released_.load(std::memory_order_acquire);
+                    if (can_warm && kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
                         job = dequeue_for(
                             std::chrono::milliseconds(config_.shared_prefix_warm_grace_ms));
                     }
-                    while (!job && !stopping_.load() && kv_cache_.warm_pending() &&
+                    while (can_warm && !job && !stopping_.load() && kv_cache_.warm_pending() &&
                            !has_pending_jobs() &&
                            kv_cache_.warm_next_on_engine([this] {
                                return has_pending_jobs() || stopping_.load();
@@ -1512,7 +1519,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // threads too. Drain the raw queue before returning so run() does not hit
     // its client-shutdown timeout and the destructor never has to wake threads
     // after the server/backend teardown has already started.
-    while (ServerJob * queued = try_dequeue()) {
+    // A queued residency operation or a released model stops admission, not
+    // this drain.
+    while (ServerJob * queued = take_queued_job()) {
         const ParsedRequest & req = queued->req;
         const ResponseError error = ResponseError::unavailable(
             "server_shutting_down", "server shutting down");

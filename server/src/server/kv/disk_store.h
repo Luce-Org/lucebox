@@ -26,6 +26,19 @@
 //
 // Every layout directory is indexed for the disk budget and the TTL; only
 // the live layout's files are ever restored.
+//
+// Several servers share one directory (POSIX). Each holds a shared lock on
+// <dir>/.lock for its lifetime (an older binary, which takes it exclusively,
+// keeps new servers off and is kept off by them), and an exclusive lock on
+// <dir>/.identity-<salt>.lock per model identity it serves: one server per
+// identity, so no two servers ever write the same file, pins file or views.
+// The budget and the TTL are the directory's: before a write is published
+// (renamed into place) the writer thread takes <dir>/.index.lock, merges what
+// is on disk into its index (other servers' new files, the ones they deleted,
+// last-used times from the headers), expires and evicts least recently used
+// files of any model until the directory fits, then renames. A write in
+// progress holds a lock on its temporary file, so start-up removes only
+// temporaries nobody is writing. Windows keeps one server per directory.
 
 #pragma once
 
@@ -39,6 +52,7 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -142,21 +156,21 @@ struct DiskDrainResult {
 // ─── DiskStore ──────────────────────────────────────────────────────────
 
 // The files of one cache directory, shared by every model of this process
-// that uses it (a DiskPrefixCache is one model's view of it): one lock on
-// <dir>/.lock against other processes, one index of every layout's files,
-// one writer thread, one budget and TTL. Startup deletes temporaries and the
-// budget evicts files of every layout, which is why one process owns the
-// directory. Everything below open() is the DiskPrefixCache's to use, under
-// mu_.
+// that uses it (a DiskPrefixCache is one model's view of it): one index of
+// every layout's files, one writer thread, one budget and TTL. Other servers
+// may use the directory too (see the file comment): the writer thread merges
+// their files into the index before each publish, and only it evicts files
+// of models other than this process's. Everything below open() is the
+// DiskPrefixCache's to use, under mu_.
 class DiskStore {
 public:
     // The store of `config.cache_dir`: the one this process already has
-    // open, or a new one, which takes the directory's lock, indexes every
-    // file (deleting corrupt, partial and outdated ones and leftover
-    // temporaries), applies the TTL and the budget and starts the writer.
-    // Null when another process holds the lock or, with `failed` set, when
-    // the directory cannot be created. The clock and free-space probe
-    // (tests) are a new store's.
+    // open, or a new one, which takes the directory's shared lock, indexes
+    // every file (deleting corrupt, partial and outdated ones and leftover
+    // temporaries nobody is writing), applies the TTL and the budget and
+    // starts the writer. Null when an older server holds the directory or,
+    // with `failed` set, when the directory cannot be created. The clock and
+    // free-space probe (tests) are a new store's.
     static std::shared_ptr<DiskStore> open(const DiskCacheConfig & config,
                                            std::function<uint64_t()> clock,
                                            std::function<uint64_t()> free_space,
@@ -174,6 +188,11 @@ public:
     // With `only`, waits for (and on the time limit cancels) that model's
     // writes only; the other models' stay queued.
     DiskDrainResult drain(double max_seconds = -1.0, const Owner * only = nullptr);
+    // Serve model identity `salt` (its layout's files, pins and views):
+    // shared by the models of this process that serve it, refused when
+    // another server on the directory does.
+    bool hold_identity(const std::array<uint8_t, 16> & salt);
+    void release_identity(const std::array<uint8_t, 16> & salt);
     uint64_t budget_bytes() const;
     size_t total_bytes() const;
     size_t entry_count() const;
@@ -233,14 +252,22 @@ public:
     // Helpers (the _locked ones need mu_).
     uint64_t now() const;
     bool expired(const DiskEntry & e, uint64_t t) const;
+    // A file of a model of this process (an identity it holds).
+    bool local_locked(const DiskEntry & e) const;
     void remove_entry(size_t idx, const char * why);
-    void expire_locked();
+    // Drop an entry whose file another server deleted (no unlink).
+    void forget_entry_locked(size_t idx);
+    // `local_only`: only this process's files (any thread); the writer
+    // thread expires and evicts the others', right after a merge.
+    void expire_locked(bool local_only = false);
     uint64_t budget_locked();
     // Evict least-recently-used files until `incoming` more bytes fit.
-    // Pinned files are never evicted: false when they leave no room.
-    bool make_room_locked(uint64_t incoming);
+    // Pinned files and entry `keep` (a write being published) are never
+    // evicted: false when they leave no room.
+    bool make_room_locked(uint64_t incoming, bool local_only = false, uint64_t keep = 0);
     void release_pending_locked(DiskEntry & e);
-    void touch_locked(DiskEntry & e);
+    // Records a use; false when the file is gone (another server evicted it).
+    bool touch_locked(DiskEntry & e);
     int find_entry_id(uint64_t id) const;
     // The snapshot in `path`, checked against its key, `layout_id` and the
     // reading model's identity `salt`; a bad file is rejected (logged).
@@ -253,18 +280,45 @@ public:
     // The auxiliary blob of the file at `path` (reads only its metadata).
     static bool read_aux(const std::string & path, std::string & aux);
 
+    // A file on disk as a merge sees it (POSIX).
+    struct ScannedFile {
+        std::string path;
+        uint64_t size = 0;
+        DiskCacheHeader hdr{};
+    };
+    // Every snapshot file of every layout: its size and header. Needs no
+    // lock (the writer thread calls it under the index lock).
+    std::vector<ScannedFile> scan_files() const;
+    // Fold `files` into the index: add the ones it lacks, take the stored
+    // last-used time and pin of the other servers' files, and drop the
+    // entries whose file is gone. Queued writes stay; ids are kept.
+    void merge_locked(const std::vector<ScannedFile> & files);
+
 private:
     explicit DiskStore(const DiskCacheConfig & config);
     bool lock_dir();
     void scan_all();
     void writer_loop();
-    bool write_file(const std::string & path, const PendingWrite & job);
+    // Write `job` to the open temporary file `f`, flushed and synced; the
+    // caller closes it after the rename.
+    bool write_file(FILE * f, const PendingWrite & job);
+    // <dir>/.index.lock, held while this server changes what is on disk
+    // under the other servers' eyes (no-op on Windows). False when another
+    // server holds it for kIndexLockSeconds, or drain() aborts the write.
+    static constexpr int kIndexLockSeconds = 10;
+    bool lock_index();
+    void unlock_index();
 
     std::thread writer_;
+    // The identities this process serves (under mu_): their lock files'
+    // descriptors (POSIX) and how many models hold each.
+    struct HeldIdentity { int fd = -1; int models = 0; };
+    std::map<std::array<uint8_t, 16>, HeldIdentity> identities_;
 #if defined(_WIN32)
     void * lock_handle_ = nullptr;
 #else
     int lock_fd_ = -1;
+    int index_fd_ = -1;
 #endif
 };
 

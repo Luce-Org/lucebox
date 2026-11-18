@@ -44,18 +44,8 @@ int main() {
         auto spaced=prepare_image_prompt({marker,55,marker,66},{image,image});
         check(bool(spaced) && spaced.images[1].layout.span.block_begin==10 && spaced.tokens[9]==55 &&
               spaced.tokens.back()==66,"text between images");
-        auto copy=pair;
-        pair.images[0].input.patches_bf16[0]=0x3f80;
-        check(copy.images[0].input.patches_bf16[0]==0,"copy owns patches");
-        auto moved=std::move(copy);
-        check(moved.images[1].input.patches_bf16[0]==0x3f80 && moved.tokens.size()==17,"move lifetime");
-        auto independent=prepare_image_prompt({marker},{image});
-        image.patches_bf16[0]=0xbf80;
-        check(independent.images[0].input.patches_bf16[0]==0,"input lifetime independence");
-        auto other_request=prepare_image_prompt({marker},{small_image(0x3f80)});
-        check(independent.tokens==other_request.tokens,"equal layout fixture");
-        independent.images[0].input.patches_bf16[0]=0xbf80;
-        check(other_request.images[0].input.patches_bf16[0]==0x3f80,"distinct requests own image storage");
+        check(pair.images[0].input.patches_bf16[0]==0 && pair.images[1].input.patches_bf16[0]==0x3f80,
+              "each image keeps its own patches in request order");
         check(bool(prepare_image_prompt(std::vector<int32_t>(4,marker),std::vector<ImagePatchInput>(4,image))),"four-image boundary");
         rejected(prepare_image_prompt({marker},{}),ImagePromptError::MarkerCount);
         rejected(prepare_image_prompt({1},{image}),ImagePromptError::MarkerCount);
@@ -92,7 +82,7 @@ int main() {
         rejected(prepare_image_prompt({1},{},{2147483647,2147483647,1}),ImagePromptError::ContextOverflow);
         check(bool(prepare_image_prompt({1},{},{2147483647,2147483646,1})),"wide exact arithmetic");
         rejected(prepare_image_prompt({1},{},{1,std::numeric_limits<uint64_t>::max(),1}),ImagePromptError::InvalidLimits);
-        std::cout<<"PASS text, cardinality, source layout residues, ordering, ownership, negative contracts, checked context\n";
+        std::cout<<"PASS text, cardinality, source layout residues, ordering, negative contracts, checked context\n";
         return 0;
     } catch (const std::exception & e) { std::cerr<<"FAIL: "<<e.what()<<'\n'; return 1; }
 }

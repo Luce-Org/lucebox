@@ -1,4 +1,4 @@
-// Exact integer comparisons: fused CPU/GPU ids vs the original graph and a scalar reference.
+// Exact integer comparisons: fused CPU/GPU ids vs a scalar reference.
 // --cpu runs without a GPU; otherwise exit 77 when no CUDA/HIP device is available.
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -10,47 +10,6 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-// Original build_qsa_attn post-top-k graph, kept here to catch ordering/tail regressions.
-static ggml_tensor * legacy_ids(ggml_context * c, ggml_tensor * blocks, int kv_start, int r) {
-    const int64_t budget = blocks->ne[0], T = blocks->ne[1];
-    blocks = ggml_cont(c, blocks);
-    ggml_tensor * order = ggml_argsort(c, ggml_cast(c, blocks, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
-    blocks = ggml_reshape_3d(c, ggml_get_rows(c,
-        ggml_view_4d(c, blocks, 1, budget, T, 1, blocks->nb[0], blocks->nb[1], blocks->nb[2], 0),
-        order), budget, T, 1);
-
-    ggml_tensor * shape3 = ggml_new_tensor_3d(c, GGML_TYPE_F32, r, budget, T);
-    ggml_tensor * tv = ggml_repeat(c,
-        ggml_reshape_3d(c, ggml_scale_bias(c, ggml_arange(c, 0.0f, (float) T, 1.0f), 1.0f, (float) kv_start),
-                        1, 1, T), shape3);
-    ggml_tensor * bf = ggml_cast(c, blocks, GGML_TYPE_F32);                        // [budget,T,1]
-    ggml_tensor * bf3 = ggml_repeat(c, ggml_reshape_3d(c, bf, 1, budget, T), shape3);
-    ggml_tensor * lim = ggml_scale_bias(c, ggml_scale(c, bf3, (float) r), 1.0f, (float) (r - 1));
-    ggml_tensor * valid = ggml_step(c, ggml_scale_bias(c, ggml_sub(c, tv, lim), 1.0f, 1.0f));
-
-    ggml_tensor * iv  = ggml_repeat(c, ggml_reshape_3d(c,
-        ggml_arange(c, 0.0f, (float) r, 1.0f), r, 1, 1), shape3);
-    ggml_tensor * cf  = ggml_scale_bias(c, ggml_add(c, ggml_scale(c, bf3, (float) r), iv), 1.0f, 1.0f);
-    cf = ggml_scale_bias(c, ggml_mul(c, cf, valid), 1.0f, -1.0f);                  // (r*b+i+1)*valid - 1
-    ggml_tensor * cells = ggml_reshape_4d(c, ggml_cast(c, cf, GGML_TYPE_I32), budget * r, T, 1, 1);
-
-    ggml_tensor * tvt = ggml_scale_bias(c, ggml_arange(c, 0.0f, (float) T, 1.0f), 1.0f, (float) kv_start);
-    ggml_tensor * br  = ggml_scale(c, ggml_floor(c, ggml_scale(c,
-        ggml_scale_bias(c, ggml_arange(c, 1.0f, (float) (T + 1), 1.0f), 1.0f, (float) kv_start),
-        1.0f / (float) r)), (float) r);
-    ggml_tensor * rows = nullptr;
-    for (int64_t i = 0; i < r - 1; ++i) {
-        ggml_tensor * cell = ggml_scale_bias(c, br, 1.0f, (float) i);
-        ggml_tensor * v = ggml_step(c, ggml_scale_bias(c, ggml_sub(c, tvt, cell), 1.0f, 1.0f));
-        ggml_tensor * val = ggml_scale_bias(c, ggml_mul(c, v, ggml_scale_bias(c, cell, 1.0f, 1.0f)), 1.0f, -1.0f);
-        ggml_tensor * row = ggml_reshape_2d(c, ggml_cast(c, val, GGML_TYPE_I32), 1, T);
-        rows = rows ? ggml_concat(c, rows, row, 0) : row;
-    }
-    return ggml_reshape_2d(c,
-        ggml_concat(c, cells, ggml_reshape_3d(c, rows, r - 1, T, 1), 0),
-        budget * r + (r - 1), T);
-}
 
 struct Result {
     bool ok = false;
@@ -88,10 +47,8 @@ static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
     }
     ggml_tensor * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4 * T);
     ggml_tensor * fused = ggml_qsa_decode_ids(c, selected, ggml_view_1d(c, positions, T, 0), r);
-    ggml_tensor * old = legacy_ids(c, selected, pos0, r);
     ggml_cgraph * gf = ggml_new_graph(c);
     ggml_build_forward_expand(gf, fused);
-    ggml_build_forward_expand(gf, old);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
     if (!buf) { ggml_free(c); return result; }
     if (scores.empty()) {
@@ -108,15 +65,13 @@ static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
     ggml_backend_tensor_set(positions, pos.data(), 0, ggml_nbytes(positions));
     if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
         result.ids.resize((size_t) fused->ne[0] * T);
-        std::vector<int32_t> old_ids(result.ids.size());
         result.selected.resize((size_t) budget * T);
         ggml_backend_tensor_get(fused, result.ids.data(), 0, ggml_nbytes(fused));
-        ggml_backend_tensor_get(old, old_ids.data(), 0, ggml_nbytes(old));
         for (int t = 0; t < T; ++t) {
             ggml_backend_tensor_get(selected, result.selected.data() + (size_t) t * budget,
                                     t * selected->nb[1], budget * sizeof(int32_t));
         }
-        result.ok = result.ids == old_ids && result.ids == reference(result.selected, T, budget, pos0, r);
+        result.ok = result.ids == reference(result.selected, T, budget, pos0, r);
     }
     ggml_backend_buffer_free(buf);
     ggml_free(c);
@@ -329,8 +284,8 @@ int main(int argc, char ** argv) {
             ok &= pass; ++cases;
         }
     }
-    // Preserve EACH backend's existing top-k tie membership: share its selected tensor between the old and
-    // fused graph, then feed precisely those selected ids to the CPU reference. CPU/GPU top-k ties may differ.
+    // Preserve EACH backend's existing top-k tie membership: read back the selected tensor its fused graph used,
+    // then feed precisely those selected ids to the CPU reference. CPU/GPU top-k ties may differ.
     for (int n_comp : {513, 1024, 1025, 1500, 4096, 5120, 5121}) {
         for (int pattern = 0; pattern < 3; ++pattern) {
             const int T = 4, budget = 512, pos0 = 2048;

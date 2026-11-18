@@ -332,7 +332,13 @@ def load_report(path: Path) -> dict[str, Any]:
 
 
 def case_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {case["id"]: case for case in report.get("cases", [])}
+    cases = {}
+    for case in report.get("cases", []):
+        case_id = case["id"]
+        if case_id in cases:
+            raise ValueError(f"duplicate case id: {case_id!r}")
+        cases[case_id] = case
+    return cases
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -340,8 +346,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
     candidate = load_report(Path(args.candidate))
     base_cases = case_map(baseline)
     cand_cases = case_map(candidate)
+    if base_cases.keys() != cand_cases.keys():
+        raise ValueError(
+            "case IDs differ between reports; "
+            f"missing from candidate: {sorted(base_cases.keys() - cand_cases.keys())}; "
+            f"missing from baseline: {sorted(cand_cases.keys() - base_cases.keys())}"
+        )
+    if not base_cases:
+        raise ValueError("comparison requires at least one case in each report")
     rows = []
-    for case_id in sorted(base_cases.keys() & cand_cases.keys()):
+    for case_id in sorted(base_cases):
         base = base_cases[case_id]
         cand = cand_cases[case_id]
         base_tps = float(base.get("mean_tok_s", 0.0))

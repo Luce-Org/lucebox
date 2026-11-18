@@ -94,11 +94,8 @@ int restorable(bool has, bool consume, bool pooled, int snap_pos, int slot_token
 }
 } // namespace
 
-TEST_CASE(KvflashRestorePlanFixture, restorable_live_session_alone_is_reported) {
+TEST_CASE(KvflashRestorePlanFixture, restorable_without_a_snapshot_is_the_live_cut_never_negative) {
     CHECK(restorable(false, false, false, 0, 0, 32000) == 32000);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, restorable_nothing_is_zero_never_negative) {
     CHECK(restorable(false, false, false, 0, 0, -1) == 0);
     CHECK(restorable(false, true, true, 20032, 20032, -1) == 0);
 }
@@ -109,24 +106,14 @@ TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_loses_to_a_longer
     CHECK(restorable(true, false, false, 20000, 20000, 20000) == 20000);
 }
 
-TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_without_a_live_cut_is_trusted) {
-    CHECK(restorable(true, false, false, 20000, 20000, -1) == 20000);
-    CHECK(restorable(true, true, false, 20000, 20000, -1) == 20000);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, restorable_misaligned_pooled_snapshot_is_thrown_away) {
-    // The backend would re-prefill the whole prompt, so the cache restores 0.
-    CHECK(restorable(true, true, true, 20001, 20001, -1) == 0);
-    // ...unless the live session still covers a prefix.
-    CHECK(restorable(true, true, true, 20001, 20001, 18000) == 18000);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, restorable_aligned_pooled_snapshot_consumes) {
+TEST_CASE(KvflashRestorePlanFixture, restorable_pooled_snapshot_counts_only_when_consumed) {
     CHECK(restorable(true, true, true, 20032, 20032, -1) == 20032);
     CHECK(restorable(true, true, true, 20032, 20032, 30000) == 30000);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, restorable_pooled_snapshot_with_consume_off_is_zero) {
+    // Misaligned: the backend would re-prefill the whole prompt, so the cache
+    // restores 0 unless the live session still covers a prefix.
+    CHECK(restorable(true, true, true, 20001, 20001, -1) == 0);
+    CHECK(restorable(true, true, true, 20001, 20001, 18000) == 18000);
+    // Consume off: same.
     CHECK(restorable(true, false, true, 20032, 20032, -1) == 0);
     CHECK(restorable(true, false, true, 20032, 20032, 9000) == 9000);
 }
@@ -145,12 +132,6 @@ TEST_CASE(KvflashRestorePlanFixture, restorable_dense_snapshot_outgrowing_the_po
                                     /*session=*/false, -1) == 0);
     CHECK(kvflash_restorable_tokens(true, false, false, 7039, 7039, 64, 40000, 8192,
                                     /*session=*/true, -1) == 7039);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, history_cold_prefill_is_just_the_tokens) {
-    const std::vector<int32_t> tok = {5, 6, 7};
-    const auto h = kvflash_restore_history(tok, 0, nullptr);
-    CHECK(h == tok);
 }
 
 TEST_CASE(KvflashRestorePlanFixture, history_uses_real_ids_for_the_restored_prefix) {
@@ -184,7 +165,6 @@ TEST_CASE(KvflashRestorePlanFixture, consume_flag_is_off_unless_exactly_one) {
 // ---- S6: KVFlash prefill on an absolute grid ------------------------------
 
 using luce::common::kvflash_prefill_batches;
-using luce::common::kvflash_prefill_batch_end;
 using luce::common::kvflash_pooled_snapshot_pos;
 using Batches = std::vector<std::pair<int, int>>;
 
@@ -260,28 +240,14 @@ TEST_CASE(KvflashRestorePlanFixture, grid_plan_small_max_batch_shrinks_the_grid)
     CHECK(kvflash_prefill_batches(9, 3, kU, kU).empty());
 }
 
-TEST_CASE(KvflashRestorePlanFixture, grid_plan_batch_end_matches_the_list) {
-    // The stateless per-position form (used by the prefill loop) and the list agree.
-    for (int start : {0, 18813, 18560}) {
-        const int end = start + 5000;
-        for (const auto & p : kvflash_prefill_batches(start, end, kU, 1024)) {
-            CHECK(kvflash_prefill_batch_end(p.first, end, kU, 1024) == p.second);
-        }
-    }
-}
-
 // ---- S9b: one extra cut point on the grid ---------------------------------
 
 TEST_CASE(KvflashRestorePlanFixture, turn_cut_splits_one_batch_and_keeps_the_grid) {
     const Batches b = kvflash_prefill_batches(0, 2000, kU, kU, {1300});
     CHECK(b == (Batches{{0, 512}, {512, 1024}, {1024, 1300}, {1300, 1536}, {1536, 2000}}));
-    // Per-position form agrees.
-    for (const auto & p : b) CHECK(kvflash_prefill_batch_end(p.first, 2000, kU, kU, {1300}) == p.second);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, turn_cut_near_the_end_leaves_a_short_final_batch) {
-    // Pend = 1000, k = 4: the last batch is the 4 generation-suffix tokens.
-    CHECK(kvflash_prefill_batches(0, 1000, kU, kU, {996}) == (Batches{{0, 512}, {512, 996}, {996, 1000}}));
+    // Wide batches: the cut splits the batch that holds it.
+    CHECK(kvflash_prefill_batches(0, 3000, kU, 1024, {1300}) ==
+          (Batches{{0, 1024}, {1024, 1300}, {1300, 2048}, {2048, 3000}}));
 }
 
 TEST_CASE(KvflashRestorePlanFixture, turn_cut_outside_or_on_the_grid_changes_nothing) {
@@ -291,11 +257,6 @@ TEST_CASE(KvflashRestorePlanFixture, turn_cut_outside_or_on_the_grid_changes_not
     // A cut at or below the start of the range is ignored (restore at C == cut).
     CHECK(kvflash_prefill_batches(1300, 2000, kU, kU, {1300}) == kvflash_prefill_batches(1300, 2000, kU, kU));
     check_plan(kvflash_prefill_batches(1300, 2000, kU, kU, {1300}), 1300, 2000, kU, kU);
-}
-
-TEST_CASE(KvflashRestorePlanFixture, turn_cut_with_wide_batches) {
-    CHECK(kvflash_prefill_batches(0, 3000, kU, 1024, {1300}) ==
-          (Batches{{0, 1024}, {1024, 1300}, {1300, 2048}, {2048, 3000}}));
 }
 
 TEST_CASE(KvflashRestorePlanFixture, several_cuts_split_in_order) {

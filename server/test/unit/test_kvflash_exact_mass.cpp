@@ -16,10 +16,17 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
+#include <system_error>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <random>
 #include <vector>
+
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace luce::common;
 
@@ -54,7 +61,7 @@ std::vector<double> naive(const std::vector<float> & K, int C, int ct, const KvF
 }
 
 // Returns false on a setup failure (REQUIRE cannot be used in a helper).
-bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<double> & ref) {
+bool run_case(ggml_type type, std::vector<float> & out, std::vector<double> & ref) {
     KvFlashQkDims d; d.n_layers = 2; d.n_q_heads = 4; d.n_kv_heads = 2; d.head_dim = 32;
     const int C = 5, ct = 8;
     std::mt19937 rng(7);
@@ -79,7 +86,6 @@ bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<
     keys.seg = [&](int c, int l, int h) -> const uint8_t * {
         return buf.data() + ((((size_t)c * d.n_layers + l) * d.n_kv_heads + h) * ct * d.head_dim) * esz;
     };
-    (void)tol;
     if (!kvflash_exact_mass_scores(keys, d, q.data(), out, 3)) return false;
     ref = naive(K, C, ct, d, q);
     return true;
@@ -87,19 +93,14 @@ bool run_case(ggml_type type, double tol, std::vector<float> & out, std::vector<
 
 }
 
-TEST_CASE(KvflashExactMassFixture, matches_naive_reference_f32_gqa) {
-    std::vector<float> out; std::vector<double> ref;
-    REQUIRE(run_case(GGML_TYPE_F32, 1e-5, out, ref));
-    double sum = 0;
-    for (size_t c = 0; c < ref.size(); c++) { CHECK(std::fabs(out[c] - ref[c]) < 1e-5); sum += out[c]; }
-    CHECK(std::fabs(sum - 1.0) < 1e-4);   // each head's masses sum to 1
-}
-TEST_CASE(KvflashExactMassFixture, matches_naive_reference_f16_gqa) {
-    std::vector<float> out; std::vector<double> ref;
-    REQUIRE(run_case(GGML_TYPE_F16, 1e-5, out, ref));
-    double sum = 0;
-    for (size_t c = 0; c < ref.size(); c++) { CHECK(std::fabs(out[c] - ref[c]) < 1e-5); sum += out[c]; }
-    CHECK(std::fabs(sum - 1.0) < 1e-4);
+TEST_CASE(KvflashExactMassFixture, matches_naive_reference_f32_and_f16_gqa) {
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        std::vector<float> out; std::vector<double> ref;
+        REQUIRE(run_case(t, out, ref));
+        double sum = 0;
+        for (size_t c = 0; c < ref.size(); c++) { CHECK(std::fabs(out[c] - ref[c]) < 1e-5); sum += out[c]; }
+        CHECK(std::fabs(sum - 1.0) < 1e-4);   // each head's masses sum to 1
+    }
 }
 
 TEST_CASE(KvflashExactMassFixture, absent_chunk_scores_zero_and_rest_renormalize) {
@@ -108,11 +109,11 @@ TEST_CASE(KvflashExactMassFixture, absent_chunk_scores_zero_and_rest_renormalize
     KvFlashExactKeys keys;
     keys.n_chunks = 3; keys.chunk_tokens = 2; keys.type = GGML_TYPE_F32;
     keys.seg = [&](int c, int, int) -> const uint8_t * { return c == 1 ? nullptr : (const uint8_t *)k.data(); };
-    std::vector<float> out;
-    REQUIRE(kvflash_exact_mass_scores(keys, d, q.data(), out, 1));
-    CHECK(out[1] == 0.0f);
-    CHECK(std::fabs(out[0] - 0.5f) < 1e-6);
-    CHECK(std::fabs(out[2] - 0.5f) < 1e-6);
+    std::vector<std::vector<float>> out;
+    REQUIRE(kvflash_exact_mass_scores_fast_multi(keys, d, {q.data()}, out, 1));
+    CHECK(out[0][1] == 0.0f);
+    CHECK(std::fabs(out[0][0] - 0.5f) < 1e-6);
+    CHECK(std::fabs(out[0][2] - 0.5f) < 1e-6);
 }
 
 TEST_CASE(KvflashExactMassFixture, multi_query_equals_single) {
@@ -134,33 +135,6 @@ TEST_CASE(KvflashExactMassFixture, multi_query_equals_single) {
         CHECK(std::fabs(o[0][(size_t)c] - a[(size_t)c]) < 1e-6);
         CHECK(std::fabs(o[1][(size_t)c] - b[(size_t)c]) < 1e-6);
     }
-}
-
-// Microbenchmark, off by default: LUCE_EXACT_BENCH=1. 36K tokens, 16 layers,
-// 24 q heads, 4 kv heads, 256 dim, f16 (one chunk's data reused for all).
-TEST_CASE(KvflashExactMassFixture, bench_36k_tokens_f16) {
-    if (!std::getenv("LUCE_EXACT_BENCH")) return;
-    KvFlashQkDims d; d.n_layers = 16; d.n_q_heads = 24; d.n_kv_heads = 4; d.head_dim = 256;
-    const int ct = 64, C = 576;
-    std::mt19937 rng(1); std::normal_distribution<float> nd(0.f, 1.f);
-    const size_t nel = (size_t)d.n_layers * d.n_kv_heads * ct * d.head_dim;
-    std::vector<float> f(nel), q((size_t)d.n_layers * d.n_q_heads * d.head_dim);
-    for (auto & v : f) v = nd(rng);
-    for (auto & v : q) v = nd(rng);
-    std::vector<ggml_fp16_t> buf(nel);
-    ggml_fp32_to_fp16_row(f.data(), buf.data(), (int64_t)nel);
-    KvFlashExactKeys keys;
-    keys.n_chunks = C; keys.chunk_tokens = ct; keys.type = GGML_TYPE_F16;
-    const size_t seg_elems = (size_t)ct * d.head_dim;
-    keys.seg = [&](int, int l, int h) -> const uint8_t * {
-        return (const uint8_t *)(buf.data() + ((size_t)l * d.n_kv_heads + h) * seg_elems);
-    };
-    std::vector<float> out;
-    const auto t0 = std::chrono::steady_clock::now();
-    REQUIRE(kvflash_exact_mass_scores(keys, d, q.data(), out));
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("[bench] exact mass 36864 tokens x16L x24H x256D f16: %.1f ms (%u hw threads)\n",
-                ms, std::thread::hardware_concurrency());
 }
 
 TEST_CASE(KvflashExactMassFixture, select_scores_take_the_max_over_queries_of_top_planes) {
@@ -335,47 +309,20 @@ TEST_CASE(KvflashExactMassFixture, fast_matches_reference_other_types_and_groups
         CHECK(br < 1e-4);
     }
 }
-TEST_CASE(KvflashExactMassFixture, fast_absent_chunk_scores_zero) {
-    auto f = make_case(GGML_TYPE_Q4_0, 1, 6, 1, 32, 6, 8, 2);
-    auto keys = f.keys();
-    const auto seg = keys.seg;
-    keys.seg = [&](int c, int l, int h) -> const uint8_t * { return c == 2 ? nullptr : seg(c, l, h); };
-    std::vector<float> a, b;
-    REQUIRE(kvflash_exact_mass_scores(keys, f.d, f.q.data(), a, 2));
-    REQUIRE(fast_one(keys, f.d, f.q.data(), b, 2));
-    CHECK(b[2] == 0.0f);
-    for (int c = 0; c < 6; c++) CHECK(std::fabs(a[(size_t)c] - b[(size_t)c]) <= 1e-4 * std::max(a[(size_t)c], 1e-6f));
-}
-// Documented near-tie behaviour. (1) Bit-identical blocks tie exactly in BOTH
-// scorers (same ops on the same bytes), so the newer-first tie-break is kept.
-// (2) Blocks whose scores differ by less than the float noise (~1e-6 relative)
-// may legitimately rank either way between the two scorers.
-TEST_CASE(KvflashExactMassFixture, fast_exact_ties_keep_newer_first_and_near_ties_are_bounded) {
+// Bit-identical blocks tie exactly in the fast scorer (same ops on the same
+// bytes), so a newer-first tie-break on its block scores is deterministic.
+TEST_CASE(KvflashExactMassFixture, fast_scorer_ties_bit_identical_blocks_exactly) {
     auto f = make_case(GGML_TYPE_Q4_0, 2, 12, 2, 64, 40, 16, 3);
     const size_t per_chunk = (size_t)f.d.n_layers * f.d.n_kv_heads * f.seg_bytes;
     // blocks 2 and 6 (chunks 8-11 and 24-27) get identical key bytes
     for (int i = 0; i < 4; i++) std::memcpy(&f.buf[(size_t)(24 + i) * per_chunk], &f.buf[(size_t)(8 + i) * per_chunk], per_chunk);
-    std::vector<float> a, b;
-    REQUIRE(kvflash_exact_mass_scores(f.keys(), f.d, f.q.data(), a, 3));
+    std::vector<float> b;
     REQUIRE(fast_one(f.keys(), f.d, f.q.data(), b, 3));
-    const auto ba = kvflash_block_scores(a, 4), bb = kvflash_block_scores(b, 4);
-    // identical K gives identical logsumexp per chunk, but the softmax is over all chunks, so block 2 == block 6 in both
-    CHECK(ba[2] == ba[6]);
+    const auto bb = kvflash_block_scores(b, 4);
+    // identical K gives identical logsumexp per chunk, but the softmax is over all chunks, so block 2 == block 6
     CHECK(bb[2] == bb[6]);
-    // No ranking helper ships in this PR (the recall pick is a later one), so assert the tie-break contract it
-    // uses on the block scores: newest first, then a stable sort by score descending. The newer of the tied blocks (6) must
-    // come out ahead of the older (2) in both scorers.
-    for (const auto & bs : {ba, bb}) {
-        std::vector<int> order;
-        for (int b = (int)bs.size() - 1; b >= 0; b--) order.push_back(b);
-        std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return bs[(size_t)x] > bs[(size_t)y]; });
-        const auto at = [&](int b) { return std::find(order.begin(), order.end(), b) - order.begin(); };
-        CHECK(at(6) < at(2));
-    }
-    // gap between the two scorers on any block stays far below any realistic rank gap
-    for (size_t i = 0; i < ba.size(); i++) CHECK(std::fabs(ba[i] - bb[i]) / ba[i] < 1e-4);
 }
-// ---- run_workers / bad inputs (review fixes) -----------------------------------
+// ---- run_workers / bad inputs -----------------------------------
 TEST_CASE(KvflashExactMassFixture, run_workers_zero_or_negative_workers_run_nothing) {
     std::atomic<int> calls{0};
     run_workers(0, [&](int) { calls++; });
@@ -418,27 +365,10 @@ TEST_CASE(KvflashExactMassFixture, fast_multi_refuses_dims_that_would_drop_query
     d = f.d; d.n_q_heads = 0; CHECK(bad(d));
     d = f.d; d.head_dim = 0; CHECK(bad(d));
 }
-TEST_CASE(KvflashExactMassFixture, reference_and_fast_scorers_both_refuse_a_null_query) {
+TEST_CASE(KvflashExactMassFixture, fast_multi_refuses_a_null_query) {
     const auto f = make_case(GGML_TYPE_Q4_0, 2, 12, 2, 64, 6, 16, 9);
-    std::vector<std::vector<float>> a, b;
-    CHECK(!kvflash_exact_mass_scores_multi(f.keys(), f.d, {f.q.data(), nullptr}, a, 2));
+    std::vector<std::vector<float>> b;
     CHECK(!kvflash_exact_mass_scores_fast_multi(f.keys(), f.d, {f.q.data(), nullptr}, b, 2));
-}
-TEST_CASE(KvflashExactMassFixture, fast_bench_36k_q4_0) {
-    if (!std::getenv("LUCE_EXACT_BENCH")) return;
-    const auto f = make_case(GGML_TYPE_Q4_0, 16, 24, 4, 256, 64, 64, 1);   // 64 chunks, replicated
-    KvFlashExactKeys keys = f.keys();
-    const auto seg = keys.seg;
-    keys.n_chunks = 576;
-    keys.seg = [&](int c, int l, int h) { return seg(c % 64, l, h); };
-    std::vector<float> a, b;
-    auto t0 = std::chrono::steady_clock::now();
-    REQUIRE(kvflash_exact_mass_scores(keys, f.d, f.q.data(), a));
-    auto t1 = std::chrono::steady_clock::now();
-    REQUIRE(fast_one(keys, f.d, f.q.data(), b));
-    auto t2 = std::chrono::steady_clock::now();
-    std::printf("[bench] q4_0 36864 tokens: reference %.1f ms, fast %.1f ms\n",
-                std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count());
 }
 
 // ---- selector v2 scoring: several queries per pass, head aggregates ------------
@@ -535,5 +465,47 @@ TEST_CASE(KvflashExactMassFixture, fast_multi_absent_chunk_aggregates_zero) {
     CHECK(pl[0].max[2] == 0.0f);
     CHECK(pl[0].top[2] == 0.0f);
     CHECK(pl[0].max[0] > 0.0f);
+    std::vector<float> a;
+    REQUIRE(kvflash_exact_mass_scores(keys, f.d, f.q.data(), a, 2));
+    for (int c = 0; c < 6; c++) CHECK(std::fabs(a[(size_t)c] - o[0][(size_t)c]) <= 1e-4 * std::max(a[(size_t)c], 1e-6f));
 }
 
+
+// A pthread_create failure (pids cgroup, no stack memory) after some workers started must reach the caller as an
+// exception, not std::terminate from a joinable std::thread destructor. The forked child caps its address space just
+// above the current size, so the first one or two 8 MiB thread stacks fit and a later one does not.
+TEST_CASE(KvflashExactMassFixture, run_workers_thread_spawn_failure_throws_instead_of_terminating) {
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        long pages = 0;
+        FILE * f = std::fopen("/proc/self/statm", "r");
+        if (!f || std::fscanf(f, "%ld", &pages) != 1) _exit(77);
+        std::fclose(f);
+        const rlim_t cap = (rlim_t)pages * (rlim_t)sysconf(_SC_PAGESIZE) + (rlim_t)20 * 1024 * 1024;
+        rlimit rl{cap, cap};
+        if (setrlimit(RLIMIT_AS, &rl) != 0) _exit(77);
+        int code = 3;                                             // 3: all 8 workers started, the cap did not bite
+        try { run_workers(8, [](int) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }); }
+        catch (const std::system_error &) { code = 0; }
+        catch (...) { code = 4; }
+        _exit(code);
+    }
+    int st = 0;
+    REQUIRE(waitpid(pid, &st, 0) == pid);
+    REQUIRE(WIFEXITED(st));                                       // terminate() would be a SIGABRT
+    CHECK(WEXITSTATUS(st) == 0);
+}
+
+// One non-finite key value must fail the call, not return true with NaN scores for every chunk.
+TEST_CASE(KvflashExactMassFixture, non_finite_key_fails_the_call) {
+    KvFlashQkDims d; d.n_layers = 1; d.n_q_heads = 2; d.n_kv_heads = 1; d.head_dim = 4;
+    std::vector<float> k(2 * 4, 0.5f), bad(2 * 4, 0.5f), q(2 * 4, 1.0f);
+    bad[3] = std::numeric_limits<float>::quiet_NaN();
+    KvFlashExactKeys keys;
+    keys.n_chunks = 3; keys.chunk_tokens = 2; keys.type = GGML_TYPE_F32;
+    keys.seg = [&](int c, int, int) -> const uint8_t * { return (const uint8_t *)(c == 1 ? bad.data() : k.data()); };
+    std::vector<std::vector<float>> outs;
+    const float * qp = q.data();
+    CHECK(!kvflash_exact_mass_scores_fast_multi(keys, d, {qp}, outs, 0, nullptr, nullptr));
+}

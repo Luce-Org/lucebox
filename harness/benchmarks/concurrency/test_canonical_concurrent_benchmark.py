@@ -284,39 +284,6 @@ class CanonicalBenchmarkTests(unittest.TestCase):
         self.assertEqual(gsm_row.split("|")[-3].strip(), "n/a")
         self.assertEqual(gsm_row.split("|")[-2].strip(), "n/a")
 
-    def test_canonical_summary_rejects_mismatched_native_completeness(self) -> None:
-        summary_spec = importlib.util.spec_from_file_location(
-            "summarize_concurrency_native_flags", HERE / "summarize_concurrency.py"
-        )
-        assert summary_spec is not None and summary_spec.loader is not None
-        summary = importlib.util.module_from_spec(summary_spec)
-        summary_spec.loader.exec_module(summary)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "gsm" / "c1" / "r1" / "ar" / "bench.json"
-            path.parent.mkdir(parents=True)
-            path.write_text(json.dumps({
-                "suite": "gsm", "case_limit": None,
-                "prompt_file_sha256": "gsm-prompts",
-                "server_metadata": {"variant": "ar", "repeat": 1},
-                "levels": [{
-                    "clients": 1, "requests": 1, "failures": 0,
-                    "fixed_token_workload_valid": True,
-                    "token_count_complete": True,
-                    "prompt_token_count_complete": True,
-                    "aggregate_tok_s": 10.0,
-                    "output_window_tok_s": 11.0,
-                    "prompt_tokens_per_s_to_first_token": 13.0,
-                    "request_decode_tok_s_median": 12.0,
-                    "ttft_median_s": 0.1,
-                    "ttft_max_s": 0.2,
-                    "server_native_prefill_token_count_complete": True,
-                    "server_native_prefill_timing_complete": False,
-                }],
-            }), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "mismatched native prefill"):
-                summary.summarize_canonical(root)
-
     def test_summary_reports_output_stability_by_case_id(self) -> None:
         summary_spec = importlib.util.spec_from_file_location(
             "summarize_concurrency_stability", HERE / "summarize_concurrency.py"

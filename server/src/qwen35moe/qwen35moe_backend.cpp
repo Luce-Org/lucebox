@@ -1514,7 +1514,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         layer.shared_batched_graph.free();
     }
 
-    if (!restore_target_cache_from_snapshot(slot)) {
+    if (!restore_target_cache_from_snapshot(slot, req.restore_kv_slot)) {
         result.fail(GenerateErrorCode::BackendSpecific, "restore");
         out_io.emit(-1);
         return result;

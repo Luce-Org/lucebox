@@ -2,6 +2,7 @@
 #include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
 
+#include "common/moe_hybrid_routing_stats.h"
 #include "common/peer_access.h"
 #include "common/sampler.h"
 #include "common/snapshot_backend.h"
@@ -25,18 +26,31 @@
 
 namespace luce::common {
 
-// The expert device's read-ahead of each split layer's picks (qwen4exp_graph.cpp, kReadAheadPicks): per layer with
-// hot experts, the cold experts' router rows as Q8_0 [n_embd, n_cold] and their expert ids, on the expert device.
-// A layer without them (or a failed allocation) only loses the read-ahead: the output does not depend on it.
+// Prompt lookup (common/prompt_lookup.h) beside the adaptive MTP, in the single-slot loop and the multi-slot engine.
+// Burn-in kill switch: LUCE_QWEN4EXP_LOOKUP=0.
+static bool prompt_lookup_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("LUCE_QWEN4EXP_LOOKUP");
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+// The expert device's read-ahead of each split layer's picks (qwen4exp_graph.cpp, kReadAheadPicks): per split layer,
+// the router rows of the experts the target's slots do not hold at start, as Q8_0 [n_embd, n_cold], and their expert
+// ids, on the expert device. A layer without them (or a failed allocation) only loses the read-ahead: the output does
+// not depend on it.
 static void load_qwen4exp_read_ahead(Qwen4ExpWeights & w) {
     const int64_t qk = ggml_blck_size(GGML_TYPE_Q8_0);
     std::vector<std::vector<int32_t>> cold_ids((size_t) w.n_layer);
     for (int il = 0; il < w.n_layer; ++il) {
-        const ggml_tensor * R = w.layers[(size_t) il].ffn_gate_inp;
-        if (!w.hot_lut[(size_t) il] || !R || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) ||
-            R->ne[0] != w.n_embd || R->ne[1] != w.n_expert || w.n_embd % qk != 0) continue;
-        const std::vector<int32_t> & hot = w.hot->layers[(size_t) il].hot_local_by_global;
-        for (int e = 0; e < w.n_expert; ++e) if (hot[(size_t) e] < 0) cold_ids[(size_t) il].push_back(e);
+        const Qwen4ExpLayer & L = w.layers[(size_t) il];
+        const ggml_tensor * R = L.ffn_gate_inp;
+        if (!w.on_expert_device(L.ffn_gate_exps) || !R || R->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(R) || R->ne[0] != w.n_embd || R->ne[1] != w.n_expert || w.n_embd % qk != 0) continue;
+        std::vector<uint8_t> held((size_t) w.n_expert, 0);
+        if (w.hot) for (int32_t e : w.hot->initial[(size_t) il]) held[(size_t) e] = 1;
+        for (int e = 0; e < w.n_expert; ++e) if (!held[(size_t) e]) cold_ids[(size_t) il].push_back(e);
     }
     w.ahead_router.assign((size_t) w.n_layer, nullptr);
     w.ahead_ids.assign((size_t) w.n_layer, nullptr);
@@ -73,7 +87,7 @@ static void load_qwen4exp_read_ahead(Qwen4ExpWeights & w) {
         bytes += q.size() + ids.size() * sizeof(int32_t);
         ++layers;
     }
-    std::fprintf(stderr, "[qwen4exp] read-ahead: cold routers of %d layers on the expert device (%.1f MiB)\n", layers,
+    std::fprintf(stderr, "[qwen4exp] read-ahead: routers of %d layers on the expert device (%.1f MiB)\n", layers,
                  bytes / 1048576.0);
 }
 
@@ -108,80 +122,29 @@ static void load_qwen4exp_output_tail(Qwen4ExpWeights & w, ggml_backend_t target
                  (long long) (rows - tail), (long long) rows - 1, (long long) rows, bytes.size() / 1048576.0);
 }
 
-// Split mode: copy the most-routed experts of the routing-stats CSV, up to
-// `budget` bytes of them, to the target, plus the per-layer lookup tables that
-// send each pick to one device.
+// Split mode: hot expert slots for `budget` bytes on the target (Qwen4ExpHotSet), started from the routing-stats CSV
+// when one is given, and the expert device's read-ahead.
 static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w, const std::string & csv,
                                       uint64_t budget) {
-    if (csv.empty() || !w.expert_backend) return true;
-    const char * path = csv.c_str();
-    std::string err;
     MoeHybridRoutingStats stats;
-    if (!MoeHybridRoutingStats::load_csv(path, stats, &err) ||
-        !stats.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
-        std::fprintf(stderr, "[qwen4exp] hot experts: %s: %s\n", path, err.empty() ? "shape mismatch" : err.c_str());
-        return false;
-    }
-    std::vector<MoeLayerDesc> descs((size_t) w.n_layer);
-    std::vector<uint64_t> expert_bytes((size_t) w.n_layer);
-    for (int il = 0; il < w.n_layer; ++il) {
-        const Qwen4ExpLayer & L = w.layers[(size_t) il];
-        descs[(size_t) il].ffn_gate_exps = L.ffn_gate_exps;
-        descs[(size_t) il].ffn_up_exps   = L.ffn_up_exps;
-        descs[(size_t) il].ffn_down_exps = L.ffn_down_exps;
-        expert_bytes[(size_t) il] = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
-    }
-    MoeHybridPlacement placement;
-    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(stats, expert_bytes, budget, 0, placement, &err)) {
-        std::fprintf(stderr, "[qwen4exp] hot experts: placement failed: %s\n", err.c_str());
-        return false;
-    }
-    MoeHybridConfig cfg;
-    cfg.n_embd = w.n_embd;
-    cfg.n_expert = w.n_expert;
-    cfg.n_expert_used = w.n_expert_used;
-    cfg.n_ff_exp = (int) w.layers[0].ffn_gate_exps->ne[1];
-    cfg.n_layer = w.n_layer;
-    cfg.cold_expert_backend = MoeHybridColdBackend::None;   // the full stacks stay on the expert device
-    cfg.materialize_cold_experts = false;
-    w.hot = std::make_unique<MoeHybridStorage>();
-    if (!build_moe_hybrid_storage(cfg, backend, placement, descs, *w.hot, &err)) {
-        std::fprintf(stderr, "[qwen4exp] hot experts: %s\n", err.c_str());
-        return false;
-    }
-    ggml_context * lut_ctx = w.derived.open(2 * (size_t) w.n_layer);
-    w.hot_lut.assign((size_t) w.n_layer, nullptr);
-    w.cold_lut.assign((size_t) w.n_layer, nullptr);
-    for (int il = 0; lut_ctx && il < w.n_layer; ++il) {
-        if (w.hot->layers[(size_t) il].hot_expert_ids.empty()) continue;
-        w.hot_lut[(size_t) il]  = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
-        w.cold_lut[(size_t) il] = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
-    }
-    if (!w.derived.commit(backend)) {
-        w.hot_lut.clear();
-        w.cold_lut.clear();
-        std::fprintf(stderr, "[qwen4exp] hot experts: lookup table allocation failed\n");
-        return false;
-    }
-    uint64_t hot_routes = 0, routes = 0;
-    double hot_bytes = 0;
-    for (int il = 0; il < w.n_layer; ++il) {
-        const std::vector<int32_t> & hot = w.hot->layers[(size_t) il].hot_local_by_global;
-        hot_bytes += (double) placement.hot_counts[(size_t) il] * (double) expert_bytes[(size_t) il];
-        for (int e = 0; e < w.n_expert; ++e) {
-            routes += stats.count(il, e);
-            if (w.hot_lut[(size_t) il] && hot[(size_t) e] >= 0) hot_routes += stats.count(il, e);
+    if (!csv.empty()) {
+        std::string err;
+        if (!MoeHybridRoutingStats::load_csv(csv.c_str(), stats, &err) ||
+            !stats.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+            std::fprintf(stderr, "[qwen4exp] hot experts: %s: %s\n", csv.c_str(), err.empty() ? "shape mismatch" : err.c_str());
+            return false;
         }
-        if (!w.hot_lut[(size_t) il]) continue;
-        std::vector<int32_t> cold((size_t) w.n_expert);
-        for (int e = 0; e < w.n_expert; ++e) cold[(size_t) e] = hot[(size_t) e] >= 0 ? -1 : e;
-        ggml_backend_tensor_set(w.hot_lut[(size_t) il], hot.data(), 0, hot.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(w.cold_lut[(size_t) il], cold.data(), 0, cold.size() * sizeof(int32_t));
+    }
+    if (budget > 0) {
+        auto hot = std::make_unique<Qwen4ExpHotSet>();
+        if (hot->init(backend, w, budget, csv.empty() ? nullptr : &stats)) {
+            w.hot = std::move(hot);
+        } else {
+            std::fprintf(stderr, "[qwen4exp] hot experts: no room for a slot per layer (%.2f GiB)\n",
+                         (double) budget / (1ull << 30));
+        }
     }
     load_qwen4exp_read_ahead(w);
-    std::fprintf(stderr, "[qwen4exp] hot experts: %d of %d (%.2f GiB) on the target, %.1f%% of the profiled picks\n",
-                 placement.total_hot, w.n_layer * w.n_expert, hot_bytes / (1ull << 30),
-                 routes ? 100.0 * (double) hot_routes / (double) routes : 0.0);
     return true;
 }
 
@@ -245,17 +208,21 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         for (auto * ctx : w.extra_meta_ctxs) count_shadow(ctx);
     }
     const size_t state = ggml_backend_buffer_get_size(cache.buf);
-    // The other concurrency slots' caches carry no MTP draft layer or verify rollback (only this cache drafts),
-    // so each reserves the trunk part of this cache's buffer.
-    size_t mtp_state = 0;
+    // The other concurrency slots' caches carry the MTP draft layer and the rollback rows of a batched verify
+    // (kQwen4ExpBatchedVerifyRows), so each reserves the trunk part of this cache's buffer, the draft K/V and that
+    // many of its rollback rows.
+    size_t draft_kv = 0, rollback = 0;
     for (const ggml_tensor * t : {cache.mtp_k, cache.mtp_v, cache.mtp_prev_hidden, cache.mtp_chain_hidden,
-                                  cache.mtp_chain_ids, cache.spec_ple}) {
-        if (t) mtp_state += ggml_nbytes(t);
+                                  cache.mtp_chain_ids}) {
+        if (t) draft_kv += ggml_nbytes(t);
     }
-    for (const ggml_tensor * t : cache.spec_ssm) mtp_state += ggml_nbytes(t);
-    for (const ggml_tensor * t : cache.spec_conv) mtp_state += ggml_nbytes(t);
-    const size_t slot_state = state > mtp_state ? state - mtp_state : 0;
+    if (cache.spec_ple) rollback += ggml_nbytes(cache.spec_ple);
+    for (const ggml_tensor * t : cache.spec_conv) rollback += ggml_nbytes(t);
+    const size_t mtp_state = draft_kv + rollback;
     const bool mtp = qwen4exp_verify_supported(cache);
+    const int verify_rows = std::min(kQwen4ExpBatchedVerifyRows, cache.mtp_draft + 1);
+    const size_t slot_state = (state > mtp_state ? state - mtp_state : 0) +
+        (mtp ? draft_kv + rollback / (size_t) (cache.mtp_draft + 1) * (size_t) verify_rows : 0);
     const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
     const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
     size_t decode = 0, verify = 0, draft = 0, runtime_scratch = 0, runtime_host = 0;
@@ -292,6 +259,12 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     for (const size_t bytes : verify_width) verify += bytes;
     for (const size_t bytes : draft_width) draft += bytes;
     draft += (size_t) cache.mtp_draft * draft_width[1];
+    // Every other slot's own draft graphs: rank 0 per catch-up width up to a batched verify's, and its later ranks.
+    size_t slot_draft = 0;
+    if (mtp) {
+        for (int n = 1; n <= verify_rows; ++n) slot_draft += draft_width[n];
+        slot_draft += (size_t) (verify_rows - 1) * draft_width[1];
+    }
     // A multi-slot engine also keeps its batched decode graph resident: plan its widest
     // shapes, every slot at the end of the dense span, and at the end of the context.
     size_t batched = 0;
@@ -306,10 +279,30 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             if (!retain(m, resident)) return 0;
             batched = std::max(batched, resident);
         }
+        // And the batched verify graph, at the same two shapes.
+        size_t batched_verify = 0;
+        for (const bool qsa : {false, true}) {
+            if (!mtp || (qsa && !qsa_rows)) continue;
+            const int end = qsa ? cache.max_ctx : dense_last + 1;
+            const Qwen4ExpGraphMemory m = qwen4exp_batched_verify_graph_memory(
+                backend, w, cache, slots, verify_rows, std::max(0, end - verify_rows));
+            size_t resident = 0;
+            if (!retain(m, resident)) return 0;
+            batched_verify = std::max(batched_verify, resident);
+        }
+        batched += batched_verify;
+        // And the batched draft's later ranks (qwen4exp_mtp_draft_slots: ranks 1 .. verify_rows - 2), each a graph of
+        // every slot's row, attending over the widest draft K/V span.
+        if (mtp && verify_rows > 2) {
+            const Qwen4ExpGraphMemory m = qwen4exp_mtp_rank_slots_graph_memory(backend, w, cache, slots,
+                                                                                cache.max_ctx - 1);
+            size_t resident = 0;
+            if (!retain(m, resident)) return 0;
+            batched += (size_t) (verify_rows - 2) * resident;
+        }
     }
-    // The decode workspaces stay resident while the next prompt prefills. Only
-    // this cache drafts and verifies; the other concurrency slots decode only.
-    const size_t fixed = (slots - resident_slots) * slot_state + shadow + shadow_tmp +
+    // The decode workspaces stay resident while the next prompt prefills.
+    const size_t fixed = (slots - resident_slots) * slot_state + (slots - 1) * slot_draft + shadow + shadow_tmp +
                          slots * decode + verify + draft + batched;
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu batched=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, batched, runtime_scratch, runtime_host);
@@ -334,7 +327,9 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
             graph = std::max(graph, m.graph + m.metadata);
             inputs = std::max(inputs, m.inputs);
             mask = std::max(mask, m.mask);
-            host = std::max(host, m.host);
+            // m.host: two chunks' host inputs, the running chunk's and its lookahead's. With concurrent slots the
+            // seq engine can also hold every other slot's finished lookahead (Qwen4ExpSeqEngine::prompt_inputs).
+            host = std::max(host, slots > 1 ? m.host / 2 * (size_t) (slots + 1) : m.host);
             scratch = std::max(scratch, m.scratch);
             return true;
         };
@@ -546,13 +541,17 @@ bool Qwen4ExpBackend::load_target() {
     return true;
 }
 
-// Split mode, one sequence: the most-routed experts of --expert-placement also run on the target, for decode and
-// verify steps (a prompt chunk keeps every pick on the expert device). They take the memory the fitted context and
-// the prompt chunk leave, at most LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick
-// on the expert device, so a request computes the same alone and beside other requests: no hot copies.
+// Split mode, one sequence, with --expert-placement: hot expert slots on the target for decode and verify steps (a
+// prompt chunk keeps every pick on the expert device), started from the placement and then following the served
+// picks (Qwen4ExpHotSet). They take the memory the fitted context and the prompt chunk leave, at most
+// LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick on the expert device, so a
+// request computes the same alone and beside other requests: no hot copies. The expert device's read-ahead (no
+// effect on the output) is built either way.
 bool Qwen4ExpBackend::load_hot_experts() {
-    if (cfg_.expert_placement_path.empty() || cfg_.max_concurrency > 1 || !weights_.expert_backend || chunk_ <= 0)
+    if (!weights_.expert_backend || chunk_ <= 0)
         return true;
+    if (cfg_.expert_placement_path.empty() || cfg_.max_concurrency > 1)
+        return load_qwen4exp_hot_experts(backend_, weights_, std::string(), 0);
     Qwen4ExpChunkPlan room;
     room.rows = chunk_;
     plan_chunk(&room);
@@ -562,9 +561,9 @@ bool Qwen4ExpBackend::load_hot_experts() {
     const uint64_t budget = std::min<uint64_t>(expert_budget_bytes_from_env(UINT64_MAX), spare);
     std::fprintf(stderr, "[qwen4exp] hot experts: %.2f GiB beside a %d-row prompt chunk (available %.2f GiB)\n",
                  (double) budget / (1ull << 30), chunk_, (double) room.available / (1ull << 30));
-    if (budget == 0) return true;
     if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path, budget)) return false;
-    chunk_ = plan_chunk();   // the decode and verify graphs grew with the hot experts' picks
+    if (!weights_.hot) return true;
+    chunk_ = plan_chunk();   // the decode and verify graphs grew with the hot experts' lanes
     return chunk_ > 0;
 }
 
@@ -601,7 +600,10 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
 }
 
 void Qwen4ExpBackend::release_target() {
-    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
+    for (int i = 0; i < kMaxSlots; ++i) {
+        snapshot_free(i);
+        free_qwen4exp_snapshot(displaced_[i]);
+    }
     tokens_.clear(); logits_.clear();
     seq_engine_.reset();
     for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
@@ -618,9 +620,13 @@ bool Qwen4ExpBackend::create_main_cache() {
     // The slot states do not depend on the context, so a context fit's rebuilt cache keeps them.
     if (cfg_.max_concurrency > 1 && !slot_states_.buf &&
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
-    return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
-        cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
-        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx));
+    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
+            cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
+            slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
+            take_kept_remote(0)))
+        return false;
+    disk_layout_ = qwen4exp_disk_layout(cache_);
+    return true;
 }
 
 // --kvflash: each slot's pool, sized with the weights resident and no cache yet ("auto" takes a share of the free
@@ -661,20 +667,36 @@ int Qwen4ExpBackend::remote_layers_for(const Qwen4ExpChunkPlan & plan, size_t mi
     return (size_t) remote * plan.layer_bytes <= available - available / 10 ? remote : remote_layers_;
 }
 
+// The concurrency slots after the first, in place: the sequence engine keeps pointers to them across a release.
+bool Qwen4ExpBackend::create_seq_caches() {
+    seq_caches_.resize((size_t)cfg_.max_concurrency - 1);
+    int state_slot = 1;
+    for (Qwen4ExpCache & cache : seq_caches_) {
+        // With MTP, each slot drafts and verifies too (Qwen4ExpSeqEngine): the rollback rows of a batched verify.
+        const bool mtp = cfg_.verify_width != 1 && qwen4exp_verify_supported(cache_);
+        const int slot = state_slot++;
+        if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, mtp,
+                                   mtp ? std::min(kQwen4ExpBatchedVerifyRows, cache_.mtp_draft + 1) - 1 : 1,
+                                   &slot_states_, slot, remote_layers_,
+                                   kvflash_pool_for(cfg_.device.max_ctx), take_kept_remote((size_t) slot))) {
+            return false;
+        }
+        cache.split_owner = &cache_;
+    }
+    return true;
+}
+
 bool Qwen4ExpBackend::start_seq_engine() {
     if (cfg_.max_concurrency <= 1) return true;
-    seq_caches_.resize((size_t)cfg_.max_concurrency - 1);
+    if (!create_seq_caches()) return false;
     std::vector<Qwen4ExpCache *> caches{&cache_};
-    for (Qwen4ExpCache & cache : seq_caches_) {
-        if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, false, 1,
-                                   &slot_states_, (int) caches.size(), remote_layers_,
-                                   kvflash_pool_for(cfg_.device.max_ctx))) return false;
-        cache.split_owner = &cache_;
-        caches.push_back(&cache);
-    }
+    for (Qwen4ExpCache & cache : seq_caches_) caches.push_back(&cache);
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
         backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_,
-        cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_);
+        cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_, prompt_lookup_on() ? &lookup_policy_ : nullptr);
+    // Its checkpoints are this backend's snapshots, which the disk session cache writes and reads.
+    static_assert(Qwen4ExpSeqEngine::kPrefixCheckpoints == kMaxSlots, "one checkpoint per snapshot slot");
+    seq_engine_->use_backend_snapshots(snapshots_.data(), displaced_.data());
     std::fprintf(stderr,
         "[qwen4exp-seq] independent-slot engine enabled: %d full F16 caches, ctx=%d, chunk=%d\n",
         cfg_.max_concurrency, cfg_.device.max_ctx, chunk_);
@@ -720,6 +742,185 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
     parked_ = false;
     std::printf("[qwen4exp] target unparked\n");
     std::fflush(stdout);
+    return true;
+}
+
+// ── Residency ──────────────────────────────────────────────────────────
+// Split mode holds two kinds of memory: the routed expert stacks on the expert device (71.7 GiB for Flash Next) and
+// everything else on the target. A release of the target device keeps the stacks where they are, so bringing the
+// model back uploads only the target's part (7 GiB) and rebuilds the caches. The layout found at first load (the
+// fitted context, the slots, the attention layers moved to the expert device) is reused as it is, and the prefix
+// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release.
+
+ModelBackend::Residency Qwen4ExpBackend::residency() const {
+    Residency r;
+    r.gpus.push_back(target_gpu());
+    if (expert_gpu() >= 0) r.gpus.push_back(expert_gpu());
+    if (cache_.kvflash || kvflash_pool_ > 0) {
+        r.reason = "qwen4exp: --kvflash pages KV rows the release would drop";
+    } else if (!backend_) {
+        r.reason = "qwen4exp: not loaded";
+    } else {
+        r.supported = true;
+        if (expert_gpu() >= 0) r.keepable.push_back(expert_gpu());
+    }
+    if (held_ != Held::all) r.released.push_back(target_gpu());
+    if (held_ == Held::none && expert_gpu() >= 0) r.released.push_back(expert_gpu());
+    auto size = [](ggml_backend_buffer_t b) -> size_t { return b ? ggml_backend_buffer_get_size(b) : 0; };
+    size_t target = 0, expert = 0;
+    if (held_ == Held::all) {
+        target += size(weights_.buf) + size(weights_.mtp_vocab_buf) + size(slot_states_.buf);
+        target += size(cache_.buf);
+        expert += size(cache_.remote_buf);
+        for (const Qwen4ExpCache & c : seq_caches_) {
+            target += size(c.buf);
+            expert += size(c.remote_buf);
+        }
+    }
+    expert += size(weights_.expert_buf) + size(weights_.expert_host_buf);   // the stacks in locked host memory too
+    expert += size(weights_.kept_expert_buf) + size(weights_.kept_expert_host_buf);
+    for (ggml_backend_buffer_t b : kept_remote_bufs_) expert += size(b);   // K/V kept through a release
+    r.bytes.push_back(expert_gpu() >= 0 ? target : target + expert);
+    if (expert_gpu() >= 0) r.bytes.push_back(expert);
+    return r;
+}
+
+void Qwen4ExpBackend::free_kept_remote_bufs() {
+    for (ggml_backend_buffer_t b : kept_remote_bufs_) {
+        if (b) ggml_backend_buffer_free(b);
+    }
+    kept_remote_bufs_.clear();
+}
+
+void Qwen4ExpBackend::release_device_state(bool keep_experts) {
+    using clock = std::chrono::steady_clock;
+    auto t = clock::now();
+    auto lap = [&t]() {
+        const auto now = clock::now();
+        const double s = std::chrono::duration<double>(now - t).count();
+        t = now;
+        return s;
+    };
+    snapshot_flush_deferred();   // a deferred snapshot is the live cache: save it before the cache goes
+    tokens_.clear();             // the serial path's cache no longer holds them
+    logits_.clear();
+    free_drafter();
+    if (seq_engine_) seq_engine_->release_device_state();
+    const double s_engine = lap();
+    free_kept_remote_bufs();
+    auto free_cache = [&](Qwen4ExpCache & cache) {
+        if (keep_experts) {
+            // The expert device keeps this cache's rows buffer: freeing and allocating tens of GiB of shared
+            // memory there costs about a second each way.
+            kept_remote_bufs_.push_back(cache.remote_buf);
+            cache.remote_buf = nullptr;
+        }
+        free_qwen4exp_cache(cache);
+        cache = {};
+    };
+    free_cache(cache_);
+    for (Qwen4ExpCache & cache : seq_caches_) free_cache(cache);
+    free_qwen4exp_slot_states(slot_states_);
+    slot_states_ = {};
+    const double s_caches = lap();
+    free_qwen4exp_weights(weights_, keep_experts);
+    const double s_weights = lap();
+    // The pools' cached blocks, retained graphs and the weight shadows keyed by the freed weights' addresses.
+    ggml_backend_cuda_trim_pool(backend_);
+    if (weights_.expert_backend) ggml_backend_cuda_trim_pool(weights_.expert_backend);
+    std::fprintf(stderr, "[qwen4exp] release stages: engine %.2f, caches %.2f, weights %.2f, pools %.2f s\n",
+                 s_engine, s_caches, s_weights, lap());
+}
+
+bool Qwen4ExpBackend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    const Residency r = residency();
+    if (!r.supported) {
+        error = r.reason;
+        return false;
+    }
+    if (parked_) {
+        error = "qwen4exp: parked";
+        return false;
+    }
+    auto named = [&](int gpu) { return gpus.empty() || std::find(gpus.begin(), gpus.end(), gpu) != gpus.end(); };
+    const bool split = expert_gpu() >= 0;
+    const bool experts_go = !split || named(expert_gpu());
+    const Held want = experts_go ? Held::none : named(target_gpu()) ? Held::experts : Held::all;
+    // A release only reduces what is held (all, then experts, then none): GPUs this model does not hold are a
+    // no-op, never a way back to Held::all without a reinstate.
+    if ((int) want <= (int) held_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (held_ == Held::all) {
+        release_device_state(/*keep_experts=*/want == Held::experts);
+    } else if (weights_.kept_expert_buf) {   // experts -> none
+        for (ggml_backend_buffer_t * b : {&weights_.kept_expert_buf, &weights_.kept_expert_host_buf}) {
+            if (*b) ggml_backend_buffer_free(*b);
+            *b = nullptr;
+        }
+        free_kept_remote_bufs();
+        ggml_backend_cuda_trim_pool(weights_.expert_backend);
+    }
+    held_ = want;
+    std::fprintf(stderr, "[qwen4exp] released %s in %.2f s\n",
+                 held_ == Held::experts ? "the target device (the expert stacks stay)" : "every device",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return true;
+}
+
+bool Qwen4ExpBackend::reinstate(std::string & error) {
+    if (held_ == Held::all) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int frozen_chunk = chunk_;
+    auto fail = [&](const std::string & why) {
+        error = "qwen4exp: " + why;
+        std::fprintf(stderr, "[qwen4exp] reinstate failed: %s; nothing stays on the GPUs\n", why.c_str());
+        release_device_state(/*keep_experts=*/false);
+        held_ = Held::none;
+        return false;
+    };
+    std::vector<std::pair<const char *, double>> stages;
+    auto lap = [&, t = t0](const char * name) mutable {
+        const auto now = std::chrono::steady_clock::now();
+        stages.emplace_back(name, std::chrono::duration<double>(now - t).count());
+        t = now;
+    };
+    if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
+                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
+        return fail(std::string("model load failed: ") + luce_last_error());
+    }
+    lap("load");
+    load_qwen4exp_output_tail(weights_, backend_);
+    lap("tail");
+    // The context, the slots and the attention layers on the expert device are the ones found at first load.
+    if (!create_main_cache()) return fail("cache creation failed");
+    lap("cache");
+    if (remote_layers_ && !move_qwen4exp_attention(weights_, remote_layers_)) {
+        return fail("moving attention to the expert device failed");
+    }
+    lap("attention");
+    chunk_ = plan_chunk();
+    if (chunk_ <= 0) return fail("insufficient prefill memory at the fitted context");
+    lap("plan");
+    if (!load_hot_experts()) return fail("hot experts failed");
+    lap("hot");
+    if (cfg_.max_concurrency > 1) {
+        if (!create_seq_caches()) return fail("full-cache slot allocation failed");
+        if (seq_engine_) seq_engine_->reinstate_device_state(chunk_);
+    }
+    lap("slots");
+    if (chunk_ != frozen_chunk) {
+        std::fprintf(stderr, "[qwen4exp] prompt chunk %d (was %d at first load)\n", chunk_, frozen_chunk);
+    }
+    free_kept_remote_bufs();   // none should be left
+    held_ = Held::all;
+    std::string detail;
+    for (const auto & [name, sec] : stages) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%s%s %.2f", detail.empty() ? "" : ", ", name, sec);
+        detail += buf;
+    }
+    std::fprintf(stderr, "[qwen4exp] reinstated in %.2f s (%s)\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), detail.c_str());
     return true;
 }
 
@@ -878,12 +1079,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         mtp_costs_.load(mtp_width_, decode_ctx);
         mtp_width_.carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
     }
-    // Prompt lookup (common/prompt_lookup.h) beside the adaptive MTP. Burn-in kill switch: LUCE_QWEN4EXP_LOOKUP=0.
-    static const bool lookup_on = [] {
-        const char * e = std::getenv("LUCE_QWEN4EXP_LOOKUP");
-        return e == nullptr || std::strcmp(e, "0") != 0;
-    }();
-    const bool use_lookup = adaptive && lookup_on;
+    const bool use_lookup = adaptive && prompt_lookup_on();
     long long lookup_rounds = 0, lookup_drafts = 0, lookup_accepted = 0;
     double draft_s = 0.0;
     auto verify_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
@@ -1090,6 +1286,39 @@ void Qwen4ExpBackend::snapshot_free(int slot) {
     free_qwen4exp_snapshot(snapshots_[slot]);
 }
 
+OwnedSnapshot Qwen4ExpBackend::snapshot_copy(int slot) const {
+    // The live state of a deferred save is copied out by snapshot_flush_deferred first.
+    if (slot < 0 || slot >= kMaxSlots || slot == live_slot_) return {};
+    return export_qwen4exp_snapshot(disk_layout_, snapshots_[slot]);
+}
+
+OwnedSnapshot Qwen4ExpBackend::snapshot_detach(int slot) {
+    if (slot < 0 || slot >= kMaxSlots) return {};
+    if (slot == live_slot_) snapshot_flush_deferred();
+    return take_qwen4exp_snapshot(disk_layout_, snapshots_[slot]);
+}
+
+OwnedSnapshot Qwen4ExpBackend::snapshot_take_displaced(int slot) {
+    if (slot < 0 || slot >= kMaxSlots) return {};
+    return take_qwen4exp_snapshot(disk_layout_, displaced_[slot]);
+}
+
+void Qwen4ExpBackend::snapshot_drop_displaced(int slot) {
+    if (slot >= 0 && slot < kMaxSlots) free_qwen4exp_snapshot(displaced_[slot]);
+}
+
+bool Qwen4ExpBackend::snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf, int cur_pos,
+                                     int32_t last_tok) {
+    if (slot < 0 || slot >= kMaxSlots || !ctx || !buf || !snap_backend_) return false;
+    snapshot_free(slot);
+    OwnedSnapshot read(ctx, buf, cur_pos, last_tok);
+    if (import_qwen4exp_snapshot(snap_backend_, cache_, read, snapshots_[slot])) {
+        return true;   // the import took `read`'s buffer, or copied it and `read` frees it
+    }
+    read.release();   // the caller frees what it handed over
+    return false;
+}
+
 bool Qwen4ExpBackend::snapshot_used(int slot) const {
     return slot >= 0 && slot < kMaxSlots && (slot == live_slot_ || snapshots_[slot].buf);
 }
@@ -1100,20 +1329,44 @@ int Qwen4ExpBackend::snapshot_cur_pos(int slot) const {
 }
 
 size_t Qwen4ExpBackend::snapshot_bytes_estimate(int tokens) const {
+    return snapshot_bytes(tokens, /*rows=*/true);
+}
+
+size_t Qwen4ExpBackend::snapshot_state_bytes_estimate(int tokens) const {
+    // A KVFlash pool's rows are its slots: a snapshot exists only while they map positions one to one (a context
+    // within the pool), where a backup saves little, so its snapshots stay whole. Split mode keeps one row per
+    // position on either device, and a strip copy reaches both.
+    return cache_.kvflash ? 0 : snapshot_bytes(tokens, /*rows=*/false);
+}
+
+size_t Qwen4ExpBackend::snapshot_bytes(int tokens, bool rows) const {
     if (!snap_backend_ || !cache_.buf) return 0;
     const int n = std::clamp(tokens, 0, cache_.max_ctx);
     if (!n) return 0;
     size_t host = 0;
-    const size_t copies = qwen4exp_snapshot_bytes(snap_backend_, cache_, n, &host);
+    const size_t copies = qwen4exp_snapshot_bytes(snap_backend_, cache_, n, &host, rows);
     return copies + host + (size_t(n) + weights_.n_vocab +
         std::max(0, weights_.ple_ngram_size - 1)) * sizeof(int32_t);
+}
+
+bool Qwen4ExpBackend::snapshot_drop_kv(int slot) {
+    if (!snapshot_state_bytes_estimate(1) || !snapshot_used(slot)) return false;
+    // A deferred snapshot is the live cache: copy it out first.
+    if (slot == live_slot_) snapshot_flush_deferred();
+    return snapshots_[slot].buf && drop_qwen4exp_snapshot_rows(cache_, snapshots_[slot]);
+}
+
+bool Qwen4ExpBackend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < kMaxSlots && snapshots_[slot].state_only;
 }
 
 bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
     size_t remaining = snapshot_budget_;
     for (int i = 0; i < kMaxSlots; ++i) {
         if (i == slot || i == replaced || !snapshot_used(i)) continue;
-        const size_t bytes = snapshot_bytes_estimate(snapshot_cur_pos(i));
+        // A state-only backup holds its point state alone.
+        const size_t bytes = snapshot_state_only(i) ? snapshot_state_bytes_estimate(snapshot_cur_pos(i))
+                                                    : snapshot_bytes_estimate(snapshot_cur_pos(i));
         if (bytes > remaining) return false;
         remaining -= bytes;
     }
@@ -1137,13 +1390,20 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
     if (prefix.size() > req.prompt.size() || !std::equal(prefix.begin(), prefix.end(), req.prompt.begin())) {
         return generate_impl(req, io);
     }
+    // A concurrency engine checkpoint (from the disk cache) keeps no logits: it resumes only a longer prompt.
+    if (prefix.size() == req.prompt.size() && slot != live_slot_ && snapshots_[slot].logits.empty()) {
+        return generate_impl(req, io);
+    }
     const int pos = snapshot_cur_pos(slot);
     if (slot == live_slot_) {
         live_slot_ = -1; // consume the zero-copy checkpoint before mutation
         std::fprintf(stderr, "[qwen4exp-snap] resident slot=%d pos=%d\n", slot, pos);
     } else {
-        snapshot_flush_deferred();
-        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_)) return generate_impl(req, io);
+        snapshot_flush_deferred();   // a deferred donor too: the restore below overwrites the live cache
+        // A state-only backup takes its rows from the deeper snapshot the request names; without it, recompute.
+        const int kv = req.restore_kv_slot;
+        const Qwen4ExpSnapshot * rows = kv >= 0 && kv < kMaxSlots && kv != slot ? &snapshots_[kv] : nullptr;
+        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
     }
@@ -1201,6 +1461,7 @@ void Qwen4ExpBackend::free_drafter() {
 
 void Qwen4ExpBackend::shutdown() {
     free_drafter();
+    free_kept_remote_bufs();
     if (backend_) release_target();
     free_snapshot_backend(snap_backend_, backend_);
     snap_backend_ = nullptr;

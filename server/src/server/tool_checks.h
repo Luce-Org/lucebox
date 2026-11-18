@@ -13,7 +13,11 @@
 //   4. checks a final answer given after tool results, once per user request:
 //      the model goes through the request part by part, and its new turn is
 //      kept only if it makes tool calls that have not already failed;
-//   5. if the model calls a tool when tool_choice is "none", retry once with
+//   5. draws an empty reply again, the same request without a note, up to
+//      twice: a turn that ended with no text and no call (often inside its
+//      thinking) gives the agent nothing to run, and agents take it as the
+//      final answer;
+//   6. if the model calls a tool when tool_choice is "none", retry once with
 //      a note that tools are unavailable and skip the other tool checks; if
 //      the retry still calls one, its calls are dropped and its text is the
 //      answer, so no tool call reaches the client.
@@ -90,6 +94,13 @@ std::string dropped_call_note(const json & request);
 
 // The assistant message of a chat.completion response, or nullptr.
 json * reply_message(json & response);
+// How many times an empty reply is drawn again.
+constexpr int kEmptyRedraws = 2;
+// The model ended its turn (finish_reason "stop") with no text and no call.
+bool empty_reply(const json & response);
+// `request` to draw again for the `draw`th time: a seed the client set moves
+// on by `draw`, so the sample can differ. The log says empty=redrawn|kept.
+json redraw(const json & request, int draw);
 
 // The reply calls two or more different tools.
 bool needs_replan(const json & reply);

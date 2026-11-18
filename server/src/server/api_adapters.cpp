@@ -402,7 +402,7 @@ CompletionTokenCounts feed_non_streaming_tokens(
             classify_generated_token(tokenizer, emitter, token, text);
         if (delivery == TokenDelivery::kSkip) continue;
 
-        emitter.emit_token(text);
+        emitter.emit_token(text, delivery == TokenDelivery::kThinkTag);
         // Matching the streaming path, only ordinary text is checked
         // against stop sequences — think-tag markers never count.
         if (delivery == TokenDelivery::kText && emitter.stop_hit()) break;
@@ -490,9 +490,12 @@ json build_openai_completion_response(
         // finish_details mirrors ds4_eval.c's eval_think_close_info.
         // close_kind is "natural" when the model closed its own thinking
         // block, "hard" when the BudgetHook force-closed it at the budget
-        // boundary. See docs/specs/thinking-budget.md "v2 design".
+        // boundary, "open" when the reply ended inside it. See
+        // docs/specs/thinking-budget.md "v2 design".
+        const bool thinking_open = emitter.first_content_token_index() < 0 &&
+                                   emitter.mode() == StreamMode::REASONING;
         choice["finish_details"] = {
-            {"close_kind", result.budget_forced_close ? "hard" : "natural"},
+            {"close_kind", result.budget_forced_close ? "hard" : thinking_open ? "open" : "natural"},
             {"thinking_tokens", counts.reasoning},
             {"content_tokens", counts.content},
             {"total_tokens", counts.total},

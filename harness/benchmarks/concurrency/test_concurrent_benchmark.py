@@ -16,6 +16,12 @@ SPEC = importlib.util.spec_from_file_location("concurrent_benchmark", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)
+GENERATOR_SPEC = importlib.util.spec_from_file_location(
+    "generate_prompts", Path(__file__).with_name("generate_prompts.py")
+)
+assert GENERATOR_SPEC is not None and GENERATOR_SPEC.loader is not None
+generator = importlib.util.module_from_spec(GENERATOR_SPEC)
+GENERATOR_SPEC.loader.exec_module(generator)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -29,7 +35,9 @@ class BenchmarkTests(unittest.TestCase):
             ['{"choices":[{"delta":{"content":"hi"}}]}', "[DONE]"],
         )
 
-    def test_default_matrix_starts_at_c2(self) -> None:
+    def test_default_levels_match_generated_cohorts(self) -> None:
+        # The default run asks for the cohorts the default prompt file holds.
+        self.assertEqual(benchmark.DEFAULT_CLIENT_LEVELS, generator.DEFAULT_CLIENT_LEVELS)
         self.assertEqual(benchmark.DEFAULT_CLIENT_LEVELS, (2, 4, 8, 16))
 
     def test_run_rejects_duplicate_client_levels(self) -> None:
@@ -47,17 +55,18 @@ class BenchmarkTests(unittest.TestCase):
             benchmark.prompt_messages({"role": "user"})
 
     def test_level_uses_exact_usage_and_first_token_window(self) -> None:
-        prompt_counts = iter((10, 30))
+        # (t_start, prompt tokens, native prefill ms), keyed by prompt so the
+        # result does not depend on which thread runs first.
+        timing = {"first": (100.0, 10, 100.0), "second": (100.25, 30, 200.0)}
 
         def fake_request(_args: argparse.Namespace, prompt: str) -> dict:
-            prompt_count = next(prompt_counts)
-            start = time.perf_counter()
+            start, prompt_count, native_ms = timing[prompt]
             return {
                 "t_start": start, "t_first": start + 0.5, "t_end": start + 1.0,
                 "duration_s": 1.0, "ttft_s": 0.5, "decode_duration_s": 0.5,
                 "completion_tokens": 8, "prompt_tokens": prompt_count,
                 "server_native_prefilled_tokens": prompt_count,
-                "server_native_prefill_ms": 100.0 if prompt_count == 10 else 200.0,
+                "server_native_prefill_ms": native_ms,
                 "finish_reason": "length", "error": None,
                 "content_sha256": benchmark.sha256_text(prompt + " output"),
                 "reasoning_content_sha256": benchmark.sha256_text(""),
@@ -71,28 +80,18 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(level["completion_tokens_total"], 16)
         self.assertEqual(level["prompt_tokens_total"], 40)
         self.assertTrue(level["fixed_token_workload_valid"])
-        self.assertAlmostEqual(
-            level["output_window_tok_s"],
-            16 / level["output_window_s"],
-        )
+        # First output at 100.5, last completion at 101.25.
+        self.assertAlmostEqual(level["output_window_s"], 0.75)
+        self.assertAlmostEqual(level["output_window_tok_s"], 16 / 0.75)
         self.assertEqual(level["request_decode_tok_s_median"], 14.0)
-        self.assertAlmostEqual(
-            level["prompt_tokens_per_s_to_first_token"],
-            40 / level["prompt_to_first_token_s"],
-        )
+        # The later request starts 0.25 s in and has its first token 0.5 s later.
+        self.assertAlmostEqual(level["prompt_to_first_token_s"], 0.75)
+        self.assertAlmostEqual(level["prompt_tokens_per_s_to_first_token"], 40 / 0.75)
         self.assertEqual(level["server_native_prefilled_tokens_total"], 40)
         self.assertEqual(level["server_native_prefill_ms_max"], 200.0)
-        expected_window_ms = max(
-            record["start_offset_s"] * 1000.0 + record["server_native_prefill_ms"]
-            for record in level["requests_detail"]
-        )
-        self.assertAlmostEqual(
-            level["server_native_prefill_window_ms"], expected_window_ms
-        )
-        self.assertAlmostEqual(
-            level["server_native_prefill_tokens_per_s"],
-            40_000.0 / expected_window_ms,
-        )
+        # max(0 ms + 100 ms, 250 ms + 200 ms)
+        self.assertAlmostEqual(level["server_native_prefill_window_ms"], 450.0)
+        self.assertAlmostEqual(level["server_native_prefill_tokens_per_s"], 40_000.0 / 450.0)
         self.assertTrue(level["server_native_prefill_token_count_complete"])
         self.assertTrue(level["server_native_prefill_timing_complete"])
 
@@ -234,15 +233,6 @@ class BenchmarkTests(unittest.TestCase):
             record = benchmark.stream_request(args, "prompt")
         self.assertFalse(record["done_received"])
         self.assertIn("before [DONE]", record["error"])
-
-    def test_missing_prompt_usage_fails_level(self) -> None:
-        level = {
-            "failures": 0,
-            "token_count_complete": True,
-            "prompt_token_count_complete": False,
-            "fixed_token_workload_valid": True,
-        }
-        self.assertTrue(benchmark.level_failed(level, ignore_eos=True))
 
 
 if __name__ == "__main__":

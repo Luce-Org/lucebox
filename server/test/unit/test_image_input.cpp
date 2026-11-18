@@ -86,6 +86,7 @@ int main() {
         ImageInputLimits limits;
         limits.image_count = 1;
         check(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error, limits), "image count cap ignored");
+        check(images.empty() && normalized.is_null(), "count cap published partial images");
         limits.image_count = 4;
         limits.request_bytes = 10;
         check(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error, limits), "aggregate byte cap ignored");

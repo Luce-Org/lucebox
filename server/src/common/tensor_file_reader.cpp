@@ -1,9 +1,12 @@
 #include "tensor_file_reader.h"
+#include "parallel_upload.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <chrono>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -16,7 +19,7 @@ namespace luce::common {
 
 namespace {
 
-constexpr size_t kPieceBytes = (size_t) 32 << 20;  // one read
+constexpr size_t kPieceBytes = (size_t) 64 << 20;  // one read
 constexpr size_t kMaxThreads = 8;                  // reads in flight
 constexpr size_t kAlign = ReadOnlyFile::kDirectAlign;
 
@@ -100,7 +103,17 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
     std::atomic<size_t> next{0};
     size_t end = n_split;
     std::atomic<bool> failed{false};
-    std::mutex write_mu;  // one tensor write at a time
+    // A few tensor writes at a time: one leaves a discrete GPU's link idle while it stages and synchronizes
+    // each piece, and more than four interleave too finely (R9700 on PCIe Gen3 x4: 3.45 GB/s from 1-4
+    // writers of staged copies, 2.35 GB/s from 8-16).
+    std::mutex write_mu, error_mu;
+    std::condition_variable write_cv;
+    int writers = 0;
+    const int max_writers = [] {
+        const char * env = std::getenv("LUCE_LOAD_WRITERS");
+        const int n = env ? std::atoi(env) : 0;
+        return n > 0 ? std::min(n, 16) : 4;
+    }();
     std::string first_error;
     const auto worker = [&] {
         std::vector<uint8_t> buf;
@@ -129,15 +142,25 @@ bool TensorFileReader::load(const std::vector<TensorFileSpan> & spans, std::stri
                 src = aligned;
             }
             const int read_errno = errno;
-            std::lock_guard<std::mutex> lk(write_mu);
             if (!ok) {
+                std::lock_guard<std::mutex> lk(error_mu);
                 if (!failed.exchange(true)) {
                     first_error = std::string("failed to read weights of tensor ") +
                                   ggml_get_name(p.span->tensor) + ": " + std::strerror(read_errno);
                 }
                 return;
             }
+            {
+                std::unique_lock<std::mutex> lk(write_mu);
+                write_cv.wait(lk, [&] { return writers < max_writers; });
+                ++writers;
+            }
             ggml_backend_tensor_set(p.span->tensor, src, p.span->tensor_offset + p.at, p.size);
+            {
+                std::lock_guard<std::mutex> lk(write_mu);
+                --writers;
+            }
+            write_cv.notify_one();
         }
     };
     const size_t n_threads = std::min(kMaxThreads, n_split);
@@ -176,12 +199,41 @@ bool load_tensor_spans(const std::string & path, const void * mapping, size_t ma
         cached += mapped_resident_bytes(mapping, lo, (size_t) (hi - lo));
     }
     TensorFileReader reader;
-    if (cached < wanted - wanted / 10 && reader.open(path)) return reader.load(spans, err);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto report = [&](const char * how) {
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[load] %.2f GiB in %.2f s (%.2f GB/s) %s, %.0f%% cached\n", wanted / 1073741824.0, s,
+                     s > 0 ? wanted / s / 1e9 : 0.0, how, wanted ? 100.0 * cached / wanted : 0.0);
+    };
+    if (cached < wanted - wanted / 10 && reader.open(path)) {
+        const bool ok = reader.load(spans, err);
+        report("with threaded reads");
+        return ok;
+    }
+    // Cached: copy from the mapping on several threads (parallel_upload.h),
+    // so the staged host copies overlap instead of queueing on one thread.
+    // Meta (tensor-parallel) tensors are written whole, one after another,
+    // as the reader path does.
+    std::vector<UploadPiece> pieces;
+    std::vector<const TensorFileSpan *> whole;
     for (const TensorFileSpan & s : spans) {
         if (!s.tensor || s.size == 0) continue;
-        ggml_backend_tensor_set(s.tensor, static_cast<const uint8_t *>(mapping) + s.file_offset,
-                                s.tensor_offset, s.size);
+        if (whole_writes_only(s.tensor)) {
+            whole.push_back(&s);
+            continue;
+        }
+        const uint8_t * src = static_cast<const uint8_t *>(mapping) + s.file_offset;
+        for (size_t at = 0; at < s.size; at += kPieceBytes) {
+            pieces.push_back(UploadPiece{s.tensor, src + at, s.tensor_offset + at,
+                                         std::min(s.size - at, kPieceBytes)});
+        }
     }
+    upload_pieces(pieces);
+    for (const TensorFileSpan * s : whole) {
+        ggml_backend_tensor_set(s->tensor, static_cast<const uint8_t *>(mapping) + s->file_offset,
+                                s->tensor_offset, s->size);
+    }
+    report("from the page cache");
     return true;
 }
 

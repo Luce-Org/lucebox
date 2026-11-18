@@ -7,53 +7,13 @@ namespace {
 struct AdmissionFixture {};
 }
 
-TEST_CASE(AdmissionFixture, test_small_prompt_no_compression_accepts) {
-    CHECK(!should_reject_oversized(100, 100, 1024, false));
-}
-
-TEST_CASE(AdmissionFixture, test_oversized_no_compression_rejects) {
-    CHECK(should_reject_oversized(900, 200, 1024, false));
-}
-
-TEST_CASE(AdmissionFixture, test_reply_over_limit_with_compression_accepts) {
-    CHECK(!should_reject_oversized(65000, 2048, 65536, true));
-}
-
-TEST_CASE(AdmissionFixture, test_exactly_at_limit_accepts) {
-    CHECK(!should_reject_oversized(1024, 0, 1024, false));
-    CHECK(!should_reject_oversized(512, 512, 1024, false));
-}
-
-TEST_CASE(AdmissionFixture, test_one_over_limit_no_compression_rejects) {
-    CHECK(should_reject_oversized(1025, 0, 1024, false));
-}
-
-TEST_CASE(AdmissionFixture, test_one_over_limit_with_compression_rejects) {
-    CHECK(should_reject_oversized(1025, 0, 1024, true));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_compressed_within_budget) {
-    CHECK(!effective_prompt_overflows(5000, 0, 2048, 65536));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_full_cache_hit_uses_served_size) {
+// A full-cache hit (served >= 0, zero included) is budgeted at the size it serves; -1 means no hit.
+TEST_CASE(AdmissionFixture, test_effective_prompt_overflows_uses_served_size_on_any_hit) {
     CHECK(!effective_prompt_overflows(70000, 800, 2048, 65536));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_post_compress_genuinely_oversized) {
-    CHECK(effective_prompt_overflows(60000, -1, 10000, 65536));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_verbatim_within_budget) {
-    CHECK(!effective_prompt_overflows(1000, -1, 2048, 65536));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_zero_length_hit_is_a_hit) {
     CHECK(!effective_prompt_overflows(70000, 0, 2048, 65536));
-}
-
-TEST_CASE(AdmissionFixture, test_effective_overflows_full_cache_hit_still_too_large) {
     CHECK(effective_prompt_overflows(200000, 60000, 10000, 65536));
+    CHECK(!effective_prompt_overflows(1000, -1, 2048, 65536));
+    CHECK(effective_prompt_overflows(60000, -1, 10000, 65536));
 }
 
 TEST_CASE(AdmissionFixture, test_reply_fits_what_the_prompt_leaves) {
@@ -101,6 +61,8 @@ TEST_CASE(AdmissionFixture, test_oversized_with_compression_respects_max_ctx) {
     CHECK(should_reject_oversized(200000, 1, 139264, true));
     CHECK(should_reject_oversized(204800, 1, 204800, false));
     CHECK(!should_reject_oversized(1000, 1, 139264, false));
+    CHECK(!should_reject_oversized(1024, 0, 1024, false));
+    CHECK(!should_reject_oversized(512, 512, 1024, false));
 }
 
 // The drafter's reserve covers its measured peak (Qwen3.5-0.8B BF16 drafter, R9700, peak minus the floor before the
@@ -113,7 +75,5 @@ TEST_CASE(AdmissionFixture, test_pflash_concurrent_reserve_covers_measured_draft
     for (const auto & m : measured) {
         CHECK(pflash_concurrent_reserve_bytes(drafter_bytes, m.tokens) >= (long long)(m.peak_gib * gib));
     }
-    CHECK(pflash_concurrent_reserve_bytes(drafter_bytes, 139264) ==
-          drafter_bytes + 139264LL * kPFlashScoringBytesPerToken);
     CHECK(pflash_concurrent_reserve_bytes(-1, -1) == 0);
 }

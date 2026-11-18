@@ -11,6 +11,7 @@
 
 static thread_local size_t g_mmvq_launch_count = 0;
 static thread_local size_t g_mmvq_mmid_grouped_launch_count = 0;
+static thread_local size_t g_mmvq_mmid_grouped_launch_count_on[GGML_CUDA_MAX_DEVICES] = {};
 
 extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
     return g_mmvq_launch_count;
@@ -18,6 +19,10 @@ extern "C" size_t ggml_backend_cuda_get_mmvq_launch_count(void) {
 
 extern "C" size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void) {
     return g_mmvq_mmid_grouped_launch_count;
+}
+
+extern "C" size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count_on(int device) {
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES ? g_mmvq_mmid_grouped_launch_count_on[device] : 0;
 }
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1070,6 +1075,15 @@ static int mmvq_invariant_rows(int64_t nrows_x, mmvq_parameter_table_id table_id
 #define MMVQ_INVARIANT_LDS_DEFAULT 16
 #define MMVQ_INVARIANT_LDS_MAX_BYTES 65536
 #define MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS 32768
+// Blocks per column staged at a time: MMVQ_INVARIANT_LDS_CHUNK, halved where that many blocks of every column would
+// not fit the block's LDS (above fourteen columns). Either way a multiple of every type's blocks_per_iter, so each
+// lane's K walk is the one-column kernel's.
+static constexpr __host__ __device__ int mmvq_invariant_lds_chunk(int ncols_dst) {
+    return ncols_dst*MMVQ_INVARIANT_LDS_CHUNK*(int) sizeof(block_q8_1) <= MMVQ_INVARIANT_LDS_MAX_BYTES
+        ? MMVQ_INVARIANT_LDS_CHUNK : MMVQ_INVARIANT_LDS_CHUNK/2;
+}
+static_assert(MMVQ_INVARIANT_MAX_BATCH_SIZE*mmvq_invariant_lds_chunk(MMVQ_INVARIANT_MAX_BATCH_SIZE)*
+              (int) sizeof(block_q8_1) <= MMVQ_INVARIANT_LDS_MAX_BYTES, "the widest staged chunk fits the LDS");
 // Whole-K staging: the T columns' blocks fit the block's LDS, so a block stages them once and its waves
 // take weight-row groups from a block-local counter. Up to MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS rows the
 // launch is LUCE_MMVQ_INVARIANT_LDS_BLOCKS persistent blocks (default two per multiprocessor, 40 on gfx1151; the 2560-12288-row trunk
@@ -1323,7 +1337,7 @@ static __global__ void mul_mat_vec_q(
     // host compilation pass and other tables see a plain kernel).
     static_assert(c_invariant_lds_waves == 0 ||
                   (type == GGML_TYPE_Q8_0 && c_width_invariant && c_row_warps == 1 &&
-                   MMVQ_INVARIANT_LDS_CHUNK % (vdr*warp_size/qi) == 0),
+                   mmvq_invariant_lds_chunk(ncols_dst) % (vdr*warp_size/qi) == 0),
                   "LDS-staged invariant launch needs Q8_0 width-invariant rows and whole iterations per chunk");
     constexpr int lds_waves = (c_invariant_lds_waves > 0 && nwarps == 1 && rows_per_cuda_block == c_invariant_rpb)
         ? c_invariant_lds_waves : 0;
@@ -1689,8 +1703,9 @@ static __global__ void mul_mat_vec_q(
             return;
         }
         const int kbx_offset = kbx_base + row0*stride_row_x;
-        for (int c0 = 0; c0 < blocks_per_row_x; c0 += MMVQ_INVARIANT_LDS_CHUNK) {
-            const int nbc = min(MMVQ_INVARIANT_LDS_CHUNK, blocks_per_row_x - c0);
+        constexpr int lds_chunk = mmvq_invariant_lds_chunk(ncols_dst);
+        for (int c0 = 0; c0 < blocks_per_row_x; c0 += lds_chunk) {
+            const int nbc = min(lds_chunk, blocks_per_row_x - c0);
             const int nints = nbc*ints_per_block;
             if (c0 > 0) {
                 __syncthreads();  // every wave is done with the previous chunk
@@ -3784,6 +3799,44 @@ static bool mmvq_moe_matches_single_column(const int cc, const int ncols_x, cons
     }
 }
 
+// A MUL_MAT_ID that ggml_backend_cuda_mul_mat_id_grouped marked takes the grouped kernel, which computes every
+// (token, route) pair as the MoE kernel does, only under batch-invariant products and only where the MoE kernel
+// reproduces the single-token launch (mmvq_moe_matches_single_column), so each token keeps the arithmetic it gets
+// alone. Tokens routed to the same expert then share its weight reads through the cache. Declined, the product
+// runs as it would unmarked, with the same bytes:
+//   - ROCmFP2 only, the routed-expert format test_ds41_mmid_width_invariance pins in grouped mode on RDNA3/RDNA4;
+//   - up to the batch-invariant MoE width (get_mmvq_mmid_max_batch: 8 rows on RDNA3/RDNA4); 9 to 16 rows fall
+//     back to per-row reads;
+//   - expert rows in whole four-row tiles (the grouped kernel reads four rows per tile with no row bound);
+//   - not where the single-column launch is another kernel, such as RDNA4's eight-wave tables, including the
+//     short-row case that runs on the MoE kernel (mmvq_rdna4_moe_short_rows) and would match;
+//   - not with LUCE_MMID_GROUPED=0. LUCE_MMID_GROUPED_TYPES and LUCE_MMID_GROUPED_DEVICE do not apply here.
+static bool mmid_grouped_requested(const ggml_tensor * dst, int cc) {
+    if (dst->op != GGML_OP_MUL_MAT_ID || ggml_get_op_params_i32(dst, 1) != GGML_CUDA_MMID_GROUPED) {
+        return false;
+    }
+    static const bool switched_off = []() {
+        const char * e = std::getenv("LUCE_MMID_GROUPED");
+        return e != nullptr && std::strcmp(e, "0") == 0;
+    }();
+    static const bool use_moe_kernel = mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
+    const ggml_tensor * src0 = dst->src[0];
+    const int64_t ncols_dst = dst->ne[2];
+    if (switched_off || !use_moe_kernel || !ggml_cuda_mmvq_batch_invariant() ||
+        src0->type != GGML_TYPE_Q2_0_ROCMFP2 || src0->ne[1] % 4 != 0 ||
+        ncols_dst < 2 || dst->ne[1]*ncols_dst > MMID_GROUPED_MAX_PAIRS || !mmid_grouped_arch_ok(cc)) {
+        return false;
+    }
+    return mmvq_moe_matches_single_column<GGML_TYPE_Q2_0_ROCMFP2>(
+        cc, (int) src0->ne[0], (int) ncols_dst, get_device_table_id(cc));
+}
+
+bool ggml_cuda_mmvq_mmid_grouped_for(const ggml_tensor * mul_mat_id, int cc) {
+    return ggml_cuda_mmvq_mmid_grouped_enabled(mul_mat_id->src[0]->type, cc, mul_mat_id->ne[2],
+                                               mul_mat_id->ne[1]*mul_mat_id->ne[2]) ||
+           mmid_grouped_requested(mul_mat_id, cc);
+}
+
 // RDNA4 MUL_MAT_ID with short expert rows runs on the one-wave MoE kernel at every width, decode included.
 // RDNA4's single-column launch gives each output row eight waves; when a row holds fewer quant blocks than
 // eight waves read in one K step, most of those waves have nothing to read (qwen4exp's experts on gfx1201:
@@ -3841,11 +3894,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
     // The gfx1151 ROCmFP4 dense weight-reuse kernel accepts up to sixteen
-    // columns; every other path keeps the generic MMVQ batch limit.
+    // columns, batch-invariant products up to ggml_cuda_mmvq_invariant_max_ncols;
+    // every other path keeps the generic MMVQ batch limit.
     const bool wide_rocmfp4_reuse =
         type == GGML_TYPE_Q4_0_ROCMFP4_FAST && ids == nullptr && is_gfx1151(cc);
     GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MAX_MOE_BATCH_SIZE
                               : wide_rocmfp4_reuse ? ROCMFP4_REUSE_MAX_COLS
+                              : ggml_cuda_mmvq_batch_invariant() ? ggml_cuda_mmvq_invariant_max_ncols()
                                                    : MMVQ_MAX_BATCH_SIZE));
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
@@ -4005,14 +4060,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
                                  calc_nwarps(type, 1, table_id) == 8) ||
                                 (rdna4_rows && GGML_CUDA_CC_IS_RDNA3_5(cc));
         if (!has_ids && (!has_fusion || rdna4_glu) && (ncols_dst == 1 || width_invariant) &&
-            ncols_dst <= MMVQ_Q8_RDNA4_MAX_COLS && rdna4_arch && warp_size == 32 && mmvq_q8_0_rdna4_enabled()) {
-            mul_mat_vec_q8_0_rdna4_launch(
-                vx, vy, dst, ncols_dst, ncols_x, nrows_x, stride_row_x, stride_col_y,
-                stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x,
-                stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst, kb_off,
-                rdna4_glu ? fusion.gate : nullptr, fusion.glu_param0, (int) fusion.glu_op,
-                mmvq_q8_twin{fusion.twin_x, fusion.twin_dst, 0, fusion.twin_nrows, fusion.twin_stride_col_dst}, stream);
+            rdna4_arch && warp_size == 32 && mmvq_q8_0_rdna4_enabled()) {
+            // Wider batch-invariant products: consecutive launches of at most MMVQ_Q8_RDNA4_MAX_COLS columns, each
+            // column with this kernel's bits.
+            for (int j0 = 0; j0 < ncols_dst; j0 += MMVQ_Q8_RDNA4_MAX_COLS) {
+                float * twin_dst = fusion.twin_dst ? fusion.twin_dst + (int64_t) j0*fusion.twin_stride_col_dst : nullptr;
+                mul_mat_vec_q8_0_rdna4_launch(
+                    vx, (const block_q8_1 *) vy + (int64_t) j0*stride_col_y, dst + (int64_t) j0*stride_col_dst,
+                    std::min(MMVQ_Q8_RDNA4_MAX_COLS, ncols_dst - j0), ncols_x, nrows_x, stride_row_x, stride_col_y,
+                    stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x,
+                    stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, kb_off,
+                    rdna4_glu ? fusion.gate : nullptr, fusion.glu_param0, (int) fusion.glu_op,
+                    mmvq_q8_twin{fusion.twin_x, twin_dst, 0, fusion.twin_nrows, fusion.twin_stride_col_dst}, stream);
+            }
             return;
         }
     }
@@ -4031,7 +4092,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
             const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
             const bool lds_whole = lds_waves > 0 && !has_fusion && mmvq_invariant_lds_whole(ncols_dst, ncols_x/QK8_0);
             const int lds_bytes = lds_waves > 0
-                ? ncols_dst*(lds_whole ? ncols_x/QK8_0 : std::min<int>(MMVQ_INVARIANT_LDS_CHUNK, ncols_x/QK8_0))*(int) sizeof(block_q8_1) : 0;
+                ? ncols_dst*(lds_whole ? ncols_x/QK8_0 : std::min<int>(mmvq_invariant_lds_chunk(ncols_dst), ncols_x/QK8_0))*
+                  (int) sizeof(block_q8_1) : 0;
             // Whole-K staging runs persistent blocks up to MMVQ_INVARIANT_LDS_PERSIST_MAX_ROWS rows: at most
             // LUCE_MMVQ_INVARIANT_LDS_BLOCKS (two per CU), never more than the row groups give each wave one; the
             // kernel learns the row count through ids_stride.
@@ -4062,6 +4124,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 16); \
             GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 2, 32); \
             GGML_MMVQ_INVARIANT_LAUNCH_RPB(NC, 4, 16)
+            static_assert(MMVQ_INVARIANT_MAX_BATCH_SIZE == 16, "a launch case per width up to the ceiling");
             switch (ncols_dst*128 + rpb*16 + lds_waves/4) {
                 GGML_MMVQ_INVARIANT_LAUNCH(2);
                 GGML_MMVQ_INVARIANT_LAUNCH(3);
@@ -4070,6 +4133,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 GGML_MMVQ_INVARIANT_LAUNCH(6);
                 GGML_MMVQ_INVARIANT_LAUNCH(7);
                 GGML_MMVQ_INVARIANT_LAUNCH(8);
+                GGML_MMVQ_INVARIANT_LAUNCH(9);
+                GGML_MMVQ_INVARIANT_LAUNCH(10);
+                GGML_MMVQ_INVARIANT_LAUNCH(11);
+                GGML_MMVQ_INVARIANT_LAUNCH(12);
+                GGML_MMVQ_INVARIANT_LAUNCH(13);
+                GGML_MMVQ_INVARIANT_LAUNCH(14);
+                GGML_MMVQ_INVARIANT_LAUNCH(15);
+                GGML_MMVQ_INVARIANT_LAUNCH(16);
                 default: GGML_ABORT("unreachable batch-invariant width");
             }
 #undef GGML_MMVQ_INVARIANT_LAUNCH
@@ -4778,7 +4849,7 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.gate == nullptr && fusion_local.x_bias == nullptr && fusion_local.gate_bias == nullptr &&
         mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_device_ok();
     if (ids && (q5_grouped || ggml_cuda_mmvq_mmid_grouped_enabled(
-            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst))) {
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst) || mmid_grouped_requested(dst, cc))) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
@@ -4855,6 +4926,7 @@ void ggml_cuda_mul_mat_vec_q(
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
                 np, stream)) {
             ++g_mmvq_mmid_grouped_launch_count;
+            ++g_mmvq_mmid_grouped_launch_count_on[ggml_cuda_get_device()];
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=grouped\n",

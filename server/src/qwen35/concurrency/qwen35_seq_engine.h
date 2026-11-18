@@ -80,6 +80,8 @@ public:
     size_t estimate_prefix_store_bytes(int tokens) const override;
 
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
+    size_t estimate_prefix_state_bytes(int tokens) const override;
+    bool drop_prefix_kv(PrefixStoreRef checkpoint) override;
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,

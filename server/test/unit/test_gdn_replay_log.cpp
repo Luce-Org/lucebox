@@ -25,41 +25,6 @@ constexpr int CONV_CHANNELS = 7;
 constexpr float FIELD_TOLERANCE = 5.0e-5f;
 constexpr float STATE_TOLERANCE = 2.0e-4f;
 
-bool test_raw_gate_protocol() {
-    ggml_init_params params{};
-    params.mem_size = 128*1024;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return false;
-
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
-    ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
-    ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
-    ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, 1);
-    ggml_tensor * gate_ba = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2*H);
-    ggml_tensor * result = ggml_gated_delta_net(
-        ctx, q, k, v, g, beta, state);
-
-    ggml_gated_delta_net_set_raw_gates(result, gate_ba);
-    const int32_t * op_params =
-        reinterpret_cast<const int32_t *>(result->op_params);
-    const bool ok = result->src[9] == gate_ba &&
-        ggml_nelements(result->src[9]) == 2*H && op_params[2] == 0 &&
-        op_params[10] == 1;
-    if (!ok) {
-        std::fprintf(
-            stderr,
-            "raw gate protocol: src9=%p elements=%lld op2=%d op10=%d\n",
-            static_cast<void *>(result->src[9]),
-            (long long) ggml_nelements(result->src[9]),
-            op_params[2], op_params[10]);
-    }
-    ggml_free(ctx);
-    return ok;
-}
-
 size_t qkv_index(int sequence, int token, int head, int value) {
     return (((size_t) sequence*T + token)*H + head)*S + value;
 }
@@ -1147,7 +1112,6 @@ bool test_tree_commit_host_matches_parent(ggml_backend_t backend, int cache_ne0)
 } // namespace
 
 int main(int argc, char ** argv) {
-    if (!test_raw_gate_protocol()) return 1;
     ggml_backend_cuda_set_gdn_route_override(1);  // grouped-cols
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {

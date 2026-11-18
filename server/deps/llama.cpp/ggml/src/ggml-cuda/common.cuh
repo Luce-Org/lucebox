@@ -5,6 +5,8 @@
 
 // MUL_MAT op_params[1]: see ggml_backend_cuda_mul_mat_whole_row_lanes.
 #define GGML_CUDA_WHOLE_ROW_LANES 0x574C524B
+// MUL_MAT_ID op_params[1]: see ggml_backend_cuda_mul_mat_id_grouped.
+#define GGML_CUDA_MMID_GROUPED 0x4D4D4947
 #include "ggml-cuda.h"
 
 #include <cerrno>

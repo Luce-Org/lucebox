@@ -283,16 +283,41 @@ json with_note(const json & request, const json & reply, const std::string & not
     return next;
 }
 
-json * reply_message(json & response) {
+namespace {
+
+// The first choice of a chat.completion response, when it has a message.
+const json * first_choice(const json & response) {
     if (!response.is_object() || !response.contains("choices") ||
         !response["choices"].is_array() || response["choices"].empty()) {
         return nullptr;
     }
-    json & choice = response["choices"][0];
+    const json & choice = response["choices"][0];
     if (!choice.is_object() || !choice.contains("message") || !choice["message"].is_object()) {
         return nullptr;
     }
-    return &choice["message"];
+    return &choice;
+}
+
+}  // namespace
+
+json * reply_message(json & response) {
+    return first_choice(response) ? &response["choices"][0]["message"] : nullptr;
+}
+
+bool empty_reply(const json & response) {
+    const json * choice = first_choice(response);
+    if (!choice || choice->value("finish_reason", json()) != "stop") return false;
+    const json & message = (*choice)["message"];
+    return calls_of(message).empty() &&
+           text_of(message.value("content", json())).find_first_not_of(" \t\r\n") == std::string::npos;
+}
+
+json redraw(const json & request, int draw) {
+    json again = request;
+    if (again.contains("seed") && again["seed"].is_number_integer()) {
+        again["seed"] = again["seed"].get<uint64_t>() + (uint64_t) draw;
+    }
+    return again;
 }
 
 bool needs_replan(const json & reply) {

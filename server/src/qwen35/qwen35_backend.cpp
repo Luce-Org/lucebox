@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <typeinfo>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -226,8 +227,9 @@ static int64_t concurrent_fixed_cache_bytes(
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
+    ( !(w).eos_disabled &&                                                \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
-   || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+   || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) ) )
 
 static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
                                         const TargetWeights & w) {
@@ -646,6 +648,12 @@ bool Qwen35Backend::init() {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
+    // reinstate() rebuilds this cache with the same arguments, not ones
+    // derived from the memory free then, so snapshots keep matching it.
+    layout_max_verify_tokens_ = max_verify_tokens;
+    layout_ctx_alloc_ = ctx_alloc;
+    layout_feat_cap_ = target_feat_cap;
+    layout_fixed_chain_ = fixed_chain.enabled;
     if (cfg_.paged_attention) {
         const auto supported_type = [](ggml_type type) {
             return type == GGML_TYPE_F16 ||
@@ -744,13 +752,19 @@ bool Qwen35Backend::init() {
         std::fflush(stdout);
     }
 
+    init_feature_mirror(fixed_chain.enabled);
+
+    return true;
+}
+
+void Qwen35Backend::init_feature_mirror(bool fixed_chain_enabled) {
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is a conversion buffer; on split-GPU, a cross-device mirror.
     // Cap at the drafter's trained window (DFLASH_DRAFTER_TRAINED_CTX), not at
     // draft_ctx_max: the old floor let the drafter see only a shallow suffix, so
     // accept collapsed once committed exceeded it (8K+).
-    if (cfg_.draft_path && !use_remote_draft &&
-        !fixed_chain.enabled) {
+    if (cfg_.draft_path && !cfg_.remote_draft.enabled() &&
+        !fixed_chain_enabled) {
         const int mirror_cap = w_.is_moe
             ? luce::common::dflash_drafter_window(cfg_.device.max_ctx)
             : std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
@@ -762,7 +776,105 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
+}
 
+// ── Residency (model switching) ─────────────────────────────────────────
+// One request at a time with a local drafter on the target GPU: the target
+// and draft weights go and come back through park()/unpark(), and the KV
+// cache, draft KV and feature mirror are freed and rebuilt with the layout
+// found at init. Prefix snapshots live in system memory and stay.
+
+ModelBackend::Residency Qwen35Backend::residency() const {
+    Residency r;
+    r.gpus.push_back(cfg_.device.gpu);
+    if (typeid(*this) != typeid(Qwen35Backend)) {
+        r.reason = "qwen35: not implemented for this variant";
+    } else if (concurrent_slots() > 1 || seq_engine_) {
+        r.reason = "qwen35: needs --max-concurrency 1";
+    } else if (cfg_.paged_attention) {
+        r.reason = "qwen35: paged attention is not supported";
+    } else if (kvflash_active()) {
+        r.reason = "qwen35: --kvflash pages KV rows the release would drop";
+    } else if (cfg_.remote_draft.enabled()) {
+        r.reason = "qwen35: a remote draft is not supported";
+    } else if (cfg_.device.is_multi_device() || tensor_parallel_ || split_gpus_) {
+        r.reason = "qwen35: needs the target and the draft on one GPU";
+    } else if (!target_backend_) {
+        r.reason = "qwen35: not loaded";
+    } else {
+        r.supported = true;
+    }
+    if (released_) r.released.push_back(cfg_.device.gpu);
+    size_t bytes = 0;
+    if (!released_) {
+        auto size = [](ggml_backend_buffer_t b) -> size_t { return b ? ggml_backend_buffer_get_size(b) : 0; };
+        const MemoryReport m = memory_report();
+        if (!m.cache.host) {
+            bytes = m.cache.kv_bytes + m.cache.recurrent_bytes + m.cache.draft_feature_bytes + m.cache.other_bytes;
+        }
+        if (!target_parked_) bytes += size(w_.buf);
+        if (!draft_parked_) bytes += size(dw_.buf);
+    }
+    r.bytes.push_back(bytes);
+    return r;
+}
+
+bool Qwen35Backend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    const Residency r = residency();
+    if (!r.supported) {
+        error = r.reason;
+        return false;
+    }
+    if (released_ || (!gpus.empty() && std::find(gpus.begin(), gpus.end(), cfg_.device.gpu) == gpus.end())) {
+        return true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(target_backend_);
+    // park() copies a deferred snapshot (the live cache) to system memory and
+    // releases the weights and the graphs built over them.
+    park(ParkTarget::All);
+    dflash_target_.reset();
+    free_drafter();
+    state_ladder_clear();   // its checkpoints complete the KV about to go
+    draft_kv_free(draft_kv_);
+    draft_feature_mirror_free(feature_mirror_);
+    free_target_cache(cache_);
+    cache_ = TargetCache{};
+    release_scratch();   // also trims the device pools
+    released_ = true;
+    std::printf("[residency] released GPU %d in %.2f s\n", cfg_.device.gpu,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    return true;
+}
+
+bool Qwen35Backend::reinstate(std::string & error) {
+    if (!released_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!unpark(ParkTarget::All)) {
+        error = std::string("qwen35: reload failed: ") + luce_last_error();
+        park(ParkTarget::All);
+        return false;
+    }
+    const auto t_weights = std::chrono::steady_clock::now();
+    if (!create_target_cache(w_, cfg_.device.max_ctx, layout_max_verify_tokens_, target_backend_, cache_,
+                             /*prefill_only=*/true, layout_ctx_alloc_, /*paged=*/false, /*n_slots=*/1,
+                             layout_fixed_chain_, cfg_.cache_type_k, cfg_.cache_type_v, layout_feat_cap_)) {
+        error = std::string("qwen35: cache: ") + luce_last_error();
+        free_target_cache(cache_);
+        cache_ = TargetCache{};
+        park(ParkTarget::All);
+        return false;
+    }
+    const auto t_cache = std::chrono::steady_clock::now();
+    init_feature_mirror(layout_fixed_chain_);
+    released_ = false;
+    const auto t_end = std::chrono::steady_clock::now();
+    auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    std::printf("[residency] reinstated GPU %d in %.2f s (weights %.2f s, cache %.2f s, mirror %.2f s)\n",
+                cfg_.device.gpu, secs(t0, t_end), secs(t0, t_weights), secs(t_weights, t_cache),
+                secs(t_cache, t_end));
+    std::fflush(stdout);
     return true;
 }
 
@@ -1330,11 +1442,52 @@ bool Qwen35Backend::snapshot_used(int slot) const {
            (live_snapshot_deferred_ && slot == live_snapshot_slot_);
 }
 
-bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+bool Qwen35Backend::restore_target_cache_from_snapshot(int slot, int kv_slot) {
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
-    return restore_target_cache(prefix_snapshots_[slot], cache_);
+    return restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                snapshot_kv_source(slot, kv_slot));
+}
+
+bool Qwen35Backend::state_only_snapshots() const {
+    // Concurrent serving keeps its checkpoints through the SeqEngine
+    // (drop_prefix_kv). A KVFlash pool keeps state-only rungs of its own
+    // beside the live cache (state_ladder_), and its pooled snapshots carry
+    // the pool layout of their own position. Tensor-parallel and split-GPU
+    // snapshots hold shards on several devices; their row split is not
+    // implemented, so they stay whole.
+    return !cfg_.paged_attention && !kvflash_active() && !tensor_parallel_ &&
+           !split_gpus_ && snap_backend_ != nullptr;
+}
+
+const PrefixSnapshot * Qwen35Backend::snapshot_kv_source(int slot, int kv_slot) const {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].state_only ||
+        kv_slot < 0 || kv_slot >= PREFIX_SLOTS || kv_slot == slot) {
+        return nullptr;
+    }
+    return prefix_snapshots_[kv_slot].ctx ? &prefix_snapshots_[kv_slot] : nullptr;
+}
+
+size_t Qwen35Backend::snapshot_state_bytes_estimate(int tokens) const {
+    if (!state_only_snapshots() || tokens <= 0) return 0;
+    return estimate_target_cache_state_bytes(
+        w_, cache_, tokens, ggml_backend_get_default_buffer_type(snap_backend_));
+}
+
+bool Qwen35Backend::snapshot_drop_kv(int slot) {
+    if (!state_only_snapshots() || slot < 0 || slot >= PREFIX_SLOTS) return false;
+    // A deferred snapshot is the live state: copy it out, then it is a
+    // snapshot like any other.
+    if (slot == live_snapshot_slot_) {
+        materialize_live_snapshot();
+        live_snapshot_slot_ = -1;
+    }
+    return drop_prefix_snapshot_kv(prefix_snapshots_[slot]);
+}
+
+bool Qwen35Backend::snapshot_state_only(int slot) const {
+    return slot >= 0 && slot < PREFIX_SLOTS && prefix_snapshots_[slot].state_only;
 }
 
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
@@ -1427,7 +1580,7 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     ref.buf      = snap.buf;
     ref.cur_pos  = snap.cur_pos;
     ref.last_tok = snap.last_tok;
-    ref.pooled   = snap.is_pooled;
+    ref.pooled   = snap.is_pooled || snap.state_only;   // neither holds dense K/V: never written
     return ref;
 }
 
@@ -1876,10 +2029,35 @@ void Qwen35Backend::release_scratch() {
                  trimmed / (1024.0 * 1024.0));
 }
 
+void Qwen35Backend::trim_pools_at_ar_handoff(const char * reason) {
+    // Nothing trims the legacy pool while a reply decodes, and the tile FA
+    // kernel's f16 K/V copies grow with the context, so a long reply leaves
+    // 1-2 GiB of smaller blocks cached. The handoff's differently shaped graphs
+    // (prefix replay, then single-token decode) then need a block none of them
+    // can serve, and the driver has no VRAM left for it.
+    size_t trimmed = 0;
+    if (ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+        trimmed += ggml_backend_cuda_trim_pool(target_backend_);
+    }
+    if (draft_backend_ && draft_backend_ != target_backend_ &&
+        ggml_backend_cuda_has_legacy_pool(draft_backend_)) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+    if (trimmed > 0) {
+        std::fprintf(stderr, "[vram] %s: spec->AR handoff trimmed %.1f MiB from device pools\n",
+                     reason, trimmed / (1024.0 * 1024.0));
+    }
+}
+
 // ── Generate (speculative decode) ───────────────────────────────────────
 
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
+    struct EosScope {
+        bool & flag;
+        ~EosScope() { flag = false; }
+    } eos_scope{w_.eos_disabled};
+    w_.eos_disabled = req.ignore_eos;
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
     generating_ = true;
@@ -2076,6 +2254,11 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
+    struct EosScope {
+        bool & flag;
+        ~EosScope() { flag = false; }
+    } eos_scope{w_.eos_disabled};
+    w_.eos_disabled = req.ignore_eos;
     // The live cache already is this snapshot when it was saved (or kept,
     // deferred) after the previous generation and nothing ran since.
     const bool live_restore = slot >= 0 && slot == live_snapshot_slot_ &&
@@ -2181,7 +2364,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             const bool restored = consume
                 ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
                    kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
-                : restore_target_cache(prefix_snapshots_[slot], cache_);
+                : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                       snapshot_kv_source(slot, req.restore_kv_slot));
             if (!restored) {
                 std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
                              slot, luce_last_error());
@@ -4377,6 +4561,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                 "switching to AR\n",
                 last_tok, (int)out_tokens.size());
             step_graph_destroy(draft_sg);
+            trim_pools_at_ar_handoff("invalid-seed");
             cache_.last_tok = out_tokens.back();
             if (!finish_speculative_state()) return false;
             bool ok = do_ar_decode(committed, budget, out_tokens, io,
@@ -5418,6 +5603,9 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
         int injected = 0;
+        if (floor_to_ar || budget_close_fired) {
+            trim_pools_at_ar_handoff(floor_to_ar ? "floor" : "budget-close");
+        }
         if (floor_to_ar) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);

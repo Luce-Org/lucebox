@@ -1,6 +1,11 @@
-// Selector-v2 exact chunk mass on the target backend. Same quantity and the
-// same outputs as kvflash_exact_mass_scores_fast_multi (kvflash_exact_fast.h): per (query, chunk) the mean over the
-// (layer, q-head) planes, plus KvFlashMassPlanes{top,max}; the CPU needs ~1.7 s for 64 queries at 514 sealed chunks.
+// Selector-v2 exact chunk mass on the target backend. The same quantity as kvflash_exact_mass_scores_fast_multi
+// (kvflash_exact_fast.h): per (query, chunk) the mean over the (layer, q-head) planes, plus KvFlashMassPlanes{top,max}.
+// NOT the same numbers: with Q4_0/Q8_0 keys ggml_mul_mat quantises the queries to 8 bits (the CPU backend and, by reading, the
+// CUDA/HIP MMQ path), while the AVX2 scorer keeps them in F32. Measured against it on the ggml CPU backend (CUDA/HIP size not measured), the largest
+// relative deviation of the select score is ~2e-3 at 60 sealed chunks, 1.7e-2 at 200 and 4e-2 at 400, and the k-highest
+// chunk sets can differ for some k. F16 keys deviate by <1e-3 and F32 keys by <1e-5. The two scorers are therefore not
+// interchangeable inside one session: a caller that falls back from one to the other changes which chunk sits at a
+// residency boundary. The CPU scorer needs ~1.7 s for 64 queries at 514 sealed chunks.
 //
 // Side graphs per call, stock ggml ops only (ggml / ggml-backend / ggml-alloc; no ggml-cuda.h), so it runs on
 // CUDA, HIP, Vulkan and, for the unit test, the ggml CPU backend:
@@ -259,6 +264,7 @@ public:
         // Aggregate over the planes, per query in parallel.
         constexpr int K = kExactTopPlanes;
         const int Kp = std::min(K, PL);
+        std::atomic<bool> non_finite{false};
         parallel_for(N, [&](int n) {
             std::vector<float> tmp((size_t)PL);
             for (int gb = 0; gb < NBT; gb++) {
@@ -267,6 +273,7 @@ public:
                 const float * x = out + ((size_t)n * NBT + gb) * PL;
                 double s = 0;
                 for (int i = 0; i < PL; i++) s += x[i];
+                if (!std::isfinite(s)) { non_finite = true; return; }   // NaN would also break the nth_element below
                 outs[(size_t)n][(size_t)c] = (float)(s / PL);
                 if (!planes) continue;
                 std::copy(x, x + PL, tmp.begin());
@@ -277,6 +284,7 @@ public:
                 (*planes)[(size_t)n].max[(size_t)c] = *std::max_element(tmp.begin(), tmp.begin() + Kp);
             }
         });
+        if (non_finite) return fail("non-finite mass");
         const auto t6 = clk::now();
         tm.gather = ms(t0, t1);
         tm.agg = ms(t5, t6); tm.total = ms(t0, t6);

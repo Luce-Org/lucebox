@@ -29,6 +29,10 @@ struct GenerateRequest {
     // Existing physical snapshot coordinates during the cache migration.
     int snap_pos = -1;
     int snap_slot = -1;
+    // A restore from a state-only snapshot (ModelBackend::snapshot_drop_kv):
+    // the slot of the deeper snapshot whose attention rows it takes. -1
+    // otherwise.
+    int restore_kv_slot = -1;
     // Ascending prompt positions a later request may restore a snapshot at
     // (the prefix cache's chat boundaries and cuts). A backend whose chunked
     // prefill depends on where chunks start begins one at each, so a restored
@@ -49,6 +53,9 @@ struct GenerateRequest {
     // request under a grammar on a backend that does not speculate under one
     // (ModelBackend::speculates_under_constraint).
     bool force_ar_decode = false;
+    // The request's `ignore_eos`: an end token does not stop the generation,
+    // it runs to the output cap (load tests that replay recorded reply lengths).
+    bool ignore_eos = false;
 };
 
 // Backend-independent failure categories. generate_error_code() is their

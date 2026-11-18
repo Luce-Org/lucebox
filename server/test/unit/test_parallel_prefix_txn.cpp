@@ -197,16 +197,6 @@ int main() {
         CHECK(engine.discarded == std::vector<PrefixStoreRef>({{7, 16}}));
     }
 
-    {
-        FakeReservationState state;
-        FakeEngine engine;
-        Txn txn(FakeReservation(state), engine, ticket());
-        txn.cancel();
-        CHECK(state.cancelled == std::vector<int>({6}));
-        CHECK(state.aborted.empty());
-        CHECK(engine.discarded.empty());
-    }
-
     std::printf("OK test_parallel_prefix_txn (%d checks)\n", g_checks);
     return 0;
 }

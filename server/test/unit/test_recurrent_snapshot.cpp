@@ -18,6 +18,8 @@ using luce::common::StepGraph;
 using luce::common::estimate_paged_target_cache_snapshot_bytes;
 using luce::common::free_prefix_snapshot;
 using luce::common::replace_paged_target_cache;
+using luce::common::drop_prefix_snapshot_kv;
+using luce::common::estimate_paged_target_cache_state_bytes;
 using luce::common::restore_paged_target_cache;
 using luce::common::restore_ssm_state;
 using luce::common::snapshot_paged_target_cache;
@@ -393,6 +395,133 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
                      restored_convs.begin()));
 
     free_prefix_snapshot(snap);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+// A checkpoint that a deeper one extends keeps its recurrent state only and
+// restores with the deeper one's attention rows.
+TEST_CASE(RecurrentSnapshotFixture, state_only_paged_checkpoint_restores_with_deeper_rows) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) SKIP("CPU backend is unavailable");
+    ggml_init_params params{};
+    params.mem_size = 12 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        SKIP("could not initialize ggml context");
+    }
+    ggml_tensor * key = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 64, 2);
+    ggml_tensor * value = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 64, 2);
+    ggml_tensor * ssm = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 2, 2);
+    ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 2, 2);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    CHECK(buffer != nullptr);
+    if (!buffer) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        SKIP("could not allocate CPU backend tensors");
+    }
+    std::vector<float> keys((size_t)ggml_nelements(key));
+    std::vector<float> values((size_t)ggml_nelements(value));
+    std::vector<float> early_states((size_t)ggml_nelements(ssm));
+    std::vector<float> early_convs((size_t)ggml_nelements(conv));
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys[i] = (float)i + 1.0f;
+        values[i] = (float)i + 1001.0f;
+    }
+    for (size_t i = 0; i < early_states.size(); ++i) early_states[i] = (float)i + 2001.0f;
+    for (size_t i = 0; i < early_convs.size(); ++i) early_convs[i] = (float)i + 3001.0f;
+    set_tensor(key, keys);
+    set_tensor(value, values);
+    set_tensor(ssm, early_states);
+    set_tensor(conv, early_convs);
+
+    TargetCache cache;
+    cache.backend = backend;
+    cache.max_ctx = 64;
+    cache.n_seq_slots = 2;
+    cache.kv_k_type = GGML_TYPE_F32;
+    cache.attn_k = {key};
+    cache.attn_v = {value};
+    cache.ssm_state = {ssm};
+    cache.conv_state = {conv};
+
+    // The turn at 12 tokens, then the same sequence at 20 with the recurrent
+    // state it has there: its rows [0, 12) are the turn's.
+    const std::vector<uint32_t> source_blocks = {2, 0};
+    PrefixSnapshot turn, deeper;
+    CHECK(snapshot_paged_target_cache(cache, /*seq_slot=*/1, source_blocks,
+                                      /*block_size=*/16, /*token_count=*/12, turn));
+    set_tensor(ssm, std::vector<float>(early_states.size(), 7.0f));
+    set_tensor(conv, std::vector<float>(early_convs.size(), 8.0f));
+    CHECK(snapshot_paged_target_cache(cache, /*seq_slot=*/1, source_blocks,
+                                      /*block_size=*/16, /*token_count=*/20, deeper));
+
+    const size_t whole_bytes = ggml_backend_buffer_get_size(turn.buf);
+    CHECK(drop_prefix_snapshot_kv(turn));
+    CHECK(turn.state_only && turn.cur_pos == 12 &&
+          turn.layout == PrefixSnapshot::Layout::paged);
+    CHECK(ggml_backend_buffer_get_size(turn.buf) ==
+          estimate_paged_target_cache_state_bytes(cache));
+    CHECK(ggml_backend_buffer_get_size(turn.buf) < whole_bytes);
+    CHECK(ggml_backend_buffer_get_type(turn.buf) == ggml_backend_cpu_buffer_type());
+    // It holds no rows to drop twice.
+    CHECK(!drop_prefix_snapshot_kv(turn));
+
+    const auto clear = [&]() {
+        set_tensor(key, std::vector<float>(keys.size(), 0.0f));
+        set_tensor(value, std::vector<float>(values.size(), 0.0f));
+        set_tensor(ssm, std::vector<float>(early_states.size(), 0.0f));
+        set_tensor(conv, std::vector<float>(early_convs.size(), 0.0f));
+    };
+    clear();
+    const std::vector<uint32_t> destination_blocks = {1, 3};
+    // Alone, with itself, or with another state-only checkpoint it has no rows.
+    CHECK(!restore_paged_target_cache(turn, cache, /*seq_slot=*/0,
+                                      destination_blocks, /*block_size=*/16));
+    CHECK(!restore_paged_target_cache(turn, cache, /*seq_slot=*/0,
+                                      destination_blocks, /*block_size=*/16, &turn));
+    CHECK(restore_paged_target_cache(turn, cache, /*seq_slot=*/0,
+                                     destination_blocks, /*block_size=*/16, &deeper));
+
+    const auto restored_keys = get_tensor(key);
+    const auto restored_values = get_tensor(value);
+    for (int head = 0; head < 2; ++head) {
+        for (int row = 0; row < 64; ++row) {
+            // Destination block 1 holds logical rows [0, 16): the first 12
+            // are restored, nothing else is written.
+            const bool restored = row >= 16 && row < 16 + 12;
+            for (int element = 0; element < 2; ++element) {
+                const size_t dst = (size_t)head * 128 + (size_t)row * 2 + element;
+                const size_t src = (size_t)head * 128 + (size_t)(32 + row - 16) * 2 + element;
+                CHECK(restored_keys[dst] == (restored ? keys[src] : 0.0f));
+                CHECK(restored_values[dst] == (restored ? values[src] : 0.0f));
+            }
+        }
+    }
+    // The recurrent state is the turn's own, not the deeper checkpoint's.
+    const auto restored_states = get_tensor(ssm);
+    const auto restored_convs = get_tensor(conv);
+    CHECK(std::equal(early_states.begin() + early_states.size() / 2, early_states.end(),
+                     restored_states.begin()));
+    CHECK(std::equal(early_convs.begin() + early_convs.size() / 2, early_convs.end(),
+                     restored_convs.begin()));
+
+    // A checkpoint that is not deeper cannot give the rows.
+    PrefixSnapshot shallower;
+    CHECK(snapshot_paged_target_cache(cache, /*seq_slot=*/0, destination_blocks,
+                                      /*block_size=*/16, /*token_count=*/8, shallower));
+    CHECK(!restore_paged_target_cache(turn, cache, /*seq_slot=*/1,
+                                      source_blocks, /*block_size=*/16, &shallower));
+
+    free_prefix_snapshot(shallower);
+    free_prefix_snapshot(turn);
+    free_prefix_snapshot(deeper);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);

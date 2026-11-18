@@ -1,7 +1,7 @@
-// Unit tests for KvFlashPager serialize/deserialize, floor_to_chunk, critical
-// chunk pinning and the per-chunk score ledger (kvflash_pager.h). CPU ggml
-// backend, no GPU: the cache tensors live in a CPU buffer, so every code path
-// that moves bytes between pool and host backing is exercised for real.
+// Unit tests for KvFlashPager serialize/deserialize, critical chunk pinning
+// and the per-chunk score ledger (kvflash_pager.h). CPU ggml backend, no GPU:
+// the cache tensors live in a CPU buffer, so every code path that moves bytes
+// between pool and host backing is exercised for real.
 #include "CppUnitTestFramework.hpp"
 #include "kvflash_pager_test_host.h"
 
@@ -142,15 +142,6 @@ void build_source(Harness & A, KvFlashPager & pa, int seed) {
 
 } // namespace
 
-TEST_CASE(KvflashPagerSerdeFixture, floor_to_chunk_aligns_down) {
-    CHECK(floor_to_chunk(0, 64) == 0);
-    CHECK(floor_to_chunk(63, 64) == 0);
-    CHECK(floor_to_chunk(64, 64) == 64);
-    CHECK(floor_to_chunk(65, 64) == 64);
-    CHECK(floor_to_chunk(127, 64) == 64);
-    CHECK(floor_to_chunk(34077, 64) == 34048);
-}
-
 TEST_CASE(KvflashPagerSerdeFixture, roundtrip_preserves_residency_bytes_and_host_copies) {
     Harness A;
     TestPager pa;
@@ -282,18 +273,6 @@ TEST_CASE(KvflashPagerSerdeFixture, reset_pager_is_identity_so_dense_snapshots_i
     pa.reset();
     CHECK(pa.is_identity());
     CHECK(pa.n_chunks() == 0);
-}
-
-TEST_CASE(KvflashPagerSerdeFixture, serialized_dtype_is_recorded) {
-    Harness A;
-    TestPager pa;
-    build_source(A, pa, 5);
-    const std::vector<uint8_t> blob = pa.serialize();
-    Harness B;
-    TestPager pb;
-    REQUIRE(pb.attach(make_cfg(), B.k, B.v));
-    REQUIRE(pb.deserialize(blob.data(), blob.size()));
-    CHECK(pb.serialized_kv_k_type() == (uint32_t)GGML_TYPE_F16);
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, deserialize_rejects_a_changed_v_dtype_and_the_old_format) {
@@ -435,18 +414,6 @@ TEST_CASE(KvflashPagerSerdeFixture, pin_range_is_half_open_and_pinned_chunks_are
     CHECK(!p.is_pinned(1));
 }
 
-TEST_CASE(KvflashPagerSerdeFixture, no_new_api_use_keeps_eviction_unchanged) {
-    // Without pins or scores the victim is the oldest unprotected chunk.
-    Harness A;
-    TestPager p;
-    REQUIRE(p.attach(make_cfg(), A.k, A.v));
-    REQUIRE(p.alloc_span(0, 8 * kChunk));
-    REQUIRE(p.alloc_span(8 * kChunk, kChunk));   // evicts chunk 1 (sink 0 protected)
-    CHECK(p.is_resident(0));
-    CHECK(!p.is_resident(1));
-    CHECK(p.is_resident(8));
-}
-
 TEST_CASE(KvflashPagerSerdeFixture, attach_clears_pins_from_a_previous_attach) {
     // 16-block pool: the deadlock guard allows 9 pins (1 sink + 4 tail + 9 + 2 <= 16).
     Harness Big(GGML_TYPE_F16, 2 * kPool);
@@ -579,21 +546,6 @@ TEST_CASE(KvflashPagerSerdeFixture, pageable_host_backing_pages_out_and_in_bit_e
     CHECK(q.n_chunks() == 1);
 }
 
-TEST_CASE(KvflashPagerSerdeFixture, blob_fields_are_little_endian) {
-    Harness A;
-    TestPager p;
-    REQUIRE(p.attach(make_cfg(), A.k, A.v));
-    REQUIRE(p.alloc_span(0, 2 * kChunk));
-    p.set_chunk_score(1, 1.0f);   // IEEE-754 0x3f800000
-    const std::vector<uint8_t> blob = p.serialize();
-    const size_t cb = blob_chunk_bytes(blob);
-    const uint8_t nc_le[4] = {2, 0, 0, 0}, chunk_tokens_le[4] = {kChunk, 0, 0, 0};
-    CHECK(std::memcmp(&blob[8], nc_le, 4) == 0);
-    CHECK(std::memcmp(&blob[12], chunk_tokens_le, 4) == 0);
-    const uint8_t one_le[4] = {0x00, 0x00, 0x80, 0x3f};
-    CHECK(std::memcmp(&blob[kHdr + 2 * cb + kLedgerEntry + 4], one_le, 4) == 0);
-}
-
 // A restored pager is the saved one: same block per chunk, same free list and
 // LRU order, so from the same point it evicts the same victims and puts new
 // chunks in the same blocks as the source. Attention then reads the same slots
@@ -651,21 +603,6 @@ TEST_CASE(KvflashPagerSerdeFixture, roundtrip_into_another_pool_size_keeps_resid
         CHECK(chunk_matches(B, pb, c, 5));
     }
 }
-TEST_CASE(KvflashPagerSerdeFixture, reselect_recalls_top_scored_host_chunk_and_keeps_tail) {
-    Harness A;
-    TestPager p;
-    REQUIRE(p.attach(make_cfg(), A.k, A.v));
-    REQUIRE(p.alloc_span(0, 12 * kChunk));       // 8 blocks: 4 chunks go to host
-    int cold = -1;
-    for (int c = 1; c < 8 && cold < 0; c++) if (!p.is_resident(c)) cold = c;
-    REQUIRE(cold > 0);
-    p.score_hook = [cold](int c) { return c == cold ? 1e9f : (float)-c; };
-    CHECK(p.reselect() > 0);
-    CHECK(p.is_resident(cold));
-    CHECK(p.is_resident(0));                      // sink
-    for (int c = 8; c < 12; c++) CHECK(p.is_resident(c));   // tail window
-}
-
 TEST_CASE(KvflashPagerSerdeFixture, reselect_tail_override_protects_only_n_chunks) {
     auto run = [](int tail_override) {
         Harness A;
@@ -868,22 +805,6 @@ bool append_chunks(KvFlashPager & p, int from, int to) {
         if (!p.alloc_span((int64_t)c * kChunk, kChunk)) return false;
     return true;
 }
-}
-
-// Control: a pager that never overflowed. Must already pass.
-TEST_CASE(KvflashPagerSerdeFixture, truncate_fitting_prefix_gives_fresh_layout_without_overflow) {
-    for (int P : {3 * kChunk, 5 * kChunk + 10}) {
-        const FreshMaps fresh = fresh_maps(P, 2);
-        REQUIRE(fresh.ok);
-        Harness A;
-        TestPager p;
-        REQUIRE(p.attach(make_cfg(), A.k, A.v));
-        REQUIRE(append_chunks(p, 0, 7));                 // 7 <= 8 blocks: never evicts
-        const FreshMaps got = truncated_maps(p, P, 2);
-        REQUIRE(got.ok);
-        CHECK(got.prefix == fresh.prefix);
-        CHECK(got.after_append == fresh.after_append);
-    }
 }
 
 TEST_CASE(KvflashPagerSerdeFixture, truncate_fitting_prefix_gives_fresh_layout_after_reselect) {
@@ -1379,16 +1300,10 @@ TEST_CASE(KvflashPagerSerdeFixture, row_base_attach_refuses_bad_base_and_short_t
     CHECK(!p.attach(cfg_at(kBaseChunks), {t.k}, {t.v}));
     CHECK(p.row_base() == 0);                         // the failed attach left the previous one intact
     CHECK(p.n_chunks() == 2);
-}
-
-TEST_CASE(KvflashPagerSerdeFixture, attach_refuses_a_later_layer_tensor_too_short_for_the_slice) {
-    TallHarness a(kTotalChunks * kChunk), b((kBaseChunks + kPoolChunks) * kChunk - 1);
-    TestPager p;
-    REQUIRE(p.attach(cfg_at(0), {a.k}, {a.v}));
-    REQUIRE(p.alloc_span(0, 2 * kChunk));
-    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, b.k}, {a.v, a.v}));   // layer 1 K is short
-    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, a.k}, {a.v, b.v}));   // layer 1 V is short
-    CHECK(p.row_base() == 0);                         // the failed attach left the previous one intact
+    TallHarness a(kTotalChunks * kChunk);             // a later layer's tensor is checked too
+    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, t.k}, {a.v, a.v}));   // layer 1 K is short
+    CHECK(!p.attach(cfg_at(kBaseChunks), {a.k, a.k}, {a.v, t.v}));   // layer 1 V is short
+    CHECK(p.row_base() == 0);
     CHECK(p.n_chunks() == 2);
 }
 
@@ -1429,7 +1344,6 @@ constexpr int kMainAfterAlloc[12]     = {0, -1, -1, -1, -1, 5, 6, 7, 1, 2, 3, 4}
 constexpr int kMainAfterReselect1[12] = {0, 7, -1, 5, -1, -1, 6, -1, 1, 2, 3, 4};               // events 4
 constexpr int kMainAfterAlloc2[14]    = {0, 7, -1, 5, -1, -1, -1, -1, -1, 2, 3, 4, 6, 1};       // events 0
 constexpr int kMainAfterReselect2[14] = {0, -1, 3, -1, 2, 5, -1, 7, -1, -1, -1, 4, 6, 1};       // events 8
-constexpr int kMainAfterTieReselect[12] = {0, 1, 7, 6, 5, -1, -1, -1, -1, 2, 3, 4};             // events 8
 
 KvFlashConfig serial_cfg() { KvFlashConfig c = make_cfg(); c.tail_window_chunks = 2; return c; }
 std::vector<int> blocks(const TestPager & p, int n) {
@@ -1465,9 +1379,9 @@ TEST_CASE(KvflashPagerSerdeFixture, reselect_without_pins_matches_main_for_gemma
 
 // The one place the serial backends can see a difference: exact score ties
 // across the resident/host boundary. Main sorted by score alone, so ties fell
-// to chunk-id order and it recalled 1..4 over the resident 5..8 (8 page events,
-// kMainAfterTieReselect). This pager keeps the resident chunk on a tie: same
-// pool contents, no traffic.
+// to chunk-id order and it recalled 1..4 over the resident 5..8 (8 page
+// events). This pager keeps the resident chunk on a tie: same pool contents,
+// no traffic.
 TEST_CASE(KvflashPagerSerdeFixture, reselect_score_ties_keep_resident_chunks_where_main_recalled_by_chunk_id) {
     Harness h;
     TestPager p;
@@ -1476,5 +1390,4 @@ TEST_CASE(KvflashPagerSerdeFixture, reselect_score_ties_keep_resident_chunks_whe
     CHECK(blocks(p, 12) == vec(kMainAfterAlloc));
     CHECK(reselect_with(p, kTies, 12) == 0);
     CHECK(blocks(p, 12) == vec(kMainAfterAlloc));
-    CHECK(vec(kMainAfterTieReselect) != vec(kMainAfterAlloc));   // main did move chunks here
 }

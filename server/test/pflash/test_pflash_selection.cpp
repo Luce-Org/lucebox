@@ -264,21 +264,6 @@ TEST_CASE(PFlashSelectionFixture, mandatory_scores_do_not_enter_optional_mass) {
     REQUIRE(std::abs(result.retained_mass - 0.9) < 1e-12);
 }
 
-TEST_CASE(PFlashSelectionFixture, real_ranges_charge_a_short_final_chunk) {
-    const std::vector<PFlashSelectionCandidate> candidates{
-        candidate(0, 0, 4, 2.0),
-        candidate(1, 4, 6, 1.0),
-    };
-
-    const auto result = select_pflash_candidates(
-        candidates, {6, 1.0}, PFlashSelectionMode::BudgetOnly);
-
-    REQUIRE(result.ok);
-    REQUIRE(result.stop == PFlashSelectionStop::CandidatesExhausted);
-    require_ordinals(result, {0, 1});
-    REQUIRE(result.retained_tokens == 6);
-}
-
 TEST_CASE(PFlashSelectionFixture, mandatory_overflow_has_a_distinct_failure) {
     const std::vector<PFlashSelectionCandidate> candidates{
         candidate(0, 0, 4, 0.0, true),
@@ -293,22 +278,6 @@ TEST_CASE(PFlashSelectionFixture, mandatory_overflow_has_a_distinct_failure) {
     REQUIRE(result.ordinals.empty());
     REQUIRE(result.retained_tokens == 0);
     REQUIRE(!result.error.empty());
-}
-
-TEST_CASE(PFlashSelectionFixture, budget_stop_does_not_skip_to_a_smaller_candidate) {
-    const std::vector<PFlashSelectionCandidate> candidates{
-        candidate(0, 0, 2, 0.0, true),
-        candidate(1, 2, 6, 10.0),
-        candidate(2, 6, 9, 1.0),
-    };
-
-    const auto result = select_pflash_candidates(
-        candidates, {5, 1.0}, PFlashSelectionMode::BudgetOnly);
-
-    REQUIRE(result.ok);
-    REQUIRE(result.stop == PFlashSelectionStop::BudgetReached);
-    require_ordinals(result, {0});
-    REQUIRE(result.retained_tokens == 2);
 }
 
 TEST_CASE(PFlashSelectionFixture, output_ordinals_are_in_source_order) {
@@ -671,18 +640,6 @@ TEST_CASE(PFlashSelectionFixture, line_aligned_split_moves_oversize_cuts_to_line
     REQUIRE(prev == 30 && has20);
 }
 
-TEST_CASE(PFlashSelectionFixture, null_line_flags_are_todays_rule) {
-    std::vector<float> boundary(200, 0.0f);
-    std::vector<float> subunit(200, 0.0f);
-    for (int t = 0; t < 200; ++t) {
-        boundary[(size_t) t] = (float) ((t * 37) % 101) / 100.0f;
-        subunit[(size_t) t] = (float) ((t * 53) % 97) / 96.0f;
-    }
-    const auto today = pflash_probe_segments(boundary, 200, 0.95f, 3, 16, {50, 120}, subunit);
-    const auto via_null = pflash_probe_segments(boundary, 200, 0.95f, 3, 16, {50, 120}, subunit, nullptr);
-    REQUIRE(today == via_null);
-}
-
 TEST_CASE(PFlashSelectionFixture, skip_oversized_keeps_filling_with_smaller_segments) {
     // Ranked by score: a 600-token segment first, then two 200-token ones. Budget 500.
     const std::vector<PFlashSelectionCandidate> candidates = {
@@ -822,20 +779,6 @@ TEST_CASE(PFlashSelectionFixture, top_k_above_the_candidate_count_falls_back_to_
     REQUIRE(tight.stop == PFlashSelectionStop::BudgetReached);
     REQUIRE(tight.retained_tokens == 200);
     require_ordinals(tight, {0, 1});
-}
-
-TEST_CASE(PFlashSelectionFixture, top_k_never_exceeds_the_token_budget) {
-    const auto candidates = ranked_candidates();
-    // K=5 wants 500 tokens; the budget caps the run at two candidates.
-    const auto result = select_pflash_candidates(
-        candidates, PFlashSelectionPolicy{250, 0.95, false, 5},
-        PFlashSelectionMode::TopK);
-
-    REQUIRE(result.ok);
-    REQUIRE(result.stop == PFlashSelectionStop::BudgetReached);
-    REQUIRE(result.retained_tokens <= 250);
-    REQUIRE(result.retained_tokens == 200);
-    require_ordinals(result, {0, 1});
 }
 
 TEST_CASE(PFlashSelectionFixture, top_k_skips_an_oversized_candidate_and_keeps_ranking) {

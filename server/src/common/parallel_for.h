@@ -15,7 +15,8 @@ template <class W> inline void run_workers(int n, W worker) {
     std::vector<std::exception_ptr> err((size_t)n);
     auto run = [&](int w) { try { worker(w); } catch (...) { err[(size_t)w] = std::current_exception(); } };
     std::vector<std::thread> th;
-    for (int w = 1; w < n; w++) th.emplace_back(run, w);
+    try { for (int w = 1; w < n; w++) th.emplace_back(run, w); }
+    catch (...) { for (auto & t : th) t.join(); throw; }   // a joinable std::thread destructor would terminate
     run(0);
     for (auto & t : th) t.join();
     for (auto & e : err) if (e) std::rethrow_exception(e);

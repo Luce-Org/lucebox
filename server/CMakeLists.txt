@@ -589,10 +589,11 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_graph.cpp
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
+    src/qwen4exp/qwen4exp_hot.cpp
+    src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
-    src/pflash/anchor_scan.cpp
     src/pflash/pflash_selection.cpp
     src/pflash/pflash_fold.cpp
     src/pflash/pflash_request_probe.cpp
@@ -1161,13 +1162,22 @@ if(LUCE_TESTS)
         test_seq_engine_contract
         test_seq_batch_plan
         test_client_send_buffer
-        test_ds4_mix_fitter)
+        test_ds4_mix_fitter
+        test_ds4v_image_assembly
+        test_ds4v_image_integration
+        test_ds4v_image_policy
+        test_ds4v_image_prompt
+        test_ds41v_image
+        test_ds41v_vision
+        test_ds4_mix_converter
+        test_deepseek4_roctx
+        test_qwen35_roctx
+        test_qwen35_image)
     set(_luce_cpu_cppunit_targets
         test_feature_gate
         test_cluster_unit
         test_platform_compat
         test_paged_kv_pool
-        test_seq_slot_kv
         test_blocking_row_pool
         test_rope_tail
         test_kernel_qualification_core
@@ -1175,7 +1185,11 @@ if(LUCE_TESTS)
         test_uma_budget
         test_mmq_tile_twin_gate
         test_gdn_single_commit
-        test_glue_fusions)
+        test_glue_fusions
+        test_ds4_engram
+        test_ds4_dmix_entry_validation
+        test_recurrent_snapshot
+        test_qwen35_split_tree_guard)
 
     # Standalone check of the DS4 MIX histogram fitter: reuses the converter
     # source with its main() renamed away, so it needs the converter's
@@ -1457,10 +1471,6 @@ if(LUCE_TESTS)
         target_include_directories(test_qsa3_gate_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_qsa3_gate_parity PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_qsa3_gate_parity)
-        # Guards the hc grouped norm node order (qwen4exp_graph.cpp hc_mix): gamma view expanded first makes
-        # RMS_NORM and MUL adjacent (fusable) and hash-equal to the legacy order.
-        luce_add_ggml_gpu_executable(test_hc_norm_mul_fusion test/unit/test_hc_norm_mul_fusion.cpp)
-        list(APPEND _raw_unit_test_targets test_hc_norm_mul_fusion)
         # Guards the wave-per-row gated norm kernels (GDN tail ncols=128 with gamma,
         # attention gate ncols=256 without) against the block-per-row kernels they
         # replace: byte-identical F16 rows at T in {1,7,333,4096}.
@@ -1545,6 +1555,11 @@ if(LUCE_TESTS)
         target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_fattn_mma256)
 
+        # Sparse-mask flash attention (ggml_flash_attn_ext_set_sparse_mask): skipping the KV tiles every query masks
+        # out is bit-identical over the DFlash drafter's ring layouts.
+        luce_add_ggml_gpu_executable(test_fattn_sparse_mask_gpu test/unit/test_fattn_sparse_mask_gpu.cpp)
+        list(APPEND _raw_unit_test_targets test_fattn_sparse_mask_gpu)
+
         # Standalone mmb-vs-library-GEMM differential on one quantized MUL_MAT,
         # against a CPU dequant reference. See the file header.
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_mmb_cublas_diff.cpp")
@@ -1573,18 +1588,6 @@ if(LUCE_TESTS)
             target_compile_definitions(test_getrows_scalar PRIVATE GGML_USE_HIP)
             target_link_libraries(test_getrows_scalar PRIVATE ggml-cpu)
             list(APPEND _raw_unit_test_targets test_getrows_scalar)
-        endif()
-
-        # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
-        # only builds when the rocWMMA fattn kernel is enabled so the
-        # default HIP build stays independent of the optional package.
-        if(GGML_HIP_ROCWMMA_FATTN)
-            luce_add_ggml_gpu_executable(test_rocwmma_layout test/unit/test_rocwmma_layout.cpp)
-            set_source_files_properties(test/unit/test_rocwmma_layout.cpp PROPERTIES LANGUAGE HIP)
-            set_target_properties(test_rocwmma_layout PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
-            target_compile_definitions(test_rocwmma_layout PRIVATE GGML_USE_HIP)
-            target_include_directories(test_rocwmma_layout PRIVATE ${GGML_HIP_ROCWMMA_INCLUDE_DIR})
-            list(APPEND _raw_unit_test_targets test_rocwmma_layout)
         endif()
 
         # Benchmark, not a test: built with the tests but deliberately NOT added
@@ -1700,19 +1703,6 @@ if(LUCE_TESTS)
         target_link_libraries(test_rms_norm_hip PRIVATE luce_common ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_rms_norm_hip)
     endif()
-    # DS4 Hierarchical-Controller pre-mix kernels vs CPU reference. HIP only:
-    # deepseek4_hc_cuda.cu is compiled into luce_common on this backend. Validates
-    # the HC mix matvec + NHC=4 Sinkhorn path against the device's actual wave width.
-    if(LUCE_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_hc_cuda.cpp")
-        add_executable(test_deepseek4_hc_cuda test/unit/test_deepseek4_hc_cuda.cpp)
-        set_source_files_properties(test/unit/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_deepseek4_hc_cuda PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
-        target_include_directories(test_deepseek4_hc_cuda PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
-        target_link_libraries(test_deepseek4_hc_cuda PRIVATE luce_common ${LUCE_GGML_BACKEND_TARGET})
-        list(APPEND _raw_unit_test_targets test_deepseek4_hc_cuda)
-    endif()
     # Helper copies must not break another thread's graph capture (several
     # models served by one process).
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_capture_safe_copies.cpp")
@@ -1758,36 +1748,6 @@ if(LUCE_TESTS)
             set_tests_properties(q5_mmid_grouped_cuda PROPERTIES
                 SKIP_REGULAR_EXPRESSION "q5-mmid-grouped SKIP")
         endif()
-        add_test(NAME deepseek4_mmid_grouped_cuda_reject_parent_width
-            COMMAND ${CMAKE_COMMAND} -E env LUCE_MMID_TEST_WIDTH=16
-                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --mmid-only)
-        set_tests_properties(deepseek4_mmid_grouped_cuda_reject_parent_width
-            PROPERTIES WILL_FAIL TRUE)
-        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_accounting
-            COMMAND $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
-                --test-benchmark-iterations)
-        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_config
-            COMMAND ${CMAKE_COMMAND}
-                -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
-                -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_benchmark_config
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_benchmark_config.cmake)
-        set_tests_properties(deepseek4_mmid_grouped_cuda_benchmark_config
-            PROPERTIES SKIP_REGULAR_EXPRESSION "mmid-benchmark-config.*SKIP: no supported GPU")
-        foreach(_mmid_cli_case IN ITEMS parent_benchmark no_gpu)
-            add_test(NAME deepseek4_mmid_grouped_cuda_${_mmid_cli_case}
-                COMMAND ${CMAKE_COMMAND}
-                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
-                    -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_cli_${_mmid_cli_case}
-                    -DTEST_CASE=${_mmid_cli_case}
-                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_cli.cmake)
-        endforeach()
-        unset(_mmid_cli_case)
-        add_test(NAME deepseek4_mmid_grouped_cuda_combine_override
-            COMMAND ${CMAKE_COMMAND} -E env LUCE_MOE_COMBINE_VEC4=0
-                LUCE_MOE_COMBINE_BENCH=0 --unset=LUCE_MOE_COMBINE_BENCH_TOKENS
-                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
-        set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
-            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_qn_split_fusions.cpp")
         # Host-only (GGML C API): the Qwen3.8 split fusions against their
@@ -1965,7 +1925,7 @@ if(LUCE_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_ds41v_vision)
         # The same image path on a real projector, dumped for the reference
-        # comparison (scripts/ds41v_reference_check.py); skips without one.
+        # comparison (scripts/ds41v_reference_check.py); a tool, not a ctest.
         add_executable(test_ds41v_encoder_dump test/unit/test_ds41v_encoder_dump.cpp)
         target_include_directories(test_ds41v_encoder_dump PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_link_libraries(test_ds41v_encoder_dump PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base)
@@ -1974,7 +1934,6 @@ if(LUCE_TESTS)
         else()
             target_link_libraries(test_ds41v_encoder_dump PRIVATE hip::host)
         endif()
-        list(APPEND _raw_unit_test_targets test_ds41v_encoder_dump)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_roctx.cpp")
         add_executable(test_deepseek4_roctx
@@ -2074,11 +2033,22 @@ if(LUCE_TESTS)
         else()
             target_link_libraries(test_ds4_load_transactional PRIVATE hip::host)
         endif()
-        # Self-skips (returns 0) unless DS4_TEST_MODEL points at a qtype-105 model.
+        # Skips (77) unless DS4_TEST_MODEL points at a qtype-105 model.
         add_test(NAME ds4_load_transactional COMMAND test_ds4_load_transactional)
+        set_tests_properties(ds4_load_transactional PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    add_executable(test_ds41_mxfp8 test/unit/test_ds41_mxfp8.cpp)
+    target_link_libraries(test_ds41_mxfp8 PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME test_ds41_mxfp8_cpu COMMAND test_ds41_mxfp8 cpu)
+    add_test(NAME test_ds41_mxfp8_gpu COMMAND test_ds41_mxfp8 gpu)
+    set_tests_properties(test_ds41_mxfp8_gpu PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(test_ds41_mmid_width_invariance test/unit/test_ds41_mmid_width_invariance.cpp)
     target_link_libraries(test_ds41_mmid_width_invariance PRIVATE ggml ggml-base ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "hip")
+        # The device's gfx name: RDNA3 / RDNA4 must take the grouped kernel for ROCmFP2.
+        target_compile_definitions(test_ds41_mmid_width_invariance PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_ds41_mmid_width_invariance PRIVATE hip::host)
+    endif()
     # Five tokens: the DSpark verify width (q=5) of the DS4.1 profiles.
     add_test(NAME test_ds41_mmid_width_invariance COMMAND test_ds41_mmid_width_invariance 5 64)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_rocmfp3_mix_registry.cpp")
@@ -2288,11 +2258,15 @@ if(LUCE_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
     add_test(NAME qwen4exp_mtp COMMAND test_qwen4exp_mtp)
+    set_tests_properties(qwen4exp_mtp PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_mtp)
 
     # Exercise synthetic gfx1151 MMID admission without initializing a GPU.
     add_executable(test_qwen4exp_mtp_dispatch test/unit/test_qwen4exp_mtp_dispatch.cpp)
     target_link_libraries(test_qwen4exp_mtp_dispatch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
     add_test(NAME qwen4exp_mtp_dispatch COMMAND test_qwen4exp_mtp_dispatch)
+    set_tests_properties(qwen4exp_mtp_dispatch PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_mtp_dispatch)
     add_executable(test_qwen4exp_chunk test/unit/test_qwen4exp_chunk.cpp)
     target_include_directories(test_qwen4exp_chunk PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen4exp_chunk PRIVATE ggml)
@@ -2300,12 +2274,27 @@ if(LUCE_TESTS)
     add_test(NAME test_qwen4exp_chunk COMMAND test_qwen4exp_chunk)
     set_tests_properties(test_qwen4exp_chunk PROPERTIES LABELS cpu)
     list(APPEND _luce_cpu_test_targets test_qwen4exp_chunk)
+    add_executable(test_qwen4exp_carve test/unit/test_qwen4exp_carve.cpp)
+    target_include_directories(test_qwen4exp_carve PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_compile_options(test_qwen4exp_carve PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
+    add_test(NAME test_qwen4exp_carve COMMAND test_qwen4exp_carve)
+    set_tests_properties(test_qwen4exp_carve PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_carve)
 
     add_executable(test_qwen4exp_prefix_cache test/unit/test_qwen4exp_prefix_cache.cpp)
     target_include_directories(test_qwen4exp_prefix_cache PRIVATE ${LUCE_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     target_link_libraries(test_qwen4exp_prefix_cache PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    # Not `cpu`: on a CUDA build its KVFlash pager records CUDA events, which the
+    # hosted runner's driver stub refuses.
     add_test(NAME qwen4exp_prefix_cache COMMAND test_qwen4exp_prefix_cache)
+    # Guards the batched verify's QSA rows: one synthetic full-attention layer (no model file), each slot's rows
+    # against consecutive T=1 decode steps, bit for bit. Compiles qwen4exp_graph.cpp into the test for its builders.
+    add_executable(test_qwen4exp_batched_verify_qsa test/unit/test_qwen4exp_batched_verify_qsa.cpp)
+    target_include_directories(test_qwen4exp_batched_verify_qsa PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen4exp_batched_verify_qsa PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME qwen4exp_batched_verify_qsa COMMAND test_qwen4exp_batched_verify_qsa)
+    set_tests_properties(qwen4exp_batched_verify_qsa PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_forward.cpp")
         add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)
@@ -2327,11 +2316,6 @@ if(LUCE_TESTS)
         target_include_directories(test_vs_oracle PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_vs_oracle PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_laguna_forward.cpp")
-        add_executable(smoke_laguna_forward test/smoke/smoke_laguna_forward.cpp)
-        target_include_directories(smoke_laguna_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_laguna_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench/bench_laguna_ttft.cpp")
         add_executable(bench_laguna_ttft test/bench/bench_laguna_ttft.cpp)
         target_include_directories(bench_laguna_ttft PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
@@ -2352,9 +2336,7 @@ if(LUCE_TESTS)
         target_include_directories(bench_laguna_spark PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_spark PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
-    # This synthetic stream benchmark touches a multi-gigabyte sparse file and
-    # requires a real CUDA device. Keep it manually runnable instead of adding
-    # it to the hosted server-unit suite.
+    # Streams synthetic experts (a few hundred KiB) through a real CUDA device.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_moe_stream.cpp"
        AND LUCE_GPU_BACKEND STREQUAL "cuda")
         add_executable(test_moe_stream
@@ -2365,16 +2347,12 @@ if(LUCE_TESTS)
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test_moe_stream PRIVATE
             luce_common ggml ${LUCE_GGML_BACKEND_TARGET} CUDA::cudart)
+        list(APPEND _raw_unit_test_targets test_moe_stream)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/unit/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(test_laguna_daemon PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_target_forward.cpp")
-        add_executable(smoke_target_forward test/smoke/smoke_target_forward.cpp)
-        target_include_directories(smoke_target_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_target_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_generate.cpp")
         add_executable(test_generate test/unit/test_generate.cpp)
@@ -2407,16 +2385,6 @@ if(LUCE_TESTS)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_seq_slot_kv.cpp")
-        # SeqSlotManager over the SlotKv interface: host only, no model or GPU.
-        add_executable(test_seq_slot_kv
-            test/unit/test_seq_slot_kv.cpp
-            src/common/concurrency/seq_slot_manager.cpp
-            src/common/concurrency/paged_kv_pool.cpp)
-        target_include_directories(test_seq_slot_kv PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        list(APPEND _raw_unit_test_targets test_seq_slot_kv)
     endif()
     if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_engram.cpp")
         # DeepSeek V4.1 Engram addressing and row decode: host only, no ggml or
@@ -2817,7 +2785,6 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_mask_upload.cpp
             test/unit/test_adaptive_keep_ratio.cpp
             test/unit/test_skip_park_guard.cpp
-            test/unit/test_bandit_integration.cpp
             test/unit/test_admission.cpp
             test/unit/test_restore_delta.cpp
             test/unit/test_restore_bounds.cpp
@@ -2828,7 +2795,6 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
             test/unit/test_ddtree_tau.cpp
-            test/unit/test_anchor_transitive.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp
             test/pflash/test_pflash_fold.cpp
@@ -2840,7 +2806,6 @@ if(LUCE_TESTS)
             test/pflash/test_pflash_session_offload.cpp
             test/pflash/test_pflash_ident_query.cpp
             test/unit/test_qwen35_causal_mask.cpp
-            test/unit/test_model_test_paths.cpp
             test/unit/test_gguf_mmap.cpp
             test/unit/test_kv_quant.cpp
             test/unit/test_kvflash_pager_serde.cpp
@@ -2866,21 +2831,25 @@ if(LUCE_TESTS)
             test/unit/test_moe_hybrid_storage.cpp
             test/unit/test_meta_buffer_oom.cpp
             test/unit/test_tensor_file_reader.cpp)
+        # Swap groups are POSIX only (flock, kill, sockets).
+        if(NOT WIN32)
+            list(APPEND _server_unit_sources test/unit/test_swap_group.cpp)
+        endif()
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/unit/test_gpu_sampler_cuda.cpp
-                test/unit/test_cuda_pool_shutdown.cpp
                 test/unit/test_kvflash_pager_cuda_race.cpp
                 test/unit/test_draft_topk_cuda.cpp)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/residency.cpp
+            src/server/swap_group.cpp
             src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
-            src/server/prompt_normalize.cpp
-            src/pflash/anchor_scan.cpp)
+            src/server/prompt_normalize.cpp)
         target_include_directories(test_server_unit PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
@@ -3104,7 +3073,6 @@ if(LUCE_TESTS)
         test_ggml_cluster_allreduce
         test_cluster_unit
         test_qwen35_tensor_parallel
-        test_deepseek4_hc_cuda
         test_capture_safe_copies
         test_flashprefill_kernels
         test_cuda_comm_api
@@ -3112,7 +3080,6 @@ if(LUCE_TESTS)
         test_rms_norm_hip
         test_rope_tail
         test_paged_kv_pool
-        test_seq_slot_kv
         test_ds4_engram
         test_ggml_host_mailbox_cuda
         test_rocmfp3_mix_registry
@@ -3156,8 +3123,6 @@ if(LUCE_TESTS)
                     set(_unit_ctest_name rocmfpx_reference)
                 elseif(_unit_target STREQUAL "test_rms_norm_hip")
                     set(_unit_ctest_name rms_norm_hip)
-                elseif(_unit_target STREQUAL "test_deepseek4_hc_cuda")
-                    set(_unit_ctest_name deepseek4_hc_cuda)
                 elseif(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
                     set(_unit_ctest_name deepseek4_mmid_grouped_cuda)
                 elseif(_unit_target STREQUAL "test_draft_topk_cuda")
@@ -3327,11 +3292,9 @@ if(LUCE_TESTS)
     set(_luce_internal_h_cuda_tests
         smoke_draft_graph
         test_vs_oracle
-        smoke_laguna_forward
         bench_laguna_ttft
         bench_laguna_pflash
         bench_laguna_generate
-        smoke_target_forward
         test_generate
         test_dflash
         test_model_smoke
@@ -3509,6 +3472,8 @@ if(LUCE_SERVER)
         add_executable(luce_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/residency.cpp
+            src/server/swap_group.cpp
             src/server/api_adapters.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
@@ -3526,6 +3491,9 @@ if(LUCE_SERVER)
                     -DSERVER=$<TARGET_FILE:luce_server>
                     -DBACKEND=${LUCE_GPU_BACKEND}
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_model_names.cmake)
+            # No GPU or model needed: the hosted cpu job runs it.
+            set_tests_properties(server_cli_model_names PROPERTIES LABELS cpu)
+            list(APPEND _luce_cpu_test_targets luce_server)
         endif()
         if(LUCE_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(luce_server PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)

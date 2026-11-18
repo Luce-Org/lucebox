@@ -428,8 +428,91 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
     return true;
 }
 
+bool deepseek4_snapshot_drop_rows(DeepSeek4Snapshot & snap) {
+    if (!snap.ctx || !snap.buf || !snap.owns_storage || snap.state_only ||
+        !snap.hc_state_snap) {
+        return false;
+    }
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() *
+                  (deepseek4_snapshot_tensor_count((int) snap.layers.size(),
+                                                   snap.meta_snap != nullptr) + 4) + 4096;
+    ip.no_alloc = true;
+    DeepSeek4Snapshot kept;
+    kept.ctx = ggml_init(ip);
+    if (!kept.ctx) return false;
+    // The same tensors under the same names, the row tensors down to their
+    // one placeholder row: a ggml buffer cannot give back part of itself.
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> copies;
+    const auto like = [&](const ggml_tensor * t) -> ggml_tensor * {
+        if (!t) return nullptr;
+        ggml_tensor * out = declare_like(kept.ctx, t, t->name);
+        copies.emplace_back(t, out);
+        return out;
+    };
+    const auto rows = [&](const ggml_tensor * t) -> ggml_tensor * {
+        return t ? declare_rows(kept.ctx, t, 0, t->name) : nullptr;
+    };
+    kept.hc_state_snap = like(snap.hc_state_snap);
+    kept.layers.assign(snap.layers.size(), {});
+    for (size_t il = 0; il < snap.layers.size(); ++il) {
+        const auto & src = snap.layers[il];
+        auto & dst = kept.layers[il];
+        dst.n_comp = src.n_comp;
+        dst.n_index_comp = src.n_index_comp;
+        dst.raw_kv = like(src.raw_kv);
+        dst.comp_kv = rows(src.comp_kv);
+        dst.index_comp_kv = rows(src.index_comp_kv);
+        dst.attn_compressor.state_kv = like(src.attn_compressor.state_kv);
+        dst.attn_compressor.state_score = like(src.attn_compressor.state_score);
+        dst.indexer_compressor.state_kv = like(src.indexer_compressor.state_kv);
+        dst.indexer_compressor.state_score = like(src.indexer_compressor.state_score);
+    }
+    kept.meta_snap = like(snap.meta_snap);
+    kept.last_logits_snap = like(snap.last_logits_snap);
+    kept.spec_feat_snap = like(snap.spec_feat_snap);
+    for (const auto & copy : copies) {
+        if (!copy.second) {
+            ggml_free(kept.ctx);
+            return false;
+        }
+    }
+    kept.buf = ggml_backend_alloc_ctx_tensors_from_buft(
+        kept.ctx, ggml_backend_buffer_get_type(snap.buf));
+    if (!kept.buf) {
+        ggml_free(kept.ctx);
+        return false;
+    }
+    for (const auto & copy : copies) {
+        ggml_backend_tensor_copy(const_cast<ggml_tensor *>(copy.first), copy.second);
+    }
+    kept.cur_pos = snap.cur_pos;
+    kept.engram_tokens = snap.engram_tokens;
+    kept.owns_storage = true;
+    kept.state_only = true;
+    free_deepseek4_snapshot(snap);
+    snap = std::move(kept);
+    return true;
+}
+
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache) {
+                                DeepSeek4Cache & cache,
+                                const DeepSeek4Snapshot * rows_from) {
+    if (snap.state_only) {
+        if (!rows_from || rows_from == &snap || !rows_from->ctx || rows_from->state_only ||
+            rows_from->cur_pos < snap.cur_pos ||
+            rows_from->layers.size() != snap.layers.size()) {
+            std::fprintf(stderr,
+                         "[deepseek4] snapshot restore: state-only snapshot without rows\n");
+            return false;
+        }
+    } else {
+        rows_from = nullptr;
+    }
+    // Where the compressed and index rows of layer `il` come from.
+    const auto rows_of = [&](size_t il) -> const DeepSeek4Snapshot::LayerSnap & {
+        return rows_from ? rows_from->layers[il] : snap.layers[il];
+    };
     if (!snap.ctx || !cache.ctx || !cache.buf || !snap.hc_state_snap ||
         snap.layers.size() != cache.layers.size() || snap.cur_pos < 0 ||
         snap.cur_pos > cache.max_ctx) {
@@ -454,8 +537,12 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
         const auto & src = snap.layers[il];
         const auto & dst = cache.layers[il];
         const bool raw_ok = tensors_compatible(src.raw_kv, dst.raw_kv);
-        const bool comp_ok = prefix_tensors_compatible(src.comp_kv, dst.comp_kv, src.n_comp);
-        const bool index_ok = prefix_tensors_compatible(src.index_comp_kv, dst.index_comp_kv, src.n_index_comp);
+        // A donor holds at least the rows of the shorter prompt.
+        const auto & rows = rows_of(il);
+        const bool comp_ok = rows.n_comp >= src.n_comp &&
+            prefix_tensors_compatible(rows.comp_kv, dst.comp_kv, rows.n_comp);
+        const bool index_ok = rows.n_index_comp >= src.n_index_comp &&
+            prefix_tensors_compatible(rows.index_comp_kv, dst.index_comp_kv, rows.n_index_comp);
         const bool attn_kv_ok = tensors_compatible(src.attn_compressor.state_kv, dst.attn_compressor.state_kv);
         const bool attn_score_ok = tensors_compatible(src.attn_compressor.state_score, dst.attn_compressor.state_score);
         const bool index_kv_ok = tensors_compatible(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv);
@@ -483,11 +570,12 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
     }
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const auto & src = snap.layers[il];
+        const auto & rows = rows_of(il);
         auto & dst = cache.layers[il];
         if (!copy_to_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv && !copy_prefix_to_backend(src.comp_kv, dst.comp_kv, src.n_comp)) ||
-            (src.index_comp_kv &&
-             !copy_prefix_to_backend(src.index_comp_kv, dst.index_comp_kv, src.n_index_comp)) ||
+            (rows.comp_kv && !copy_prefix_to_backend(rows.comp_kv, dst.comp_kv, src.n_comp)) ||
+            (rows.index_comp_kv &&
+             !copy_prefix_to_backend(rows.index_comp_kv, dst.index_comp_kv, src.n_index_comp)) ||
             !copy_opt_to_backend(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
             !copy_opt_to_backend(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
             !copy_opt_to_backend(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||

@@ -14,15 +14,21 @@ public:
             int mmvq_max_ncols = 0,
             bool skip_property_check = false,
             int ds4_mix_mmv_max_tokens = 0,
-            bool mmvq_batch_invariant = false)
+            bool mmvq_batch_invariant = false,
+            int mmvq_invariant_max_ncols = 0)
         : disable_graphs_(disable_graphs),
           override_mmvq_(mmvq_max_ncols > 0),
           skip_property_check_(skip_property_check),
           override_ds4_mix_(ds4_mix_mmv_max_tokens > 0),
-          batch_invariant_(mmvq_batch_invariant) {
+          batch_invariant_(mmvq_batch_invariant),
+          override_invariant_width_(mmvq_invariant_max_ncols > 0) {
         if (batch_invariant_) {
             previous_batch_invariant_ =
                 ggml_backend_cuda_set_mmvq_batch_invariant(true);
+        }
+        if (override_invariant_width_) {
+            previous_invariant_width_ =
+                ggml_backend_cuda_set_mmvq_invariant_max_ncols(mmvq_invariant_max_ncols);
         }
         if (disable_graphs_) {
             previous_graphs_disabled_ =
@@ -44,6 +50,9 @@ public:
     }
 
     ~ScopedCudaGraphOverrides() {
+        if (override_invariant_width_) {
+            ggml_backend_cuda_set_mmvq_invariant_max_ncols(previous_invariant_width_);
+        }
         if (batch_invariant_) {
             ggml_backend_cuda_set_mmvq_batch_invariant(previous_batch_invariant_);
         }
@@ -73,11 +82,13 @@ private:
     bool skip_property_check_ = false;
     bool override_ds4_mix_ = false;
     bool batch_invariant_ = false;
+    bool override_invariant_width_ = false;
     bool previous_graphs_disabled_ = false;
     bool previous_batch_invariant_ = false;
     bool previous_skip_property_check_ = false;
     int previous_mmvq_max_ncols_ = 0;
     int previous_ds4_mix_max_tokens_ = 0;
+    int previous_invariant_width_ = 0;
 };
 
 }  // namespace luce::common

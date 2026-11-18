@@ -6,10 +6,15 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace luce::common::gbnf {
 
 namespace {
+
+// The most times "{m,n}" may repeat an item: each one becomes rules, and a
+// request chooses the numbers.
+constexpr int kMaxRepetitions = 2000;
 
 // NOTE: assumes valid UTF-8 (but checks for overrun).
 std::pair<uint32_t, const char *> decode_utf8_char(const char * src) {
@@ -553,6 +558,12 @@ const char * Parser::parse_sequence(const char * src, const std::string & rule_n
         if (last_sym_start == rule.size()) {
             throw std::runtime_error(std::string("expecting preceding item to */+/?/{ at ") + pos);
         }
+        // Each repetition is expanded into rules, so a count is bounded: a
+        // larger minimum is refused, a larger maximum means "no maximum".
+        if (min_times > kMaxRepetitions) {
+            throw std::runtime_error("a repetition count above " + std::to_string(kMaxRepetitions) + " is not supported");
+        }
+        if (max_times > kMaxRepetitions) max_times = -1;
         Rule prev_rule(rule.begin() + last_sym_start, rule.end());
         if (min_times == 0) {
             rule.resize(last_sym_start);

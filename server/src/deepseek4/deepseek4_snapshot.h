@@ -110,8 +110,18 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              DeepSeek4Snapshot & out,
                              const DeepSeek4SnapshotAux * aux = nullptr);
 
+// A state-only `snap` takes its compressed and index rows from `rows_from`,
+// a whole snapshot of a prompt that extends it.
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache);
+                                DeepSeek4Cache & cache,
+                                const DeepSeek4Snapshot * rows_from = nullptr);
+
+// Free the compressed and index rows of a snapshot that owns its storage and
+// keep the rest (DeepSeek4Snapshot::state_only). Row i of those tensors
+// depends only on positions before (i + 1) * ratio, so a deeper snapshot of
+// the same prompt holds the same rows. False, with `snap` unchanged, when it
+// is not a whole owning snapshot or the allocation fails.
+bool deepseek4_snapshot_drop_rows(DeepSeek4Snapshot & snap);
 
 // Rebind a deserialized context (tensors named as declared above, optionally
 // prefixed) into `out` using the meta tensor for row counts and position.

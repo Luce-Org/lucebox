@@ -200,11 +200,14 @@ its earlier tool calls (ToolMemory, which a new process does not have). Each
 file stores that replay text and startup loads it back into ToolMemory.
 
 **Budget.** Every layout directory under the cache directory is indexed, also
-files of another model or KV type, so the cap covers the whole directory. The
-budget never exceeds the cache's bytes plus the free space minus a reserve
-(the larger of 1 GiB and 5% of the disk, at most 16 GiB). Before a write the
-least recently used files are deleted until the new file fits. A hit rewrites
-the file's `last_used` field in place, so LRU order survives restarts.
+files of another model, KV type or server, so the cap covers the whole
+directory. The budget never exceeds the cache's bytes plus the free space
+minus a reserve (the larger of 1 GiB and 5% of the disk, at most 16 GiB).
+When a write is queued, this server's least recently used files are deleted
+until it fits; before it is renamed into place, the writer merges the
+directory (see *Several servers*) and deletes the least recently used files
+of any model until the directory fits. A hit rewrites the file's `last_used`
+field in place, so LRU order survives restarts and other servers see it.
 
 **TTL.** A file unused for longer than `--kv-cache-ttl` hours is deleted at
 startup, before each write, and when a lookup meets it.
@@ -214,7 +217,8 @@ startup, before each write, and when a lookup meets it.
 - Format v5 ends with an XXH64 checksum of the whole file (the header with
   `last_used` zeroed). A hit verifies it while reading: a corrupt or partial
   file is a logged miss, it is deleted and the prompt is prefilled. Startup
-  deletes leftover `.tmp` files, files of older formats and truncated files.
+  deletes leftover `.tmp` files nobody writes, files of older formats and
+  truncated files.
 - A file is restored only when its identity matches: model path, size, mtime
   and a content fingerprint (SHA-1 of the first and last MiB), KV cache types,
   K rotation, `--max-ctx`, chat template and draft model, plus the snapshot's
@@ -222,11 +226,36 @@ startup, before each write, and when a lookup meets it.
   live cache (the paged restore against the page table too).
 - Each file stores the exact key token ids; a hit compares them with the
   prompt.
-- One process per directory: startup takes an exclusive lock on
-  `<dir>/.lock`. The models of one process share the directory's store
-  (`DiskStore`: one index, one writer, one budget and TTL), each restoring
-  only the files its own identity wrote; a second process on the same
-  directory runs without a disk cache and logs it.
+- The models of one process share the directory's store (`DiskStore`: one
+  index, one writer, one budget and TTL), each restoring only the files its
+  own identity wrote. Other servers can share the directory too (below).
+
+**Several servers.** Servers on one machine share one cache directory, one
+budget and one TTL (POSIX; on Windows the first server keeps the directory
+and the others run without a disk cache):
+
+- Each holds a shared lock on `<dir>/.lock` for its lifetime. An older
+  server, which takes it exclusively, keeps newer ones off, and is kept off
+  by them (both log it).
+- Each model identity is served by one server at a time
+  (`<dir>/.identity-<salt>.lock`): its files, pins file and views are its
+  alone, so no two servers write the same file. A second server of the same
+  model and settings runs without a disk cache and logs it.
+- Before a write is renamed into place, the writer thread takes
+  `<dir>/.index.lock` and merges the directory into its index: the files
+  other servers wrote, the ones they deleted, and their `last_used` times.
+  The TTL and the budget then apply to the whole directory, and the file is
+  renamed. Only the writer thread deletes other servers' files, right after
+  that merge; a request never waits on another server.
+- A file another server deletes while it is being read stays readable to
+  the end; one deleted earlier is a miss (`is gone`) and leaves the index.
+- A temporary file is locked while it is written, so a server starting up
+  removes only temporaries nobody writes.
+- Each server keeps the whole directory within its own `--kv-cache-budget`
+  and `--kv-cache-ttl`: with different values, the smaller one wins once
+  that server writes. Queued writes count for the server that queued them
+  only, so the directory exceeds the budget by at most the files being
+  written at that moment.
 
 **Without RAM slots.** With `--prefix-cache-slots 0` nothing leaves RAM, so
 nothing new is written; the entries already on disk are still served. Only
@@ -235,8 +264,18 @@ The `auto` scope and the cold-head and continued checkpoints this mode used
 to write are retired; `auto` and `auto:N` read as `full`, and
 `--kv-cache-interval` is accepted and ignored.
 
+**Engines.** Concurrent engines keep their checkpoints in the backend's
+snapshot slots (Qwen paged, `qwen4exp`), where the disk cache writes and
+reads them. A capture keeps the checkpoint it replaces aside until the
+scheduler claims it: written when worth keeping, freed otherwise. A backend
+whose snapshots are not plain ggml tensors packs them itself
+(`ModelBackend::snapshot_exports`): `qwen4exp` stores its snapshot buffer as
+one tensor and its host fields (positions, tokens, draft state, logits, each
+strip's place) as another, hands a snapshot in system memory to the writer
+without a copy, and keeps a disk read in place.
+
 **Not covered.** Single-sequence `--paged-attention` keeps no snapshots, and
-the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
+the concurrent DeepSeek4 engine keeps its checkpoints outside the backend's
 snapshot slots: both run without a disk cache (logged at startup).
 
 **Cache-aware admission.** PFlash's admission counts the deeper of the RAM
@@ -474,7 +513,47 @@ Coding agents grow one conversation turn by turn, and each turn's snapshot is a
 strict prefix of the next. After committing a snapshot, the single-sequence
 path frees the ancestors it supersedes, keeping only the shallowest one (the
 shared system/tools head) and protected tool pins. A conversation therefore
-holds about two snapshots instead of one per turn. Chains that are abandoned,
+holds about two snapshots instead of one per turn.
+
+**State backups.** A superseded turn repeats the per-position rows of the
+snapshot that supersedes it; only the state of its own position is its own.
+Where the backend can drop a snapshot's rows, the superseded turns are
+therefore kept instead of freed, as *state-only backups*. A prompt that
+departs from the conversation before its end (an edited or retried last
+message, a second request from the same point, a client that drops its last
+turns) restores the deepest backup it still extends, with the rows of the
+newer snapshot (`[pc] state backup slot=N ... restores with the rows of
+slot=M`), and prefills only what follows.
+
+The policy is the same for every backend and both serving paths
+(`KvCache::trim_superseded`). Backups thin out with distance: the previous
+turn is kept, then one at least twice as far behind the newest snapshot as the
+last one kept, and so on, so a conversation holds a number that grows with the
+logarithm of its length and a prompt that departs d tokens back resumes within
+about 2d of its end. A backup is never written to disk and leaves RAM with the
+last snapshot whose rows can restore it. Under the resident limit, the backups
+of the conversation being served are evicted after the leaves of the other
+conversations, not before.
+
+A backend takes part by saying what one backup holds and by dropping and
+borrowing rows (`ModelBackend::snapshot_state_bytes_estimate`,
+`snapshot_drop_kv`, `GenerateRequest::restore_kv_slot`; for concurrent
+serving `SeqEngine::estimate_prefix_state_bytes`, `drop_prefix_kv`,
+`PrefixStorePlan::restore_kv`):
+
+| Backend | A backup keeps | Size | Rows it borrows |
+|---|---|---|---|
+| Qwen3.5/3.6/3.8, MoE variants | recurrent and conv state, drafter features | about 370 MB (27B) | attention K/V |
+| Qwen3.8-Flash-Next | recurrent, conv and PLE state, draft hidden state, logits | about 118 MB | attention K/V, indexer keys and pooled blocks, draft-layer K/V |
+| DeepSeek V4 / V4.1 | raw window, compressor windows, HC state, logits, features | tens of MB | compressed and index rows |
+
+Single-sequence and concurrent serving both take part for these three. They
+rely on a prefix's rows not depending on how it was reached, which holds
+because these backends start a prefill chunk at every restore point
+(`GenerateRequest::restore_points`). Not covered, and unchanged: a KVFlash pool
+(Qwen keeps state-only rungs of its own beside the live cache there), layer
+split and cluster serving, and the other backends, which keep the previous
+turn whole while the limit holds it. Chains that are abandoned,
 for example after a client compacts its context, are bounded by
 `--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
 the oldest leaf first. When no single entry makes enough room, it evicts several,
@@ -647,3 +726,24 @@ With right-sized snapshots, typical save/restore transfers are small:
 The old full-size approach (1.5 GB per snapshot) is eliminated. System RAM
 footprint is proportional to actual token count, enabling many more cached
 prefixes with no VRAM cost.
+
+## Measuring the hit rate
+
+`scripts/bench_agentx_cache.py` replays the public coding-agent traces of the AgentX
+benchmark against a running server and reports the share of prompt tokens read from the
+cache, next to the share a cache that never misses would read on the same requests. The
+client is the official AgentX harness running its `agentx` scenario unchanged, so the
+harness itself checks the benchmark's rules and marks the run `submission_valid`; the
+report prints that verdict.
+
+```bash
+python3 server/scripts/bench_agentx_cache.py run --url http://127.0.0.1:8080 \
+    --model qwen3.8-27b --tokenizer Qwen/Qwen3.8-27B --sessions 1 --out results/agentx-1
+```
+
+The default corpus is the official 256K one (every request at most 256,000 tokens): serve
+it with `--max-ctx 262144`. The traces hold the shape of real Claude Code sessions and no
+text, so the client sends filler text of the recorded lengths, replays the recorded
+replies, and asks for each reply at its recorded length with `ignore_eos`. They carry no tool calls: the [Agent Turn Cache](API.md#agent-turn-cache),
+which keeps the state a tool-call turn leaves behind, does not take part, and every turn
+resumes from the end of the previous prompt.
