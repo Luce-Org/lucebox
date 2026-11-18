@@ -731,8 +731,8 @@ void Qwen4ExpBackend::settle_indexer_recall() {
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
     recall_mode_ = s.mode;
     if (cache_.pool_qsa)
-        std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; "
-                     "LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
+        std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; the "
+                     "replayed tail densely; LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
 }
 
 // After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.
@@ -1186,6 +1186,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     };
     capture();
     auto inputs = pos < (int) req.prompt.size() ? prepare(pos) : Qwen4ExpInputs{};
+    bool replay = false;   // the second tail pass: prompt chunks attend the pool densely
     auto tail_rewind = [&]() {
         if (!tail_snap.buf) return false;
         run_indexer_recall(recall_hook);
@@ -1201,6 +1202,7 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         if (!ok) return false;
         pos = tail_pos;
         tail_pos = -1;
+        replay = true;
         cuts = q4_prefill_cuts(req.restore_points, pos, snap_cut, -1, -1);
         tokens_.resize((size_t) pos);
         mtp_pending = tail_mtp;
@@ -1239,10 +1241,12 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         if (in_tail && q4_recall_run_breaks(n, end, (int) req.prompt.size())) cache_.recall_q_n = 0;
         cache_.recall_capture = in_tail && n > 1;
         const bool captured = cache_.recall_capture;
+        cache_.pool_prompt_dense = replay;
         const Qwen4ExpForwardResult r = qwen4exp_forward(
             backend_, weights_, cache_, req.prompt.data() + pos, n, pos, logits, mtp ? &hidden : nullptr,
             false, mtp_prefill, &inputs);
         cache_.recall_capture = false;
+        cache_.pool_prompt_dense = false;
         if (!r.ok) {
             result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
             return result;

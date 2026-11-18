@@ -181,6 +181,9 @@ struct Qwen4ExpCache {
     // resident chunks (the indexer scores every block by position; picks outside the pool are dropped) instead of
     // densely over the pool. Set by the backend (LUCE_Q4_POOL_QSA) where the stable QSA graph is supported.
     bool pool_qsa = false;
+    // This prompt forward attends the pool densely despite pool_qsa: the replayed recall tail, whose rows are the
+    // question's and persist (QSA there read 512 blocks of the resident pool and lost P2 4/40 on the 14-session gate).
+    bool pool_prompt_dense = false;
     ggml_tensor * mtp_k = nullptr;      // MTP draft layer, same layout; null unless created with `mtp`
     ggml_tensor * mtp_v = nullptr;
     ggml_tensor * mtp_prev_hidden = nullptr; // one pending trunk row, for the next prefill chunk's first pair

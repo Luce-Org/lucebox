@@ -2698,7 +2698,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // A pool_qsa cache attends T=1 and verify rows through QSA only inside a stable graph (the chunk table's home).
     const bool paged = cache.pool_qsa && stable_qsa_supported(backend, w, cache, kv_end);
     // Its prompt chunks attend through QSA too, over this graph's own chunk table (built below).
-    const bool pool_prompt = cache.pool_qsa && !verify && n_tokens > 1;
+    const bool pool_prompt = cache.pool_qsa && !cache.pool_prompt_dense && !verify && n_tokens > 1;
     const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, verify ? 1 : n_tokens, pos0, w.qsa, paged, pool_prompt);
     const bool reuse_ws = n_tokens == 1;
     // Verify: row t attends as a T=1 decode at pos0 + t (see Qwen4ExpAttnRow), over that
