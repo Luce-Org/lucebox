@@ -3551,11 +3551,12 @@ bool Qwen35Backend::kvflash_exact_scores_gpu(int sealed, const std::vector<const
         // Default: the fused kernel, with the evicted K it reads kept on the device between calls (the chunk versions say which
         // slots are still current). Where the kernel cannot score this K, or with LUCE_KVFLASH_GPU_SCORE_FUSED=0: the logits graph,
         // call-scoped. The graph spans every slot held, so it never gets the archive.
-        const bool fused = env_int_or_default("LUCE_KVFLASH_GPU_SCORE_FUSED", 1) != 0 &&
-                           luce::common::KvFlashGpuMass::fused_available(pool_k[0]->type, d.head_dim, d.n_layers);
+        // A failed fused run latches the kernel off in the scorer: fused() is false from then on, and the archive goes with it.
+        kvflash_gpu_mass_->set_fused(env_int_or_default("LUCE_KVFLASH_GPU_SCORE_FUSED", 1) != 0 &&
+                                     luce::common::KvFlashGpuMass::fused_available(pool_k[0]->type, d.head_dim, d.n_layers));
+        const bool fused = kvflash_gpu_mass_->fused();
         std::vector<uint64_t> ver;
         for (int c = 0; fused && c < sealed; c++) ver.push_back(p.chunk_version(c));
-        kvflash_gpu_mass_->set_fused(fused);
         if (kvflash_gpu_mass_->score(pool_k, blk, [&](int c, int l, int h) { return p.host_k_seg(c, l, h); },
                                      ct, d, qs, outs, &planes, &tm, &why, fused ? &ver : nullptr)) {
             std::fprintf(stderr, "[kvflash] gpu scorer: n_q=%d sealed=%d resident=%d gather %.1f h2d %.1f graph %.1f d2h %.1f agg %.1f total %.1f ms batches=%d peak=%.0f MiB "

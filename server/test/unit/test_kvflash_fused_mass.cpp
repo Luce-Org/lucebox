@@ -154,6 +154,18 @@ TEST_CASE(KvflashFusedMassFixture, q8_reference_is_close_to_the_float_scorer) {
     CHECK(w < 0.1);
 }
 
+// The caller asks for the fused kernel before every call; after one failed run the answer stays no.
+TEST_CASE(KvflashFusedMassFixture, fused_latch_stays_off_after_the_first_failure) {
+    KvFlashFusedLatch f;
+    CHECK(!f.on());
+    f.set(true);  CHECK(f.on());
+    f.set(false); CHECK(!f.on());
+    f.set(true);  CHECK(f.on());
+    f.fail();     CHECK(!f.on());
+    f.set(true);  CHECK(!f.on());   // qwen35_backend's per-call set_fused(true) does not re-arm it
+    f.set(false); f.set(true); CHECK(!f.on());
+}
+
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
 namespace {
 // Device run of the fused kernel on `s` (Q8_0): chunks alternate between the pool tensors (shuffled blocks) and the device copy.

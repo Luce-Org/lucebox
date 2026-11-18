@@ -164,4 +164,13 @@ inline void kvflash_fused_reduce_ref(const KvFlashFusedPartials & p, const KvFla
     }
 }
 
+// Pure: whether a scorer runs the fused kernel. The first failed run latches it off for the scorer's life: set(true) from the
+// caller (every call) does not bring it back, so a kernel that cannot run costs one attempt, not one per call.
+struct KvFlashFusedLatch {
+    bool want = false, failed = false;
+    void set(bool on) { want = on; }
+    void fail() { failed = true; }
+    bool on() const { return want && !failed; }
+};
+
 }  // namespace luce::common

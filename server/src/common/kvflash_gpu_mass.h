@@ -169,7 +169,10 @@ public:
 
     // The fused chunk-mass kernel (kvflash_fused_mass_cuda.h) instead of the logits graph, when the K is q8_0 and the build has it.
     // Its scores follow the same MMQ numerics but are not bit-equal to the graph's.
-    void set_fused(bool on) { fused_ = on; }
+    // The first failed fused run turns it off for good (KvFlashFusedLatch); fused() says what the next call will do, and a caller
+    // that keeps the archive for the kernel (passes versions) asks it after set_fused().
+    void set_fused(bool on) { fused_.set(on); }
+    bool fused() const { return fused_.on(); }
     // Can the fused kernel score this K? The logits graph spans every archive slot, held for this call's chunks or not, so callers
     // keep the archive (pass versions) only when this holds.
     static bool fused_available(ggml_type kt, int D, int L) {
@@ -342,7 +345,7 @@ public:
         tm.uploaded = U; tm.archived = keep ? (int)aslots_.size() : 0;
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
         // The fused kernel: one pass over the pool K and the archive where they are, no logits. Any failure: the graph below.
-        if (fused_ && fused_available(kt, D, L)) {
+        if (fused_.on() && fused_available(kt, D, L)) {
             tm.h2d = ms(t1, clk::now());
             const auto t2 = clk::now();
             luce::common::KvFlashFusedGeom g;
@@ -380,7 +383,8 @@ public:
                 if (timing) *timing = tm;
                 return true;
             }
-            if (!fused_warned_) { fused_warned_ = true; std::fprintf(stderr, "[kvflash] fused scorer unavailable: %s; using the logits graph\n", e.c_str()); }
+            fused_.fail();
+            std::fprintf(stderr, "[kvflash] fused scorer failed: %s; using the logits graph from now on\n", e.c_str());
         }
 #endif
         ggml_backend_tensor_set_async(be_, q_all, qbuf, 0, ggml_nbytes(q_all));
@@ -526,7 +530,7 @@ private:
     ggml_backend_t            be_;
     ggml_backend_buffer_type_t host_buft_ = nullptr;
     size_t                    batch_bytes_;
-    bool                      fused_ = false, fused_warned_ = false;
+    luce::common::KvFlashFusedLatch fused_;
     size_t                    fused_part_bytes_ = (size_t)256 << 20;   // device bytes of one partials tile
     luce::common::KvFlashFusedWs * fws_ = nullptr;
     ggml_backend_buffer_t     stage_ = nullptr;   // pinned: evicted K staging, then the queries
