@@ -251,6 +251,20 @@ TEST_CASE(KvflashFusedMassFixture, device_kernel_tiles_the_queries_without_chang
     CHECK(t2 > 1);
 }
 
+// The 27B shape: head dim 256 (8 q8_0 blocks per row), 64-token chunks, 24 q heads over 4 kv heads.
+TEST_CASE(KvflashFusedMassFixture, device_kernel_matches_the_cpu_reference_at_d256_ct64) {
+    FSynth s;
+    s.build(GGML_TYPE_Q8_0, 2, 24, 4, 256, 37, 64, 9, 11);
+    int t1 = 0, t2 = 0;
+    const double a = fused_gpu_worst(s, (size_t)1 << 30, 1e-8, &t1);
+    const double b = fused_gpu_worst(s, (size_t)48 * 37 * 2 * 4 * 4, 1e-8, &t2);   // 4 queries per tile
+    std::fprintf(stderr, "device vs reference at D=256 ct=64 worst %.3g / %.3g (tiles %d / %d)\n", a, b, t1, t2);
+    CHECK(a >= 0); CHECK(b >= 0);
+    CHECK(a <= 1e-5); CHECK(b <= 1e-5);
+    CHECK(t1 == 1);
+    CHECK(t2 > 1);
+}
+
 TEST_CASE(KvflashFusedMassFixture, wmma_arch_gate_matches_the_compiled_kernel_archs) {
     CHECK(kvflash_fused_arch_has_wmma("gfx1200"));
     CHECK(kvflash_fused_arch_has_wmma("gfx1201"));
