@@ -31,7 +31,7 @@ static ggml_tensor * pack_values(ggml_context * c, ggml_tensor * values) {
     return ggml_cont(c, ggml_permute(c, blocks, 1, 0, 2, 3));
 }
 
-// chunk_map (decode only): K/V live in a KVFlash pool, 64-token chunk c at rows chunk_map[c] (-1 = not resident),
+// chunk_map (unmasked): K/V live in a KVFlash pool, 64-token chunk c at rows chunk_map[c] (-1 = not resident),
 // read through ggml_qsa_decode_ids_paged; the reference then attends over the resident selected keys.
 static constexpr int CHUNK = 64;
 
@@ -39,7 +39,7 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng,
                 const std::vector<int32_t> * chunk_map = nullptr, uint64_t * hash_out = nullptr) {
     const int T = cs.T, kv_len = cs.pos0 + T;
     const bool packed = T >= 128;
-    if (chunk_map && (packed || cs.mask)) return false;
+    if (chunk_map && cs.mask) return false;
     const int rows = chunk_map ? (int) chunk_map->size() * CHUNK : cs.ctx;   // K/V rows of the cache tensor
     const int nk = chunk_map ? rows : packed ? (kv_len + 3) / 4 * 4 : kv_len;   // the graph pads K/V to whole 4-key blocks
     const int n_after = kv_len / R;
@@ -201,6 +201,20 @@ int main() {
         const bool same = run(gpu, cs, a, nullptr, &h_pos) && run(gpu, cs, b, &all_in, &h_pool) && h_pos == h_pool;
         std::printf("qsa-attn paged all resident T=%d pos=%d %s\n", cs.T, cs.pos0, same ? "bit-identical OK" : "FAIL");
         ok &= same && run(gpu, cs, d, &some_out);
+        cases += 2;
+    }
+    // A prompt chunk over the pool (packed prefill kernel): the arena rows come out of position order, so the
+    // accumulation order changes; both maps must match the reference over the resident selected keys.
+    for (const Case & cs : std::vector<Case>{{130, 1001, 512, 4096, false}, {257, 3000, 512, 4096, false},
+                                             {300, 6001, 512, 8192, false}}) {
+        const int n_chunks = cs.ctx / CHUNK;
+        std::vector<int32_t> all_in((size_t) n_chunks), some_out((size_t) n_chunks);
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            all_in[(size_t) ci] = (n_chunks - 1 - ci) * CHUNK;
+            some_out[(size_t) ci] = ci % 3 == 1 && ci < (cs.pos0 / CHUNK) ? -1 : all_in[(size_t) ci];
+        }
+        ok &= run(gpu, cs, rng, &all_in);
+        ok &= run(gpu, cs, rng, &some_out);
         cases += 2;
     }
     ggml_backend_free(gpu);

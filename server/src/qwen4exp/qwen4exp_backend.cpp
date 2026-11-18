@@ -731,7 +731,7 @@ void Qwen4ExpBackend::settle_indexer_recall() {
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
     recall_mode_ = s.mode;
     if (cache_.pool_qsa)
-        std::fprintf(stderr, "[q4-recall] decode and verify attend the KVFlash pool through QSA (resident blocks only; "
+        std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; "
                      "LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
 }
 
