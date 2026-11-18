@@ -9,7 +9,8 @@
 //     ctx window anchored at `committed` and shared by every query row,
 //     noise columns causal (j <= q).
 //   causal == false (DFlash 2 upstream GGUF, attention.causal = false):
-//     noise columns fully visible; the ctx window is per query row,
+//     noise columns [0, noise_width) visible (a narrower step hides the wider step's stale rows);
+//     the ctx window is per query row,
 //     visible iff q_pos - k_pos < window with q_pos = committed + q.
 
 #include <algorithm>
@@ -23,10 +24,11 @@ constexpr uint16_t kDraftMaskF16NegInf = 0xFC00;
 
 inline std::vector<uint16_t> build_draft_swa_mask(
         int cap, int kv_total, int q_len, int committed,
-        const int32_t * slot_pos, int window, bool causal) {
+        const int32_t * slot_pos, int window, bool causal, int noise_width = 0) {
     std::vector<uint16_t> m((size_t)kv_total * q_len, kDraftMaskF16NegInf);
     const int win = std::min(committed, cap);
     const int lo  = committed - win;               // oldest position the ring can hold
+    if (noise_width <= 0 || noise_width > q_len) noise_width = q_len;
     for (int q = 0; q < q_len; q++) {
         uint16_t * row = m.data() + (size_t)q * kv_total;
         int row_lo;
@@ -41,7 +43,7 @@ inline std::vector<uint16_t> build_draft_swa_mask(
             if (p >= row_lo && p < committed) row[s] = kDraftMaskF16Zero;
         }
         for (int j = 0; j < q_len; j++)
-            if (!causal || j <= q) row[cap + j] = kDraftMaskF16Zero;
+            if (causal ? j <= q : j < noise_width) row[cap + j] = kDraftMaskF16Zero;
     }
     return m;
 }

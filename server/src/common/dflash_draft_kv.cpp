@@ -332,10 +332,10 @@ bool draft_kv_begin_step(DraftKvState & st,
         // Causal (DFlash 1): the window is anchored at `committed` for ALL
         // noise rows on purpose, replicating the legacy one-shot drafter graph
         // (a per-row bound would change the trained pattern). Non-causal
-        // (upstream DFlash 2): per-query window, noise fully visible.
+        // (upstream DFlash 2): per-query window, noise visible up to the step width.
         st.mask_hbuf = build_draft_swa_mask(st.cap, st.kv_total, st.q_len, committed,
                                             st.slot_pos.data(), dw.swa_window,
-                                            st.swa_causal);
+                                            st.swa_causal, noise_width);
         ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
                                 sizeof(uint16_t) * mask_elems);
     }

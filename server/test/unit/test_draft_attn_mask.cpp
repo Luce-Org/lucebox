@@ -59,6 +59,14 @@ int main() {
         for (int q = 0; q < Q; q++)
             for (int p = committed - CAP; p < committed; p++) CHECK(vis(m, q, ctx_slot(p)));
     }
+    // a step narrower than the block: noise rows past the width still hold the wider step's K/V, never visible
+    {
+        const int committed = 100, width = 3;
+        auto sp = ring(committed);
+        auto m = build_draft_swa_mask(CAP, KV_TOTAL, Q, committed, sp.data(), 16, false, width);
+        for (int q = 0; q < Q; q++)
+            for (int j = 0; j < Q; j++) CHECK(vis(m, q, CAP + j) == (j < width));
+    }
     // stale slot (position >= committed after a rollback) is never visible
     {
         const int committed = 50;
