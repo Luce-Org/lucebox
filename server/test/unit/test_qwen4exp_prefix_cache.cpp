@@ -219,6 +219,42 @@ struct Qwen4ExpPrefixTest {
         CHECK(b.snapshot_drop_kv(1) && b.live_slot_ < 0 && b.snapshot_state_only(1) && b.snapshot_cur_pos(1) == 6);
         std::puts("PASS state-only backups: the allowance counts their state; a deferred snapshot is copied out first");
     }
+
+    // Past a KVFlash pool a snapshot holds its point state alone (its rows stay in the pager): the allowance charges
+    // that, not the pool's rows.
+    static void pager_budget() {
+        constexpr int pool = 512;
+        Qwen4ExpBackend b({});
+        b.backend_ = b.snap_backend_ = ggml_backend_cpu_init();
+        CHECK(b.backend_);
+        auto & c = b.cache_;
+        c.max_ctx = 4096;
+        c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
+        auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, pool, 2); };
+        c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+        c.indexer_raw = c.indexer_k = {nullptr, nullptr};
+        c.ssm_state = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2)};
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, b.backend_);
+        CHECK(c.buf);
+        KvFlashConfig cfg;
+        cfg.pool_tokens = pool;
+        c.kvflash = std::make_unique<KvFlashPager>();
+        c.kvflash->set_pinned_host_backing(false);
+        CHECK(c.kvflash->attach(cfg, c.attn_k, c.attn_v));
+        CHECK(qwen4exp_kvflash_reserve(c, 0, 300));
+        for (int p = 300; p < 2000; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+        c.cur_pos = 2000;
+        b.tokens_.assign(2000, 1); b.logits_ = {1}; b.weights_.n_vocab = 1;
+        const size_t point = b.snapshot_bytes(2000, /*rows=*/false);
+        CHECK(point > 0 && 2 * point < b.snapshot_bytes_estimate(2000));
+        b.snapshot_budget_ = 2 * point;
+        CHECK(b.snapshot_save(0) && b.snapshots_[0].rows_in_pager);
+        CHECK(b.snapshot_save_deferred(1));   // the live cache is past the pool too
+        CHECK(!b.snapshot_save(2));           // two point states use the allowance up
+        b.snapshot_flush_deferred();
+        CHECK(b.snapshots_[1].rows_in_pager);
+        std::puts("PASS a snapshot past the KVFlash pool counts its point state against the allowance");
+    }
 };
 } // namespace luce::common
 
@@ -880,6 +916,7 @@ int main(int argc, char ** argv) {
     rollback_reset();
     Qwen4ExpPrefixTest::budget();
     Qwen4ExpPrefixTest::state_budget();
+    Qwen4ExpPrefixTest::pager_budget();
     auto backend = argc > 1 ? ggml_backend_cuda_init(0) : ggml_backend_cpu_init();
     CHECK(backend);
     copies(backend, backend);
