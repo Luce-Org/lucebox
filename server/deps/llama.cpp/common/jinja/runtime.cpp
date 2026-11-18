@@ -779,6 +779,12 @@ value member_expression::execute_impl(context & ctx) {
         } else {
             property = this->property->execute(ctx);
         }
+    } else if (is_stmt<integer_literal>(this->property)) {
+        // syntax: obj.index
+        property = this->property->execute(ctx);
+        if (property->as_int() < 0) {
+            throw std::runtime_error("Static member property cannot be negative");
+        }
     } else {
         // syntax: obj.prop
         if (!is_stmt<identifier>(this->property)) {

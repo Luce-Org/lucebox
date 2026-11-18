@@ -101,8 +101,8 @@ layers 0-12, 13-23, 24-33, 34-44.
   request stops prefill exactly at the snapshot position.
 - **Layer split is sequential**: one GPU works at a time; ggml_backend_sched
   copies the mHC state across each boundary.
-- **One graph per step**: rebuilt every token, no CUDA graphs yet. Decode is
-  about 20 tok/s on 4x RTX PRO 6000.
+- **One graph per step**: rebuilt per decode token and per prefill chunk, no
+  CUDA graphs yet. Decode is about 20 tok/s on 4x RTX PRO 6000.
 - **GPU prefill and DSA ties**: ggml's cuBLAS runs F32 GEMMs in TF32, which can
   flip near-tie pool selections in batched prefill. Decode uses the F32 mat-vec
   kernels. Upstream avoids this with a fused F32 lightning-indexer kernel; porting

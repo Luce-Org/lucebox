@@ -1084,8 +1084,41 @@ const func_builtins & value_array_t::get_builtins() const {
             std::reverse(arr.begin(), arr.end());
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
-        {"unique", [](const func_args &) -> value {
-            throw not_implemented_exception("Array unique builtin not implemented");
+        {"unique", [](const func_args & args) -> value {
+            args.ensure_count(1, 3);
+            args.ensure_vals<value_array>();
+            value val       = args.get_pos(0);
+            value val_case  = args.get_kwarg_or_pos("case_sensitive", 1);
+            value attribute = args.get_kwarg_or_pos("attribute",      2);
+            // FIXME: unique is currently always case sensitive
+            //const bool case_sensitive = val_case->as_bool(); // undefined == false
+            const bool attr_is_int = is_val<value_int>(attribute);
+            std::vector<value> result;
+            std::vector<value> seen;
+            for (const auto & item : val->as_array()) {
+                value key = item;
+                if (!attribute->is_undefined()) {
+                    if (attr_is_int && is_val<value_array>(item)) {
+                        key = item->at(attribute->as_int());
+                    } else if (!attr_is_int && is_val<value_object>(item)) {
+                        key = item->at(attribute);
+                    } else {
+                        throw raised_exception("unique: unsupported attribute on " + item->type());
+                    }
+                }
+                bool dup = false;
+                for (const auto & s : seen) {
+                    if (value_compare(s, key, value_compare_op::eq)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    seen.push_back(key);
+                    result.push_back(item);
+                }
+            }
+            return mk_val<value_array>(std::move(result));
         }},
     };
     return builtins;

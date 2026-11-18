@@ -26,6 +26,7 @@ using namespace luce::common;
 namespace {
 
 int g_failures = 0;
+bool g_skipped = false;
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -427,7 +428,8 @@ void test_reference() {
     const char * gguf = std::getenv("GLM5_REF_GGUF");
     const char * prefix = std::getenv("GLM5_REF_PREFIX");
     if (!gguf || !prefix) {
-        std::printf("  skipped (set GLM5_REF_GGUF and GLM5_REF_PREFIX)\n");
+        std::printf("  set GLM5_REF_GGUF and GLM5_REF_PREFIX to run\n");
+        g_skipped = true;
         return;
     }
     std::vector<int32_t> toks;
@@ -505,9 +507,11 @@ void test_reference() {
 
 void run(const char * name, const std::function<void()> & fn) {
     const int before = g_failures;
+    g_skipped = false;
     std::printf("[glm5] %s\n", name);
     fn();
-    std::printf("[glm5] %s: %s\n", name, g_failures == before ? "ok" : "FAILED");
+    std::printf("[glm5] %s: %s\n", name,
+                g_failures != before ? "FAILED" : g_skipped ? "SKIPPED" : "ok");
 }
 
 }  // namespace

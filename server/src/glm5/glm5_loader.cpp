@@ -198,6 +198,7 @@ bool read_hparams(const gguf_context * g, Glm5Weights & w, std::vector<uint32_t>
     else if (gating != 2) bad = "expert_gating_func must be sigmoid (2)";
     else if (groups > 1) bad = "expert groups are not supported";
     else if (w.n_shared != 1) bad = "expected exactly one shared expert";
+    else if (!w.idx_select_tail) bad = "indexer kpool_select_tail must be true";
     if (!bad.empty()) {
         set_last_error("glm5: unsupported GGUF: " + bad);
         return false;
@@ -524,13 +525,16 @@ bool load_glm5_model(const std::string & path,
                 return false;
             }
             const uint8_t * base = static_cast<const uint8_t *>(src.shard->map.data());
-            const size_t pos = gguf_get_data_offset(src.shard->gguf) +
-                               gguf_get_tensor_offset(src.shard->gguf, src.index);
-            if (pos + 3 * sizeof(float) > src.shard->map.size()) {
+            const size_t file_size = src.shard->map.size();
+            const size_t data_off = gguf_get_data_offset(src.shard->gguf);
+            const size_t tensor_off = gguf_get_tensor_offset(src.shard->gguf, src.index);
+            if (data_off > file_size || tensor_off > file_size - data_off ||
+                3 * sizeof(float) > file_size - data_off - tensor_off) {
                 set_last_error("glm5: " + name + " lies outside the file");
                 free_glm5_model(out);
                 return false;
             }
+            const size_t pos = data_off + tensor_off;
             std::memcpy(k == 0 ? L.hc_attn_scale : L.hc_ffn_scale, base + pos, 3 * sizeof(float));
         }
     }

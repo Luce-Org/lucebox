@@ -76,7 +76,7 @@ private:
         std::vector<float> logits;              // predicts the token at cur_pos
         std::vector<std::vector<uint8_t>> data; // per snapshot_tensors() entry
     };
-    static constexpr int kSnapshotSlots = 16;
+    static constexpr int kSnapshotSlots = kMaxSlots;
 
     Glm5BackendConfig            cfg_;
     std::vector<ggml_backend_t>  backends_;   // one per weight device
