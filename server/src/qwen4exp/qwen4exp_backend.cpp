@@ -713,6 +713,12 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
                      recall_mode_);
         recall_mode_ = 0;
     }
+    // Before the cache is sized, so the pin equals --verify-width 5. ponytail: a later settle to score only keeps the pin.
+    if (const int w = q4_recall_verify_width(recall_mode_, cfg_.verify_width); w != cfg_.verify_width) {
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=2 pins the MTP verify width to %d (the adaptive width "
+                     "varies with step timings, which changes recall's picks run to run; --verify-width overrides)\n", w);
+        cfg_.verify_width = w;
+    }
 }
 
 // The layout context fitting settled (pool vs context, attention placement) decides what recall can do; the cache is

@@ -93,6 +93,10 @@ int main() {
     assert(st.mode == 1 && st.why == nullptr);
     st = q4_recall_settle(0, 3, false);                         // off stays off, silently
     assert(st.mode == 0 && st.why == nullptr);
+    // Recall pins an adaptive MTP verify width (0) to 5; an explicit width and the other modes keep theirs.
+    assert(q4_recall_verify_width(2, 0) == 5);
+    assert(q4_recall_verify_width(2, 3) == 3 && q4_recall_verify_width(2, 1) == 1);
+    assert(q4_recall_verify_width(1, 0) == 0 && q4_recall_verify_width(0, 0) == 0);
     // Env integers: the whole string, in range; unset or empty is the default without complaint, anything else the
     // default and a refusal for the caller to name.
     auto e = q4_parse_env_int(nullptr, 0, 2, 0);

@@ -67,6 +67,11 @@ inline Q4EnvInt q4_parse_env_int(const char * v, int lo, int hi, int def) {
 // LUCE_Q4_RECALL_TAIL: tokens, 0 = no two-pass tail; contexts stay below 2^24.
 constexpr int kQ4RecallTailDefault = 2048, kQ4RecallTailMax = (1 << 24) - 1;
 
+// --verify-width under recall (0 = adaptive). The adaptive width learns from wall-clock step costs, so verify batch
+// shapes, and with them the low bits of the KV, vary run to run; recall's top-k vote flips on those near-ties.
+// Mode 2 pins an adaptive width to 5 (two runs gave identical logs); an explicit width is the user's.
+inline int q4_recall_verify_width(int mode, int width) { return mode == 2 && width == 0 ? 5 : width; }
+
 // Bytes of one full-attention layer's recall storage (F32 raw indexer keys per position, pooled keys per block of
 // `ratio`), which a pool allocates at the full max_ctx; 0 for a layer without an indexer.
 inline int64_t q4_recall_layer_bytes(int64_t max_ctx, int64_t head_size, int64_t ratio) {
