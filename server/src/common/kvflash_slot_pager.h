@@ -12,6 +12,7 @@
 #include "kvflash_pager.h"
 #include "kvflash_slot_plan.h"
 
+#include <functional>
 #include <vector>
 
 namespace luce::common {
@@ -20,6 +21,14 @@ namespace luce::common {
 
 class KvFlashSlotPager : public KvFlashPager {
 public:
+    // Called before every reset of this pager. The slot pagers share the backend's exact GPU scorer, whose device archive
+    // holds their evicted K: the backend drops this pager's part of it here (Qwen35Backend::kvflash_drop_archive_of).
+    std::function<void(const KvFlashPager &)> on_reset;
+    void reset() {
+        if (on_reset) on_reset(*this);
+        KvFlashPager::reset();
+    }
+
     // Attach slot `slot` of `n_slots` with a quota of `quota_chunks` chunks.
     // cfg.pool_tokens and cfg.row_base are derived; the K/V tensors are the
     // shared arena (>= kvflash_arena_rows rows, or none for the no-tensor path).

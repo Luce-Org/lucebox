@@ -387,12 +387,12 @@ struct World {
     int evicted() const { return (int)std::count(blk.begin(), blk.end(), -1); }
     // Scores with `gm` (versions when `keyed`); returns the chunks whose host K the call read.
     int score(KvFlashGpuMass & gm, bool keyed, std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> & planes,
-              KvFlashGpuMassTiming * tm = nullptr) {
+              KvFlashGpuMassTiming * tm = nullptr, const void * owner = nullptr) {
         segs = 0;
         const std::vector<uint64_t> v(ver.begin(), ver.begin() + (long)blk.size());
         std::string why;
         const bool ok = gm.score(pool_k, blk, [&](int c, int l, int h) { segs++; return (const uint8_t *)seg_rw(c, l, h); }, cfg.CT, s.dims(),
-                                 s.qptrs(), outs, &planes, tm, &why, keyed ? &v : nullptr);
+                                 s.qptrs(), outs, &planes, tm, &why, keyed ? &v : nullptr, owner);
         if (!ok) { std::fprintf(stderr, "gpu mass: %s\n", why.c_str()); return -1; }
         return segs / (cfg.L * cfg.HK);
     }
@@ -524,6 +524,40 @@ TEST_CASE(KvflashGpuMassFixture, drop_archive_frees_the_device_copy_and_the_next
     CHECK(gm.archive_bytes() > 0);
     REQUIRE(w.score(fresh, false, ref, pref) == 18);
     CHECK(same_scores(o, pl, ref, pref, 16));
+}
+
+// The slot pagers share one scorer: a reset drops that pager's slots only, and the device copy goes when no other pager holds one.
+TEST_CASE(KvflashGpuMassFixture, archive_drop_by_owner_keeps_the_other_pagers_slots) {
+    int a = 0, b = 0;   // two pagers, by address
+    std::vector<Slot> held = {{1, 11, &a}, {3, 13, &a}, {1, 21, &b}, {2, 22, &b}, {4, 24, &b}};
+    CHECK(kvflash_gpu_archive_drop_owner(held, &a));   // b still holds three
+    CHECK(held[0].chunk == -1);
+    CHECK(held[1].chunk == -1);
+    auto p = kvflash_gpu_archive_plan(held, {1, 2, 4}, {20, 21, 22, 23, 24});
+    CHECK(!p.reset);                                   // 2 dead of 5
+    CHECK(p.upload.empty());
+    CHECK(p.chunk_of == (std::vector<int>{-1, -1, 1, 2, 4}));
+    // a dead slot counts as stale whatever its chunk was: once they are most of the archive, the next call starts it over
+    std::vector<Slot> mostly = {{1, 11, &a}, {3, 13, &a}, {1, 21, &b}};
+    CHECK(kvflash_gpu_archive_drop_owner(mostly, &a));
+    CHECK(kvflash_gpu_archive_plan(mostly, {1}, {20, 21}).reset);
+    CHECK(!kvflash_gpu_archive_drop_owner(held, &b));  // nobody left: the caller frees the device copy
+}
+TEST_CASE(KvflashGpuMassFixture, drop_archive_of_one_pager_keeps_the_device_copy_another_pager_scores_from) {
+    World w(small_cfg(GGML_TYPE_Q8_0, 60, 8));
+    KvFlashGpuMass gm(w.be);
+    std::vector<std::vector<float>> o;
+    std::vector<KvFlashMassPlanes> pl;
+    KvFlashGpuMassTiming tm;
+    int a = 0, b = 0;
+    w.place(60, newest(60, 20));
+    REQUIRE(w.score(gm, true, o, pl, &tm, &b) == 38);
+    gm.drop_archive(&a);                               // a holds nothing here: b's slots stay
+    CHECK(gm.archive_bytes() > 0);
+    CHECK(w.score(gm, true, o, pl, &tm, &b) == 0);     // and score without a new upload
+    CHECK(tm.archived == 38);
+    gm.drop_archive(&b);
+    CHECK(gm.archive_bytes() == 0);
 }
 
 TEST_CASE(KvflashGpuMassFixture, without_versions_every_call_uploads_every_evicted_chunk) {

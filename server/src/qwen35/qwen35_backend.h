@@ -359,6 +359,7 @@ protected:
     bool                    kvflash_gpu_failed_ = false;     // the GPU scorer refused or failed once: the CPU scorer for the rest of the process
     std::unique_ptr<KvFlashGpuMass> kvflash_gpu_mass_;       // lazily built on target_backend_, buffers reused across reselects
     void kvflash_reset_pager();   // kvflash_pager_.reset() and the scorer's device archive, stale with it
+    void kvflash_drop_archive_of(const KvFlashPager & p);   // the archived chunks of one pager (a slot's, or kvflash_pager_)
     KvFlashQkDims kvflash_exact_dims() const;
     int kvflash_tp_degree() const { return cfg_.device.is_tensor_parallel() ? (int)cfg_.device.layer_split_gpus.size() : 1; }
     // Same contract as kvflash_exact_scores with planes (selector v2); false = unavailable, the CPU scorer must run.

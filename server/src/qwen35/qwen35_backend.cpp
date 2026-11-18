@@ -1928,6 +1928,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
     std::vector<KvFlashSlotPager *> raw;
     for (int i = 0; i < n_slots; i++) {
         kvf_pagers_.push_back(std::make_unique<KvFlashSlotPager>());
+        kvf_pagers_.back()->on_reset = [this](const KvFlashPager & p) { kvflash_drop_archive_of(p); };
         if (!kvf_arena_->add(*kvf_pagers_.back())) { set_last_error("KVFlash slot " + std::to_string(i) + ": arena add failed"); return false; }
         if (!kvf_pagers_.back()->attach_slice(i, n_slots, quota_chunks, KvFlashConfig{}, cache_.attn_k, cache_.attn_v)) {
             set_last_error("KVFlash slot " + std::to_string(i) + ": pager attach failed (quota " +
@@ -3430,7 +3431,7 @@ bool Qwen35Backend::kvflash_restore_pooled(const PrefixSnapshot & snap,
     if (!kvflash_active() || ct <= 0 || snap.kvflash_blob.empty()) return false;
     const bool ok = kvflash_pager_.deserialize(snap.kvflash_blob.data(), snap.kvflash_blob.size());
     // deserialize() resets the pager inside (a refused header leaves it as it was; dropping then only costs a re-upload).
-    if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive();
+    kvflash_drop_archive_of(kvflash_pager_);
     if (!ok) {
         std::fprintf(stderr, "[kvflash] pager deserialize failed\n");
         return false;
@@ -3768,10 +3769,16 @@ bool Qwen35Backend::kvflash_exact_scores_on(KvFlashPager & p, int sealed, const 
     return ok;
 }
 
-// Every pager reset goes through here (kvflash_restore_pooled, whose reset is inside deserialize(), drops it itself): the GPU scorer's device archive holds K of the old chunks, stale from now on.
+// Every reset of kvflash_pager_ goes through here (kvflash_restore_pooled, whose reset is inside deserialize(), drops it itself): the GPU scorer's device archive holds K of the old chunks, stale from now on.
 void Qwen35Backend::kvflash_reset_pager() {
     kvflash_pager_.reset();
-    if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive();
+    kvflash_drop_archive_of(kvflash_pager_);
+}
+
+// The slot pagers score through the same scorer (kvflash_exact_scores_gpu_on) and call this from their reset
+// (KvFlashSlotPager::on_reset): only the reset pager's archived chunks go, the other slots keep theirs.
+void Qwen35Backend::kvflash_drop_archive_of(const KvFlashPager & p) {
+    if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive(&p);
 }
 
 // Selector v2 on the target backend (kvflash_gpu_mass.h): the pool K tensors are graph leaves, evicted chunks are
@@ -3811,7 +3818,7 @@ bool Qwen35Backend::kvflash_exact_scores_gpu_on(KvFlashPager & p, int sealed, co
         std::vector<uint64_t> ver;
         for (int c = 0; fused && c < sealed; c++) ver.push_back(p.chunk_version(c));
         if (kvflash_gpu_mass_->score(pool_k, blk, [&](int c, int l, int h) { return p.host_k_seg(c, l, h); },
-                                     ct, d, qs, outs, &planes, &tm, &why, fused ? &ver : nullptr)) {
+                                     ct, d, qs, outs, &planes, &tm, &why, fused ? &ver : nullptr, &p)) {
             std::fprintf(stderr, "[kvflash] gpu scorer: n_q=%d sealed=%d resident=%d gather %.1f h2d %.1f graph %.1f d2h %.1f agg %.1f total %.1f ms batches=%d peak=%.0f MiB "
                                  "uploaded=%d of %d evicted (%d held) fused=%d\n",
                          (int)qs.size(), sealed, n_res, tm.gather, tm.h2d, tm.graph, tm.d2h, tm.agg, tm.total, tm.batches, tm.peak_bytes / 1048576.0,

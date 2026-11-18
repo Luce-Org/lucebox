@@ -47,6 +47,22 @@ TEST_CASE(KvflashSlotKvFixture, acquire_gives_distinct_slots_then_exhausts_and_r
     CHECK(w.kv->owned_block_count(a, *std::make_unique<uint32_t>()) == PagedKvStatus::StaleHandle);
 }
 
+// The slot pagers share the backend's GPU scorer, whose device archive holds their evicted K: a slot pager's reset tells
+// on_reset first, whichever path resets it.
+TEST_CASE(KvflashSlotKvFixture, every_reset_of_a_slot_pager_calls_on_reset_for_that_pager) {
+    World w;
+    std::vector<const KvFlashPager *> seen;
+    for (int i = 0; i < kN; i++) w.s[i]->on_reset = [&](const KvFlashPager & p) { seen.push_back(&p); };
+    PagedKvSequenceHandle a;
+    REQUIRE(w.kv->acquire_reserved(1, 256, a) == PagedKvStatus::Ok);   // a new request resets the slot's pager
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0] == static_cast<const KvFlashPager *>(&*w.s[a.slot]));
+    CHECK(w.kv->clear(a) == PagedKvStatus::Ok);
+    CHECK(w.kv->release(a) == PagedKvStatus::Ok);
+    REQUIRE(seen.size() == 3);
+    CHECK(seen[2] == seen[0]);
+}
+
 TEST_CASE(KvflashSlotKvFixture, host_ledger_decides_busy_vs_permanent_and_release_gives_it_back) {
     World w(/*budget=*/10 * kChunkBytes);                         // ten chunks of host backing in total
     PagedKvSequenceHandle a, b;

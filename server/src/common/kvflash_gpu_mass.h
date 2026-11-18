@@ -80,8 +80,20 @@ inline std::vector<int> kvflash_gpu_mass_chunk_of(const std::vector<int> & block
     return chunk_of;
 }
 
-// What an archive slot holds: chunk `chunk` as it was at version `ver`.
-struct KvFlashGpuArchiveSlot { int chunk = -1; uint64_t ver = 0; };
+// What an archive slot holds: chunk `chunk` as it was at version `ver`, for the pager `owner` (an address, compared only: the
+// slot pagers share one scorer). chunk -1 = dead: its pager was reset, the slot is masked until the archive is started over.
+struct KvFlashGpuArchiveSlot { int chunk = -1; uint64_t ver = 0; const void * owner = nullptr; };
+
+// Pure: the pager `owner` was reset, so its slots can never score again: they go dead. false = no slot of another pager is
+// left, and the caller frees the archive.
+inline bool kvflash_gpu_archive_drop_owner(std::vector<KvFlashGpuArchiveSlot> & slots, const void * owner) {
+    bool other = false;
+    for (KvFlashGpuArchiveSlot & s : slots) {
+        if (s.owner == owner) s.chunk = -1;
+        other = other || s.chunk >= 0;
+    }
+    return other;
+}
 
 struct KvFlashGpuArchivePlan {
     bool             reset = false;   // most slots are stale: drop them all first
@@ -92,11 +104,11 @@ struct KvFlashGpuArchivePlan {
 // Pure: `slots` = what the archive holds, `evicted` = this call's evicted chunks (ascending), ver[c] = version of
 // sealed chunk c. A slot scores only when its chunk is evicted now and still has the slot's version: a resident chunk
 // is scored from the pool, a rewritten one from a new slot. Slots of chunks >= ver.size() (a call that scores fewer
-// chunks) are kept and masked.
+// chunks) are kept and masked. A dead slot counts as stale.
 inline KvFlashGpuArchivePlan kvflash_gpu_archive_plan(const std::vector<KvFlashGpuArchiveSlot> & slots, const std::vector<int> & evicted,
                                                       const std::vector<uint64_t> & ver) {
     KvFlashGpuArchivePlan p;
-    auto stale = [&](const KvFlashGpuArchiveSlot & s) { return s.chunk >= 0 && (size_t)s.chunk < ver.size() && ver[(size_t)s.chunk] != s.ver; };
+    auto stale = [&](const KvFlashGpuArchiveSlot & s) { return s.chunk < 0 || ((size_t)s.chunk < ver.size() && ver[(size_t)s.chunk] != s.ver); };
     p.reset = 2 * (size_t)std::count_if(slots.begin(), slots.end(), stale) > slots.size();
     std::vector<int> slot_of(ver.size(), -1);
     if (!p.reset) {
@@ -178,6 +190,10 @@ public:
     // Free the device archive. For the owner of the pager: after KvFlashPager::reset() every slot is stale (chunk versions only
     // grow), so nothing held can score again. The next call that passes versions builds a new one.
     void drop_archive() { arch_free(); }
+    // The same for one of several pagers that score through this scorer: the other pagers' slots stay and score. The device
+    // copy is freed when no other pager holds a slot; else the dead slots go when the archive is next started over (a call
+    // where dead and stale slots are most of it, or one that does not fit beside it) or when the last other pager is reset.
+    void drop_archive(const void * owner) { if (!kvflash_gpu_archive_drop_owner(aslots_, owner)) arch_free(); }
     size_t archive_bytes() const { return arch_bytes(); }
     static bool fused_available(ggml_type kt, int D, int L) {
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
@@ -208,12 +224,13 @@ public:
     // host_seg(c, l, h): the evicted chunk's ct rows for (layer, kv head), as KvFlashKSegFn. qs[i]: L*Hq*D floats.
     // Fills outs / planes like kvflash_exact_mass_scores_fast_multi. false (+ why): outs / planes are not valid.
     // versions: (*versions)[c] = KvFlashPager::chunk_version(c) for every sealed chunk keeps the uploaded K on the
-    // device for the next call; null = upload every evicted chunk and free it on return.
+    // device for the next call; null = upload every evicted chunk and free it on return. owner: whose chunks these are, for
+    // drop_archive(owner).
     bool score(const std::vector<ggml_tensor *> & pool_k, const std::vector<int> & block_of, const KvFlashKSegFn & host_seg,
                int ct, const KvFlashQkDims & d, const std::vector<const float *> & qs,
                std::vector<std::vector<float>> & outs, std::vector<KvFlashMassPlanes> * planes,
                KvFlashGpuMassTiming * timing = nullptr, std::string * why = nullptr,
-               const std::vector<uint64_t> * versions = nullptr) {
+               const std::vector<uint64_t> * versions = nullptr, const void * owner = nullptr) {
         auto fail = [&](const std::string & m) { if (why) *why = m; return false; };
         using clk = std::chrono::steady_clock;
         auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -345,7 +362,7 @@ public:
                 ggml_backend_tensor_set_async(be_, a, stage + ((size_t)l * HK + h) * U * SEG, (size_t)h * a->nb[2] + (size_t)n_kept * SEG, (size_t)U * SEG);
         }
         ggml_backend_synchronize(be_);
-        for (int c : plan.upload) aslots_.push_back({c, keep ? (*versions)[(size_t)c] : 0});
+        for (int c : plan.upload) aslots_.push_back({c, keep ? (*versions)[(size_t)c] : 0, owner});
         tm.uploaded = U; tm.archived = keep ? (int)aslots_.size() : 0;
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
         // The fused kernel: one pass over the pool K and the archive where they are, no logits. Any failure: the graph below.
