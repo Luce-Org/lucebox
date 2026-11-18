@@ -254,23 +254,20 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
         }
 
-        // Pattern 5: \s*[\r\n]+
+        // Pattern 5: \s*[\r\n]+ — the greedy \s* backtracks to the last
+        // newline of the whitespace run, so "\n \n" is one piece.
         if (is_whitespace(cp)) {
-            size_t p = pos;
+            size_t p = pos, nl_end = pos;
             int cl = 0;
             uint32_t c = peek_cp(p, &cl);
-            // Consume leading whitespace
-            while (cl > 0 && is_whitespace(c) && !is_newline(c)) {
+            while (cl > 0 && is_whitespace(c)) {
                 p += cl;
+                if (is_newline(c)) nl_end = p;
                 c = peek_cp(p, &cl);
             }
-            if (cl > 0 && is_newline(c)) {
-                while (cl > 0 && is_newline(c)) {
-                    p += cl;
-                    c = peek_cp(p, &cl);
-                }
-                pieces.push_back(text.substr(pos, p - pos));
-                pos = p;
+            if (nl_end > pos) {
+                pieces.push_back(text.substr(pos, nl_end - pos));
+                pos = nl_end;
                 continue;
             }
             // Pattern 6: \s+(?!\S) — whitespace NOT followed by non-whitespace
@@ -702,37 +699,53 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string & text, bool match_control) const {
-    return encode_matching(text, match_control ? added_tokens_ : user_added_tokens_);
+    return encode_matching(text, match_control ? added_tokens_ : user_added_tokens_, {}, {});
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string & text, bool match_control,
-                                       const std::vector<int32_t> & literal) const {
-    if (literal.empty()) return encode(text, match_control);
+                                       const std::vector<int32_t> & literal,
+                                       const std::vector<std::pair<size_t, size_t>> & spans,
+                                       const std::vector<int32_t> & as_text) const {
+    const auto & all = match_control ? added_tokens_ : user_added_tokens_;
+    if (literal.empty()) return encode_matching(text, all, spans, as_text);
     std::vector<std::pair<std::string, int32_t>> added;
-    for (const auto & entry : match_control ? added_tokens_ : user_added_tokens_) {
+    for (const auto & entry : all) {
         if (std::find(literal.begin(), literal.end(), entry.second) == literal.end()) {
             added.push_back(entry);
         }
     }
-    return encode_matching(text, added);
+    return encode_matching(text, added, spans, as_text);
 }
 
 std::vector<int32_t> Tokenizer::encode_matching(
-        const std::string & text, const std::vector<std::pair<std::string, int32_t>> & added) const {
-    // If no added tokens, fast path: pre-tokenize → BPE entire text.
-    if (added.empty()) {
-        std::vector<std::string> pieces = pre_tokenize(text);
-        std::vector<int32_t> ids;
-        for (const auto & piece : pieces) {
+        const std::string & text, const std::vector<std::pair<std::string, int32_t>> & added,
+        const std::vector<std::pair<size_t, size_t>> & spans,
+        const std::vector<int32_t> & as_text) const {
+    std::vector<int32_t> ids;
+    // Pre-tokenize + BPE a run of plain text.
+    const auto plain = [&](const std::string & segment) {
+        for (const auto & piece : pre_tokenize(segment)) {
             auto piece_ids = bpe_encode_piece(piece);
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
+    };
+    // If no added tokens, fast path: pre-tokenize → BPE entire text.
+    if (added.empty()) {
+        plain(text);
         return ids;
     }
 
+    // Whether an added token found at `at` stays text: one of `as_text`
+    // inside a span. Matches come in order, so the spans are walked once.
+    size_t span = 0;
+    const auto stays_text = [&](size_t at, int32_t id) {
+        while (span < spans.size() && spans[span].second <= at) ++span;
+        return span < spans.size() && spans[span].first <= at &&
+               std::find(as_text.begin(), as_text.end(), id) != as_text.end();
+    };
+
     // Split text into segments: alternating normal text and special tokens.
     // Special tokens are matched greedily (longest first).
-    std::vector<int32_t> ids;
     size_t pos = 0;
     while (pos < text.size()) {
         // Try to match any added token at current position.
@@ -740,7 +753,8 @@ std::vector<int32_t> Tokenizer::encode_matching(
         for (const auto & [tok_str, tok_id] : added) {
             if (pos + tok_str.size() <= text.size() &&
                 text.compare(pos, tok_str.size(), tok_str) == 0) {
-                ids.push_back(tok_id);
+                if (stays_text(pos, tok_id)) plain(tok_str);
+                else ids.push_back(tok_id);
                 pos += tok_str.size();
                 matched = true;
                 break;
@@ -758,12 +772,7 @@ std::vector<int32_t> Tokenizer::encode_matching(
         }
 
         // Pre-tokenize + BPE the normal segment.
-        std::string segment = text.substr(pos, next_special - pos);
-        std::vector<std::string> pieces = pre_tokenize(segment);
-        for (const auto & piece : pieces) {
-            auto piece_ids = bpe_encode_piece(piece);
-            ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
-        }
+        plain(text.substr(pos, next_special - pos));
         pos = next_special;
     }
     return ids;

@@ -327,7 +327,7 @@ bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaS
     call.rdna4    = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     call.routed   = args.ids_dst != nullptr || args.expert_bounds != nullptr;
     const mmq_twin_choice choice = mmq_twin_choose(on, call);
-    if (choice.inert_why != nullptr || choice.tile == mmq_twin_tile::parent) {
+    if (choice.tile == mmq_twin_tile::parent) {
         return false;
     }
     const bool rows32 = choice.tile == mmq_twin_tile::rows32;

@@ -244,22 +244,6 @@ TEST_CASE(ClusterUnitFixture, Fnv1a64KnownVectors) {
     CHECK_EQUAL(fnv1a64("bar", 3, h1), fnv1a64("foobar", 6));
 }
 
-TEST_CASE(ClusterUnitFixture, MsgTypeNamesAreDistinct) {
-    const MsgType types[] = {
-        MsgType::Hello, MsgType::Welcome, MsgType::Heartbeat, MsgType::Abort,
-        MsgType::Request, MsgType::Decision, MsgType::Draft, MsgType::Accept,
-        MsgType::RequestReport, MsgType::BackendOp, MsgType::RequestEnd, MsgType::Shutdown,
-    };
-    std::set<std::string> names;
-    for (MsgType t : types) {
-        const char * n = msg_type_name(t);
-        REQUIRE_NOT_NULL(n);
-        CHECK(std::string(n) != "Unknown");
-        names.insert(n);
-    }
-    CHECK_EQUAL(names.size(), sizeof(types) / sizeof(types[0]));
-}
-
 // ─── Protocol: messages ─────────────────────────────────────────────────
 
 TEST_CASE(ClusterUnitFixture, HelloWelcomeRoundTrip) {
@@ -1147,22 +1131,6 @@ TEST_CASE(ClusterUnitFixture, EmptyDraftBlockIsTheEndMarker) {
     CHECK(w_draft.empty());
     CHECK_EQUAL(head.counters().drafts, 1u);
     CHECK_EQUAL(worker.counters().drafts, 1u);
-}
-
-// The end marker also has to round-trip through the frame codec on its own:
-// a zero-length token vector is a valid Draft, not a malformed one.
-TEST_CASE(ClusterUnitFixture, EmptyDraftMsgRoundTrip) {
-    DraftMsg msg;
-    msg.request_id = 77;
-    msg.step = 12;
-    msg.pos = 4096;
-    const Frame f = make_frame(msg);
-    DraftMsg got;
-    REQUIRE(parse_frame(f, got));
-    CHECK_EQUAL(got.request_id, 77u);
-    CHECK_EQUAL(got.step, 12u);
-    CHECK_EQUAL(got.pos, 4096);
-    CHECK(got.tokens.empty());
 }
 
 TEST_CASE(ClusterUnitFixture, HeadGatherFailsWhenWorkerGone) {

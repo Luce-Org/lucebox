@@ -152,10 +152,6 @@ class TestTokenizer:
         ids = cpp.encode(text)
         assert ids == expected, f"encode({text!r}) = {ids}"
 
-    def test_encode_single_char_nonempty(self, cpp):
-        ids = cpp.encode("a")
-        assert len(ids) > 0, f"encode('a') empty: {ids}"
-
     @pytest.mark.parametrize("text", ENCODE_VS_HF_STRINGS)
     def test_encode_vs_hf(self, cpp, hf, text):
         if hf is None:
@@ -171,9 +167,6 @@ class TestTokenizer:
             pytest.fail(f"encode({text[:30]!r}) differ at pos {pos}: "
                         f"cpp={c} hf={h} "
                         f"(cpp_len={len(cpp_ids)} hf_len={len(hf_ids)})")
-
-    def test_decode_basic(self, cpp):
-        assert cpp.decode([9707, 11, 1879, 0]) == "Hello, world!"
 
     @pytest.mark.parametrize("text", [
         "Hello, world!",

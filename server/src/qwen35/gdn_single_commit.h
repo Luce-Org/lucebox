@@ -186,14 +186,6 @@ inline const char * swap_snapshot_block_reason(bool keep_base_on,
     return nullptr;
 }
 
-// SINGLE_REPLAY given KEEP_BASE's verdict: it replaces the checkpoints a
-// keep-base verify writes, so it inherits every KEEP_BASE exclusion.
-inline const char * single_replay_inherited_reason(bool keep_base_on,
-                                                   const char * keep_base_why) {
-    if (!keep_base_on) return "requires KEEP_BASE";
-    return keep_base_why;
-}
-
 // What verify_batch knows about one keep-base verify when SINGLE_REPLAY is on.
 struct ReplayFacts {
     // Its GDN op takes the grouped-cols kernel, whose update the commit

@@ -669,6 +669,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             tool_checks::tool_calls_allowed(req.tool_choice,
                                             req.tool_checks_pass));
         emitter->set_chat_codec(chat_codec_.get());
+        emitter->set_think_tags_are_tokens(think_tags_are_tokens());
         if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {

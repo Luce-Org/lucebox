@@ -1091,7 +1091,6 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 static bool glue_gate_up_stack(const TargetLayer & L, ggml_backend_t backend, int n_tokens) {
     if (!luce::qwen35::glue::gate_up_stack_on()) return false;
     luce::qwen35::glue::GateUpFacts f;
-    f.on = true;
     f.stacked = L.ffn_gate_up != nullptr && L.w_gate != nullptr;
     f.unit_scales = L.w_gate_s == 1.0f && L.w_up_s == 1.0f;
     if (f.stacked) {
@@ -1816,7 +1815,6 @@ static ggml_tensor * build_delta_net_block(
     luce::qwen35::glue::StridedGdnPlan glue_plan;
     if (luce::qwen35::glue::strided_gates_on()) {
         luce::qwen35::glue::StridedGdnFacts f;
-        f.on = true;
         f.stacked_ba = stacked_ba;
         f.ba_copy = stacked_ba && beta_2d->op == GGML_OP_CONT;
         f.fused_chain = fused_plain && !use_chunked;

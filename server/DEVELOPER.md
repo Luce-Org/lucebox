@@ -189,10 +189,10 @@ that need local model files/binaries are marked `model`.
 pytest -m "not server and not model and not slow"
 
 # Server tests against a running server:
-pytest server/test/python/test_server_smoke.py -v --base-url http://localhost:8080
+pytest server/test/python/test_server_integration.py -v --base-url http://localhost:8080
 
 # Or let pytest spawn luce_server itself:
-pytest server/test/python/test_server_smoke.py -v --launch models/Qwen3-0.6B-BF16.gguf
+pytest server/test/python/test_server_integration.py -v --launch models/Qwen3-0.6B-BF16.gguf
 
 # Parallel-serving tests need the slot count; with --launch it also adds
 # --paged-attention --max-concurrency N to the spawned server:

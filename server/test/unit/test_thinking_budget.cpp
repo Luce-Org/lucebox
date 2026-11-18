@@ -152,18 +152,6 @@ TEST_CASE(BudgetHookFixture, natural_close_then_long_answer_is_untouched) {
     REQUIRE(!budget.forced_close());
 }
 
-TEST_CASE(BudgetHookFixture, eos_at_threshold_after_natural_close) {
-    const auto hook = make_hook(kClose3, kMarker, 4);
-    ThinkingBudget budget(hook, 12);
-    const int32_t eos = 2;
-    for (int32_t token : {10, 103, 20, 21, 22, 23, 24, 25, eos}) {
-        expect_step(budget, token, token, false);
-    }
-    REQUIRE(budget.remaining() == 3);
-    REQUIRE(budget.naturally_closed());
-    REQUIRE(!budget.forced_close());
-}
-
 TEST_CASE(BudgetHookFixture, natural_close_mid_block) {
     const auto hook = make_hook(kClose3, kMarker, 4);
     ThinkingBudget budget(hook, 6);

@@ -56,7 +56,7 @@ std::shared_ptr<OutputConstraint> OutputConstraint::snapshot() const {
 }
 
 OutputConstraint::State OutputConstraint::initial_state() const {
-    return options_.wait_for.empty() ? State::engaged : State::waiting;
+    return options_.wait_for.empty() && options_.wait_for_token < 0 ? State::engaged : State::waiting;
 }
 
 void OutputConstraint::reset() {
@@ -152,6 +152,10 @@ void OutputConstraint::accept(int32_t token) {
     const std::string & piece = known ? vocab_->pieces[(size_t) token] : no_text;
     if (state_ == State::waiting) {
         if (!known) return;
+        if (options_.wait_for_token >= 0) {
+            if (token == options_.wait_for_token) state_ = State::engaged;
+            return;
+        }
         tail_ += piece;
         const size_t at = tail_.find(options_.wait_for);
         if (at == std::string::npos) {

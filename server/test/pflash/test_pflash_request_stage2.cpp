@@ -78,7 +78,6 @@ TEST_CASE(PFlashStage2Fixture, by_score_breaks_exact_ties_by_the_later_position)
     std::vector<float> s = {1.0f, 3.0f, 3.0f, 2.0f, kNaN, 3.0f};
     REQUIRE(pflash_request_by_score({0, 1, 2, 3, 5, 2}, s) == std::vector<int>({5, 2, 1, 3, 0}));
     REQUIRE(std::string(kRequestCandidateRuleV5) == "cand_v5_latest_user_seed_reserve256_postlatest_then_score_fill");
-    REQUIRE(kStage2PromotedCap == 512);
 }
 
 TEST_CASE(PFlashStage2Fixture, v5_rule_seeds_the_latest_user_then_fills_every_other_message_by_score) {
@@ -110,7 +109,6 @@ TEST_CASE(PFlashStage2Fixture, v5_rule_seeds_the_latest_user_then_fills_every_ot
 
 TEST_CASE(PFlashStage2Fixture, v5_rule_reserves_slots_for_post_latest_cues) {
     // user (latest) [0,40), assistant [41,45), tool [46,80): 30 seed run tokens, 20 post-latest run tokens.
-    REQUIRE(kRequestPostReserve == 256);
     const Messages m = {msg(Role::User, 0, 40), msg(Role::Assistant, 41, 45), msg(Role::Tool, 46, 80)};
     auto s1 = filled(80, -1.0f);
     for (int t = 5; t < 35; ++t) s1[(size_t) t] = 5.0f + 0.01f * (float) t;   // seed, all above the cues

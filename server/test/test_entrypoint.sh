@@ -193,9 +193,12 @@ has_flag "$out" --draft && fail "DSpark drafter passed to paged DeepSeek V4"
 out="$(run_entrypoint FAKE_PROBE="$DUAL_AMD_DS4" LUCE_DRAFT="$TMP_DIR/drafts" -- --max-concurrency 1)"
 has_flag "$out" --draft || fail "single-lane DeepSeek V4 lost its DSpark drafter"
 
-# ── retired variables do not reach the server ──────────────────────────────
-out="$(run_entrypoint LUCE_THINK_SOFT_CLOSE_MIN_RATIO=0.5 LUCE_DEBUG_THINKING_LOGITS=1 --)"
-grep -q "soft-close\|debug-thinking" <<<"$out" && fail "retired flags forwarded"
+# ── retired variables are ignored with a warning ───────────────────────────
+run_entrypoint LUCE_THINK_SOFT_CLOSE_MIN_RATIO=0.5 LUCE_DEBUG_THINKING_LOGITS=1 -- >/dev/null
+for retired in LUCE_THINK_SOFT_CLOSE_MIN_RATIO LUCE_DEBUG_THINKING_LOGITS; do
+    grep -q "$retired is no longer supported" "$TMP_DIR/stderr" ||
+        fail "$retired not reported as retired"
+done
 
 # ── devices subcommand ─────────────────────────────────────────────────────
 probe_args="$(env LUCE_DIR="$TMP_DIR" LUCE_TARGET="$TARGET" LUCE_SERVER_BIN="$FAKE_SERVER" \

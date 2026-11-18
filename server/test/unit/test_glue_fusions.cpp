@@ -7,11 +7,10 @@
 // test_glue_fusions_gpu checks the memo itself on the GPU.
 //
 // Strided gates (qwen35/glue_fusions.h): which copies of stacked
-// projection slices the qwen35 graph drops on which path, and the inert
-// reasons where a copy stays.
+// projection slices the qwen35 graph drops on which path.
 //
 // Gate|up stack (qwen35/glue_fusions.h): when the FFN runs one
-// GEMM over the stacked ffn_gate|ffn_up, and when it says it is inert.
+// GEMM over the stacked ffn_gate|ffn_up.
 
 #include "CppUnitTestFramework.hpp"
 
@@ -21,7 +20,6 @@
 #include "ggml.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace {
@@ -251,7 +249,6 @@ using luce::qwen35::glue::strided_gdn_plan;
 // both copies, fused chain kernels with raw gates.
 StridedGdnFacts chain_verify() {
     StridedGdnFacts f;
-    f.on = true;
     f.stacked_ba = true;
     f.ba_copy = true;
     f.fused_chain = true;
@@ -265,20 +262,10 @@ StridedGdnFacts chain_verify() {
 
 }  // namespace
 
-TEST_CASE(StridedGdnPlanCase, turned_off_changes_nothing) {
-    StridedGdnFacts f = chain_verify();
-    f.on = false;
-    const StridedGdnPlan p = strided_gdn_plan(f);
-    CHECK_FALSE(p.gates);
-    CHECK_FALSE(p.z);
-    CHECK_NULL(p.inert_why);
-}
-
 TEST_CASE(StridedGdnPlanCase, chain_verify_drops_all_three_copies) {
     const StridedGdnPlan p = strided_gdn_plan(chain_verify());
     CHECK_TRUE(p.gates);
     CHECK_TRUE(p.z);
-    CHECK_NULL(p.inert_why);
 }
 
 TEST_CASE(StridedGdnPlanCase, nothing_to_drop_where_the_parent_copies_nothing) {
@@ -288,7 +275,6 @@ TEST_CASE(StridedGdnPlanCase, nothing_to_drop_where_the_parent_copies_nothing) {
     const StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_FALSE(p.gates);
     CHECK_FALSE(p.z);
-    CHECK_NULL(p.inert_why);
     f = chain_verify();
     f.stacked_ba = false;   // separate ssm_beta / ssm_alpha GEMMs: contiguous already
     f.ba_copy = false;
@@ -297,7 +283,6 @@ TEST_CASE(StridedGdnPlanCase, nothing_to_drop_where_the_parent_copies_nothing) {
     const StridedGdnPlan q = strided_gdn_plan(f);
     CHECK_FALSE(q.gates);
     CHECK_FALSE(q.z);
-    CHECK_NULL(q.inert_why);
 }
 
 TEST_CASE(StridedGdnPlanCase, mapped_verify_reads_z_in_place) {
@@ -307,11 +292,9 @@ TEST_CASE(StridedGdnPlanCase, mapped_verify_reads_z_in_place) {
     StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_FALSE(p.gates);   // its own views and kernel; nothing for the fusion to do
     CHECK_TRUE(p.z);        // the same contiguous GDN output rows as the chain
-    CHECK_NULL(p.inert_why);
     f.fusion_enabled = false;   // the unfused silu needs a contiguous input
     p = strided_gdn_plan(f);
     CHECK_FALSE(p.z);
-    CHECK_NOT_NULL(p.inert_why);
 }
 
 // Every segment that is not the dense single-sequence chain on the fused
@@ -327,10 +310,6 @@ TEST_CASE(StridedGdnPlanCase, other_paths_keep_both_copies) {
         const StridedGdnPlan p = strided_gdn_plan(f);
         CHECK_FALSE(p.gates);
         CHECK_FALSE(p.z);
-        CHECK_NOT_NULL(p.inert_why);
-        if (p.inert_why) {
-            CHECK_TRUE(std::string(p.inert_why).find("compact multi-sequence decode") != std::string::npos);
-        }
     }
     // z alone (separate ssm_beta / ssm_alpha GEMMs) stays too.
     StridedGdnFacts f = chain_verify();
@@ -339,7 +318,6 @@ TEST_CASE(StridedGdnPlanCase, other_paths_keep_both_copies) {
     f.ba_copy = false;
     const StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_FALSE(p.z);
-    CHECK_NOT_NULL(p.inert_why);
 }
 
 TEST_CASE(StridedGdnPlanCase, missing_raw_gate_kernel_keeps_the_gate_copies) {
@@ -348,7 +326,6 @@ TEST_CASE(StridedGdnPlanCase, missing_raw_gate_kernel_keeps_the_gate_copies) {
     const StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_FALSE(p.gates);
     CHECK_TRUE(p.z);         // still the dense chain: z reads the stack
-    CHECK_NOT_NULL(p.inert_why);
 }
 
 TEST_CASE(StridedGdnPlanCase, z_needs_the_fused_cuda_kernel) {
@@ -357,17 +334,12 @@ TEST_CASE(StridedGdnPlanCase, z_needs_the_fused_cuda_kernel) {
     StridedGdnPlan p = strided_gdn_plan(f);
     CHECK_TRUE(p.gates);
     CHECK_FALSE(p.z);
-    CHECK_NOT_NULL(p.inert_why);
     f = chain_verify();
     f.cuda_backend = false;
     f.fused_chain = false;   // a CPU backend has no fused chain kernel either
     p = strided_gdn_plan(f);
     CHECK_FALSE(p.gates);
     CHECK_FALSE(p.z);
-    CHECK_NOT_NULL(p.inert_why);
-    if (p.inert_why) {
-        CHECK_EQUAL(std::string(p.inert_why), std::string("copies stay: not a CUDA/HIP backend"));
-    }
 }
 
 TEST_CASE(StridedGdnPlanCase, both_fusions_are_on_by_default) {
@@ -388,7 +360,6 @@ using luce::qwen35::glue::gate_up_plan;
 
 GateUpFacts stacked_exact() {
     GateUpFacts f;
-    f.on = true;
     f.stacked = true;
     f.unit_scales = true;
     f.backend_inexact = nullptr;
@@ -397,38 +368,26 @@ GateUpFacts stacked_exact() {
 
 }  // namespace
 
-TEST_CASE(GateUpPlanCase, turned_off_keeps_two_gemms) {
-    GateUpFacts f = stacked_exact();
-    f.on = false;
-    const GateUpPlan p = gate_up_plan(f);
-    CHECK_FALSE(p.stack);
-    CHECK_NULL(p.inert_why);
-}
-
 TEST_CASE(GateUpPlanCase, exact_backend_stacks) {
     const GateUpPlan p = gate_up_plan(stacked_exact());
     CHECK_TRUE(p.stack);
-    CHECK_NULL(p.inert_why);
 }
 
-TEST_CASE(GateUpPlanCase, layers_without_a_stack_are_silent) {
+TEST_CASE(GateUpPlanCase, layers_without_a_stack_keep_two_gemms) {
     GateUpFacts f = stacked_exact();
     f.stacked = false;              // gate and up of different types: no alias
     f.backend_inexact = "ignored";
     const GateUpPlan p = gate_up_plan(f);
     CHECK_FALSE(p.stack);
-    CHECK_NULL(p.inert_why);
 }
 
-TEST_CASE(GateUpPlanCase, inexact_backend_or_scales_are_inert) {
+TEST_CASE(GateUpPlanCase, inexact_backend_or_scales_keep_two_gemms) {
     GateUpFacts f = stacked_exact();
     f.backend_inexact = "MMVQ width (decode keeps its gate/up kernels)";
     GateUpPlan p = gate_up_plan(f);
     CHECK_FALSE(p.stack);
-    CHECK_EQUAL(std::string(p.inert_why), std::string(f.backend_inexact));
     f = stacked_exact();
     f.unit_scales = false;          // NVFP4 per-tensor scales apply per GEMM
     p = gate_up_plan(f);
     CHECK_FALSE(p.stack);
-    CHECK_NOT_NULL(p.inert_why);
 }

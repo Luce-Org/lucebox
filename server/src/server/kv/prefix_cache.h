@@ -36,8 +36,7 @@ namespace luce::common {
 // serves an edit of the last message. The ones behind skip_index, the
 // conversation being served, are the exception: they wait until no leaf of
 // another conversation is left, so the requests in between (subagents, other
-// sessions) do not cost the live conversation its way back. Pointer overload
-// is the core (no token copies); the value overload is for tests.
+// sessions) do not cost the live conversation its way back.
 //
 // protected_lru (optional, same size): entries marked true go last. When
 // every other leaf is protected, the oldest protected leaf is the victim.
@@ -52,10 +51,6 @@ namespace luce::common {
 // only skipped or held entries and their ancestors remain; 0 if ids_lru is
 // empty or, impossibly, no leaf exists.
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
-                               const std::vector<bool> * protected_lru = nullptr,
-                               int skip_index = -1,
-                               const std::vector<bool> * held_lru = nullptr);
-int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
                                const std::vector<bool> * protected_lru = nullptr,
                                int skip_index = -1,
                                const std::vector<bool> * held_lru = nullptr);
@@ -532,6 +527,9 @@ private:
                                    int committed_cut, size_t resident_bytes,
                                    bool protect);
     void abort_inline_reservation(InlineReservation & reservation);
+    // Drops the further entries the reservation's resident-budget plan
+    // evicts. Their payloads left RAM in KvCache::clear_for_capture.
+    void erase_extra_victims(const InlineReservation & reservation);
     void replace_inline_entry(int slot, int target_cut,
                               const std::vector<int32_t> & prompt_ids,
                               bool protect, size_t resident_bytes);

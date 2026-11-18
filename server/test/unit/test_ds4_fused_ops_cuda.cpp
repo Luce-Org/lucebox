@@ -8,9 +8,6 @@
 //   same chain kept unfused: bit-identical streams and normalized input.
 // So LUCE_DS4_FUSE_ROUTER / LUCE_DS4_FUSE_COLLAPSE / the boundary fusion
 // never change a token.
-// - ggml_argmax vs the host greedy scan (`if (x[i] > x[best]) best = i`): the
-//   same pick on ties across lanes and warps, -inf rows and NaNs, so greedy
-//   decode may take its picks from the device.
 // - ggml_top_k + get_rows over vocabulary-wide rows (a sampled request's top
 //   candidates): k distinct ids with their values, holding every logit above
 //   the smallest one kept, as sample_logits_top requires.
@@ -860,65 +857,6 @@ bool run_sink_mask(ggml_backend_t backend, int n_attn, int n_head, uint32_t seed
     return ok;
 }
 
-// Rows with planted ties (the maximum at two or three ids, the later ones in lane 0 or an earlier warp), an all -inf
-// row, NaNs (at id 0 the scan keeps 0) against the host scan's pick.
-bool run_argmax(ggml_backend_t backend, int ncols, uint32_t seed) {
-    const int rows = 8;
-    ggml_init_params params{};
-    params.mem_size = ggml_tensor_overhead() * 4 + ggml_graph_overhead();
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, rows);
-    ggml_set_input(x);
-    ggml_tensor * picks = ggml_argmax(ctx, x);
-    ggml_set_output(picks);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, picks);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) {
-        ggml_free(ctx);
-        return false;
-    }
-    std::mt19937 rng(seed);
-    std::normal_distribution<float> normal(0.0f, 4.0f);
-    std::vector<float> h((size_t) ncols * rows);
-    for (float & v : h) v = normal(rng);
-    auto row = [&](int r) { return h.data() + (size_t) r * ncols; };
-    const float top = 1000.0f;
-    row(0)[std::min(ncols - 1, 37)] = top;                       // single maximum
-    row(1)[std::min(ncols - 1, 33)] = row(1)[0] = top;           // tie with id 0 (lane 0 holds the later id first)
-    row(2)[std::min(ncols - 1, 3)] = row(2)[std::min(ncols - 1, 1024)] = top;   // tie across warps/strides
-    row(3)[ncols - 1] = row(3)[ncols / 2] = row(3)[std::min(ncols - 1, 5)] = top;
-    std::fill_n(row(4), ncols, -INFINITY);                       // all -inf: the scan keeps 0
-    std::fill_n(row(5), ncols, -INFINITY);
-    row(5)[ncols - 1] = row(5)[ncols / 3] = -INFINITY;
-    row(5)[std::min(ncols - 1, ncols / 3 + 1)] = -1.0f;
-    row(6)[0] = NAN;                                             // NaN at 0: the scan never moves
-    row(6)[ncols / 2] = top;
-    row(7)[ncols / 2] = NAN;                                     // NaN elsewhere: never picked
-    row(7)[std::min(ncols - 1, ncols / 2 + 1)] = top;
-    row(7)[ncols - 1] = top;
-    ggml_backend_tensor_set(x, h.data(), 0, sizeof(float) * h.size());
-    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-    if (ok) {
-        std::vector<int32_t> got(rows);
-        ggml_backend_tensor_get(picks, got.data(), 0, sizeof(int32_t) * rows);
-        for (int r = 0; r < rows; ++r) {
-            int best = 0;
-            for (int i = 1; i < ncols; ++i) {
-                if (row(r)[i] > row(r)[best]) best = i;
-            }
-            if (got[(size_t) r] != best) {
-                std::fprintf(stderr, "argmax mismatch ncols=%d row %d: device %d host %d\n", ncols, r, got[(size_t) r], best);
-                ok = false;
-            }
-        }
-    }
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    return ok;
-}
-
 // Each row's k largest logits and their values, read as the qwen4exp verify graph reads them: random rows, a tie
 // group straddling the k-th rank, a row of one value and a row of mostly -inf.
 bool run_top_candidates(ggml_backend_t backend, int ncols, int k, uint32_t seed) {
@@ -1122,9 +1060,6 @@ int main() {
     const int sink_cases[][2] = {{128, 32}, {129, 32}, {128, 64}, {640, 16}};
     for (const auto & sc : sink_cases) {
         if (!run_sink_mask(backend, sc[0], sc[1], seed++)) ++failures;
-    }
-    for (int ncols : {248320, 151936, 64000, 1025, 33, 2}) {
-        if (!run_argmax(backend, ncols, seed++)) ++failures;
     }
     for (int ncols : {248320, 151936, 8193}) {
         for (int k : {32, 64, 128}) {

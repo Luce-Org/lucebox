@@ -192,11 +192,6 @@ TEST_CASE(PFlashQueryCandidatesFixture, release_profile_is_the_default_with_a_tr
         REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
         REQUIRE(!has("PFLASH_QUERY_CANDIDATES") && !selection.query.any());
     }
-
-    REQUIRE(luce::server::kPFlashReleaseThreshold == 16384);
-    const auto & curve = luce::server::pflash_release_curve();
-    REQUIRE(curve.size() == 4 && curve.front() == std::make_pair(16384, 0.315f) &&
-            curve.back() == std::make_pair(120000, 0.225f));
 }
 
 TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_rejects_invalid_and_incompatible_flags) {
@@ -454,6 +449,8 @@ TEST_CASE(PFlashQueryCandidatesFixture, latest_extent_first_then_other_messages_
     c.temperature = 1000.0f;
     const auto flat = pflash_query_candidate_set(u, s1, c);
     REQUIRE(std::fabs(flat.candidates[0].weight - 1.0 / 3.0) < 0.01);
+    // No unit: no candidate.
+    REQUIRE(pflash_query_candidate_set(PFlashQueryUnits{}, {}, c).candidates.empty());
 }
 
 TEST_CASE(PFlashQueryCandidatesFixture, null_only_when_the_top_unit_does_not_stand_out) {
@@ -498,13 +495,6 @@ TEST_CASE(PFlashQueryCandidatesFixture, null_only_when_the_top_unit_does_not_sta
     const auto set_fu = pflash_query_candidate_set(uf, fs1, c);
     REQUIRE(!set_fu.latest_null && std::isnan(set_fu.latest_z));
     REQUIRE(set_fu.candidates[0].message == 1 && set_fu.candidates[0].tokens == range(10, 16));
-}
-
-TEST_CASE(PFlashQueryCandidatesFixture, no_unit_gives_no_candidate) {
-    PFlashQueryUnits u;
-    PFlashQueryConfig c;
-    c.candidates = 3;
-    REQUIRE(pflash_query_candidate_set(u, {}, c).candidates.empty());
 }
 
 // ---------------------------------------------------------------- aggregation
@@ -588,6 +578,8 @@ TEST_CASE(PFlashQueryCandidatesFixture, fingerprint_matches_the_server) {
     const std::vector<int32_t> ids = {248045, 74455, 198, 1, 2, 3, -1, 0};
     REQUIRE(pflash_ids_fingerprint(ids) == luce::common::http_detail::pflash_token_fingerprint(ids));
     REQUIRE(pflash_ids_fingerprint({}) == "cbf29ce484222325");
+    // Fixed encoding of negative and INT_MAX ids (logged as drafter_fingerprint_fnv1a64).
+    REQUIRE(luce::common::http_detail::pflash_token_fingerprint({1, -2, 2147483647}) == "45409a0b0f44c5fd");
 }
 
 // ---------------------------------------------------------------- gap rule

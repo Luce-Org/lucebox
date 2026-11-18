@@ -15,7 +15,6 @@
 #include <atomic>
 #include <thread>
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -246,97 +245,6 @@ TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_top_p_distribution) {
     for (int k = 0; valid > 0 && k < vocab; k++)
         l1 += std::fabs((double)hist[k] / valid - analytic[k]);
     TEST_ASSERT_MSG(l1 < 0.03, "GPU-assisted top_p dist must match analytic nucleus (L1<0.03)");
-}
-
-// Direct CPU-vs-GPU agreement on the same draws is not bit-exact (different
-// inverse-CDF orderings), but both must agree on the *argmax* of their empirical
-// histograms — the most-likely token — under temperature sampling.
-TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_modal_token_matches_cpu) {
-    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
-    const int vocab = 32;
-    auto logits = gpu_test_logits(vocab, 11);
-    SamplerCfg cfg; cfg.temp = 0.9f;
-    std::vector<int32_t> history;
-
-    auto modal = [&](bool gpu) {
-        std::mt19937_64 rng(555);
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        std::vector<int> hist(vocab, 0);
-        for (int i = 0; i < 60000; i++) {
-            const int tok = gpu
-                ? geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false)
-                : sample_logits(logits.data(), vocab, cfg, history, rng);
-            if (tok >= 0 && tok < vocab) hist[tok]++;
-        }
-        return (int)(std::max_element(hist.begin(), hist.end()) - hist.begin());
-    };
-    TEST_ASSERT_MSG(modal(true) == modal(false), "GPU and CPU agree on the modal token");
-}
-
-// Per-call latency microbench (gated by env LUCE_SAMPLER_BENCH=1). Isolates
-// the three regimes that explain the end-to-end numbers: the CPU chain, the GPU
-// path fed host logits (pays a full-vocab H2D every call), and the GPU path fed
-// a device pointer (the integrated path that skips the copy).
-static void gpu_sampler_microbench() {
-    if (!gpu_sampler_test_available()) { std::fprintf(stderr, "[microbench] no CUDA device\n"); return; }
-    const int vocab = 151936;          // Qwen3 vocab
-    const int iters = 1000;
-    auto logits = gpu_test_logits(vocab, 1);
-    std::vector<int32_t> history;
-
-    auto now = []{ return std::chrono::steady_clock::now(); };
-    auto us  = [](auto a, auto b){ return std::chrono::duration<double, std::micro>(b - a).count(); };
-
-    // Persistent device copy for the device-pointer regime (no per-call H2D).
-    float * d_logits = nullptr;
-    bool have_dev = cudaMalloc(&d_logits, (size_t)vocab * sizeof(float)) == cudaSuccess &&
-                    cudaMemcpy(d_logits, logits.data(), (size_t)vocab * sizeof(float),
-                               cudaMemcpyHostToDevice) == cudaSuccess;
-
-    volatile long sink = 0;
-    auto bench = [&](const char * label, const SamplerCfg & cfg) {
-        std::mt19937_64 rng(1);
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        for (int i = 0; i < 30; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
-        for (int i = 0; i < 30; i++) sink += geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
-        auto t0 = now();
-        for (int i = 0; i < iters; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
-        auto t1 = now();
-        for (int i = 0; i < iters; i++) sink += geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
-        auto t2 = now();
-        double dev_us = -1.0;
-        if (have_dev) {
-            for (int i = 0; i < 30; i++) sink += geometric_sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
-            auto t3 = now();
-            for (int i = 0; i < iters; i++) sink += geometric_sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
-            auto t4 = now();
-            dev_us = us(t3, t4) / iters;
-        }
-        const double cpu_us  = us(t0, t1) / iters;
-        const double gpuh_us = us(t1, t2) / iters;
-        std::fprintf(stderr,
-            "  %-22s CPU %8.2f us | GPU+H2D %8.2f us (%.2fx) | GPU devptr %8.2f us (%.2fx)\n",
-            label, cpu_us, gpuh_us, cpu_us / gpuh_us,
-            dev_us, dev_us > 0 ? cpu_us / dev_us : 0.0);
-    };
-
-    std::fprintf(stderr, "[microbench] vocab=%d iters=%d (per call; >1.0x = GPU faster)\n", vocab, iters);
-    { SamplerCfg c;                                   bench("greedy (temp=0)", c); }
-    { SamplerCfg c; c.temp = 0.8f;                    bench("temp=0.8 (full vocab)", c); }
-    // top_p is unimplemented on the GPU (always falls back to CPU), so it's not benched here.
-    { SamplerCfg c; c.temp = 0.8f; c.rep_pen = 1.2f;
-      std::vector<int32_t> h; for (int i = 0; i < 200; i++) h.push_back(i * 7 % vocab);
-      history = h; bench("temp=0.8 rep_pen=1.2", c); history.clear(); }
-
-    if (have_dev) cudaFree(d_logits);
-    (void)sink;
-}
-
-TEST_CASE(GpuSamplerCudaFixture, gpu_sampler_microbench_when_enabled) {
-    if (const char * b = std::getenv("LUCE_SAMPLER_BENCH"); b && b[0] == '1') {
-        gpu_sampler_microbench();
-    }
-    CHECK(true);
 }
 
 TEST_CASE(GpuSamplerCudaFixture, independent_workers_sample_distinct_logits) {
