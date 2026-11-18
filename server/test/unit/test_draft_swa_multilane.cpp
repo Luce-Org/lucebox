@@ -56,9 +56,12 @@ std::vector<bool> layer_pattern(const DraftWeights & weights) {
     return pattern;
 }
 
+// Causal drafters share one ctx window anchored at `committed` and see the noise rows causally. Upstream DFlash 2
+// drafters (attention.causal = false) see every noise row, and query q at committed + q sees ctx position p iff
+// committed + q - p < SWA_WINDOW.
 bool check_lane_mask(const DraftKvState & state, int committed) {
-    const int window_start = committed - SWA_WINDOW;
     for (int query = 0; query < state.q_len; ++query) {
+        const int window_start = state.swa_causal ? committed - SWA_WINDOW : committed + query - SWA_WINDOW + 1;
         const size_t row = static_cast<size_t>(query) * state.kv_total;
         for (int slot = 0; slot < state.cap; ++slot) {
             const int position = state.slot_pos[static_cast<size_t>(slot)];
@@ -73,7 +76,7 @@ bool check_lane_mask(const DraftKvState & state, int committed) {
             }
         }
         for (int noise = 0; noise < state.q_len; ++noise) {
-            const uint16_t expected = noise <= query ? F16_ZERO : F16_NEG_INF;
+            const uint16_t expected = !state.swa_causal || noise <= query ? F16_ZERO : F16_NEG_INF;
             if (state.mask_hbuf[
                     row + static_cast<size_t>(state.cap + noise)] != expected) {
                 std::fprintf(stderr,
