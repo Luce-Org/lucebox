@@ -603,7 +603,9 @@ static void kvflash(ggml_backend_t backend) {
     for (auto * t : c.attn_k) ggml_backend_tensor_memset(t, 0x3c, 0, 300 * t->nb[1]);   // F16 1.0 on head 0's rows
     c.cur_pos = 300;
     Qwen4ExpSnapshot s, relocated;
+    CHECK(!qwen4exp_snapshot_rows_in_pager(c));
     CHECK(save_qwen4exp_snapshot(backend, backend, c, s));
+    CHECK(!s.rows_in_pager);
     // The pooled strips stop at the pool; the snapshot sizes say so.
     CHECK(qwen4exp_snapshot_bytes(backend, c, c.max_ctx) == qwen4exp_snapshot_bytes(backend, c, pool));
     CHECK(qwen4exp_snapshot_bytes(backend, c, pool) > qwen4exp_snapshot_bytes(backend, c, pool - 64));
@@ -627,6 +629,7 @@ static void kvflash(ggml_backend_t backend) {
     // Past the pool the rows stay in the pager: the snapshot is the point state, and a restore truncates the live
     // pager back to its position (the backend checks the live tokens extend the snapshot's). No disk form.
     ggml_backend_tensor_memset(c.ssm_state[0], 0x11, 0, ggml_nbytes(c.ssm_state[0]));
+    CHECK(qwen4exp_snapshot_rows_in_pager(c));   // the seq engine refuses this capture: its slots restore cold
     CHECK(save_qwen4exp_snapshot(backend, backend, c, relocated));
     CHECK(relocated.rows_in_pager && relocated.strips.size() == 2 && relocated.cur_pos == 2300);
     CHECK(export_qwen4exp_snapshot("layout", relocated).empty());

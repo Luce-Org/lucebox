@@ -485,12 +485,16 @@ void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s) {
     s = {};
 }
 
+bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c) {
+    return c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos);
+}
+
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
                             Qwen4ExpSnapshot & s) {
     free_qwen4exp_snapshot(s);
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
     // Past the pool (or once paging relocated the prefix) the rows are the pager's: keep the point state alone.
-    const bool pager = c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos);
+    const bool pager = qwen4exp_snapshot_rows_in_pager(c);
     size_t count = 0;
     snapshot_strips(c, c.cur_pos, c.indexer_blocks, true,
                     [&](ggml_tensor *, size_t, size_t, bool rows) { count += !(pager && rows); });
