@@ -96,8 +96,16 @@ public:
     // Returns the formatted SSE strings to send.
     std::vector<std::string> emit_start();
 
-    // Process a text token and return SSE chunks to send.
-    std::vector<std::string> emit_token(const std::string & piece);
+    // Process a text token and return SSE chunks to send. `think_tag`: the
+    // piece is a thinking-boundary token ("<think>" or "</think>\n", from
+    // classify_generated_token's kThinkTag).
+    std::vector<std::string> emit_token(const std::string & piece, bool think_tag = false);
+
+    // The vocabulary has thinking-boundary tokens (think_close_token): only
+    // they open and close the thinking, and "<think>" or "</think>" spelled in
+    // ordinary pieces stay text, as the codec shows them in a message
+    // (RenderedPrompt::markup). A buffered tool call still splits on the text.
+    void set_think_tags_are_tokens(bool on) { think_tags_are_tokens_ = on; }
 
     // Flush remaining buffered content and emit final events.
     // `completion_tokens` is the total token count. `timings`, when
@@ -204,6 +212,13 @@ private:
     // Emit the text the tool parser left around the calls in tool_buffer_.
     void emit_tool_buffer_text(std::vector<std::string> & out, const std::string & text);
 
+    // Run the state machine over window_.
+    void run_window(std::vector<std::string> & out);
+    // Where `tag` is spelled in window_, when the text form switches modes.
+    size_t find_text_tag(const char * tag) const;
+    // A thinking-boundary token (`tag`), after the held-back text `before`.
+    void take_think_tag(std::vector<std::string> & out, const std::string & before, const std::string & tag);
+
     // SSE data line
     static std::string sse_data(const std::string & json_str);
     static std::string sse_event(const std::string & type, const std::string & json_str);
@@ -220,6 +235,7 @@ private:
     ToolMemory * tool_memory_;
 
     StreamMode   mode_;
+    bool         think_tags_are_tokens_ = false;
     bool         tool_from_reasoning_ = false;
     bool         suppress_undeclared_tool_protocol_ = false;
     std::string  window_;           // holdback buffer

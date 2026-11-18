@@ -38,7 +38,7 @@ bool matches(const std::string & grammar, const std::string & text) {
 // pieces it should pick instead, a tool-call opener and an end token.
 enum Tok : int32_t {
     FENCE, OBJ_OPEN, OBJ_CLOSE, KEY_A, COLON, ONE, NEWLINE, TOOL_CALL, THINK_END,
-    PROSE, NUL_BYTE, END, N_TOK,
+    PROSE, NUL_BYTE, END, CLOSE_LT, THINK_WORD, CLOSE_GT, N_TOK,
 };
 
 std::shared_ptr<const ConstraintVocab> toy_vocab() {
@@ -55,6 +55,9 @@ std::shared_ptr<const ConstraintVocab> toy_vocab() {
     pieces[PROSE] = "Sure";
     pieces[NUL_BYTE] = std::string(1, '\0');
     pieces[END] = "<|im_end|>";
+    pieces[CLOSE_LT] = "</";
+    pieces[THINK_WORD] = "think";
+    pieces[CLOSE_GT] = ">";
     return ConstraintVocab::build(std::move(pieces), {END});
 }
 
@@ -256,6 +259,21 @@ TEST_CASE(OutputConstraintFixture, waits_for_the_end_of_thinking) {
     constraint->accept(NEWLINE);       // leading whitespace is allowed
     CHECK(!constraint->allows(PROSE));
     CHECK(constraint->allows(OBJ_OPEN));
+}
+
+// With a </think> token, only the token ends the wait: the text spelled in
+// ordinary pieces, as the codec shows it in a message, is still thinking.
+TEST_CASE(OutputConstraintFixture, waits_for_the_end_of_thinking_token) {
+    OutputConstraint::Options options;
+    options.wait_for = "</think>";
+    options.wait_for_token = THINK_END;
+    auto constraint = schema_constraint(options);
+    for (const Tok token : {CLOSE_LT, THINK_WORD, CLOSE_GT}) constraint->accept(token);
+    CHECK(!constraint->engaged());
+    CHECK(constraint->allows(PROSE));
+    constraint->accept(THINK_END);
+    CHECK(constraint->engaged());
+    CHECK(!constraint->allows(PROSE));
 }
 
 TEST_CASE(OutputConstraintFixture, off_grammar_token_breaks_instead_of_dead_ending) {

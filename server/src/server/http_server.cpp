@@ -3138,6 +3138,7 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         options.wait_for = config_.think_marker_token_ids.empty()
             ? std::string("</think>")
             : tokenizer_.decode(config_.think_marker_token_ids);
+        if (think_tags_are_tokens()) options.wait_for_token = think_close_token(tokenizer_);
     }
     options.release_prefixes = std::move(openers);
     options.calls_only = must_call;
@@ -4037,8 +4038,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     };
     if (!admission) open_stream();
 
-    // A pass that fails leaves the reply it would have replaced.
-    auto pass = [&](const json & body, json & response, bool * dropped = nullptr) {
+    // A pass that fails leaves the reply it would have replaced. A note pass
+    // (the default) keeps no checkpoint or turn of its own.
+    auto pass = [&](const json & body, json & response, bool * dropped = nullptr,
+                    bool note_pass = true) {
         if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
             return false;
         }
@@ -4046,7 +4049,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   /*note_pass=*/true, &req.ordered_tools, req.client) ||
+                                   note_pass, &req.ordered_tools, req.client) ||
             status != 200) {
             return false;
         }
@@ -4076,6 +4079,23 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         return true;
     }
     open_stream();
+
+    // An empty reply (the model ended its turn with no text and no call, often
+    // inside its thinking) gives the agent nothing to run, and agents take it
+    // as the final answer. Draw it again: the same request, no note, so the
+    // conversation and its cache are those of the first pass. A dropped call
+    // also leaves the reply empty; its own check below handles it.
+    int draws = 0;
+    while (draws < tc::kEmptyRedraws && !dropped_call && tc::empty_reply(response)) {
+        json again;
+        bool again_dropped = false;  // a pass that fails can still set it
+        if (!pass(tc::redraw(request, ++draws), again, &again_dropped, /*note_pass=*/false)) break;
+        response = std::move(again);
+        reply = tc::reply_message(response);
+        dropped_call = again_dropped;
+    }
+    const char * empty = draws == 0 ? "-"
+                       : dropped_call || !tc::empty_reply(response) ? "redrawn" : "kept";
 
     // If the model calls a tool when tool_choice is "none", retry
     // once with a note that tools are unavailable. If the retry still
@@ -4153,8 +4173,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         }
     }
     std::fprintf(stderr,
-                 "[tool-checks] %s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), tool_free, dropped, replan,
+                 "[tool-checks] %s empty=%s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), empty, tool_free, dropped, replan,
                  final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
@@ -5120,6 +5140,8 @@ std::string HttpServer::apply_unified_view(
         return (int) std::ceil((double) prompt_tokens * (double) drafter_tokens / (double) input);
     };
     const auto encode_len = [&] (const std::string & piece) { return (int) tokenizer_.encode(piece).size(); };
+    // Request text recalled into the prompt: counted as it is emitted, with encode_data.
+    const auto data_len = [&] (const std::string & piece) { return (int) layout.encode_data(tokenizer_, piece).size(); };
     const auto & pins = request.required_instruction_spans;
     const int query_end = request.score_query_end;
     const int query_begin = request.score_query_end - request.score_query_tokens;
@@ -5822,12 +5844,12 @@ std::string HttpServer::apply_unified_view(
                     if (region.lines.escaped) {
                         const size_t from = region.layout.cuts[(size_t) u];
                         const size_t to = region.layout.cuts[(size_t) u + 1];
-                        rc.unit_cost[(size_t) u] = encode_len(pu::json_unescape(text, from, to));
+                        rc.unit_cost[(size_t) u] = data_len(pu::json_unescape(text, from, to));
                     } else {
                         rc.unit_cost[(size_t) u] = region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
                     }
                 }
-                rc.label_cost = encode_len(pu::recall_label_text(region.kind, region.brief) + "\n") + encode_len("\n");
+                rc.label_cost = data_len(pu::recall_label_text(region.kind, region.brief) + "\n") + encode_len("\n");
                 region_caps[ri] = widened_cap(region.cap, region.droppable);
                 rc.cap = region_caps[ri] - (ri == largest ? wrapper : 0);
                 orders[ri] = pu::rank_units(rc.score, rc.held);
@@ -5886,8 +5908,8 @@ std::string HttpServer::apply_unified_view(
                     std::vector<int> cost((size_t) region.layout.units());
                     for (int u = 0; u < region.layout.units(); ++u) {
                         cost[(size_t) u] = region.lines.escaped
-                            ? encode_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
-                                                           region.layout.cuts[(size_t) u + 1]))
+                            ? data_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
+                                                         region.layout.cuts[(size_t) u + 1]))
                             : region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
                     }
                     regions_trace.push_back({{"region", ri}, {"cb", region.cb}, {"held", region.held},
@@ -5967,9 +5989,11 @@ std::string HttpServer::apply_unified_view(
                         const bool lead = !body.empty() && body.front() == '\n';
                         if (!first) add(tokenizer_.encode(trail ? "\n" : "\n\n"), "recall_wrapper");
                         first = false;
-                        add(tokenizer_.encode(label + (lead ? "" : "\n")), "recall_label");
+                        // The label names the request's call, and the body is
+                        // its text: both encode as the codec encodes message text.
+                        add(layout.encode_data(tokenizer_, label + (lead ? "" : "\n")), "recall_label");
                         if (region.lines.escaped) {
-                            add(tokenizer_.encode(body), "recall_text");
+                            add(layout.encode_data(tokenizer_, body), "recall_text");
                         } else {
                             add(std::vector<int32_t>(raw.begin() + region.unit_tb[(size_t) u],
                                                      raw.begin() + region.unit_te[(size_t) b]),
@@ -6703,6 +6727,10 @@ json HttpServer::memory_json() const {
     return out;
 }
 
+bool HttpServer::think_tags_are_tokens() const {
+    return chat_codec_ && think_close_token(tokenizer_) >= 0;
+}
+
 bool HttpServer::save_generated_turn(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & generated,
@@ -7137,7 +7165,7 @@ void HttpServer::configure_generation_io(
         }
         if (!req.stream || text.empty()) return true;
 
-        for (const auto & chunk : emitter.emit_token(text)) {
+        for (const auto & chunk : emitter.emit_token(text, delivery == TokenDelivery::kThinkTag)) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 output.client_disconnected = true;
                 return false;
@@ -7165,7 +7193,7 @@ bool HttpServer::deliver_generation_token(
     // streaming still has no frame to send for an empty string.
     if (text.empty() && req.stream) return true;
 
-    const auto chunks = emitter.emit_token(text);
+    const auto chunks = emitter.emit_token(text, delivery == TokenDelivery::kThinkTag);
     if (req.stream && !chunks.empty()) {
         // Disable silent-prefill heartbeats only once there is a real frame
         // to buffer. Complete a partial comment ahead of that frame.
@@ -7307,6 +7335,7 @@ void HttpServer::process_job(ServerJob * job) {
                        tool_checks::tool_calls_allowed(req.tool_choice,
                                                        req.tool_checks_pass));
     emitter.set_chat_codec(chat_codec_.get());
+    emitter.set_think_tags_are_tokens(think_tags_are_tokens());
 
     // Emit initial SSE events only for local generation. The upstream owns
     // the proxied event sequence.
