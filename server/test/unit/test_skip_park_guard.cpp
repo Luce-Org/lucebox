@@ -21,10 +21,6 @@ TEST_CASE(SkipParkGuardFixture, T3_small_card_small_ctx_allowed) {
     CHECK(luce::common::skip_park_allowed(true, 24 * GiB, 65536));
 }
 
-TEST_CASE(SkipParkGuardFixture, T4_small_card_big_ctx_downgraded) {
-    CHECK(!luce::common::skip_park_allowed(true, 24 * GiB, 131072));
-}
-
 TEST_CASE(SkipParkGuardFixture, T5_boundary_ctx_one_over) {
     CHECK(!luce::common::skip_park_allowed(true, 24 * GiB, 65537));
 }

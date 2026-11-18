@@ -111,16 +111,6 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
     return skip_index >= 0 || held_lru ? -1 : 0;
 }
 
-int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
-                               const std::vector<bool> * protected_lru,
-                               int skip_index,
-                               const std::vector<bool> * held_lru) {
-    std::vector<const std::vector<int32_t> *> ptrs;
-    ptrs.reserve(ids_lru.size());
-    for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs, protected_lru, skip_index, held_lru);
-}
-
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,

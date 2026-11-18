@@ -51,8 +51,6 @@ public:
     virtual bool supports_dflash_spec_decode() const { return false; }
     virtual DFlashTarget * dflash_target() { return nullptr; }
     virtual bool supports_remote_draft() const { return false; }
-    virtual bool supports_kvflash() const { return false; }
-    virtual bool supports_mixed_backend_layer_split() const { return false; }
     virtual bool pflash_gives_candidate_scores() const { return false; }
 
     virtual const char * default_compress_drafter_path() const { return ""; }
@@ -128,8 +126,6 @@ public:
     bool supports_dflash_spec_decode() const override;
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override;
-    bool supports_kvflash() const override;
-    bool supports_mixed_backend_layer_split() const override;
     bool pflash_gives_candidate_scores() const override {
         return adapter_ && adapter_->pflash_gives_candidate_scores();
     }

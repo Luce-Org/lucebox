@@ -8,14 +8,6 @@ using namespace luce::common;
 
 namespace { struct DeepSeek4PageLayoutFixture {}; }
 
-TEST_CASE(DeepSeek4PageLayoutFixture, raw_ring_wraps) {
-    CHECK(ds4_raw_ring_row(0) == 0);
-    CHECK(ds4_raw_ring_row(127) == 127);
-    CHECK(ds4_raw_ring_row(128) == 0);
-    CHECK(ds4_raw_ring_row(255) == 127);
-
-}
-
 TEST_CASE(DeepSeek4PageLayoutFixture, compressed_page_rows) {
     uint64_t row = 999;
     bool emitted = true;

@@ -34,11 +34,10 @@
 // (launch_mul_mat_q_pf), bit-exact too unless the caller holds the split-k
 // scope (ggml_backend_cuda_set_mmq_splitk_scope).
 //
-// Excluded paths, which keep the parent tile with a reason (inert_why): a
-// device that is not RDNA4, and MUL_MAT_ID (expert-routed) calls of up to 48
-// columns. Calls wider than 48 columns (prefill), types without a twin and,
-// for the 2-warp twin, outputs of more than 6144 rows keep the parent tile
-// without one.
+// Excluded paths, which keep the parent tile: a device that is not RDNA4,
+// MUL_MAT_ID (expert-routed) calls, calls wider than 48 columns (prefill),
+// types without a twin and, for the 2-warp twin, outputs of more than 6144
+// rows.
 
 #include "ggml.h"
 
@@ -64,9 +63,8 @@ struct mmq_twin_call {
 };
 
 struct mmq_twin_choice {
-    mmq_twin_tile tile      = mmq_twin_tile::parent;
-    int            mmq_x     = 16;       // the twin's x-tile: 16, 32 or 48
-    const char *   inert_why = nullptr;  // set: an enabled twin is excluded here
+    mmq_twin_tile tile  = mmq_twin_tile::parent;
+    int           mmq_x = 16;  // the twin's x-tile: 16, 32 or 48
 };
 
 // Widest call a twin serves at x-tile 16: every instance picks mmq_x = 16 up
@@ -177,15 +175,7 @@ inline mmq_twin_choice mmq_twin_choose(const mmq_twins_enabled & on, const mmq_t
     if (!on.ud_smalltile && !on.two_warp) {
         return choice;
     }
-    if (!call.rdna4) {
-        choice.inert_why = "device is not RDNA4";
-        return choice;
-    }
-    if (call.ncols > MMQ_TWIN_WIDE_MAX_COLS) {
-        return choice;
-    }
-    if (call.routed) {
-        choice.inert_why = "MUL_MAT_ID (expert-routed) MMQ";
+    if (!call.rdna4 || call.ncols > MMQ_TWIN_WIDE_MAX_COLS || call.routed) {
         return choice;
     }
     if (call.ncols > MMQ_TWIN_MAX_COLS) {

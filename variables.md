@@ -102,7 +102,6 @@ Untagged variables are operational tuning knobs.
 | `LUCE_GPU_DRAFT_TOPK` | GPU draft top-k. |
 | `LUCE_TQ3_VERIFY` | TQ3-quantized verify path. |
 | `LUCE_N_SAMPLE` / `LUCE_SAMP` | 🧪 **test/bench** Sample count/mode. |
-| `LUCE_SAMPLER_BENCH` | 🧪 **test/bench** Sampler benchmark mode. |
 | `LUCE_SV_DEBUG` | 🐛 **debug** Sampled-verify debug output. |
 
 ## Adaptive experts / adaptive verify width

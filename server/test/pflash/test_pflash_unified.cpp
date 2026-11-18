@@ -392,7 +392,7 @@ TEST_CASE(PFlashUnifiedFixture, test_unified_reread_by_content) {
     REQUIRE(!m.is_reread());
 }
 
-TEST_CASE(PFlashUnifiedFixture, test_unified_reread_multiple_regions) {
+TEST_CASE(PFlashUnifiedFixture, unified_reread_uncovers_the_changed_line_and_keeps_its_neighbours) {
     const std::string v1 = numbered_text(50, "alpha ");
     std::string v2 = v1;
     v2.replace(v2.find("alpha 20\n"), 9, "ALPHA 20\n");

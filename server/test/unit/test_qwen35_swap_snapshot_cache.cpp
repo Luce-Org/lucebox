@@ -55,6 +55,16 @@ TEST_CASE(Qwen35SwapSnapshotCache, exchange_keeps_identity_and_reset_restores_la
     void * const live_data = live->data;
     void * const spare_data = spare->data;
 
+    // Unswapped, the parent's reset clears base_buf only: the snapshot keeps
+    // its bytes.
+    set_all(live, 5.0f);
+    set_all(spare, 6.0f);
+    luce::common::reset_recurrent_state(c);
+    CHECK(!c.ssm_state_swapped);
+    CHECK(live->data == live_data);
+    CHECK(get_all(live) == filled(live, 0.0f));
+    CHECK(get_all(spare) == filled(spare, 6.0f));
+
     set_all(live, 1.0f);
     set_all(spare, 2.0f);
     gp::exchange_pairs(c.ssm_state, c.ssm_state_snap, c.ssm_state_swapped);
@@ -92,21 +102,4 @@ TEST_CASE(Qwen35SwapSnapshotCache, exchange_keeps_identity_and_reset_restores_la
     luce::common::free_target_cache(c);
     CHECK(!c.ssm_state_swapped);
     CHECK(c.ssm_state.empty());
-}
-
-TEST_CASE(Qwen35SwapSnapshotCache, unswapped_reset_is_unchanged) {
-    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
-    TinyGdnTarget t(ggml_backend_cpu_init(), /*state_dim=*/16, /*raw_gates=*/false);
-    REQUIRE(t.ok);
-    TargetCache & c = t.cache;
-    ggml_tensor * live = c.ssm_state[0];
-    void * const live_data = live->data;
-    set_all(live, 5.0f);
-    set_all(c.ssm_state_snap[0], 6.0f);
-    luce::common::reset_recurrent_state(c);
-    CHECK(!c.ssm_state_swapped);
-    CHECK(live->data == live_data);
-    CHECK(get_all(live) == filled(live, 0.0f));
-    // The parent's reset clears base_buf only: the snapshot keeps its bytes.
-    CHECK(get_all(c.ssm_state_snap[0]) == filled(live, 6.0f));
 }

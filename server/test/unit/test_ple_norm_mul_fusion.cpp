@@ -1,4 +1,5 @@
-// Node-order + parity test for the PLE grouped norm (qwen4exp_graph.cpp ple_grouped_norm): RMS_NORM [n_embd, hc, T]
+// Node-order + parity test for the PLE grouped norm (qwen4exp_graph.cpp ple_grouped_norm; hc_mix builds the same
+// graph): RMS_NORM [n_embd, hc, T]
 // -> MUL by the gamma weight viewed [n_embd, hc]. The backend fuses RMS_NORM + MUL only when the two nodes are
 // adjacent, and a gamma RESHAPE visited as the MUL's second operand lands between them; expanding the view first (the
 // default, LUCE_PLE_FUSE_LEGACY=1 keeps the old order) makes them adjacent. Checks the adjacency on the expanded graph

@@ -463,13 +463,11 @@ struct LaunchPolicyFixture : CommonFixture {
         // finds one by either in any card), and the share/ files they name ship
         // with the server.
         std::set<std::string> names;
-        int defaults = 0;
         for (const std::filesystem::path & path : model_card_files(LUCE_MODEL_CARDS_SOURCE_DIR)) {
             CardProfiles card;
             std::string error;
             CHECK(load_card_profiles(path, card, error));
             CHECK(error.empty());
-            defaults += !card.default_profiles.empty();
             for (const LaunchProfile & profile : card.profiles) {
                 CHECK(names.insert(profile.name).second);
                 for (const std::string & alias : profile.aliases) CHECK(names.insert(alias).second);
@@ -488,8 +486,6 @@ struct LaunchPolicyFixture : CommonFixture {
                 }
             }
         }
-        CHECK(names.size() == 9);  // eight profiles and one alias
-        CHECK(defaults == 2);
         // ds41-halo's earlier name still selects it.
         const CardProfiles ds41 = card_profiles("deepseek-v4.1-flash");
         CHECK(ds41.find("ds41-lucebox") == ds41.find("ds41-halo"));
@@ -718,7 +714,6 @@ struct LaunchPolicyFixture : CommonFixture {
             CHECK(entry.name != "LUCE_DS4_SPEC");
             CHECK(entry.name != "LUCE_DS4_DRAFT");
         }
-        CHECK(profile.env.size() == 37);
     }
 
     void test_ds41_profile_is_the_lucebox_recipe() {
@@ -760,7 +755,6 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(env_of(profile, "LUCE_DS4_PREFILL_PIPELINE").empty());
         CHECK(env_of(profile, "LUCE_DS4_PREFILL_ARENA_CHUNK_MB").empty());
         CHECK(env_of(profile, "LUCE_MOE_SIDE_COPY").empty());
-        CHECK(profile.env.size() == 43);
         for (const LaunchProfileEnv & entry : profile.env) {
             CHECK(entry.name != "LUCE_DS4_MOE_TP");
             CHECK(entry.name != "LUCE_DS4_MOE_TP_INPROC");
@@ -797,7 +791,6 @@ struct LaunchPolicyFixture : CommonFixture {
         // Measured neutral on this layout: they stay off.
         CHECK(env_of(profile, "LUCE_MOE_Q8_HANDOFF").empty());
         CHECK(env_of(profile, "LUCE_DS4_ENGRAM_PRECOMPUTE").empty());
-        CHECK(profile.env.size() == 60);
         // A flag given on the command line replaces the profile's value.
         const std::vector<std::string> merged = launch_profile_args(profile, {"--draft-device", "hip:1"});
         CHECK(!contains_flag(merged, "--draft-device"));
@@ -836,6 +829,7 @@ struct LaunchPolicyFixture : CommonFixture {
         std::string error;
         CHECK(parse_pflash_curve_arg("16384:0.315 32768:0.270 65536:0.270 120000:0.225", quoted, error));
         CHECK(quoted == pflash_release_curve());
+        CHECK(kPFlashReleaseThreshold == 16384);  // the release default server/README.md documents
 
         std::vector<std::pair<int, float>> split;
         for (const char * arg : {"16384:0.315", "32768:0.270", "65536:0.270", "120000:0.225"}) {

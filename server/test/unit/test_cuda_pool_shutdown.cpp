@@ -5,7 +5,7 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 #if defined(__HIPCC__)
-// Compiled as HIP here; the CUDA build compiles this file as plain C++ in test_server_unit.
+// Compiled as HIP here; the CUDA build compiles this file as plain C++.
 #include "ggml-cuda/common.cuh"
 #endif
 

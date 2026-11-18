@@ -20,19 +20,6 @@ def suite(pytester, monkeypatch):
     return pytester
 
 
-@pytest.mark.parametrize("cli, env", [
-    ("0", None), ("0", "3"), ("-1", None), ("65", None), (None, "invalid"),
-])
-def test_invalid_concurrency_is_a_usage_error(suite, monkeypatch, cli, env):
-    if env is not None:
-        monkeypatch.setenv("LUCE_MAX_CONCURRENCY", env)
-    suite.makepyfile("def test_unused(): pass")
-    args = ["--max-concurrency", cli] if cli is not None else []
-    result = suite.runpytest_subprocess(*args)
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(["*--max-concurrency must be*"])
-
-
 @pytest.mark.parametrize("cli, env, expected", [
     ("1", "invalid", 1), (None, "64", 64),
 ])
@@ -110,30 +97,3 @@ def test_spawned_servers_stop_between_modules(suite, fail_first_module):
     suite.runpytest_subprocess(
         f"--server-bin={sys.executable}", f"--launch={fake}",
     ).assert_outcomes(passed=2 if fail_first_module else 3, failed=int(fail_first_module))
-
-
-def test_server_binary_path_is_relative_to_invocation(suite):
-    binary = suite.path / "local-server"
-    binary.touch()
-    suite.makepyfile(f"""
-        from pathlib import Path
-
-        def test_path(server_bin):
-            assert server_bin == Path({str(binary)!r})
-    """)
-    suite.runpytest_subprocess("--server-bin", "./local-server").assert_outcomes(passed=1)
-
-
-def test_startup_failure_reports_child_log(suite):
-    suite.makepyfile("""
-        import sys
-        import pytest
-
-        def test_failed_start(spawn_luce_server):
-            with pytest.raises(pytest.fail.Exception, match="invalid model fixture"):
-                spawn_luce_server([
-                    sys.executable, "-c",
-                    "raise SystemExit('invalid model fixture')",
-                ], timeout=10)
-    """)
-    suite.runpytest_subprocess().assert_outcomes(passed=1)

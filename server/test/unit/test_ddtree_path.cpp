@@ -7,7 +7,6 @@
 
 using luce::common::DDTree;
 using luce::common::follow_verified_tree;
-using luce::common::truncate_verified_path;
 
 static int g_checks = 0;
 
@@ -27,17 +26,6 @@ int main() {
         follow_verified_tree(tree, posterior, pending);
     CHECK((accepted == std::vector<int>{0, 1, 2}));
     CHECK(pending == 33);
-
-    CHECK(truncate_verified_path(accepted, 2, posterior, pending));
-    CHECK((accepted == std::vector<int>{0, 1}));
-    CHECK(pending == 22);
-
-    CHECK(!truncate_verified_path(accepted, 2, posterior, pending));
-    CHECK(pending == 22);
-
-    CHECK(truncate_verified_path(accepted, 0, posterior, pending));
-    CHECK(accepted.empty());
-    CHECK(pending == -1);
 
     std::puts("ddtree path tests passed");
     return 0;

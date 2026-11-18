@@ -151,7 +151,10 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
         }
     }
     std::printf("[fp-test] kernel 1 (compute_mean_vector): max diff = %.5f %s\n",
-                max_diff_mean, max_diff_mean < 1e-2f ? "PASS" : "FAIL");
+                max_diff_mean, max_diff_mean < 1e-3f ? "PASS" : "FAIL");
+    // The means are ~0.005 and stored as bf16 (~6e-5 rounding): 1e-3 still
+    // catches a wrong divisor.
+    REQUIRE_TRUE(max_diff_mean < 1e-3f);
 
     // ── Kernel 2: compute_block_score ──
     float scale = 1.0f / std::sqrt((float)D);
@@ -234,14 +237,14 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
     }
     std::printf("[fp-test] kernel 4 (sparse_flash_forward) numerics: max diff = %.5f %s\n",
                 max_diff_attn, max_diff_attn < 5e-2f ? "PASS" : "FAIL");
+    REQUIRE_TRUE(max_diff_attn < 5e-2f);
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
     cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
 
     // ── End-to-end FlashPrefill at 8K context ──
-    // Tests the full pipeline (kernels 1-4 + block_select) wrapped via
-    // flash_prefill_forward_bf16. Compares to dense reference for a small
-    // shape, then times a 8K shape to verify it's fast.
+    // Runs the full pipeline (kernels 1-4 + block_select) wrapped via
+    // flash_prefill_forward_bf16 and requires a finite output.
     {
         constexpr int BB = 1, BS = 8192, BH = 16, BHk = 8, BD = 128;
         constexpr int BL = 128;
@@ -270,30 +273,19 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
         cfg.last_n_full = 2;
         cfg.alpha = 0.12f;
 
-        // Warm-up
         luce::common::flashprefill::flash_prefill_forward_bf16(
             bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
             1.0f / std::sqrt((float)BD), cfg);
         CK(cudaDeviceSynchronize());
 
-        cudaEvent_t e_a, e_b;
-        cudaEventCreate(&e_a);
-        cudaEventCreate(&e_b);
-        cudaEventRecord(e_a);
-        for (int it = 0; it < 5; ++it) {
-            luce::common::flashprefill::flash_prefill_forward_bf16(
-                bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
-                1.0f / std::sqrt((float)BD), cfg);
-        }
-        cudaEventRecord(e_b);
-        cudaEventSynchronize(e_b);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, e_a, e_b);
-        cudaEventDestroy(e_a);
-        cudaEventDestroy(e_b);
-        std::printf("[fp-test] e2e flash_prefill_forward_bf16 at S=%d: %.1f ms / iter (avg of 5)\n",
-                    BS, ms / 5.0f);
+        std::vector<__nv_bfloat16> bO(bQ.size());
+        CK(cudaMemcpy(bO.data(), bdO, bO.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        size_t nonfinite = 0;
+        for (const auto & x : bO) nonfinite += std::isfinite(b2f(x)) ? 0 : 1;
+        std::printf("[fp-test] e2e flash_prefill_forward_bf16 at S=%d: %zu non-finite outputs\n",
+                    BS, nonfinite);
 
         cudaFree(bdQ); cudaFree(bdK); cudaFree(bdV); cudaFree(bdO);
+        REQUIRE_TRUE(nonfinite == 0);
     }
 }

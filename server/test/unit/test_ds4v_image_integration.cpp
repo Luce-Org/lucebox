@@ -257,22 +257,11 @@ void memory_budget() {
     require(remaining_expert_budget(MAX, 1, MAX, 0, 0, 0) == 0, "late exhaustion cannot wrap");
     require(remaining_expert_budget(MAX, 0, 0, 0, 0, 0) == MAX, "uncharged maximum preserved");
     require(remaining_expert_budget(MAX, MAX - 7, 2, 1, 1, 2) == 1, "near-maximum arithmetic remains exact");
-    // Independent conservation law for uniform expert rounds: tighter primary
-    // headroom must transfer the same quantized storage amount to the cold owner.
-    constexpr uint64_t round = 64 * MiB;
-    constexpr uint64_t total_experts = 32 * GiB;
-    uint64_t last_hot = initial / round * round;
-    uint64_t last_cold = total_experts - last_hot;
+    // Every byte of a larger vision charge comes out of the expert budget.
     for (uint64_t extra = 0; extra <= 4 * GiB; extra += 17 * MiB) {
-        const uint64_t budget = remaining_expert_budget(24 * GiB, 4 * GiB, GiB,
-            256 * MiB, 512 * MiB, vision + extra);
-        const uint64_t hot = budget / round * round;
-        const uint64_t cold = total_experts - hot;
-        require(hot <= last_hot && cold >= last_cold, "reduced hot budget cannot reduce cold demand");
-        require(hot + cold == total_experts && budget - hot < round, "placement conserves expert bytes");
-        require(last_hot - hot == cold - last_cold, "lost hot bytes equal additional cold bytes");
-        last_hot = hot;
-        last_cold = cold;
+        require(remaining_expert_budget(24 * GiB, 4 * GiB, GiB, 256 * MiB, 512 * MiB, vision + extra) ==
+                    initial - extra,
+                "a larger vision charge lowers the expert budget byte for byte");
     }
 }
 } // namespace

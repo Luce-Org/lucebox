@@ -1,8 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 
 #include "common/pflash_drafter_ipc.h"
-#include "common/model_backend.h"
-#include "pflash/pflash_selection.h"
 
 #include <cmath>
 #include <string>
@@ -36,6 +34,12 @@ TEST_CASE(PFlashDrafterIpcFixture, compress2_round_trips_paper_ratio_budget) {
     REQUIRE(parsed.score_query_tokens == 128);
     REQUIRE(parsed.required_instruction_spans.empty());
     REQUIRE(parsed.path == "/tmp/pflash ids.bin");
+
+    // The narrowest scorer query window round-trips too.
+    REQUIRE(format_pflash_drafter_ipc_compress_command(
+        keep, 119900, 1, "/tmp/pflash ids.bin", line, error));
+    REQUIRE(parse_pflash_drafter_ipc_compress_command(line, parsed, error));
+    REQUIRE(parsed.score_query_tokens == 1);
 }
 
 TEST_CASE(PFlashDrafterIpcFixture, compress3_round_trips_ordered_instruction_spans) {
@@ -58,65 +62,6 @@ TEST_CASE(PFlashDrafterIpcFixture, compress3_round_trips_ordered_instruction_spa
     REQUIRE(parsed.score_query_tokens == 128);
     REQUIRE(parsed.required_instruction_spans == instructions);
     REQUIRE(parsed.path == "/tmp/pflash ids.bin");
-}
-
-TEST_CASE(PFlashDrafterIpcFixture, compress3_matches_the_local_selector_contract) {
-    ModelBackend::CompressRequest local;
-    local.input_ids.resize(32);
-    local.keep_ratio = 0.5f;
-    local.score_query_end = 32;
-    local.score_query_tokens = 4;
-    local.required_instruction_spans = {{0, 4}, {12, 14}};
-
-    std::string line;
-    std::string error;
-    REQUIRE(format_pflash_drafter_ipc_compress_command(
-        local.keep_ratio, local.score_query_end, local.score_query_tokens,
-        local.required_instruction_spans, "/tmp/ids.bin", line, error));
-    PFlashDrafterIpcCompressCommand remote;
-    REQUIRE(parse_pflash_drafter_ipc_compress_command(line, remote, error));
-    REQUIRE(remote.keep_ratio == local.keep_ratio);
-    REQUIRE(remote.score_query_end == local.score_query_end);
-    REQUIRE(remote.score_query_tokens == local.score_query_tokens);
-    REQUIRE(remote.required_instruction_spans == local.required_instruction_spans);
-
-    const auto select = [&] (const std::vector<PFlashTokenSpan> & spans) {
-        std::vector<luce::pflash::PFlashSelectionCandidate> candidates;
-        constexpr double scores[]{0.0, 9.0, 1.0, 0.0, 2.0, 3.0, 4.0, 0.0};
-        for (int chunk = 0; chunk < 8; ++chunk) {
-            const int begin = chunk * 4;
-            const int end = begin + 4;
-            candidates.push_back({
-                (size_t) chunk, begin, end, scores[chunk],
-                luce::pflash::pflash_chunk_is_structurally_required(
-                    begin, end, 28, 32, 32, spans),
-            });
-        }
-        return luce::pflash::select_pflash_candidates(
-            candidates, {16, 0.95},
-            luce::pflash::PFlashSelectionMode::BudgetOnly);
-    };
-    const auto local_result = select(local.required_instruction_spans);
-    const auto remote_result = select(remote.required_instruction_spans);
-    REQUIRE(local_result.ok);
-    REQUIRE(remote_result.ok);
-    REQUIRE(local_result.ordinals == remote_result.ordinals);
-    REQUIRE(local_result.retained_tokens == remote_result.retained_tokens);
-    REQUIRE(local_result.stop == remote_result.stop);
-
-    const std::vector<PFlashTokenSpan> out_of_range{{0, 33}};
-    std::string local_error;
-    std::string remote_error;
-    REQUIRE(!luce::pflash::validate_pflash_instruction_spans(
-        out_of_range, (int) local.input_ids.size(), local_error));
-    REQUIRE(format_pflash_drafter_ipc_compress_command(
-        local.keep_ratio, local.score_query_end, local.score_query_tokens,
-        out_of_range, "/tmp/ids.bin", line, error));
-    REQUIRE(parse_pflash_drafter_ipc_compress_command(line, remote, error));
-    REQUIRE(!luce::pflash::validate_pflash_instruction_spans(
-        remote.required_instruction_spans, (int) local.input_ids.size(),
-        remote_error));
-    REQUIRE(local_error == remote_error);
 }
 
 TEST_CASE(PFlashDrafterIpcFixture, legacy_x1000_parser_is_supported_but_quantized) {
@@ -172,6 +117,7 @@ TEST_CASE(PFlashDrafterIpcFixture, formatter_fails_closed_on_invalid_values) {
         {-0.1f, 8, "/tmp/ids.bin"},
         {1.1f, 8, "/tmp/ids.bin"},
         {0.5f, 0, "/tmp/ids.bin"},
+        {0.5f, -1, "/tmp/ids.bin"},
         {0.5f, 8, ""},
     };
 

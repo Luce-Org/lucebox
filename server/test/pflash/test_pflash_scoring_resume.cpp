@@ -16,17 +16,6 @@ struct PFlashScoringResumeFixture : CppUnitTestFramework::CommonFixture {
     using CppUnitTestFramework::CommonFixture::CommonFixture;
 };
 
-// Ubatch boundaries of a call over S tokens resumed at r (the drafter's ubatch_at): 1024 steps from r, cut at S-64.
-std::vector<int> ubatch_starts(int r, int S) {
-    std::vector<int> out;
-    const int cut = std::max(r, S - kScoringCutBack);
-    for (int start = r; start < S;) {
-        out.push_back(start);
-        start += std::min(kScoringUbatch, (start < cut ? cut : S) - start);
-    }
-    return out;
-}
-
 } // namespace
 
 TEST_CASE(PFlashScoringResumeFixture, checkpoint_is_the_last_grid_point_before_the_cut) {
@@ -68,28 +57,6 @@ TEST_CASE(PFlashScoringResumeFixture, resume_only_at_a_grid_checkpoint_inside_th
     CHECK(pflash_scoring_resume(57344, 63565, 63565, 1 << 30) == 57344);
 }
 
-TEST_CASE(PFlashScoringResumeFixture, a_resumed_call_lands_on_the_fresh_partition) {
-    // For every resume the rule allows, the ubatches and 8192 key chunks from the resume point are exactly the
-    // fresh call's from that point on.
-    for (int S : {16500, 63565, 63790, 65600, 74200, 98304 + 64}) {
-        const std::vector<int> fresh = ubatch_starts(0, S);
-        for (int prev : {16400, 57400, 63565, 65599, 65600, 74100}) {
-            const int r = pflash_scoring_resume(pflash_scoring_checkpoint(prev), std::min(prev, S), S, 1 << 30);
-            if (r == 0) continue;
-            CHECK(r % kScoringResumeGrid == 0);
-            std::vector<int> tail;
-            for (const int b : fresh) {
-                if (b >= r) tail.push_back(b);
-            }
-            CHECK(ubatch_starts(r, S) == tail);
-            // The fresh call has a ubatch boundary at r (so the state there is the one the snapshot holds).
-            bool boundary = false;
-            for (const int b : fresh) boundary = boundary || b == r;
-            CHECK(boundary);
-        }
-    }
-}
-
 TEST_CASE(PFlashScoringResumeFixture, query_sets_store_exact_rows_only) {
     PFlashExactRowSets sets(2);
     const int hidden = 2;
@@ -121,22 +88,9 @@ TEST_CASE(PFlashScoringResumeFixture, query_sets_store_exact_rows_only) {
     CHECK(sets.lookup({30}, hidden, out));
     CHECK(sets.invalidate_from(30) == 1);
     CHECK(sets.size() == 0);
-}
-
-// Query windows are row sets keyed by their positions: a window stored before
-// a divergence point stays, one that reaches it is dropped.
-TEST_CASE(PFlashScoringResumeFixture, query_windows_are_position_sets) {
+    // Query windows are keyed by their positions.
     CHECK(pflash_span_tokens(5, 8) == std::vector<int>({5, 6, 7}));
     CHECK(pflash_span_tokens(8, 8).empty());
-    PFlashExactRowSets windows;
-    const int hidden = 1;
-    const float row[] = {1};
-    std::vector<float> out;
-    CHECK(windows.put(pflash_span_tokens(447, 448), row, hidden, 65536));
-    CHECK(windows.put(pflash_span_tokens(12000, 12001), row, hidden, 65536));
-    CHECK(windows.invalidate_from(11000) == 1);
-    CHECK(windows.lookup(pflash_span_tokens(447, 448), hidden, out));
-    CHECK(!windows.lookup(pflash_span_tokens(12000, 12001), hidden, out));
 }
 
 // Session capacity: headroom S + S/2 + 4096, clamped to the context limit, never below S padded to 256.

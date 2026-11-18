@@ -66,13 +66,11 @@ class DraftDiscoveryTests(unittest.TestCase):
         draft = self.create_file("model.safetensors")
         self.assertEqual(self.resolve(), draft)
 
-    def test_empty_directory_reports_missing_weights(self):
-        with self.assertRaisesRegex(SystemExit, "no DFlash draft"):
-            self.resolve()
-
-    def test_missing_directory_reports_missing_weights(self):
-        with self.assertRaisesRegex(SystemExit, "no DFlash draft"):
-            self.resolve(root=self.root / "missing")
+    def test_empty_or_missing_directory_reports_missing_weights(self):
+        for root in (self.root, self.root / "missing"):
+            with self.subTest(root=root):
+                with self.assertRaisesRegex(SystemExit, "no DFlash draft"):
+                    self.resolve(root=root)
 
     def test_warns_when_target_version_has_no_match(self):
         draft = self.create_file("dflash-draft-3.5-q4_k_m.gguf")

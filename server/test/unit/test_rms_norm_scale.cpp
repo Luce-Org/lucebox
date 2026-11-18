@@ -1,5 +1,5 @@
-// Bitwise differential against the unfused GPU RMS_NORM -> SCALE sequence. The fusion runs on RDNA3.5 under the
-// qwen4exp profile; elsewhere both sides take the unfused path.
+// Bitwise differential against the unfused GPU RMS_NORM -> SCALE sequence. The fusion runs on HIP under the
+// qwen4exp profile; where it never launches the test skips.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -60,6 +60,7 @@ static bool run_case(ggml_backend_t gpu, int tokens, bool strided, int heads = 1
 int main() {
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     if (!gpu) return 77;
+    const size_t fused_before = ggml_backend_cuda_get_qn_fusion_count(GGML_CUDA_QN_RMS_NORM_SCALE);
     const auto previous = ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
     bool ok = true;
     for (int tokens : {1, 17, 1024, 16366}) {
@@ -68,5 +69,9 @@ int main() {
     ok = run_case(gpu, 17, true, 3) && ok; // Nonstandard head count.
     ggml_backend_cuda_set_qwen4exp_profile(previous);
     ggml_backend_free(gpu);
+    if (ok && ggml_backend_cuda_get_qn_fusion_count(GGML_CUDA_QN_RMS_NORM_SCALE) == fused_before) {
+        std::puts("SKIP: the RMS_NORM -> SCALE fusion never launched on this GPU");
+        return 77;
+    }
     return ok ? 0 : 1;
 }

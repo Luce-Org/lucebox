@@ -507,38 +507,3 @@ class ChatStreamFdLifecycleTests(unittest.TestCase):
         self.assertNotIn("pass_fds", kwargs)
         self.assertEqual(kwargs.get("close_fds"), False)
         self.assertIn("--stream-fd=123456", cmd)
-
-    def test_simulated_posix_invocation(self):
-        """Verify POSIX branch semantics under simulation regardless of host OS."""
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = 0
-        mock_proc.wait.return_value = 0
-        mock_proc.returncode = 0
-        mock_proc.stderr = None
-
-        captured_calls = []
-
-        def fake_popen(cmd, **kwargs):
-            captured_calls.append((cmd, kwargs))
-            return mock_proc
-
-        with patch("sys.platform", "linux"):
-            with patch.object(os, "read", side_effect=[b""]):
-                with patch.object(subprocess, "Popen", side_effect=fake_popen):
-                    res = chat.stream_generate(
-                        tok=MockTokenizer(),
-                        bin_path=Path(sys.executable),
-                        target=self.mock_script,
-                        draft=self.draft,
-                        prompt_bin=self.prompt_bin,
-                        n_gen=10,
-                        budget=16,
-                        stop_ids=set(),
-                    )
-
-        self.assertEqual(res, "")
-        self.assertEqual(len(captured_calls), 1)
-        cmd, kwargs = captured_calls[0]
-        self.assertIn("pass_fds", kwargs)
-        write_fd = kwargs["pass_fds"][0]
-        self.assertIn(f"--stream-fd={write_fd}", cmd)

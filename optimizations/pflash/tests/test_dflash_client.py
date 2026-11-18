@@ -99,46 +99,6 @@ def _track_dflash_lifecycle(captured_pipes: list[tuple[int, int]], captured_proc
 
 
 class TestDflashClient(unittest.TestCase):
-    def test_normal_close_releases_read_pipe(self):
-        daemon = create_mock_daemon(ready=True)
-        try:
-            client = DflashClient(
-                bin_path=daemon,
-                target_path="dummy",
-                draft_path="dummy",
-                boot_timeout_s=5.0,
-                boot_vram_mib=0,
-            )
-            r_pipe = client.r_pipe
-            self.assertGreaterEqual(r_pipe, 0)
-            os.fstat(r_pipe)
-
-            client.close()
-
-            self.assertEqual(client.r_pipe, -1)
-            with self.assertRaises(OSError):
-                os.fstat(r_pipe)
-            self.assertIsNotNone(client.proc.poll())
-        finally:
-            os.unlink(daemon)
-
-    def test_close_is_idempotent(self):
-        daemon = create_mock_daemon(ready=True)
-        try:
-            client = DflashClient(
-                bin_path=daemon,
-                target_path="dummy",
-                draft_path="dummy",
-                boot_timeout_s=5.0,
-                boot_vram_mib=0,
-            )
-            client.close()
-            client.close()
-            self.assertEqual(client.r_pipe, -1)
-            self.assertEqual(client.w_pipe, -1)
-        finally:
-            os.unlink(daemon)
-
     def test_init_failure_closes_descriptors(self):
         captured_pipes: list[tuple[int, int]] = []
         captured_procs: list[subprocess.Popen] = []
@@ -301,6 +261,7 @@ class TestDflashClient(unittest.TestCase):
 
             # Idempotent second call
             client.close()
+            self.assertEqual(client.r_pipe, -1)
         finally:
             os.unlink(daemon)
 

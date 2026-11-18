@@ -408,6 +408,28 @@ TEST_CASE(OutputConstraintFixture, parse_grammar_from_body_top_level_and_extra_b
     CHECK(error == "grammar must be a string");
 }
 
+TEST_CASE(OutputConstraintFixture, parse_session_id_from_body_extra_body_then_top_level) {
+    CHECK(parse_session_id_from_body(json{{"session_id", "top"}}) == "top");
+    CHECK(parse_session_id_from_body(json{{"extra_body", {{"session_id", "nested"}}}}) == "nested");
+    CHECK(parse_session_id_from_body(
+        json{{"session_id", "top"}, {"extra_body", {{"session_id", "nested"}}}}) == "nested");
+    // A non-string id is ignored: extra_body falls through to the top level.
+    CHECK(parse_session_id_from_body(
+        json{{"session_id", "top"}, {"extra_body", {{"session_id", 42}}}}) == "top");
+    CHECK(parse_session_id_from_body(json{{"session_id", nullptr}}).empty());
+}
+
+TEST_CASE(OutputConstraintFixture, parse_pflash_query_from_body_top_level_and_extra_body) {
+    json top = {{"pflash_query", "Which function has the deliberate error?"}};
+    CHECK(parse_pflash_query_from_body(top) == "Which function has the deliberate error?");
+    json nested = {{"extra_body", {{"pflash_query", "What is the major tributary of the Rhine?"}}}};
+    CHECK(parse_pflash_query_from_body(nested) == "What is the major tributary of the Rhine?");
+    json absent = {{"messages", json::array()}};
+    CHECK(parse_pflash_query_from_body(absent).empty());
+    json wrong_type = {{"pflash_query", 7}};
+    CHECK(parse_pflash_query_from_body(wrong_type).empty());
+}
+
 TEST_CASE(OutputConstraintFixture, output_format_schema_supports_grammar_type) {
     using http_detail::output_format_schema;
     nlohmann::ordered_json schema;

@@ -239,13 +239,6 @@ TEST_CASE(RopeTailFixture, cpu_matches_split_rotate_concat) {
     compare();
 }
 
-TEST_CASE(RopeTailFixture, cpu_mrope_cont_position_alias) {
-    backend = ggml_backend_cpu_init();
-    REQUIRE_TRUE(check_mrope_cont_alias(backend, 24, 1));
-    REQUIRE_TRUE(check_mrope_cont_alias(backend, 256, 1));
-    REQUIRE_TRUE(check_mrope_cont_alias(backend, 24, 128));
-}
-
 #ifdef LUCE_ROPE_TEST_GPU
 TEST_CASE(RopeTailFixture, gpu_matches_split_rotate_concat) {
     if (ggml_backend_cuda_get_device_count() == 0) SKIP("no CUDA/HIP device available");
