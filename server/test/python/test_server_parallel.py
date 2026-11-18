@@ -340,7 +340,10 @@ class TestParallel:
         all must finish with correct answers."""
         n = self.parallel
         count = 2 * n
-        prompts = make_math_prompts(count)
+        # make_math_prompts stops at 64 distinct prompts; each request is
+        # checked only for its own answer, so reuse them past N = 32.
+        base = make_math_prompts(min(count, 64))
+        prompts = [base[i % len(base)] for i in range(count)]
         results = self._launch_nonstream(prompts, max_tokens=512,
                                          join_timeout=1800.0)
         self._assert_all_completed(results, "non-streaming")

@@ -10,14 +10,14 @@
 
 int main() {
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
-    if (!gpu) return 1;
+    if (!gpu) return 77;
     const auto dev = ggml_backend_get_device(gpu);
     const auto host_type = ggml_backend_dev_host_buffer_type(dev);
     // Pinned host inputs are the qwen4exp input ring's path on the gfx1151 iGPU.
     if (!host_type || !ggml_backend_cuda_qwen4exp_supported(gpu)) {
         std::puts("SKIP: pinned host inputs are a gfx1151 qwen4exp path");
         ggml_backend_free(gpu);
-        return 0;
+        return 77;
     }
     const auto previous = ggml_backend_cuda_set_qwen4exp_profile(GGML_CUDA_QWEN4EXP_DEFAULT);
     bool ok = true;

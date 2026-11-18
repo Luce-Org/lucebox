@@ -46,38 +46,22 @@ def _run(usage: Any) -> dict[str, Any]:
     return result["runs"][0]
 
 
-class TokenCountTests(unittest.TestCase):
-    def test_token_count_accepts_non_negative_ints(self) -> None:
-        self.assertEqual(generation_benchmark._token_count(0), 0)
-        self.assertEqual(generation_benchmark._token_count(42), 42)
-
-    def test_token_count_rejects_bad_values(self) -> None:
-        for value in (True, False, -1, 3.0, "7", None, [], {}):
-            with self.subTest(value=value):
-                self.assertIsNone(generation_benchmark._token_count(value))
-
-
 class RunCaseUsageTests(unittest.TestCase):
     def test_valid_usage_is_reported(self) -> None:
         run = _run({"completion_tokens": 12, "prompt_tokens": 5})
         self.assertEqual(run["completion_tokens"], 12)
         self.assertEqual(run["prompt_tokens"], 5)
         self.assertEqual(run["token_count_source"], "usage")
+        # A zero prompt count is a valid count, not a bad value.
+        self.assertEqual(_run({"completion_tokens": 12, "prompt_tokens": 0})["prompt_tokens"], 0)
 
-    def test_bool_completion_tokens_fall_back_to_word_count(self) -> None:
-        run = _run({"completion_tokens": True, "prompt_tokens": 5})
-        self.assertEqual(run["completion_tokens"], 4)
-        self.assertEqual(run["token_count_source"], "approx_words")
-
-    def test_negative_completion_tokens_fall_back_to_word_count(self) -> None:
-        run = _run({"completion_tokens": -3})
-        self.assertEqual(run["completion_tokens"], 4)
-        self.assertEqual(run["token_count_source"], "approx_words")
-
-    def test_zero_completion_tokens_fall_back_to_word_count(self) -> None:
-        run = _run({"completion_tokens": 0})
-        self.assertEqual(run["completion_tokens"], 4)
-        self.assertEqual(run["token_count_source"], "approx_words")
+    def test_bad_completion_tokens_fall_back_to_word_count(self) -> None:
+        # bool is an int subclass; negative is invalid; zero carries no count.
+        for value in (True, -3, 0):
+            with self.subTest(value=value):
+                run = _run({"completion_tokens": value, "prompt_tokens": 5})
+                self.assertEqual(run["completion_tokens"], 4)
+                self.assertEqual(run["token_count_source"], "approx_words")
 
     def test_invalid_prompt_tokens_are_dropped(self) -> None:
         for value in (True, -1, "5", 5.0):

@@ -214,9 +214,8 @@ static void t5_kv_reservation() {
     const int n_layer = 40, interval = 4, n_head_kv = 10, dk = 128, dv = 128;
     const uint64_t got = luce::kv_reservation_bytes_per_token(
         n_layer, interval, n_head_kv, GGML_TYPE_Q4_0, dk, GGML_TYPE_Q4_0, dv);
-    const uint64_t expect = (uint64_t)(n_layer / interval) * (uint64_t)n_head_kv *
-        (uint64_t)(ggml_row_size(GGML_TYPE_Q4_0, dk) + ggml_row_size(GGML_TYPE_Q4_0, dv));
-    assert(got == expect);
+    // n_full = 10 layers x 10 KV heads x (72 + 72) B: a q4_0 row of 128 is 4 blocks of 18 B.
+    assert(got == 14400);
 
     // Regression guard vs the old bug (n_layer × hardcoded f16 = 2 B/elem):
     const uint64_t buggy = (uint64_t)n_layer * 2 * (uint64_t)n_head_kv * (uint64_t)dk * 2;
@@ -230,8 +229,7 @@ static void t5_kv_reservation() {
     // full_attention_interval=0 guard: no div-by-zero, falls back to n_layer.
     const uint64_t fallback = luce::kv_reservation_bytes_per_token(
         n_layer, 0, n_head_kv, GGML_TYPE_Q4_0, dk, GGML_TYPE_Q4_0, dv);
-    assert(fallback == (uint64_t)n_layer * (uint64_t)n_head_kv *
-        (uint64_t)(ggml_row_size(GGML_TYPE_Q4_0, dk) + ggml_row_size(GGML_TYPE_Q4_0, dv)));
+    assert(fallback == 57600);   // all 40 layers x 10 x 144 B
 
     std::puts("T5 PASS");
 }

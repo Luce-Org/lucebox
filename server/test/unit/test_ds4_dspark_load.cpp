@@ -1,4 +1,4 @@
-// Smoke test: load the DeepSeek-V4-Flash DSpark drafter GGUF and dump bindings.
+// Smoke test: load the DeepSeek-V4-Flash DSpark drafter GGUF and check its bindings.
 //
 //   test_ds4_dspark_load <path-to-drafter.gguf>
 //
@@ -22,8 +22,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-
-namespace luce::common { void deepseek4_dspark_dump(const DSparkDrafter &); }
 
 static uint64_t fnv1a64(const std::vector<float> & values) {
     uint64_t hash = 1469598103934665603ull;
@@ -50,7 +48,6 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "FAIL: load: %s\n", deepseek4_dspark_last_error());
         return 1;
     }
-    deepseek4_dspark_dump(d);
 
     // Contract checks.
     int rc = 0;
@@ -73,56 +70,6 @@ int main(int argc, char ** argv) {
         need(d.core.compress_ratios[il] == 0, "compress_ratio==0");
         need(L.attn_compressor_kv == nullptr, "no compressor tensors");
     }
-    // ── Weight sanity: dequantize main_proj directly (no matmul) ────
-    if (rc == 0 && d.main_proj) {
-        ggml_init_params ip{}; ip.mem_size = 64u*1024*1024; ip.no_alloc = true;
-        ggml_context * c = ggml_init(ip);
-        ggml_cgraph * g = ggml_new_graph(c);
-        ggml_tensor * f32 = ggml_cast(c, d.main_proj, GGML_TYPE_F32);
-        ggml_set_output(f32); ggml_build_forward_expand(g, f32);
-        ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (al && ggml_gallocr_alloc_graph(al, g) && ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS) {
-            size_t ne = ggml_nelements(f32);
-            std::vector<float> buf(ne);
-            ggml_backend_tensor_get(f32, buf.data(), 0, sizeof(float)*ne);
-            size_t nnan=0; double ss=0; float mn=1e30f, mx=-1e30f;
-            for (float v : buf) { if(!std::isfinite(v)) nnan++; else { ss+=(double)v*v; if(v<mn)mn=v; if(v>mx)mx=v; } }
-            std::fprintf(stderr, "[weight-check] main_proj dequant: ne=%zu nnan=%zu rms=%.5f min=%.4f max=%.4f\n",
-                         ne, nnan, std::sqrt(ss/(double)ne), mn, mx);
-        } else { std::fprintf(stderr, "[weight-check] main_proj cast failed (type %s not castable?)\n", ggml_type_name(d.main_proj->type)); }
-        if (al) ggml_gallocr_free(al); ggml_free(c);
-    }
-
-    // ── Isolate: mul_mat(weight, ones) for main_proj and attn_q_a ───
-    if (rc == 0) {
-        auto mm_check = [&](const char * nm, ggml_tensor * W) {
-            if (!W) return;
-            ggml_init_params ip{}; ip.mem_size = 64u*1024*1024; ip.no_alloc = true;
-            ggml_context * c = ggml_init(ip);
-            ggml_cgraph * g = ggml_new_graph(c);
-            ggml_tensor * x = ggml_new_tensor_2d(c, GGML_TYPE_F32, W->ne[0], 1);
-            ggml_set_input(x);
-            ggml_tensor * y = ggml_mul_mat(c, W, x);
-            ggml_set_output(y); ggml_build_forward_expand(g, y);
-            ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-            if (al && ggml_gallocr_alloc_graph(al, g)) {
-                std::vector<float> ones((size_t)W->ne[0], 1.0f);
-                ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float)*ones.size());
-                if (ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS) {
-                    size_t ne = ggml_nelements(y); std::vector<float> buf(ne);
-                    ggml_backend_tensor_get(y, buf.data(), 0, sizeof(float)*ne);
-                    size_t nn=0; for(float v:buf) if(!std::isfinite(v)) nn++;
-                    std::fprintf(stderr, "[mm-check] %-12s mul_mat(W[%lld,%lld], ones): nnan=%zu/%zu first=%.3f\n",
-                                 nm,(long long)W->ne[0],(long long)W->ne[1],nn,ne,buf.empty()?0:buf[0]);
-                }
-            }
-            if (al) ggml_gallocr_free(al); ggml_free(c);
-        };
-        mm_check("main_proj", d.main_proj);
-        mm_check("blk0.attn_q_a", d.core.layers[0].attn_q_a);
-        mm_check("blk0.ffn_gate_shexp", d.core.layers[0].ffn_gate_shexp);
-    }
-
     // ── Exercise the drafter forward with dummy inputs ──────────────
     // Validates the whole graph runs on the GPU (HC ops, MoE, rocmfp
     // matmuls, bidirectional attention, tail) and returns finite output.

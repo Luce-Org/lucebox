@@ -90,12 +90,6 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 
 namespace luce::common {
 
-// Largest multiple of chunk_tokens that is <= pos. Aligns a snapshot boundary
-// (serialize(max_chunks)) to a whole number of pager chunks.
-inline int floor_to_chunk(int pos, int chunk_tokens) {
-    return (pos / chunk_tokens) * chunk_tokens;
-}
-
 struct KvFlashConfig {
     int chunk_tokens       = 64;  // logical tokens per page
     int pool_tokens        = 0;   // resident pool capacity (multiple of chunk_tokens)
@@ -860,10 +854,6 @@ public:
             ? chunks_[(size_t)c].score : -std::numeric_limits<float>::infinity();
     }
 
-    // ggml_type of the K cache recorded in the most recent successfully
-    // deserialized blob.
-    uint32_t serialized_kv_k_type() const { return last_serialized_kv_k_type_; }
-
     // Snapshot chunks [0, max_chunks) (all when max_chunks < 0 or beyond
     // n_chunks) into a flat blob; pair with deserialize(). Resident chunks are
     // read from the pool tensors, paged-out chunks from their host backing
@@ -1087,7 +1077,6 @@ public:
         }
 
         reset();
-        last_serialized_kv_k_type_ = h[6];
         chunks_.resize(nc);
         for (size_t c = 0; c < nc; ++c) {
             ChunkState & st = chunks_[c];
@@ -1471,7 +1460,6 @@ private:
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0, row_base_ = 0;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
-    uint32_t last_serialized_kv_k_type_ = (uint32_t)GGML_TYPE_F16;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;

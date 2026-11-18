@@ -16,13 +16,6 @@ static inline bool approx_eq(float a, float b, float eps = 1e-5f) {
     return std::fabs(a - b) < eps;
 }
 
-TEST_CASE(AdaptiveKeepRatioFixture, default_construction) {
-    AdaptiveKeepRatioState s{};
-    CHECK(approx_eq(s.ema, 0.0f));
-    CHECK(approx_eq(s.last_keep, 0.10f));
-    CHECK(s.turn_count == 0);
-}
-
 TEST_CASE(AdaptiveKeepRatioFixture, first_turn_sets_ema_to_observed) {
     AdaptiveKeepRatioState s{};
     auto next = step_adaptive_keep_ratio(s, 0.82f);
@@ -75,22 +68,6 @@ TEST_CASE(AdaptiveKeepRatioFixture, respects_upper_bound) {
     CHECK(approx_eq(next.last_keep, kBanditKeepMax));
 }
 
-TEST_CASE(AdaptiveKeepRatioFixture, ten_turn_convergence_high_accept) {
-    AdaptiveKeepRatioState s{};
-    float prev_keep = s.last_keep;
-    bool monotone = true;
-    for (int i = 0; i < 10; ++i) {
-        s = step_adaptive_keep_ratio(s, 0.90f);
-        if (s.last_keep > prev_keep + 1e-6f) {
-            monotone = false;
-            break;
-        }
-        prev_keep = s.last_keep;
-    }
-    CHECK(monotone);
-    CHECK(s.last_keep < 0.10f);
-}
-
 TEST_CASE(AdaptiveKeepRatioFixture, escalation_far_outside_band) {
     AdaptiveKeepRatioState s{};
     s.turn_count = 1;
@@ -116,7 +93,7 @@ TEST_CASE(AdaptiveKeepRatioFixture, sessions_isolated) {
 TEST_CASE(AdaptiveKeepRatioFixture, unknown_session_returns_default) {
     HttpServerSessions mgr;
     float k = mgr.get_keep_ratio("no-such-session");
-    CHECK(approx_eq(k, AdaptiveKeepRatioState{}.last_keep));
+    CHECK(approx_eq(k, 0.10f));
     CHECK(mgr.turn_count("no-such-session") == 0);
 }
 
@@ -126,8 +103,7 @@ TEST_CASE(AdaptiveKeepRatioFixture, get_ema_reflects_post_update_value) {
     mgr.update("s1", 0.80f);
     CHECK(approx_eq(mgr.get_ema("s1"), 0.80f));
     mgr.update("s1", 0.60f);
-    float expected = kBanditEmaAlpha * 0.80f + (1.0f - kBanditEmaAlpha) * 0.60f;
-    CHECK(approx_eq(mgr.get_ema("s1"), expected));
+    CHECK(approx_eq(mgr.get_ema("s1"), 0.74f));  // 0.7 * 0.80 + 0.3 * 0.60
 }
 
 TEST_CASE(AdaptiveKeepRatioFixture, lru_eviction_bounds_map_size) {

@@ -850,13 +850,14 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         std::normal_distribution<float> nd(0.0f, 1.0f);
         for (float & v : h) v = nd(p.rng);
         const float nan = std::nanf("");
-        // Equal maxima in different threads, warps, strides and slices of the kernels' blocks.
+        // Equal maxima in different threads, warps, strides and slices of the kernels' blocks (clamped into rows
+        // shorter than a warp or a block).
         const int ties[6][3] = {{1, 1024, V * 7 / 10}, {37, 5, -1}, {3, 700, V - 1}, {V * 2 / 3, 31, 32}, {0, 1, 2},
                                 {-1, -1, -1}};
         for (int r = 0; r < rows; ++r) {
             float * row = h.data() + (size_t) r * V;
             if (r < 5) {
-                for (int j = 0; j < 3; ++j) if (ties[r][j] >= 0) row[ties[r][j]] = 50.0f;
+                for (int j = 0; j < 3; ++j) if (ties[r][j] >= 0) row[std::min(V - 1, ties[r][j])] = 50.0f;
             } else if (r == 5) {
                 std::fill(row, row + V, 0.25f);                        // every entry ties
             } else if (r == 8) {
@@ -1415,66 +1416,6 @@ TEST_CASE(QnSplitFusionsFixture, gdn_shared_gates) {
     each_gpu([&](ggml_backend_t be) { for (int T : {1, 2, 3, 8}) gdn_shared_gates(be, T); });
 }
 
-// Expert picks across GPUs. A routed expert pick computed on the target (a hot expert) must give the bytes the
-// expert device gives for it (a cold expert), or moving a pick between the devices changes the text. Q4_K gate/up
-// with the SwiGLU, Q5_1 down and the weighted sum, at decode and verify widths, with the batch-invariant scope on
-// and off. Prints how many outputs differ from GPU 0's; a probe for placement that never changes the text.
-TEST_CASE(QnSplitFusionsFixture, expert_parity) {
-    if (ggml_backend_cuda_get_device_count() < 2) SKIP("one GPU");
-    const GraphsOff graphs;
-    const Profile profile(true);
-    const int n_embd = 2560, n_ff = 640, n_exp = 16, n_used = 10;
-    for (const bool inv : {true, false}) {
-        const Invariant invariant(inv);
-        for (int T : {1, 2, 3, 4}) {
-            std::vector<int32_t> ids(n_used * T);
-            for (int t = 0; t < T; ++t) {
-                for (int k = 0; k < n_used; ++k) ids[t * n_used + k] = (t * 3 + k * 5) % n_exp;
-            }
-            std::vector<std::vector<uint8_t>> ref;
-            for (int dev = 0; dev < 2; ++dev) {
-                ggml_backend_ptr be(ggml_backend_cuda_init(dev));
-                REQUIRE(be != nullptr);
-                Pattern p;   // the same seed: both GPUs get the same inputs
-                ggml_tensor * gate = p.input(GGML_TYPE_Q4_K, n_embd, n_ff, n_exp);
-                ggml_tensor * up = p.input(GGML_TYPE_Q4_K, n_embd, n_ff, n_exp);
-                ggml_tensor * down = p.input(GGML_TYPE_Q5_1, n_ff, n_embd, n_exp);
-                ggml_tensor * x = p.input(GGML_TYPE_F32, n_embd, 1, T);
-                ggml_tensor * sel = p.input(GGML_TYPE_I32, n_used, T);
-                ggml_tensor * wsel = p.input(GGML_TYPE_F32, n_used, T);
-                ggml_tensor * gu = ggml_swiglu_split(p.ctx, ggml_mul_mat_id(p.ctx, gate, x, sel),
-                                                     ggml_mul_mat_id(p.ctx, up, x, sel));   // [n_ff, n_used, T]
-                ggml_tensor * dn = ggml_mul_mat_id(p.ctx, down, gu, sel);                     // [n_embd, n_used, T]
-                ggml_tensor * routed = ggml_ds4_moe_fused_combine_shared(p.ctx, dn, wsel, nullptr);
-                for (ggml_tensor * t : {gu, dn, routed}) p.output(t);
-                REQUIRE(p.alloc(be.get()));
-                p.set(sel, ids.data());
-                p.fill_rest();
-                REQUIRE(ggml_backend_graph_compute(be.get(), p.gf) == GGML_STATUS_SUCCESS);
-                std::vector<std::vector<uint8_t>> got;
-                for (ggml_tensor * t : p.outs) got.push_back(read(t));
-                if (dev == 0) { ref = got; continue; }
-                const char * names[3] = {"gate/up+swiglu", "down", "weighted sum"};
-                for (size_t o = 0; o < got.size(); ++o) {
-                    size_t n = 0;
-                    float worst = 0.0f;
-                    for (size_t i = 0; i + sizeof(float) <= got[o].size(); i += sizeof(float)) {
-                        float a, b;
-                        std::memcpy(&a, &ref[o][i], sizeof(float));
-                        std::memcpy(&b, &got[o][i], sizeof(float));
-                        if (std::memcmp(&a, &b, sizeof(float)) != 0) {
-                            ++n;
-                            worst = std::max(worst, std::fabs(a - b) / std::max(1e-30f, std::fabs(a)));
-                        }
-                    }
-                    std::printf("[expert-parity] invariant=%d T=%d %s: %zu of %zu outputs differ (max rel %.3g)\n",
-                                (int) inv, T, names[o], n, got[o].size() / sizeof(float), (double) worst);
-                }
-            }
-        }
-    }
-}
-
 // Hot lanes (qwen4exp_graph.cpp, build_moe_route): the target runs a token's first hot picks in lanes from its copies
 // of those experts, the expert device runs the other picks, and ggml_moe_combine_lanes sums every pick in route order.
 // The routed sum must be the expert device's own sum over every pick (MUL_MAT_ID on all of them, then
@@ -1724,7 +1665,9 @@ TEST_CASE(QnSplitFusionsFixture, lm_head_row_split) {
 }
 
 TEST_CASE(QnSplitFusionsFixture, argmax_ties_gpu) {
-    each_gpu([&](ggml_backend_t be) { for (int V : {248320, 151936, 100003, 64000, 8192, 8191, 5000}) argmax_ties(be, V); });
+    each_gpu([&](ggml_backend_t be) {
+        for (int V : {248320, 151936, 100003, 64000, 8192, 8191, 5000, 33, 2}) argmax_ties(be, V);
+    });
 }
 
 TEST_CASE(QnSplitFusionsFixture, argmax_ties_cpu) {

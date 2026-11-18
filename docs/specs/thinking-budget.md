@@ -548,7 +548,7 @@ an additional `finish_details` object alongside the standard OpenAI
 
 ```json
 "finish_details": {
-  "close_kind":      "natural" | "hard",
+  "close_kind":      "natural" | "hard" | "open",
   "thinking_tokens": <int>,
   "content_tokens":  <int>,
   "total_tokens":    <int>
@@ -631,6 +631,7 @@ The current taxonomy is:
 |---|---|
 | `natural` | The model emitted `</think>` on its own, either before reaching the phase-1 cap or before Level 2 had to force-close. |
 | `hard` | The phase-1 cap was reached without a model-emitted `</think>`. Either Level 2 force-closed the block in-loop (preserving KV) or Level 1 ran the phase-2 reprompt. |
+| `open` | The reply ended inside the `<think>` block: the model ended its turn, or the output cap came, before any `</think>`. |
 
 A third value `soft` is reserved for a future voluntary-close
 mechanism (logit-biasing the model toward `</think>` as the cap

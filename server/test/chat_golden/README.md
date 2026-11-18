@@ -21,17 +21,17 @@ always the current state. Each run prints how many cases match per model and pat
 
 | Path | Text | Tokens (real GGUF) |
 |---|---|---|
-| Qwen3.8 27B, codec | 27 / 27 | 26 / 27 |
-| Qwen3.8-Flash-Next, codec | 27 / 27 | 26 / 27 |
+| Qwen3.8 27B, codec | 27 / 27 | 25 / 27 |
+| Qwen3.8-Flash-Next, codec | 27 / 27 | 25 / 27 |
 | Qwen3.8-Flash-Next, Jinja | 25 / 27 | 25 / 27 |
 | Qwen3.6 27B, codec | 26 / 26 | 25 / 26 |
 | Qwen3.6 27B, Jinja | 24 / 26 | 24 / 26 |
 | Qwen3.5 27B, codec (the server default) | 20 / 26 | 19 / 26 |
 | Qwen3.5 27B, codec with `preserve_thinking: false` | 26 / 26 | 25 / 26 |
 | Qwen3.5 27B, Jinja | 24 / 26 | 24 / 26 |
-| DeepSeek V4.1, codec | 29 / 29 | 28 / 29 |
+| DeepSeek V4.1, codec | 29 / 29 | 27 / 29 |
 | DeepSeek V4.1, the encoder's own pairs, codec | 2 / 5 | 2 / 5 |
-| DeepSeek V4, codec | 28 / 28 | 27 / 28 |
+| DeepSeek V4, codec | 28 / 28 | 26 / 28 |
 | DeepSeek V4, the encoder's own pairs, codec | 2 / 4 | 2 / 4 |
 
 Of the encoders' own pairs, two each use the internal `latest_reminder` role, which no API request can send, and one of
@@ -44,9 +44,15 @@ llama.cpp and Ollama render it so), which rewrites the turns after the previous 
 prefix cache and PFlash views could not continue. The codec keeps it, as Qwen3.8 does; `preserve_thinking: false`
 renders the official prompt. Qwen3.5 also writes scalar tool-call arguments with Python's `str()` (`True`, `None`).
 
-The codecs' one token difference is deliberate: control-token text a user types (`<|im_end|>`, and DeepSeek's turn
+The codecs' token differences are deliberate. Control-token text a user types (`<|im_end|>`, and DeepSeek's turn
 markers such as `<｜User｜>`, which its vocabulary types user-defined) stays text, so a message cannot close its turn.
-Hugging Face tokenizers turn it into the token.
+The tags the template writes itself (`<think>`, `</think>`, `<tool_call>`, `<tool_response>` and their closers), when
+spelled in what a request carries (message text, reasoning, tool definitions, call arguments), stay text too, each one
+alone, as Hugging Face's `sanitize_control_tokens` writes them: a file that holds `</think>` shows the model those
+characters, not the token that ends its thinking. Of the cases, that changes Qwen3.8's and DeepSeek's
+`think_tags_in_content` (thinking sent inline in an earlier turn's content); Qwen3.6 and 3.5 read that thinking out of
+the content first. A tool response a client wraps in a user message keeps its tags as tokens, since the template reads
+it as one. Hugging Face tokenizers without sanitizing turn all of these into the tokens.
 
 The model cards name each model's codec (`chat_codec`), and the `deepseek41`, `deepseek4`, `qwen4exp`, `qwen35` and
 `qwen35moe` archs default to theirs (`qwen3.5` for `qwen35` and `qwen35moe`), so the server renders with it by default. These archs have no built-in renderer: `--chat-codec none` works only

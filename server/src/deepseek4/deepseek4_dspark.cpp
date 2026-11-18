@@ -656,37 +656,4 @@ void free_deepseek4_dspark_drafter(DSparkDrafter & d) {
     d = DSparkDrafter{};
 }
 
-// Validation dump used by the load smoke test.
-void deepseek4_dspark_dump(const DSparkDrafter & d) {
-    const DeepSeek4Weights & w = d.core;
-    auto shp = [](ggml_tensor * t) -> std::string {
-        if (!t) return "NULL";
-        char b[128];
-        std::snprintf(b, sizeof(b), "[%lld,%lld,%lld,%lld] %s",
-                      (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
-                      ggml_type_name(t->type));
-        return b;
-    };
-    std::fprintf(stderr, "── DSpark drafter dump ──\n");
-    std::fprintf(stderr, "  main_proj    %s\n", shp(d.main_proj).c_str());
-    std::fprintf(stderr, "  main_norm    %s\n", shp(d.main_norm).c_str());
-    std::fprintf(stderr, "  out_norm     %s\n", shp(w.out_norm).c_str());
-    std::fprintf(stderr, "  output_hc_fn %s\n", shp(w.output_hc_fn).c_str());
-    std::fprintf(stderr, "  markov_w1    %s\n", shp(d.markov_w1).c_str());
-    std::fprintf(stderr, "  markov_w2    %s\n", shp(d.markov_w2).c_str());
-    std::fprintf(stderr, "  conf_w       %s\n", shp(d.confidence_w).c_str());
-    std::fprintf(stderr, "  conf_b       %s\n", shp(d.confidence_b).c_str());
-    for (int il = 0; il < w.n_layer; il++) {
-        const DeepSeek4Layer & L = w.layers[il];
-        std::fprintf(stderr, "  blk.%d: attn_norm=%s q_a=%s q_b=%s kv=%s o_a=%s o_b=%s sinks=%s\n",
-            il, shp(L.attn_norm).c_str(), shp(L.attn_q_a).c_str(), shp(L.attn_q_b).c_str(),
-            shp(L.attn_kv).c_str(), shp(L.attn_output_a).c_str(), shp(L.attn_output_b).c_str(),
-            shp(L.attn_sinks).c_str());
-        std::fprintf(stderr, "         ffn_gate_exps=%s up=%s down=%s shexp(g=%s) gate_inp=%s probs_b=%s hc_attn_fn=%s hc_ffn_fn=%s\n",
-            shp(L.ffn_gate_exps).c_str(), shp(L.ffn_up_exps).c_str(), shp(L.ffn_down_exps).c_str(),
-            shp(L.ffn_gate_shexp).c_str(), shp(L.ffn_gate_inp).c_str(), shp(L.ffn_exp_probs_b).c_str(),
-            shp(L.hc_attn_fn).c_str(), shp(L.hc_ffn_fn).c_str());
-    }
-}
-
 }  // namespace luce::common

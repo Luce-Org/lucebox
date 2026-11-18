@@ -209,12 +209,11 @@ class SummarizerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeat sets differ"):
             summarizer.summarize(reports)
 
-    def test_single_repeat_does_not_claim_stability(self) -> None:
-        text = summarizer.summarize([self.item("llama", 8.0)])
-        row = next(line for line in text.splitlines() if "| llama |" in line)
-        self.assertEqual(row.split("|")[11].strip(), "n/a")
+    def test_summary_reports_output_stability(self) -> None:
+        single = summarizer.summarize([self.item("llama", 8.0)])
+        single_row = next(line for line in single.splitlines() if "| llama |" in line)
+        self.assertEqual(single_row.split("|")[11].strip(), "n/a")
 
-    def test_multiple_repeats_report_output_stability(self) -> None:
         stable = summarizer.summarize([
             self.item("llama", 8.0, repeat=1),
             self.item("llama", 9.0, repeat=2),

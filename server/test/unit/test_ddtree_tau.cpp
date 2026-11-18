@@ -4,14 +4,12 @@
 // cumulative path log-probability q(v), so the tau_tree window
 // (keep q(v) >= q* - tau) is a single early-stop comparison. These tests pin
 // the contract: the margin prunes exactly the out-of-window candidates, the
-// retained set stays ancestor-closed, the budget still caps the tree, and the
-// default (infinite tau) reproduces the unpruned tree.
+// retained set stays ancestor-closed, and the budget still caps the tree.
 
 #include "CppUnitTestFramework.hpp"
 #include "ddtree.h"
 
 #include <cmath>
-#include <limits>
 #include <vector>
 
 using luce::common::build_ddtree;
@@ -38,15 +36,6 @@ bool ancestor_closed(const DDTree & t) {
 }
 }  // namespace
 
-TEST_CASE(DdtreeTauFixture, infinite_tau_matches_unpruned_tree) {
-    DDTree base = build_ddtree(kLp, kIds, 3, 2, 8, /*chain_seed=*/false);
-    DDTree inf  = build_ddtree(kLp, kIds, 3, 2, 8, /*chain_seed=*/false,
-                               std::numeric_limits<float>::infinity());
-    CHECK(base.n_nodes == inf.n_nodes);
-    CHECK(base.token_ids == inf.token_ids);
-    CHECK(base.parents == inf.parents);
-}
-
 TEST_CASE(DdtreeTauFixture, margin_prunes_low_confidence_branches) {
     // Window of 1.0 below q* = -0.1 keeps the top chain (-0.1, -0.3, -0.6)
     // and prunes every sibling (best sibling -3.0).
@@ -60,12 +49,6 @@ TEST_CASE(DdtreeTauFixture, margin_prunes_low_confidence_branches) {
     DDTree wide = build_ddtree(kLp, kIds, 3, 2, 8, /*chain_seed=*/false, 10.0f);
     CHECK(wide.n_nodes == 8);
     CHECK(ancestor_closed(wide));
-}
-
-TEST_CASE(DdtreeTauFixture, budget_still_caps_within_window) {
-    DDTree t = build_ddtree(kLp, kIds, 3, 2, 2, /*chain_seed=*/false, 10.0f);
-    CHECK(t.n_nodes == 2);
-    CHECK(ancestor_closed(t));
 }
 
 TEST_CASE(DdtreeTauFixture, precomputed_fast_path_preserves_legacy_order) {

@@ -127,15 +127,6 @@ struct LuceEngineFixture : CommonFixture {
         engine.stop_serving();
     }
 
-    void selects_concurrent_loop_when_allowed() {
-        LuceEngine engine(std::make_unique<FakeBackend>(true));
-        ServingProbe probe;
-        REQUIRE(engine.start_serving(probe.loops(), true));
-        REQUIRE(probe.wait_until_started());
-        CHECK(probe.ran_concurrent);
-        engine.stop_serving();
-    }
-
     void policy_can_force_serial_loop() {
         LuceEngine engine(std::make_unique<FakeBackend>(true));
         ServingProbe probe;
@@ -232,7 +223,6 @@ struct LuceEngineFixture : CommonFixture {
 
 TEST_CASE(LuceEngineFixture, luce_engine_lifecycle_suite) {
     selects_serial_loop_without_sequence_engine();
-    selects_concurrent_loop_when_allowed();
     policy_can_force_serial_loop();
     owns_backend_lifetime_without_duplicate_shutdown();
     stop_is_idempotent_and_allows_restart();

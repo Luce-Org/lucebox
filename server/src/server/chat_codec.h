@@ -33,10 +33,12 @@ class Tokenizer;
 
 // One piece of a rendered prompt: text, control tokens spelled out, or
 // token IDs taken as they are (a remembered turn; `text` is their text).
+// `data`: text taken from the request (RenderedPrompt::markup).
 struct PromptPiece {
     std::string text;
     bool control = false;
     std::vector<int32_t> ids;
+    bool data = false;
 };
 
 // A byte range of RenderedPrompt::text(); `begin == npos` when there is none.
@@ -60,6 +62,12 @@ struct RenderedPrompt {
     // Added tokens that stay text inside the runs, like control tokens: the
     // codec's turn markers where the GGUF types them user-defined.
     std::vector<std::string> literal;
+    // The added tokens the template writes itself (<think>, <tool_call>, ...).
+    // Spelled in a data piece (message text, reasoning, tool definitions, call
+    // names and arguments) they stay text, each one alone, as Hugging Face's
+    // sanitize_control_tokens writes them: a file that holds "</think>" shows
+    // the model those characters, not the token that ends its thinking.
+    std::vector<std::string> markup;
     // One per input message, and the tool definitions the template renders.
     // PFlash maps the prompt with these instead of rendering variants of it.
     std::vector<MessageLayout> messages;
@@ -73,6 +81,8 @@ struct RenderedPrompt {
     // Control pieces as their token IDs, remembered turns as they were
     // generated, and the text between them as one run.
     std::vector<int32_t> tokens(const Tokenizer & tokenizer) const;
+    // `text` from the request, encoded as tokens() encodes a data piece.
+    std::vector<int32_t> encode_data(const Tokenizer & tokenizer, const std::string & text) const;
 };
 
 // Assistant turns as the model generated them, by the prompt they continued
@@ -101,6 +111,9 @@ public:
         // V4.1 puts the opening <think> in the generation prompt): it can
         // stand only where the template shows the turn's thinking.
         bool thinking = false;
+        // Where the thinking closes in `text` (think_close_token), if the turn
+        // has a close: the thinking may also spell "</think>" in ordinary pieces.
+        size_t think_end = std::string::npos;
     };
 
     explicit TurnMemory(size_t max_bytes = 64 * 1024 * 1024) : max_bytes_(max_bytes) {}
@@ -207,6 +220,11 @@ public:
 // Lucebox's five tiers (spec §4.2): "minimal" is low, "xhigh" x-high, and an
 // unknown word high.
 std::string lucebox_effort_tier(const std::string & word);
+
+// The </think> token, or -1 when the vocabulary has none as an added token.
+// With one, only it ends the thinking: the codecs show "</think>" spelled in a
+// message as text, and the emitter and turn memory split at the token.
+int32_t think_close_token(const Tokenizer & tokenizer);
 
 // The codec named `name` ("qwen3.8", "qwen3.6", "qwen3.5", "deepseek4.1", "deepseek4"), or null for an
 // unknown name.

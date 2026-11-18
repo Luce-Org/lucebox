@@ -141,6 +141,31 @@ static void test_replan() {
         call("call_1", "get_order", "{\"id\":1}"), call("call_2", "send_email", "{}")}))));
 }
 
+static json completion(const json & message, const char * finish_reason) {
+    return {{"choices", json::array({{{"index", 0}, {"message", message}, {"finish_reason", finish_reason}}})}};
+}
+
+static void test_empty_reply() {
+    // A turn that ended with nothing: thinking only, or blank text.
+    json thinking_only = answer("");
+    thinking_only["reasoning_content"] = "I'll write the file.";
+    CHECK(empty_reply(completion(thinking_only, "stop")));
+    CHECK(empty_reply(completion(answer(" \n\n"), "stop")));
+    CHECK(empty_reply(completion({{"role", "assistant"}, {"content", nullptr}}, "stop")));
+    // Something to act on, or a reply the output cap cut.
+    CHECK(!empty_reply(completion(answer("Done."), "stop")));
+    CHECK(!empty_reply(completion(assistant_calls(json::array({call("call_1", "get_order", "{}")})), "tool_calls")));
+    CHECK(!empty_reply(completion(answer(""), "length")));
+    CHECK(!empty_reply(json::object()));
+
+    // A seed the client set moves on, so the sample can differ.
+    json request = {{"messages", json::array({user("hi")})}};
+    CHECK(redraw(request, 1) == request);
+    request["seed"] = 7;
+    CHECK(redraw(request, 2)["seed"] == 9);
+    CHECK(redraw(request, 2)["messages"] == request["messages"]);
+}
+
 static void test_final_check() {
     CheckedCalls checked;
     json messages = json::array({user("Cancel order 1 and email Tom.")});
@@ -263,6 +288,7 @@ int main() {
     test_agent_request();
     test_replan();
     test_tool_free_reply();
+    test_empty_reply();
     test_final_check();
     test_fresh_calls();
     test_note();

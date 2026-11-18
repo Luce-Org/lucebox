@@ -36,8 +36,7 @@ struct DeepSeek4RoctxLoader {
 };
 
 bool deepseek4_roctx_env_enabled(const char * value);
-DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
-    bool enabled, DeepSeek4RoctxLoader loader);
+DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(DeepSeek4RoctxLoader loader);
 
 // Propagates caller-owned semantics through tokenwise exact-prefill calls,
 // where n_tokens == 1 alone cannot distinguish prefill from decode.
@@ -65,7 +64,6 @@ public:
                        const DeepSeek4RoctxMetadata & metadata = {});
     DeepSeek4RoctxRange(const char * scope,
                        const DeepSeek4RoctxMetadata & metadata,
-                       bool enabled,
                        DeepSeek4RoctxCallbacks callbacks);
     ~DeepSeek4RoctxRange();
 
