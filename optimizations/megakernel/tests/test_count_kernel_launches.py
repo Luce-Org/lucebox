@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from optimizations.megakernel import count_kernel_launches as ckl
 from optimizations.megakernel.count_kernel_launches import (
     LaunchCounts,
     build_parser,
@@ -15,7 +18,10 @@ from optimizations.megakernel.count_kernel_launches import (
     format_path_report,
     format_rate,
     parse_chrome_trace_file,
+    profile_megakernel,
+    resolve_megakernel_max_seq_len,
     validate_args,
+    validate_megakernel_sequence_length,
 )
 
 
@@ -124,17 +130,119 @@ def test_format_rate_and_reports() -> None:
     assert "flash-linear-attention, causal-conv1d" in comparison
 
 
-def test_format_comparison_handles_zero_megakernel_count() -> None:
-    mega = LaunchCounts(steps=1, kernels=0, gpu_memset=0, gpu_memcpy=0)
-    hf = LaunchCounts(steps=1, kernels=100, gpu_memset=0, gpu_memcpy=0)
+def test_format_comparison_hf_fewer_and_equal_launches() -> None:
+    mega = LaunchCounts(steps=1, kernels=10, gpu_memset=0, gpu_memcpy=0)
+    hf = LaunchCounts(steps=1, kernels=2, gpu_memset=0, gpu_memcpy=0)
 
-    comparison = format_comparison(
-        mega,
-        hf,
+    more_cmp = format_comparison(mega, hf)
+    assert "Megakernel vs HF:  5.0x more compute kernel launches per token" in more_cmp
+    assert "fewer" not in more_cmp
+
+    equal_cmp = format_comparison(
+        LaunchCounts(steps=2, kernels=6, gpu_memset=0, gpu_memcpy=0),
+        LaunchCounts(steps=1, kernels=3, gpu_memset=0, gpu_memcpy=0),
+    )
+    assert "Megakernel vs HF:  equal compute kernel launches per token (1.0x)" in equal_cmp
+
+
+def test_format_comparison_handles_zero_counts() -> None:
+    zero = LaunchCounts(steps=1, kernels=0, gpu_memset=0, gpu_memcpy=0)
+    nonzero = LaunchCounts(steps=1, kernels=100, gpu_memset=0, gpu_memcpy=0)
+
+    zero_mega = format_comparison(
+        zero,
+        nonzero,
         hf_fast_kernels={"flash_linear_attention": True, "causal_conv1d": True},
     )
-    assert "N/A (megakernel reported 0 compute kernels)" in comparison
-    assert "Note:" not in comparison
+    assert "N/A (megakernel reported 0 compute kernels)" in zero_mega
+    assert "Note:" not in zero_mega
+
+    zero_hf = format_comparison(nonzero, zero)
+    assert "N/A (HF reported 0 compute kernels)" in zero_hf
+    assert "fewer" not in zero_hf
+    assert "more" not in zero_hf
+
+    both_zero = format_comparison(zero, zero)
+    assert "N/A (both megakernel and HF reported 0 compute kernels)" in both_zero
+
+
+def test_resolve_megakernel_max_seq_len_is_backend_aware() -> None:
+    nvfp4_module = SimpleNamespace(MAX_SEQ_LEN=2048)
+    nvfp4_dec = SimpleNamespace()  # model_nvfp4.Decoder does not set dec.max_seq_len
+    assert (
+        resolve_megakernel_max_seq_len(
+            nvfp4_dec, backend="nvfp4", decoder_module=nvfp4_module
+        )
+        == 2048
+    )
+
+    bf16_module = SimpleNamespace(MAX_SEQ_LEN=2048)
+    bf16_dec = SimpleNamespace(max_seq_len=1024)
+    assert (
+        resolve_megakernel_max_seq_len(
+            bf16_dec, backend="bf16", decoder_module=bf16_module
+        )
+        == 1024
+    )
+    assert (
+        resolve_megakernel_max_seq_len(
+            SimpleNamespace(), backend="bf16", decoder_module=bf16_module
+        )
+        is None
+    )
+
+
+def test_validate_megakernel_sequence_length_boundary() -> None:
+    # Total tokens = prompt (5) + warmup (3) + steps (1) = 9 = max_seq_len + 1.
+    # Consumed KV-cache positions = (5 - 1) + 3 + 1 = 8 == max_seq_len -> allowed.
+    validate_megakernel_sequence_length(5, warmup=3, steps=1, max_seq_len=8)
+
+    # One more step consumes 9 positions (> max_seq_len=8) -> rejected.
+    with pytest.raises(ValueError, match="9 KV-cache positions.*max_seq_len \\(8\\)"):
+        validate_megakernel_sequence_length(5, warmup=3, steps=2, max_seq_len=8)
+
+
+def test_profile_megakernel_nvfp4_enforces_module_max_seq_len(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeNvfp4Decoder:
+        def __init__(self, *, model_name: str, backend: str, verbose: bool) -> None:
+            self.steps = 0
+
+        def step(self, token_id: int) -> int:
+            self.steps += 1
+            return token_id + 1
+
+    fake_module = SimpleNamespace(MAX_SEQ_LEN=8, Decoder=FakeNvfp4Decoder)
+    monkeypatch.setitem(sys.modules, "model_nvfp4", fake_module)
+    monkeypatch.setattr(ckl, "_release_cuda_memory", lambda: None)
+
+    # Boundary: prompt=5, warmup=3, steps=1 -> total=9 == MAX_SEQ_LEN+1 (8 consumed) -> allowed.
+    def fake_count(fn, *, warmup: int, steps: int) -> LaunchCounts:
+        for _ in range(warmup + steps):
+            fn()
+        return LaunchCounts(steps=steps, kernels=2 * steps, gpu_memset=0, gpu_memcpy=1)
+
+    monkeypatch.setattr(ckl, "count_kernel_launches", fake_count)
+    backend, counts = profile_megakernel(
+        "Qwen/Qwen3.5-0.8B",
+        [1, 2, 3, 4, 5],
+        backend="nvfp4",
+        warmup=3,
+        steps=1,
+    )
+    assert backend == "nvfp4"
+    assert counts.kernels_per_token == 2.0
+
+    # Past boundary: prompt=5, warmup=3, steps=2 -> 9 consumed > MAX_SEQ_LEN (8) -> rejected.
+    with pytest.raises(ValueError, match="max_seq_len \\(8\\)"):
+        profile_megakernel(
+            "Qwen/Qwen3.5-0.8B",
+            [1, 2, 3, 4, 5],
+            backend="nvfp4",
+            warmup=3,
+            steps=2,
+        )
 
 
 def test_cli_parser_defaults_and_validation() -> None:
@@ -156,4 +264,3 @@ def test_cli_parser_defaults_and_validation() -> None:
 
     with pytest.raises(ValueError, match="--prompt"):
         validate_args(parser.parse_args(["--prompt", ""]))
-

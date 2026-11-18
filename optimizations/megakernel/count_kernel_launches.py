@@ -167,6 +167,43 @@ def _release_cuda_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def resolve_megakernel_max_seq_len(
+    dec: Any,
+    *,
+    backend: str,
+    decoder_module: Any,
+) -> int | None:
+    """Resolve the active megakernel decoder's KV-cache sequence-length limit."""
+    if backend == "nvfp4":
+        return int(decoder_module.MAX_SEQ_LEN)
+    max_seq_len = getattr(dec, "max_seq_len", None)
+    return int(max_seq_len) if max_seq_len is not None else None
+
+
+def validate_megakernel_sequence_length(
+    prompt_len: int,
+    *,
+    warmup: int,
+    steps: int,
+    max_seq_len: int | None,
+) -> None:
+    """Validate that consumed KV-cache positions fit within `max_seq_len`.
+
+    Prefill consumes `prompt_len - 1` tokens, followed by `warmup + steps`
+    decode calls; the final generated token is returned and not consumed into
+    the KV cache, so `prompt_len + warmup + steps == max_seq_len + 1` is valid.
+    """
+    if max_seq_len is None:
+        return
+    consumed_tokens = (prompt_len - 1) + warmup + steps
+    if consumed_tokens > max_seq_len:
+        raise ValueError(
+            f"Megakernel decode consumes (prompt {prompt_len} - 1) + warmup ({warmup}) + "
+            f"steps ({steps}) = {consumed_tokens} KV-cache positions, exceeding "
+            f"max_seq_len ({max_seq_len})."
+        )
+
+
 def profile_megakernel(
     model_name: str,
     prompt_ids: Sequence[int],
@@ -183,13 +220,15 @@ def profile_megakernel(
     try:
         try:
             if resolved == "nvfp4":
-                from model_nvfp4 import Decoder as Nvfp4Decoder
+                import model_nvfp4 as decoder_module
 
-                dec = Nvfp4Decoder(model_name=model_name, backend="nvfp4", verbose=False)
+                dec = decoder_module.Decoder(
+                    model_name=model_name, backend="nvfp4", verbose=False
+                )
             else:
-                from model import Decoder as Bf16Decoder
+                import model as decoder_module
 
-                dec = Bf16Decoder(model_name=model_name, verbose=False)
+                dec = decoder_module.Decoder(model_name=model_name, verbose=False)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to initialize megakernel ({resolved}) for {model_name!r}. "
@@ -198,13 +237,15 @@ def profile_megakernel(
                 f"Cause: {exc}"
             ) from exc
 
-        total_tokens = len(prompt_ids) + warmup + steps
-        max_seq_len = getattr(dec, "max_seq_len", None)
-        if max_seq_len is not None and total_tokens > max_seq_len:
-            raise ValueError(
-                f"Prompt ({len(prompt_ids)}) + warmup ({warmup}) + steps ({steps}) = "
-                f"{total_tokens} exceeds megakernel max_seq_len ({max_seq_len})."
-            )
+        max_seq_len = resolve_megakernel_max_seq_len(
+            dec, backend=resolved, decoder_module=decoder_module
+        )
+        validate_megakernel_sequence_length(
+            len(prompt_ids),
+            warmup=warmup,
+            steps=steps,
+            max_seq_len=max_seq_len,
+        )
 
         for tid in prompt_ids[:-1]:
             dec.step(tid)
@@ -303,18 +344,29 @@ def format_comparison(
     """Format the megakernel vs. HuggingFace launch-count comparison."""
     mega_rate = format_rate(mega.kernels, mega.steps)
     hf_rate = format_rate(hf.kernels, hf.steps)
+    mega_per_token = mega.kernels_per_token
+    hf_per_token = hf.kernels_per_token
 
-    if mega.kernels > 0:
-        ratio = hf.kernels_per_token / mega.kernels_per_token
-        reduction = f"{ratio:.1f}x fewer compute kernel launches per token"
+    if mega.kernels == 0 and hf.kernels == 0:
+        summary = "N/A (both megakernel and HF reported 0 compute kernels)"
+    elif mega.kernels == 0:
+        summary = "N/A (megakernel reported 0 compute kernels)"
+    elif hf.kernels == 0:
+        summary = "N/A (HF reported 0 compute kernels)"
+    elif hf_per_token > mega_per_token:
+        ratio = hf_per_token / mega_per_token
+        summary = f"{ratio:.1f}x fewer compute kernel launches per token"
+    elif mega_per_token > hf_per_token:
+        ratio = mega_per_token / hf_per_token
+        summary = f"{ratio:.1f}x more compute kernel launches per token"
     else:
-        reduction = "N/A (megakernel reported 0 compute kernels)"
+        summary = "equal compute kernel launches per token (1.0x)"
 
     lines = [
         "=== Comparison ===",
         f"Megakernel:        {mega_rate} launches/token",
         f"HF Transformers:   {hf_rate} launches/token",
-        f"Reduction:         {reduction}",
+        f"Megakernel vs HF:  {summary}",
     ]
 
     if hf_fast_kernels is not None:
