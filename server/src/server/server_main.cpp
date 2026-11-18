@@ -1553,6 +1553,15 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("LUCE_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
     if (!model.kvflash_tau.empty())
         set_environment_variable("LUCE_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
+    // /props.kvflash reads the variables the backend reads, once the flags above have set them.
+    if (const char * pool = std::getenv("LUCE_KVFLASH"); pool && *pool) {
+        const auto env = [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); };
+        model.sconfig.kvflash_enabled     = true;
+        model.sconfig.kvflash_pool_tokens = std::max(0, std::atoi(pool));  // 0: "auto", sized at load
+        model.sconfig.kvflash_recall_mode = luce::server::kvflash_recall_mode(
+            inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, env("LUCE_KVFLASH_PREFILL_RESELECT"),
+            env("LUCE_KVFLASH_POLICY"), env("LUCE_KVFLASH_RESELECT_SCORER"));
+    }
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);

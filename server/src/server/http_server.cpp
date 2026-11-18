@@ -1626,6 +1626,11 @@ json build_props_body(const ServerConfig & config,
         // The C++ daemon is linked in-process; if /props is responding,
         // the daemon is alive by construction.
         {"daemon", {{"alive", true}}},
+        {"kvflash", {
+            {"enabled",     config.kvflash_enabled},
+            {"pool_tokens", config.kvflash_pool_tokens},
+            {"mode",        config.kvflash_recall_mode},
+        }},
         {"api", {{"endpoints", kApiEndpoints}}},
         // Capability flags surfaced for clients that don't want to crack
         // open `reasoning` / `speculative` / etc. — matches the Python

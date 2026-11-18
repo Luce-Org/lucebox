@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "common/kvflash_prefill_reselect.h"
 #include "placement/kfd_topology.h"
 
 #include <nlohmann/json.hpp>
@@ -410,6 +411,16 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
         {"LUCE_KVFLASH_PREAMBLE_ROWS", std::to_string(P::preamble_rows)},
         {"LUCE_KVFLASH_UQ_QUERIES", std::to_string(P::uq_queries)},
     };
+}
+
+// /props.kvflash.mode: the reselect mode the qwen35 backend resolves from LUCE_KVFLASH_PREFILL_RESELECT,
+// LUCE_KVFLASH_POLICY and LUCE_KVFLASH_RESELECT_SCORER (kvflash_reselect_mode). Empty = recall off.
+// ponytail: tensor parallelism turns recall off later, at load (kvflash_recall_features); this does not see it.
+inline std::string kvflash_recall_mode(std::string_view arch, const std::string & reselect,
+                                       const std::string & policy, const std::string & scorer) {
+    const int mode = arch == "qwen35"
+        ? luce::common::kvflash_reselect_mode(std::atoi(reselect.c_str()), policy == "qk", scorer.c_str(), nullptr) : 0;
+    return mode ? "prefill-reselect=" + std::to_string(mode) : "";
 }
 
 // PFlash with a trained scoring head (PFLASH_SCORING_HEAD_GGUF): the release
