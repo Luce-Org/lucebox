@@ -100,7 +100,8 @@ private:
     int32_t eos_chat_id_ = -1;  // <|im_end|> for Qwen3
 
     // Pre-tokenizer type
-    enum class PreTokenizer { QWEN2, QWEN35 };
+    // GLM4 (`glm4`/`glm5` pre): \p{M} does not join letter runs.
+    enum class PreTokenizer { QWEN2, QWEN35, GLM4 };
     PreTokenizer pre_type_ = PreTokenizer::QWEN35;
 
     // Decode mode: SentencePiece tokens use UTF-8 with ▁ for space;

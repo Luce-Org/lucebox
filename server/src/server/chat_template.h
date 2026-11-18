@@ -129,5 +129,7 @@ std::string python_json_dumps(const nlohmann::ordered_json & value);
 // Qwen3.8-Flash-Next's template knows the efforts low, medium and xhigh (its default); Lucebox's high, x-high and
 // max map to xhigh. Empty stays empty so the template applies its own default.
 std::string qwen4exp_template_effort(const std::string & effort);
+// GLM-5.3-Flash's template takes reasoning_effort low, high or (default) max.
+std::string glm5_template_effort(const std::string & effort);
 
 }  // namespace luce::common
