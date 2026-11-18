@@ -373,7 +373,6 @@ void Glm5StepGraph::free() {
 }
 
 bool glm5_step_is_sparse(const Glm5Weights & w, int kv_end) {
-    if (!w.idx_select_tail) return true;
     return kv_end / w.idx_kpool > w.idx_top_k / w.idx_kpool;
 }
 

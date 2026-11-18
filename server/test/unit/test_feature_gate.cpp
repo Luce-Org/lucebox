@@ -947,6 +947,20 @@ void test_feature_gate_kvflash_requires_reading_arch() {
           std::string::npos);
 }
 
+void test_feature_gate_glm5_rejects_remote_target_shard() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    CHECK(parse_placement_device_list("cuda:0,cuda:1,cuda:2,cuda:3", args.device));
+
+    // The in-process layer split is supported.
+    CHECK(gate_result(args, "glm5-next", PlacementBackend::Cuda).empty());
+
+    // A remote target shard is not.
+    BackendArgs remote = args;
+    remote.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
+    CHECK(!gate_result(remote, "glm5-next", PlacementBackend::Cuda).empty());
+}
+
 };
 }  // namespace
 
@@ -980,4 +994,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_vision_projector_by_architecture();
     test_deepseek41_paged_unqualified_switches();
     test_feature_gate_kvflash_requires_reading_arch();
+    test_feature_gate_glm5_rejects_remote_target_shard();
 }

@@ -418,6 +418,7 @@ int Glm5Backend::snapshot_cur_pos(int slot) const {
 
 size_t Glm5Backend::snapshot_bytes_estimate(int tokens) const {
     size_t bytes = (size_t) w_.n_vocab * sizeof(float);
+    tokens = std::clamp(tokens, 0, cache_.max_ctx);
     for (const auto & t : snapshot_tensors(tokens)) bytes += t.first->nb[1] * t.second;
     return bytes;
 }
