@@ -169,6 +169,7 @@ private:
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     int recall_mode_ = 0;      // LUCE_Q4_INDEXER_RECALL after refusals (0 off, 1 score only, 2 recall)
     int recall_queries_ = 64;  // LUCE_Q4_RECALL_QUERIES
+    bool pool_qsa_ = true;     // LUCE_Q4_POOL_QSA (Qwen4ExpCache::pool_qsa where supported)
     int recall_tail_ = kQ4RecallTailDefault;   // LUCE_Q4_RECALL_TAIL (mode 2 only)
     size_t snapshot_budget_ = SIZE_MAX; // with snapshots on the target, auto chunk reserves and enforces this allowance
     size_t tail_snap_bytes_ = 0;        // a live two-pass recall tail snapshot inside that allowance

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cerrno>
 #include <cstdlib>
@@ -71,6 +72,25 @@ constexpr int kQ4RecallTailDefault = 2048, kQ4RecallTailMax = (1 << 24) - 1;
 // shapes, and with them the low bits of the KV, vary run to run; recall's top-k vote flips on those near-ties.
 // Mode 2 pins an adaptive width to 5 (two runs gave identical logs); an explicit width is the user's.
 inline int q4_recall_verify_width(int mode, int width) { return mode == 2 && width == 0 ? 5 : width; }
+
+// QSA over a KVFlash pool (LUCE_Q4_POOL_QSA), each step: `rows` (n_chunks) gets chunk c's first arena row, or -1 when
+// the pool does not hold it, for the QSA ids to map through; every 4-token block of a missing chunk is hidden from each
+// of the T rows of `visibility` ([T][blocks]), so the indexer's top-k spends its budget on keys the pool holds.
+// `Pager` has KvFlashPager::block_of.
+template <class Pager>
+inline void q4_pool_qsa_inputs(const Pager & pager, int chunk, int n_chunks, int64_t blocks, int64_t T,
+                               std::vector<int32_t> & rows, std::vector<float> & visibility) {
+    const int64_t per = chunk / 4;
+    rows.assign((size_t) n_chunks, -1);
+    for (int c = 0; c < n_chunks; ++c) {
+        const int b = pager.block_of(c);
+        if (b >= 0) { rows[(size_t) c] = b * chunk; continue; }
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t i = c * per; i < std::min<int64_t>(blocks, (c + 1) * per); ++i)
+                visibility[(size_t) (t * blocks + i)] = -INFINITY;
+        }
+    }
+}
 
 // Bytes of one full-attention layer's recall storage (F32 raw indexer keys per position, pooled keys per block of
 // `ratio`), which a pool allocates at the full max_ctx; 0 for a layer without an indexer.

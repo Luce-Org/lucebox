@@ -70,6 +70,10 @@ struct Qwen4ExpDecodeWorkspace {
     // I32[10, T]. Group t: row t's valid block count, then pooling slot t (the
     // first ceil(T/4) groups): four raw rows, destination row, four M-RoPE positions.
     ggml_tensor * qsa_params = nullptr;
+    // QSA over a KVFlash pool (Qwen4ExpCache::pool_qsa): I32 [chunks of max_ctx], each pager chunk's first arena row or
+    // -1 when it is not resident; the QSA ids are mapped through it. Null otherwise.
+    ggml_tensor * chunk_rows = nullptr;
+    int chunk_tokens = 0;
     // Verify: each row's dense span (0 = QSA) and its mask or M-RoPE positions input.
     std::vector<int64_t> row_spans;
     std::vector<ggml_tensor *> row_inputs;
@@ -173,6 +177,10 @@ struct Qwen4ExpCache {
     int  recall_queries = 0;
     bool recall_capture = false;
     int  recall_q_n = 0, recall_q_pos0 = 0;
+    // A KVFlash pool with indexer rows at the full context: T=1 decode and verify rows attend through QSA over the
+    // resident chunks (the indexer scores every block by position; picks outside the pool are dropped) instead of
+    // densely over the pool. Set by the backend (LUCE_Q4_POOL_QSA) where the stable QSA graph is supported.
+    bool pool_qsa = false;
     ggml_tensor * mtp_k = nullptr;      // MTP draft layer, same layout; null unless created with `mtp`
     ggml_tensor * mtp_v = nullptr;
     ggml_tensor * mtp_prev_hidden = nullptr; // one pending trunk row, for the next prefill chunk's first pair

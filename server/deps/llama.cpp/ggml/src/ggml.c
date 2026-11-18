@@ -10020,6 +10020,21 @@ struct ggml_tensor * ggml_qsa_decode_ids(
     return result;
 }
 
+struct ggml_tensor * ggml_qsa_decode_ids_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * positions,
+        int                   ratio,
+        struct ggml_tensor  * chunk_rows,
+        int                   chunk_tokens) {
+    GGML_ASSERT(chunk_rows->type == GGML_TYPE_I32 && ggml_is_vector(chunk_rows) && ggml_is_contiguous(chunk_rows));
+    GGML_ASSERT(chunk_tokens > 0 && chunk_tokens % ratio == 0);
+    struct ggml_tensor * result = ggml_qsa_decode_ids(ctx, blocks, positions, ratio);
+    result->src[2] = chunk_rows;
+    ggml_set_op_params_i32(result, 1, chunk_tokens);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_indexer_mask(
         struct ggml_context * ctx,
         struct ggml_tensor  * base_mask,

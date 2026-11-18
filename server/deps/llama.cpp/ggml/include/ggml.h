@@ -3136,6 +3136,18 @@ extern "C" {
             struct ggml_tensor  * positions,
             int                   ratio);
 
+    // ggml_qsa_decode_ids for K/V rows kept in a paged pool: each emitted id p >= 0 becomes
+    // chunk_rows[p / chunk_tokens] + p % chunk_tokens, or -1 when that entry is negative (not resident) or past
+    // the table. chunk_rows: contiguous I32 [n_chunks]; chunk_tokens a positive multiple of ratio. The ids keep
+    // the position order of ggml_qsa_decode_ids.
+    GGML_API struct ggml_tensor * ggml_qsa_decode_ids_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * positions,
+            int                   ratio,
+            struct ggml_tensor  * chunk_rows,
+            int                   chunk_tokens);
+
     // Preserve the raw rows of base_mask and retain only selected compressed
     // rows. selected is I32 [top_k,n_tokens], indexing the compressed span;
     // base_mask is F32 [raw_rows+n_comp,n_tokens].

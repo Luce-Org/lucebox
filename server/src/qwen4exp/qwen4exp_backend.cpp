@@ -664,6 +664,7 @@ bool Qwen4ExpBackend::create_main_cache() {
             slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
             take_kept_remote(0), recall_mode_ > 0 && remote_layers_ == 0 ? recall_queries_ : 0))
         return false;
+    cache_.pool_qsa = pool_qsa_ && qwen4exp_pool_qsa_supported(backend_, weights_, cache_);
     disk_layout_ = qwen4exp_disk_layout(cache_);
     return true;
 }
@@ -703,6 +704,7 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
     recall_mode_ = env_int("LUCE_Q4_INDEXER_RECALL", 0, 2, 0);
     recall_queries_ = env_int("LUCE_Q4_RECALL_QUERIES", 2, 256, 64);
     recall_tail_ = env_int("LUCE_Q4_RECALL_TAIL", 0, kQ4RecallTailMax, kQ4RecallTailDefault);
+    pool_qsa_ = env_int("LUCE_Q4_POOL_QSA", 0, 1, 1) == 1;
     if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
                      "running with 0\n", recall_mode_, cfg_.max_concurrency);
@@ -728,6 +730,9 @@ void Qwen4ExpBackend::settle_indexer_recall() {
     if (s.why)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
     recall_mode_ = s.mode;
+    if (cache_.pool_qsa)
+        std::fprintf(stderr, "[q4-recall] decode and verify attend the KVFlash pool through QSA (resident blocks only; "
+                     "LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
 }
 
 // After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.

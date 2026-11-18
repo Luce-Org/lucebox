@@ -152,6 +152,9 @@ bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
 
 // The cache was created with `mtp` (and a loaded sidecar).
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache);
+// Qwen4ExpCache::pool_qsa can be set: a KVFlash pool with indexer rows at the full context, and a backend that runs the
+// stable QSA graph at max_ctx.
+bool qwen4exp_pool_qsa_supported(ggml_backend_t backend, const Qwen4ExpWeights & w, const Qwen4ExpCache & cache);
 
 // Retain the first `retained` verify inputs (accepted drafts + 1, or fewer at EOS).
 // Restores recurrent/conv/PLE state and truncates KV and QSA visibility by position.

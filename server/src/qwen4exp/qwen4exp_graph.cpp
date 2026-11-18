@@ -4,6 +4,7 @@
 
 #include "qwen4exp_graph.h"
 #include "qwen4exp_chunk.h"
+#include "qwen4exp_recall.h"
 
 #include "common/cuda_graph_overrides.h"
 #include "ggml-cpu.h"
@@ -805,19 +806,21 @@ struct Qwen4ExpQsaRow {
     ggml_tensor * visibility = nullptr;
     ggml_tensor * valid      = nullptr;
     int           min_valid  = 0;
+    ggml_tensor * chunk_rows = nullptr;   // a KVFlash pool's chunk table (Qwen4ExpDecodeWorkspace::chunk_rows)
+    int           chunk_tokens = 0;
 };
 
 static Qwen4ExpQsaRow qsa_row(ggml_context * c, const Qwen4ExpDecodeWorkspace & ws, int64_t t, int64_t T) {
     return { ggml_view_1d(c, ws.qsa_visibility, ws.qsa_blocks, (size_t) t * ws.qsa_blocks * sizeof(float)),
              ggml_view_1d(c, ws.qsa_params, 1, (size_t) 10 * t * sizeof(int32_t)),
-             (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4) };
+             (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4), ws.chunk_rows, ws.chunk_tokens };
 }
 
 // Every row's QSA inputs at once: [qsa_blocks, T] visibility and the T valid counts (stride: one group).
 static Qwen4ExpQsaRow qsa_rows_all(ggml_context * c, const Qwen4ExpDecodeWorkspace & ws, int64_t T) {
     return { ggml_view_2d(c, ws.qsa_visibility, ws.qsa_blocks, T, ws.qsa_blocks * sizeof(float), 0),
              ggml_view_2d(c, ws.qsa_params, 1, T, 10 * sizeof(int32_t), 0),
-             (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4) };
+             (int) std::max<int64_t>(513, (ws.kv_bucket - 255 - T) / 4), ws.chunk_rows, ws.chunk_tokens };
 }
 
 // The QSA indexer's queries of `cur` [n_embd, T]: [idim, nih, T], normed and M-RoPE'd (contiguous).
@@ -882,7 +885,10 @@ static ggml_tensor * build_qsa_attn(ggml_context * c, ggml_tensor * cur,
     }
     // The loader admits ratio 4 only and the cache keeps positions below 2^24,
     // the exact domain of the integer cell-id kernel.
-    ggml_tensor * ids = ggml_qsa_decode_ids(c, blocks, ggml_view_1d(c, positions, T, 0), (int) r);
+    // A KVFlash pool maps the position-sorted ids to its rows, so the keys are read in the same order.
+    ggml_tensor * ids = ws && ws->chunk_rows
+        ? ggml_qsa_decode_ids_paged(c, blocks, ggml_view_1d(c, positions, T, 0), (int) r, ws->chunk_rows, ws->chunk_tokens)
+        : ggml_qsa_decode_ids(c, blocks, ggml_view_1d(c, positions, T, 0), (int) r);
 
     ggml_tensor * q3 = ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3));       // [D, T, Hq]
     // Only the packed prefill kernel needs contiguous K/V; the per-query kernel reads the cache through its strides,
@@ -913,11 +919,13 @@ enum Qwen4ExpQsaMode { QSA_DENSE = 0, QSA_PREFILL = 1, QSA_DECODE = 2 };
 // Call with T=1 for verify, regardless of its batch width. T=1 keeps
 // the original dense decode/stable graph there, and sparse decode beyond it.
 // Verify rows follow the T=1 path, including its dense/sparse boundary and accumulation.
+// A KVFlash pool keeps rows in slot order: only a stable T=1/verify graph (`paged`: its workspace carries the chunk
+// table) of a pool_qsa cache attends through QSA; everything else attends densely over the pool.
 static Qwen4ExpQsaMode qsa_mode(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, int64_t T, int64_t pos0,
-                                bool enabled) {
+                                bool enabled, bool paged = false) {
     const int64_t r = qsa_ratio(w);
-    // A KVFlash pool attends densely even when LUCE_Q4_INDEXER_RECALL gave it indexer rows (slots are not position order).
-    if (!enabled || r <= 1 || cache.kvflash || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
+    if (cache.kvflash && !(paged && cache.pool_qsa && T == 1)) return QSA_DENSE;
+    if (!enabled || r <= 1 || cache.indexer_raw.empty() || !cache.indexer_raw[0]) return QSA_DENSE;
     if (w.indexer_head_size != 128 || w.indexer_n_head <= 0 || w.indexer_top_k % r != 0) return QSA_DENSE;
     const int64_t budget = w.indexer_top_k / r;
     if (budget * r + (r - 1) > 2560 || w.n_head != 12 * w.n_head_kv) return QSA_DENSE;
@@ -1033,9 +1041,13 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
     const int64_t kv_start = draft_window > 0 ? std::max<int64_t>(0, kv_len - draft_window) : 0;
     GGML_ASSERT(!draft_window || (last_only && T == 1 && !mask && qsa == QSA_DENSE));
 
-    ggml_tensor * K_full = ggml_view_3d(c, k_cache, D, kv_len - kv_start, Hk,
+    // QSA rows read K/V by id: a KVFlash pool's ids are arena rows (any row of the pool), else positions in the bucket.
+    const bool pool_ids = qsa_ws && qsa_ws->chunk_rows;
+    const int64_t qsa_span = pool_ids ? k_cache->ne[1] : qsa_ws ? qsa_ws->kv_bucket : 0;
+    const int64_t kv_view = pool_ids && qsa != QSA_DENSE ? qsa_span : kv_len - kv_start;
+    ggml_tensor * K_full = ggml_view_3d(c, k_cache, D, kv_view, Hk,
         k_cache->nb[1], k_cache->nb[2], kv_start * k_cache->nb[1]);
-    ggml_tensor * V_full = ggml_view_3d(c, v_cache, D, kv_len - kv_start, Hk,
+    ggml_tensor * V_full = ggml_view_3d(c, v_cache, D, kv_view, Hk,
         v_cache->nb[1], v_cache->nb[2], kv_start * v_cache->nb[1]);
 
     // Every token's raw indexer key goes to the cache, so blocks can be pooled whenever QSA first needs them.
@@ -1072,15 +1084,15 @@ ggml_tensor * build_full_attn(ggml_context * c, ggml_cgraph * gf, ggml_tensor * 
             // one-token scoring, the one-row top-k and the per-query attention kernel.
             const int64_t nb = qsa_ws->qsa_blocks;
             const Qwen4ExpQsaRow in = qsa_rows_all(c, *qsa_ws, T);
-            ggml_tensor * Kr = ggml_view_3d(c, k_cache, D, qsa_ws->kv_bucket, Hk, k_cache->nb[1], k_cache->nb[2], 0);
-            ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, qsa_ws->kv_bucket, Hk, v_cache->nb[1], v_cache->nb[2], 0);
+            ggml_tensor * Kr = ggml_view_3d(c, k_cache, D, qsa_span, Hk, k_cache->nb[1], k_cache->nb[2], 0);
+            ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, qsa_span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
             attn = build_qsa_attn(c, cur, Q, Kr, Vr, L, w, ratio, positions, pos0,
                 ggml_view_3d(c, pooled, pooled->ne[0], nb, 1, pooled->nb[1], pooled->nb[2], 0), nb, false, &in);
         }
         for (int64_t t = 0; !at_once && t < T; ++t) {
             const Qwen4ExpAttnRow & row = (*rows)[t];
             ggml_tensor * q = ggml_view_3d(c, Q, D, Hq, 1, Q->nb[1], Q->nb[2], (size_t) t * Q->nb[2]);
-            const int64_t span = row.qsa == QSA_DENSE ? row.span : qsa_ws ? qsa_ws->kv_bucket : pos0 + t + 1;
+            const int64_t span = row.qsa == QSA_DENSE ? row.span : qsa_ws ? qsa_span : pos0 + t + 1;
             ggml_tensor * Kr = ggml_view_3d(c, k_cache, D, span, Hk, k_cache->nb[1], k_cache->nb[2], 0);
             ggml_tensor * Vr = ggml_view_3d(c, v_cache, D, span, Hk, v_cache->nb[1], v_cache->nb[2], 0);
             ggml_tensor * a;
@@ -2017,7 +2029,7 @@ struct Qwen4ExpStableInputs {
     int max_ctx = 0;
     const std::vector<float> * emb = nullptr, * ple = nullptr;
     std::vector<float> qsa_visibility;
-    std::vector<int32_t> qsa_params, i32;
+    std::vector<int32_t> qsa_params, i32, chunk_rows;
     std::vector<ggml_fp16_t> mask;
     // The workspace's pinned staging (Qwen4ExpDecodeWorkspace::host_in): each async upload copies its data there first
     // while it fits. stage_need sums every upload's room, for the next forward to size the staging.
@@ -2076,6 +2088,11 @@ static void fill_stable_qsa(Qwen4ExpStableInputs & in, int64_t blocks) {
 static void upload_stable_qsa(Qwen4ExpStableInputs & in, const Qwen4ExpDecodeWorkspace & ws) {
     if (!in.qsa) return;
     fill_stable_qsa(in, ws.qsa_blocks);
+    if (ws.chunk_rows) {
+        q4_pool_qsa_inputs(*in.cache->kvflash, ws.chunk_tokens, (int) ws.chunk_rows->ne[0], ws.qsa_blocks, in.T,
+                           in.chunk_rows, in.qsa_visibility);
+        in.set(ws.chunk_rows, in.chunk_rows.data(), in.chunk_rows.size() * sizeof(int32_t));
+    }
     in.set(ws.qsa_visibility, in.qsa_visibility.data(), in.qsa_visibility.size() * sizeof(float));
     in.set(ws.qsa_params, in.qsa_params.data(), in.qsa_params.size() * sizeof(int32_t));
 }
@@ -2655,16 +2672,18 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         !qwen4exp_verify_supported(cache) || !cache.mtp_prev_hidden ||
         (!measure && pos0 > 0 && cache.mtp_prev_pos != pos0 - 1))) return res;
     if (!measure) cache.spec_tokens = 0;
-    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, verify ? 1 : n_tokens, pos0, w.qsa);
+    const int64_t kv_end = int64_t(pos0) + n_tokens;
+    // A pool_qsa cache attends T=1 and verify rows through QSA only inside a stable graph (the chunk table's home).
+    const bool paged = cache.pool_qsa && stable_qsa_supported(backend, w, cache, kv_end);
+    const Qwen4ExpQsaMode qsa = qsa_mode(w, cache, verify ? 1 : n_tokens, pos0, w.qsa, paged);
     const bool reuse_ws = n_tokens == 1;
     // Verify: row t attends as a T=1 decode at pos0 + t (see Qwen4ExpAttnRow), over that
     // step's stable dense span, or 0 for QSA. The spans key this width's retained graph.
     std::vector<int64_t> row_spans;
     for (int t = 0; verify && t < n_tokens; ++t) {
-        row_spans.push_back(qsa_mode(w, cache, 1, pos0 + t, w.qsa) != QSA_DENSE ? 0
+        row_spans.push_back(qsa_mode(w, cache, 1, pos0 + t, w.qsa, paged) != QSA_DENSE ? 0
             : qwen4exp_stable_kv_span(cache.kv_bucket_base, qwen4exp_attn_cap(cache), int64_t(pos0) + t + 1));
     }
-    const int64_t kv_end = int64_t(pos0) + n_tokens;
     const bool qsa_rows = reuse_ws ? qsa == QSA_DECODE : verify && row_spans.back() == 0;
     const bool stable_qsa = qsa_rows && stable_qsa_supported(backend, w, cache, kv_end);
     // T=1 decode and verify replay a retained graph, unless QSA rows lack the runtime-count path.
@@ -2804,6 +2823,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
             stable_ws.qsa_params = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 10 * T);
             ggml_set_input(stable_ws.qsa_visibility);
             ggml_set_input(stable_ws.qsa_params);
+        }
+        stable_ws.chunk_tokens = stable_qsa && cache.kvflash ? cache.kvflash->chunk_tokens() : 0;
+        stable_ws.chunk_rows = nullptr;
+        if (stable_ws.chunk_tokens) {
+            stable_ws.chunk_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                (cache.max_ctx + stable_ws.chunk_tokens - 1) / stable_ws.chunk_tokens);
+            ggml_set_input(stable_ws.chunk_rows);
         }
         // Prompt QSA derives visibility itself; verify owns a separate mask per dense row.
         if ((T > 1 || use_stable_graph) && qsa == QSA_DENSE && !verify) {
@@ -3009,6 +3035,11 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
 
     res.ok = true;
     return res;
+}
+
+bool qwen4exp_pool_qsa_supported(ggml_backend_t backend, const Qwen4ExpWeights & w, const Qwen4ExpCache & cache) {
+    return cache.kvflash && cache.kvflash->chunk_tokens() % 4 == 0 && !cache.indexer_raw.empty() && cache.indexer_raw[0] &&
+           stable_qsa_supported(backend, w, cache, cache.max_ctx);
 }
 
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache) {

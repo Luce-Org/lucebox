@@ -97,6 +97,17 @@ int main() {
     assert(q4_recall_verify_width(2, 0) == 5);
     assert(q4_recall_verify_width(2, 3) == 3 && q4_recall_verify_width(2, 1) == 1);
     assert(q4_recall_verify_width(1, 0) == 0 && q4_recall_verify_width(0, 0) == 0);
+    // Pool QSA inputs: chunk 8 tokens (2 blocks), 4 chunks, 7 visible-block columns, 2 rows. Chunks 0 and 2 resident
+    // (arena blocks 3 and 0), 1 and 3 not; chunk 3's second block lies past the columns.
+    struct { int block_of(int c) const { return c == 0 ? 3 : c == 2 ? 0 : -1; } } pg;
+    std::vector<int32_t> crow;
+    std::vector<float> vis(14, 0.f);
+    vis[6] = -INFINITY;
+    q4_pool_qsa_inputs(pg, 8, 4, 7, 2, crow, vis);
+    assert((crow == std::vector<int32_t>{24, -1, 0, -1}));
+    for (int t = 0; t < 2; ++t) {
+        for (int i = 0; i < 7; ++i) assert(std::isinf(vis[t * 7 + i]) == (i == 2 || i == 3 || i == 6));
+    }
     // Env integers: the whole string, in range; unset or empty is the default without complaint, anything else the
     // default and a refusal for the caller to name.
     auto e = q4_parse_env_int(nullptr, 0, 2, 0);
