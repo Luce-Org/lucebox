@@ -2243,6 +2243,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             std::fprintf(stderr, "[server] model card names unknown chat codec '%s'; ignoring it\n", name.c_str());
         }
     }
+    // GLM-5.3-Flash: default to the Jinja template embedded in the GGUF.
+    if (!chat_codec_set && sconfig.chat_codec.empty() && sconfig.chat_template_src.empty() &&
+        general_arch == "glm5-next" && !backend_model.metadata.chat_template.empty()) {
+        sconfig.chat_template_src = backend_model.metadata.chat_template;
+        std::fprintf(stderr, "[server] using the chat template embedded in the GGUF\n");
+    }
     if (!sconfig.chat_codec.empty() && !sconfig.chat_template_src.empty()) {
         std::fprintf(stderr, "[server] --chat-codec and --chat-template-file both set the prompt format; "
                              "pass one\n");

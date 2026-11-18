@@ -70,6 +70,12 @@ std::string qwen4exp_template_effort(const std::string & effort) {
     return "xhigh";
 }
 
+std::string glm5_template_effort(const std::string & effort) {
+    if (effort == "minimal" || effort == "low") return "low";
+    if (effort == "medium" || effort == "high") return "high";
+    return effort.empty() ? effort : "max";
+}
+
 // Python's repr(float), which json.dumps writes: the shortest digits that
 // read back, in positional notation for decimal exponents -4 < e <= 16, else
 // as d.ddde+XX; whole numbers keep ".0".

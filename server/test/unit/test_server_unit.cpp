@@ -6883,6 +6883,37 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_template_effort_mapping) {
     TEST_ASSERT(qwen4exp_template_effort("max") == "xhigh");
 }
 
+// GLM-5.3-Flash's template knows low, high and max (its default).
+TEST_CASE(ServerUnitFixture, test_glm5_template_effort_mapping) {
+    TEST_ASSERT(glm5_template_effort("") == "");
+    TEST_ASSERT(glm5_template_effort("minimal") == "low");
+    TEST_ASSERT(glm5_template_effort("low") == "low");
+    TEST_ASSERT(glm5_template_effort("medium") == "high");
+    TEST_ASSERT(glm5_template_effort("high") == "high");
+    TEST_ASSERT(glm5_template_effort("x-high") == "max");
+    TEST_ASSERT(glm5_template_effort("max") == "max");
+}
+
+#include "../fixtures/glm5_chat_template.inc"
+
+// GLM-5.3-Flash's official template renders exactly as Hugging Face's jinja2 does.
+TEST_CASE(ServerUnitFixture, test_glm5_official_template_render) {
+    const std::vector<ChatMessage> msgs = {
+        {"system", "You are helpful.", ""},
+        {"user", "What is 2+2?", ""},
+        {"assistant", "<think>Add them.</think>4", ""},
+        {"user", "And 3+3?", ""},
+    };
+    const std::string tail =
+        "<|system|>You are helpful.<|user|>What is 2+2?<|assistant|><think>Add them.</think>4"
+        "<|user|>And 3+3?<|assistant|><think>";
+    TEST_ASSERT(render_chat_template_jinja(kGlm5ChatTemplate, msgs, "", "", true, true, "") ==
+                "[gMASK]<sop><|system|>Reasoning Effort: Max" + tail);
+    TEST_ASSERT(render_chat_template_jinja(kGlm5ChatTemplate, msgs, "", "", true, true, "",
+                                           glm5_template_effort("low")) ==
+                "[gMASK]<sop><|system|>Reasoning Effort: Low" + tail);
+}
+
 // The Jinja path hands the reasoning effort to the template only when one is set (templates default it themselves).
 TEST_CASE(ServerUnitFixture, test_jinja_render_passes_reasoning_effort) {
     const std::string tmpl = "{% if reasoning_effort is defined %}{{ reasoning_effort }}{% else %}unset{% endif %}";
