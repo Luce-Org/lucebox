@@ -175,6 +175,10 @@ public:
     bool fused() const { return fused_.on(); }
     // Can the fused kernel score this K? The logits graph spans every archive slot, held for this call's chunks or not, so callers
     // keep the archive (pass versions) only when this holds.
+    // Free the device archive. For the owner of the pager: after KvFlashPager::reset() every slot is stale (chunk versions only
+    // grow), so nothing held can score again. The next call that passes versions builds a new one.
+    void drop_archive() { arch_free(); }
+    size_t archive_bytes() const { return arch_bytes(); }
     static bool fused_available(ggml_type kt, int D, int L) {
 #ifdef LUCE_HAVE_KVFLASH_FUSED_MASS
         return kt == GGML_TYPE_Q8_0 && D % 32 == 0 && D <= 256 && L <= luce::common::kFusedMaxLayers;

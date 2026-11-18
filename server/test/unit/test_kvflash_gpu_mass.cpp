@@ -502,6 +502,29 @@ TEST_CASE(KvflashGpuMassFixture, archive_reuploads_a_chunk_whose_version_changed
     CHECK(same_scores(o, pl, ref, pref, 16));
 }
 
+// A pager reset makes every slot stale; the backend drops the archive there instead of holding it until teardown.
+TEST_CASE(KvflashGpuMassFixture, drop_archive_frees_the_device_copy_and_the_next_call_starts_over) {
+    World w(small_cfg(GGML_TYPE_Q8_0, 60, 8));
+    KvFlashGpuMass gm(w.be), fresh(w.be);
+    std::vector<std::vector<float>> o, ref;
+    std::vector<KvFlashMassPlanes> pl, pref;
+    KvFlashGpuMassTiming tm;
+    CHECK(gm.archive_bytes() == 0);
+    gm.drop_archive();   // nothing held: a no-op
+    w.place(60, newest(60, 20));
+    REQUIRE(w.score(gm, true, o, pl) == 38);
+    CHECK(gm.archive_bytes() > 0);
+    gm.drop_archive();
+    CHECK(gm.archive_bytes() == 0);
+    for (uint64_t & v : w.ver) v += 5000;   // the reset pager's chunks: new versions
+    w.place(40, newest(40, 20));
+    CHECK(w.score(gm, true, o, pl, &tm) == 18);
+    CHECK(tm.archived == 18);
+    CHECK(gm.archive_bytes() > 0);
+    REQUIRE(w.score(fresh, false, ref, pref) == 18);
+    CHECK(same_scores(o, pl, ref, pref, 16));
+}
+
 TEST_CASE(KvflashGpuMassFixture, without_versions_every_call_uploads_every_evicted_chunk) {
     World w(small_cfg(GGML_TYPE_Q4_0, 60, 8));
     KvFlashGpuMass gm(w.be);

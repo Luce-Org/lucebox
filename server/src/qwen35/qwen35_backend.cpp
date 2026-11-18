@@ -2675,7 +2675,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int kvf_chunk = kvflash_pager_.chunk_tokens();
         prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_, kvflash_preamble_reserve_);
         if (!kvf_consume) {   // a consuming restore keeps the restored pager
-            kvflash_pager_.reset();
+            kvflash_reset_pager();
             if (kvflash_qk_policy_) {
                 kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
                 kvflash_qk_pooled_upto_ = 0;
@@ -2690,7 +2690,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     } else if (kvflash_active() && kv_offset == 0) {
         // Dense prefill rebuilds the pager only at completion. A boundary
         // snapshot before then must not see the previous request's mapping.
-        kvflash_pager_.reset();
+        kvflash_reset_pager();
     }
 
     // Skip KV-cache migration when resuming from a snapshot — the cache was
@@ -3181,7 +3181,7 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
     // Prefill (and snapshot restore) place rows physically contiguous at
     // [0, committed): rebuild the pager mapping identity-style and reset
     // the token history to match.
-    kvflash_pager_.reset();
+    kvflash_reset_pager();
     for (int p = 0; p < committed; p++) {
         const int slot = kvflash_pager_.slot_for(p);
         if (slot != p) {
@@ -3524,6 +3524,12 @@ bool Qwen35Backend::kvflash_exact_scores(int sealed, const std::vector<const flo
                  std::chrono::duration<double, std::milli>(tc2 - tc1).count(),
                  tm.dequant_ns.load() / 1e6, tm.dot_ns.load() / 1e6, tm.exp_ns.load() / 1e6);
     return ok;
+}
+
+// Every pager reset goes through here: the GPU scorer's device archive holds K of the old chunks, stale from now on.
+void Qwen35Backend::kvflash_reset_pager() {
+    kvflash_pager_.reset();
+    if (kvflash_gpu_mass_) kvflash_gpu_mass_->drop_archive();
 }
 
 // Selector v2 on the target backend (kvflash_gpu_mass.h): the pool K tensors are graph leaves, evicted chunks are
