@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -211,6 +212,15 @@ __global__ void partials_wmma_kernel(KPtrs kp, PartArgs a, const int * __restric
 #endif
 }
 
+// 1 when this device's code object was compiled with the WMMA body (LUCE_FUSED_WMMA), 0 when partials_wmma_kernel is empty in it.
+__global__ void wmma_compiled_kernel(int * out) {
+#ifdef LUCE_FUSED_WMMA
+    *out = 1;
+#else
+    *out = 0;
+#endif
+}
+
 template <int NBLK, int CT>
 static void launch_partials(dim3 grid, int threads, cudaStream_t st, const KPtrs & kp, const PartArgs & a, const int * src, const int8_t * q8,
                             const float * qd, float * part, bool wmma) {
@@ -279,13 +289,34 @@ __global__ void chunk_aggregate_kernel(const float * __restrict__ part, const fl
     out[2 * (size_t)nq_total * C + o] = mxp;
 }
 
+// Whether the code object loaded for the current device holds the WMMA body. The arch name alone does not say: a build
+// for gfx12-generic runs on a gfx1201 card with an empty partials_wmma_kernel, which would launch without an error and
+// leave the partials unwritten. Asked once per device; any failure means no.
+bool device_code_has_wmma(int dev) {
+    static std::atomic<int> known[64];   // 0 not asked, 1 yes, 2 no
+    if (dev < 0 || dev >= 64) return false;
+    int k = known[dev].load();
+    if (k == 0) {
+        int * d = nullptr, got = 0;
+        k = 2;
+        if (cudaMalloc(&d, sizeof(int)) == cudaSuccess) {
+            wmma_compiled_kernel<<<1, 1>>>(d);
+            if (cudaGetLastError() == cudaSuccess && cudaMemcpy(&got, d, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess && got == 1) k = 1;
+            cudaFree(d);
+        }
+        (void)cudaGetLastError();
+        known[dev].store(k);
+    }
+    return k == 1;
+}
+
 // the WMMA kernel exists only in the gfx1200/gfx1201 device pass (LUCE_FUSED_WMMA); the host asks the device which one to launch
 bool device_has_wmma() {
 #if defined(__HIP_PLATFORM_AMD__)
     int dev = 0;
     hipDeviceProp_t pr;
     if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&pr, dev) != hipSuccess) return false;
-    return kvflash_fused_arch_has_wmma(pr.gcnArchName);
+    return kvflash_fused_arch_has_wmma(pr.gcnArchName) && device_code_has_wmma(dev);
 #else
     return false;
 #endif

@@ -302,7 +302,6 @@ protected:
     KvFlashQkPool           kvflash_qk_pool_;
     KvFlashTargetQkScorer * kvflash_qk_scorer_ = nullptr;  // owned by kvflash_scorer_
     int                     kvflash_qk_pooled_upto_ = 0;   // chunks pooled so far
-    int                     spec_early_stop_repairs_ = 0;  // spec steps repaired after EOS/cancel inside a block
     // Pool keys for every chunk sealed before `committed` not pooled yet.
     void kvflash_qk_pool_to(int committed);
     // LUCE_KVFLASH_PREFILL_RESELECT=4: reselect the pool by exact attention mass at the last
@@ -412,7 +411,6 @@ protected:
     // Spec: copy the staged verify query of position new_committed - 1 into
     // q_cap, so the next reselection reads AR's query. False when that row is
     // not staged (q_cap is left as is).
-    bool kvflash_q_cap_from_stage(int new_committed);
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
