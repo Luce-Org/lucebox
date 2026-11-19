@@ -725,6 +725,9 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
 bool mmb_arch() { return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc); }
 bool mmb_enabled() { return ggml_cuda_qwen4exp_enabled(); }
 int mmb_min_t() { return 512; }
+// The MoE expert GEMM wins over MMQ from far fewer rows: on qwen4exp prefill (gfx1151) MMB took half the MMQ
+// time at 64-511 rows and a third less at 32-63. Smaller batches stay on MMVQ/MMQ (unmeasured below 32).
+int mmb_mmid_min_t() { return 32; }
 
 } // namespace
 
@@ -852,7 +855,7 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * 
     if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
-    if (T < mmb_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < mmb_mmid_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
     return true;
 }
 
