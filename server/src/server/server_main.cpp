@@ -329,7 +329,7 @@ static void print_usage(const char * prog) {
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
-        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: qk on qwen35 with --kvflash, else drafter)\n"
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -1611,12 +1611,31 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default.
+    if (!model.kvflash_pool.empty()) {
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        std::fprintf(stderr, "[kvflash] %s\n", luce::server::kvflash_recall_banner(arch, [](const char * k) {
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        }).c_str());
+        apply_env_defaults("KVFlash recall", luce::server::kvflash_recall_env(arch));
+    }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())
         set_environment_variable("LUCE_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
     if (!model.kvflash_tau.empty())
         set_environment_variable("LUCE_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
+    // /props.kvflash reads the variables the backend reads, once the flags above have set them.
+    if (const char * pool = std::getenv("LUCE_KVFLASH"); pool && *pool) {
+        const auto env = [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); };
+        model.sconfig.kvflash_enabled     = true;
+        model.sconfig.kvflash_pool_tokens = std::max(0, std::atoi(pool));  // 0: "auto", sized at load
+        model.sconfig.kvflash_recall_mode = luce::server::kvflash_recall_mode(
+            inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, env("LUCE_KVFLASH_PREFILL_RESELECT"),
+            env("LUCE_KVFLASH_POLICY"), env("LUCE_KVFLASH_RESELECT_SCORER"));
+    }
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
