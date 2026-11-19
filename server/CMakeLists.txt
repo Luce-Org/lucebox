@@ -1556,6 +1556,11 @@ if(LUCE_TESTS)
             list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
         endif()
 
+        # qwen4exp MoE MUL_MAT_ID across the MMVQ/MMQ/MMB batch cutovers vs an exact CPU reference (gfx1151).
+        luce_add_ggml_gpu_executable(test_mmb_mmid test/unit/test_mmb_mmid.cpp)
+        target_compile_definitions(test_mmb_mmid PRIVATE GGML_USE_HIP)
+        list(APPEND _raw_unit_test_targets test_mmb_mmid)
+
         # Vectorized bf16<->f32 cast vs the scalar fallback, bit-exact.
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_convert_vec.cpp")
             add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
