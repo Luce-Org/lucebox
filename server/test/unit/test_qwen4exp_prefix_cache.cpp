@@ -219,6 +219,42 @@ struct Qwen4ExpPrefixTest {
         CHECK(b.snapshot_drop_kv(1) && b.live_slot_ < 0 && b.snapshot_state_only(1) && b.snapshot_cur_pos(1) == 6);
         std::puts("PASS state-only backups: the allowance counts their state; a deferred snapshot is copied out first");
     }
+
+    // Past a KVFlash pool a snapshot holds its point state alone (its rows stay in the pager): the allowance charges
+    // that, not the pool's rows.
+    static void pager_budget() {
+        constexpr int pool = 512;
+        Qwen4ExpBackend b({});
+        b.backend_ = b.snap_backend_ = ggml_backend_cpu_init();
+        CHECK(b.backend_);
+        auto & c = b.cache_;
+        c.max_ctx = 4096;
+        c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
+        auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, pool, 2); };
+        c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+        c.indexer_raw = c.indexer_k = {nullptr, nullptr};
+        c.ssm_state = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2)};
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, b.backend_);
+        CHECK(c.buf);
+        KvFlashConfig cfg;
+        cfg.pool_tokens = pool;
+        c.kvflash = std::make_unique<KvFlashPager>();
+        c.kvflash->set_pinned_host_backing(false);
+        CHECK(c.kvflash->attach(cfg, c.attn_k, c.attn_v));
+        CHECK(qwen4exp_kvflash_reserve(c, 0, 300));
+        for (int p = 300; p < 2000; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+        c.cur_pos = 2000;
+        b.tokens_.assign(2000, 1); b.logits_ = {1}; b.weights_.n_vocab = 1;
+        const size_t point = b.snapshot_bytes(2000, /*rows=*/false);
+        CHECK(point > 0 && 2 * point < b.snapshot_bytes_estimate(2000));
+        b.snapshot_budget_ = 2 * point;
+        CHECK(b.snapshot_save(0) && b.snapshots_[0].rows_in_pager);
+        CHECK(b.snapshot_save_deferred(1));   // the live cache is past the pool too
+        CHECK(!b.snapshot_save(2));           // two point states use the allowance up
+        b.snapshot_flush_deferred();
+        CHECK(b.snapshots_[1].rows_in_pager);
+        std::puts("PASS a snapshot past the KVFlash pool counts its point state against the allowance");
+    }
 };
 } // namespace luce::common
 
@@ -562,8 +598,8 @@ static void memory(ggml_backend_t backend) {
 
 // KVFlash: a pooled cache's rows, masks and snapshots. While the context fits the pool the rows are the plain cache's;
 // past it, positions page out least recently used first (the sink chunk stays), a forward's own rows all stay
-// resident, masks follow the position each slot holds, and a relocated prefix publishes no snapshot while a restore
-// lands identity-mapped.
+// resident, masks follow the position each slot holds, a relocated prefix publishes a point-state snapshot whose
+// restore truncates the live pager, and a whole snapshot's restore lands identity-mapped.
 static void kvflash(ggml_backend_t backend) {
     constexpr int pool = 512;
     Qwen4ExpCache c;
@@ -603,7 +639,9 @@ static void kvflash(ggml_backend_t backend) {
     for (auto * t : c.attn_k) ggml_backend_tensor_memset(t, 0x3c, 0, 300 * t->nb[1]);   // F16 1.0 on head 0's rows
     c.cur_pos = 300;
     Qwen4ExpSnapshot s, relocated;
+    CHECK(!qwen4exp_snapshot_rows_in_pager(c));
     CHECK(save_qwen4exp_snapshot(backend, backend, c, s));
+    CHECK(!s.rows_in_pager);
     // The pooled strips stop at the pool; the snapshot sizes say so.
     CHECK(qwen4exp_snapshot_bytes(backend, c, c.max_ctx) == qwen4exp_snapshot_bytes(backend, c, pool));
     CHECK(qwen4exp_snapshot_bytes(backend, c, pool) > qwen4exp_snapshot_bytes(backend, c, pool - 64));
@@ -624,8 +662,23 @@ static void kvflash(ggml_backend_t backend) {
         const int32_t pos = c.kvflash_slot_pos[slot];
         CHECK((m[slot] == ggml_fp32_to_fp16(0.0f)) == (pos >= 0 && pos <= 2100));
     }
-    CHECK(!save_qwen4exp_snapshot(backend, backend, c, relocated));
+    // Past the pool the rows stay in the pager: the snapshot is the point state, and a restore truncates the live
+    // pager back to its position (the backend checks the live tokens extend the snapshot's). No disk form.
+    ggml_backend_tensor_memset(c.ssm_state[0], 0x11, 0, ggml_nbytes(c.ssm_state[0]));
+    CHECK(qwen4exp_snapshot_rows_in_pager(c));   // the seq engine refuses this capture: its slots restore cold
+    CHECK(save_qwen4exp_snapshot(backend, backend, c, relocated));
+    CHECK(relocated.rows_in_pager && relocated.strips.size() == 2 && relocated.cur_pos == 2300);
+    CHECK(export_qwen4exp_snapshot("layout", relocated).empty());
+    for (int p = 2300; p < 2600; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+    c.cur_pos = 2600;
+    ggml_backend_tensor_memset(c.ssm_state[0], 0x22, 0, ggml_nbytes(c.ssm_state[0]));
+    CHECK(restore_qwen4exp_snapshot(backend, relocated, c));
+    CHECK(c.cur_pos == 2300 && qwen4exp_kv_row(c, 0) == 0 && qwen4exp_kv_row(c, 2299) >= 0);
+    for (int p = 2304; p < 2600; ++p) CHECK(qwen4exp_kv_row(c, p) < 0);   // 2300..2303 share the kept chunk, zeroed
+    for (auto [live, copy] : relocated.strips) CHECK(bytes(live) == bytes(copy));
     CHECK(restore_qwen4exp_snapshot(backend, s, c));
+    CHECK(!restore_qwen4exp_snapshot(backend, relocated, c));   // a shorter live cache lacks its rows
+    free_qwen4exp_snapshot(relocated);
     CHECK(c.cur_pos == 300 && c.kvflash->is_identity() && c.kvflash->stats().host_bytes == 0);
     for (int p = 0; p < 300; ++p) CHECK(qwen4exp_kv_row(c, p) == p);
     for (auto [live, copy] : s.strips) CHECK(bytes(live) == bytes(copy));
@@ -634,7 +687,7 @@ static void kvflash(ggml_backend_t backend) {
     free_qwen4exp_snapshot(s);
     free_qwen4exp_cache(c);
     CHECK(!c.kvflash);
-    std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, snapshot guard");
+    std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, pager-held snapshot past the pool");
 }
 
 // expert_gpu >= 0 runs split mode (the routed experts on that GPU), with the hot experts of `placement` if given.
@@ -863,6 +916,7 @@ int main(int argc, char ** argv) {
     rollback_reset();
     Qwen4ExpPrefixTest::budget();
     Qwen4ExpPrefixTest::state_budget();
+    Qwen4ExpPrefixTest::pager_budget();
     auto backend = argc > 1 ? ggml_backend_cuda_init(0) : ggml_backend_cpu_init();
     CHECK(backend);
     copies(backend, backend);
