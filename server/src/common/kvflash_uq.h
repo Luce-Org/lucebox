@@ -124,6 +124,9 @@ inline int kvflash_uq_cut(const KvFlashHumanTurn & t, int n_queries, int kv_offs
 }
 // A mode-4 rewind to r replays the window from the new pool when r reaches back to its start.
 inline bool kvflash_uq_rewind_recaptures(const KvFlashUqPlan & p, int r) { return p.n > 0 && r <= p.win_lo; }
+// kvflash_mode4_plan's tail cap can put R inside the window. A replay from there would recompute the window's tail
+// under the new pool while the stored rows keep the old pool's, so R moves to the window's end: the window is not replayed.
+inline int kvflash_uq_snap_rewind(const KvFlashUqPlan & p, int r) { return p.n > 0 && r > p.win_lo && r < p.cut ? p.cut : r; }
 
 // Append the stored rows to the scorer's query list (no-op for an empty store).
 inline void kvflash_uq_append_queries(std::vector<const float *> & qs, const KvFlashUqStore & s, size_t qsize) {

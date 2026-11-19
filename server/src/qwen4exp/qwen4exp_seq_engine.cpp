@@ -645,6 +645,13 @@ PrefixStoreEvent Qwen4ExpSeqEngine::capture_prefix(int slot, PrefixCaptureTicket
             resident += ggml_backend_buffer_get_size(checkpoints_[i].buf);
         if (displaced_[i].buf) resident += ggml_backend_buffer_get_size(displaced_[i].buf);
     }
+    // restore_prefix only fills a cold slot, which cannot take a snapshot whose rows stay in the pager: keep the
+    // checkpoint this capture would have replaced.
+    if (qwen4exp_snapshot_rows_in_pager(*caches_[(size_t)slot])) {
+        event.elapsed_us = elapsed_us();
+        event.error = "qwen4exp prefix capture past the KVFlash pool (a cold slot cannot restore it)";
+        return event;
+    }
     const size_t need = estimate_prefix_store_bytes(ticket.checkpoint.tokens);
     if (!need || resident > prefix_allowance_ || need > prefix_allowance_ - resident) {
         event.elapsed_us = elapsed_us();
