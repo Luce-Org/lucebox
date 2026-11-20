@@ -21,7 +21,6 @@ from model import (
     DN_CONV_CHANNELS,
     DN_V_SIZE,
     DN_NUM_HEADS,
-    MAX_SEQ_LEN,
     _half_dtype,
 )
 import qwen35_megakernel_bf16_C

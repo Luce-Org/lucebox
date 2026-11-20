@@ -1,15 +1,12 @@
-// Qwen35 multi-GPU layer-split daemon entry point.
+// Arguments for the Qwen35 multi-GPU layer-split daemon.
 //
 // Shards the target model across multiple GPUs by layer ranges.
 // Each shard gets its own CUDA backend, partial weights, and KV cache.
 // Activations are transferred between shards at shard boundaries.
 //
-// NOTE: The full implementation currently lives in test/unit/test_dflash.cpp
-// (run_target_layer_split_daemon) because it depends on many helpers and
-// globals defined there. This header defines the DevicePlacement-based
-// args struct as the migration target. The implementation will move here
-// once the helper functions (run_qwen35_layer_split_forward, etc.) are
-// extracted to src/qwen35/.
+// test/unit/test_dflash.cpp fills these args for its --target-gpus daemon
+// mode (run_target_layer_split_daemon), which serves each request through
+// run_qwen35_layer_split_request() in layer_split_daemon.{h,cpp}.
 
 #pragma once
 
@@ -29,10 +26,5 @@ struct Qwen35LayerSplitDaemonArgs {
     int          max_verify_tokens = 32;
     int          stream_fd   = -1;
 };
-
-// Run the layer-split daemon. Returns 0 on clean shutdown.
-// Currently forwarded to test_dflash.cpp's run_target_layer_split_daemon().
-// Will be fully implemented here once helpers are extracted.
-int run_qwen35_layer_split_daemon(const Qwen35LayerSplitDaemonArgs & args);
 
 }  // namespace luce::common
