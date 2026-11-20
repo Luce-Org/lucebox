@@ -1643,9 +1643,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         const auto env = [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); };
         model.sconfig.kvflash_enabled     = true;
         model.sconfig.kvflash_pool_tokens = std::max(0, std::atoi(pool));  // 0: "auto", sized at load
+        const DevicePlacement & target = model.bargs.device;  // the backend's placement (backend_plan.cpp moves it)
         model.sconfig.kvflash_recall_mode = luce::server::kvflash_recall_mode(
             inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, env("LUCE_KVFLASH_PREFILL_RESELECT"),
-            env("LUCE_KVFLASH_POLICY"));
+            env("LUCE_KVFLASH_POLICY"),
+            target.is_tensor_parallel() ? (int)target.layer_split_gpus.size() : 1);  // = kvflash_tp_degree()
     }
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())

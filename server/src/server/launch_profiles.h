@@ -412,12 +412,13 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
 }
 
 // /props.kvflash.mode: the reselect mode the qwen35 backend resolves from LUCE_KVFLASH_PREFILL_RESELECT
-// and LUCE_KVFLASH_POLICY (kvflash_reselect_mode). Empty = recall off.
-// ponytail: tensor parallelism turns recall off later, at load (kvflash_recall_features); this does not see it.
+// and LUCE_KVFLASH_POLICY (kvflash_reselect_mode), then from its tensor-parallel degree at load
+// (kvflash_recall_features turns recall off above 1). Empty = recall off.
 inline std::string kvflash_recall_mode(std::string_view arch, const std::string & reselect,
-                                       const std::string & policy) {
-    const int mode = arch == "qwen35"
+                                       const std::string & policy, int tp_degree) {
+    const int asked = arch == "qwen35"
         ? luce::common::kvflash_reselect_mode(std::atoi(reselect.c_str()), policy == "qk") : 0;
+    const int mode = luce::common::kvflash_recall_features(tp_degree, {asked, 0}).reselect_mode;
     return mode ? "prefill-reselect=" + std::to_string(mode) : "";
 }
 
