@@ -3023,7 +3023,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/
-                                   (start + n_tokens < prompt_len ? 1 : 0),
+                                   ((is_final_batch ||
+                                     (snap_slot >= 0 && snap_pos >= kv_pos + n_tokens && snap_pos < kv_pos + n_tokens + prefill_ubatch) ||
+                                     !ladder.empty() || rw.run) ? 1 : -1),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/kvf_paged,
@@ -3122,15 +3124,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         // The discarded first pass of mode 4 must not count in the MoE routing stats.
         if (!rw_pass1) after_target_compute(sg_, kv_pos, n_tokens);
-        int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
-        const size_t argmax_off =
-            is_final_chunk ? sizeof(int32_t) * (size_t)(n_tokens - 1) : 0;
-        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
-        cache_.last_tok = last_tok;
-        if (is_final_chunk) {
-            prefill_last_logits_offset_ = (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
-            prefill_last_logits_valid_ = true;
+        if (sg_.argmax_tokens) {
+            int32_t last_tok = -1;
+            const int64_t n_logit_rows = sg_.logits ? sg_.logits->ne[1] : 1;
+            const size_t argmax_off = sizeof(int32_t) * (size_t)(n_logit_rows - 1);
+            ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
+            cache_.last_tok = last_tok;
+            if (is_final_chunk) {
+                prefill_last_logits_offset_ = (size_t)(n_logit_rows - 1) * (size_t)vocab * sizeof(float);
+                prefill_last_logits_valid_ = true;
+            }
         }
 
         committed = kv_pos + n_tokens;

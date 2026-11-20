@@ -2789,16 +2789,11 @@ QwenGraphOutputs build_qwen35_graph(
         }
     }
 
-    // 2. Final norm
-    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
-
-    // 3. LM head — optionally only for sampled rows (prefill computes just
-    //    the last row; fused steps the decode rows plus committing prompts'
-    //    last rows. Saves the [vocab, n_tokens] matmul and ~233MB scratch
-    //    at ubatch=384). Multi-prompt steps sample scattered rows, so they
-    //    gather by explicit index instead of a tail view.
+    // 2. Final norm + 3. LM head (skipped completely when logits_tail_rows < 0
+    //    on intermediate prefill chunks whose logits/argmax are unused).
     ggml_tensor * logits = nullptr;
-    if (w.output) {
+    if (w.output && in.logits_tail_rows >= 0) {
+        ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
         if (in.logits_row_indices) {
             out = ggml_get_rows(ctx, out, in.logits_row_indices);
         } else if (in.logits_tail_rows > 0 && in.logits_tail_rows < n_tokens) {
@@ -2810,9 +2805,14 @@ QwenGraphOutputs build_qwen35_graph(
         logits = ggml_mul_mat(ctx, w.output, out);
         ggml_set_name(logits, "logits");
         ggml_build_forward_expand(gf, logits);
-    } else {
+    } else if (!w.output) {
+        ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
         ggml_set_name(out, "result_norm");
         ggml_build_forward_expand(gf, out);
+    } else {
+        // Intermediate prefill chunk: keep final layer output attached so all
+        // layers + KV/SSM state writes execute without running the LM head.
+        ggml_build_forward_expand(gf, inpL);
     }
 
     QwenGraphOutputs og = std::move(og_early);
