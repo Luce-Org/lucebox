@@ -11,6 +11,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_cluster.h"
 #include "cluster/cluster_config.h"
+#include "common/platform_env.h"
 #include "deepseek4_norm.h"
 #include "deepseek4_image_policy.h"
 #include "deepseek4_vision.h"
@@ -107,8 +108,7 @@ static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
 }
 
 static bool ds4_env_flag(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
+    return env_flag_enabled(name);
 }
 
 // LUCE_DS4_ENGRAM_DEVICE=1: layer-major prefill applies Engram on the device

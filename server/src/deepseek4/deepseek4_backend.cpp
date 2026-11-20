@@ -192,10 +192,6 @@ static bool env_flag_disabled(const char * name) {
     return value && std::strcmp(value, "0") == 0;
 }
 
-static bool env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
-}
 
 // The expert usage profile that ranks placement: LUCE_DS4_HOTNESS_CSV, or
 // else the route counts earlier runs learned into LUCE_DS4_ROUTING_STATS_OUT.
