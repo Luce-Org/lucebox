@@ -1025,9 +1025,9 @@ bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int6
             //     so it's only faster for sufficiently small batch sizes:
             switch (type) {
                 case GGML_TYPE_Q2_K:
-                    return ne11 <= 128;
+                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
                 case GGML_TYPE_Q6_K:
-                    return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 // Wide Q4_K batches on gfx1151 favor dequantization +
                 // hipBLAS; keep MMQ for decode/small-prefill shapes and for
                 // the unmeasured RDNA 3.0 family.
