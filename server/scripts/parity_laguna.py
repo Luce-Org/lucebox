@@ -27,7 +27,7 @@ Outputs a markdown-style table; exits non-zero if any (length, position)
 pair drops below `--threshold`.
 """
 from __future__ import annotations
-import argparse, os, struct, subprocess, sys, time
+import argparse, os, struct, subprocess, sys
 from pathlib import Path
 import tempfile
 

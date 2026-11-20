@@ -43,7 +43,6 @@ server/src/
 │   ├── dflash_target.h     # DFlashTarget interface (spec decode)
 │   ├── daemon_loop.{h,cpp} # Generic stdin/stdout daemon loop
 │   ├── backend_ipc.{h,cpp} # Generic backend IPC process lifecycle
-│   ├── device_placement.h  # Multi-GPU placement config
 │   ├── gguf_inspect.{h,cpp}# Read arch + layer count from GGUF
 │   ├── layer_split_utils.{h,cpp}  # compute_layer_ranges()
 │   ├── dflash_layer_split_runtime.h  # LayerSplitRuntimeConfig + ActivationPair
@@ -178,7 +177,7 @@ pass. The target only needs to:
 2. Support KV snapshot/restore for rollback
 3. Project draft hidden states through its own lm_head
 
-### 3. DevicePlacement (`common/device_placement.h`)
+### 3. DevicePlacement (`placement/placement_config.h`)
 
 Uniform GPU configuration for all backends:
 
