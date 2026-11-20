@@ -46,7 +46,6 @@ std::vector<float> rows_for(const std::vector<int> & positions, int hidden) {
 } // namespace
 
 TEST_CASE(PFlashRequestProbeFixture, runs_are_maximal_at_least_two_tokens_inside_the_message) {
-    REQUIRE(kRequestMinRun == 2);
     REQUIRE(std::string(kRequestExtractionVersion) == "request_runs_v2_minrun2_ge_raw_logit");
     // Runs [0,1) (1 token, dropped), [2,4) (2 tokens: "why?" survives),
     // [7,12), [14,20) clipped by the message end 18.

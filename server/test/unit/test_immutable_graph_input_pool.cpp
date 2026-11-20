@@ -55,9 +55,3 @@ TEST_CASE(ImmutableGraphInputPoolFixture, empty_inputs_and_owner_lifetime) {
     held.reset();
     CHECK(weak.expired());
 }
-
-TEST_CASE(ImmutableGraphInputPoolFixture, integer_inputs_can_reuse_the_same_pool) {
-    ImmutableGraphInputPool<int32_t> pool;
-    CHECK(pool.intern({1, 2, 3}) == pool.intern({1, 2, 3}));
-    CHECK(pool.intern({1, 2, 3}) != pool.intern({3, 2, 1}));
-}

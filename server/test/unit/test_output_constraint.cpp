@@ -38,7 +38,7 @@ bool matches(const std::string & grammar, const std::string & text) {
 // pieces it should pick instead, a tool-call opener and an end token.
 enum Tok : int32_t {
     FENCE, OBJ_OPEN, OBJ_CLOSE, KEY_A, COLON, ONE, NEWLINE, TOOL_CALL, THINK_END,
-    PROSE, NUL_BYTE, END, N_TOK,
+    PROSE, NUL_BYTE, END, CLOSE_LT, THINK_WORD, CLOSE_GT, N_TOK,
 };
 
 std::shared_ptr<const ConstraintVocab> toy_vocab() {
@@ -55,6 +55,9 @@ std::shared_ptr<const ConstraintVocab> toy_vocab() {
     pieces[PROSE] = "Sure";
     pieces[NUL_BYTE] = std::string(1, '\0');
     pieces[END] = "<|im_end|>";
+    pieces[CLOSE_LT] = "</";
+    pieces[THINK_WORD] = "think";
+    pieces[CLOSE_GT] = ">";
     return ConstraintVocab::build(std::move(pieces), {END});
 }
 
@@ -258,6 +261,21 @@ TEST_CASE(OutputConstraintFixture, waits_for_the_end_of_thinking) {
     CHECK(constraint->allows(OBJ_OPEN));
 }
 
+// With a </think> token, only the token ends the wait: the text spelled in
+// ordinary pieces, as the codec shows it in a message, is still thinking.
+TEST_CASE(OutputConstraintFixture, waits_for_the_end_of_thinking_token) {
+    OutputConstraint::Options options;
+    options.wait_for = "</think>";
+    options.wait_for_token = THINK_END;
+    auto constraint = schema_constraint(options);
+    for (const Tok token : {CLOSE_LT, THINK_WORD, CLOSE_GT}) constraint->accept(token);
+    CHECK(!constraint->engaged());
+    CHECK(constraint->allows(PROSE));
+    constraint->accept(THINK_END);
+    CHECK(constraint->engaged());
+    CHECK(!constraint->allows(PROSE));
+}
+
 TEST_CASE(OutputConstraintFixture, off_grammar_token_breaks_instead_of_dead_ending) {
     auto constraint = schema_constraint();
     constraint->accept(PROSE);  // injected past the sampler
@@ -388,6 +406,28 @@ TEST_CASE(OutputConstraintFixture, parse_grammar_from_body_top_level_and_extra_b
     // extra_body non-string grammar reports error
     CHECK(!parse_grammar_from_body(json{{"extra_body", {{"grammar", false}}}}, grammar, has_grammar, error));
     CHECK(error == "grammar must be a string");
+}
+
+TEST_CASE(OutputConstraintFixture, parse_session_id_from_body_extra_body_then_top_level) {
+    CHECK(parse_session_id_from_body(json{{"session_id", "top"}}) == "top");
+    CHECK(parse_session_id_from_body(json{{"extra_body", {{"session_id", "nested"}}}}) == "nested");
+    CHECK(parse_session_id_from_body(
+        json{{"session_id", "top"}, {"extra_body", {{"session_id", "nested"}}}}) == "nested");
+    // A non-string id is ignored: extra_body falls through to the top level.
+    CHECK(parse_session_id_from_body(
+        json{{"session_id", "top"}, {"extra_body", {{"session_id", 42}}}}) == "top");
+    CHECK(parse_session_id_from_body(json{{"session_id", nullptr}}).empty());
+}
+
+TEST_CASE(OutputConstraintFixture, parse_pflash_query_from_body_top_level_and_extra_body) {
+    json top = {{"pflash_query", "Which function has the deliberate error?"}};
+    CHECK(parse_pflash_query_from_body(top) == "Which function has the deliberate error?");
+    json nested = {{"extra_body", {{"pflash_query", "What is the major tributary of the Rhine?"}}}};
+    CHECK(parse_pflash_query_from_body(nested) == "What is the major tributary of the Rhine?");
+    json absent = {{"messages", json::array()}};
+    CHECK(parse_pflash_query_from_body(absent).empty());
+    json wrong_type = {{"pflash_query", 7}};
+    CHECK(parse_pflash_query_from_body(wrong_type).empty());
 }
 
 TEST_CASE(OutputConstraintFixture, output_format_schema_supports_grammar_type) {

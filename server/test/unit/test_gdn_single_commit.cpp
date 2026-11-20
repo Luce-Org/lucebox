@@ -16,7 +16,6 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -395,31 +394,6 @@ TEST_CASE(GdnSingleCommit, rollback_plan_without_pending_commit_is_the_parent) {
     }
 }
 
-TEST_CASE(GdnSingleCommit, rollback_plan_commits_every_count_after_keep_base) {
-    for (int q = 2; q <= 16; ++q) {
-        for (bool deferred : {false, true}) {
-            gp::StateBook book;
-            book.commit_pending = true;
-            book.pending_q_len = q;
-            book.snapshot_deferred = deferred;
-            for (int c = 1; c <= q; ++c) {
-                const gp::RollbackPlan p = gp::plan_rollback(book, c, q);
-                CHECK(p.valid);
-                CHECK(!p.shortcut);
-                CHECK_EQUAL(p.ssm_index, c - 1);
-                // All accepted: the verify already left the last conv window.
-                CHECK_EQUAL(p.copy_conv, c < q);
-                CHECK_EQUAL(p.into_spare, deferred);
-            }
-            // cur_pos moved since the verify: refuse, the caller replays.
-            CHECK(!gp::plan_rollback(book, 1, q + 1).valid);
-            gp::finish_rollback(book, gp::plan_rollback(book, 1, q));
-            CHECK(!book.commit_pending);
-            CHECK(!book.snapshot_deferred);
-        }
-    }
-}
-
 TEST_CASE(GdnSingleCommit, deferred_snapshot_is_taken_before_any_live_write) {
     gp::StateBook book;
     gp::on_snapshot(book, /*swap=*/true);
@@ -475,35 +449,38 @@ TEST_CASE(GdnSingleCommit, exchange_trades_storage_and_keeps_identity) {
     CHECK(b.buffer == buf_b);
 }
 
-TEST_CASE(GdnSingleCommit, keep_base_protocol_matches_parent_state) {
-    for (uint64_t seed = 1; seed <= 64; ++seed) {
-        Protocol run(seed, /*keep_base=*/true, /*swap=*/false);
-        run.run(300);
-        CHECK(run.ok);
-        CHECK(run.checks > 300);
-        CHECK(!run.commit.swapped);
+TEST_CASE(GdnSingleCommit, protocol_matches_parent_state) {
+    // KEEP_BASE with each combination of SWAP_SNAPSHOT and SINGLE_REPLAY.
+    for (bool swap : {false, true}) {
+        for (bool replay : {false, true}) {
+            int swapped_runs = 0;
+            int commits = 0;
+            for (uint64_t seed = 1; seed <= 64; ++seed) {
+                Protocol run(seed, /*keep_base=*/true, swap, replay);
+                run.run(300);
+                CHECK(run.ok);
+                CHECK(run.checks > 300);
+                if (!swap) CHECK(!run.commit.swapped);
+                if (run.commit.swapped) swapped_runs++;
+                commits += run.commit.replay_commits;
+            }
+            if (swap) CHECK(swapped_runs > 0);   // runs end on either parity
+            if (replay) CHECK(commits > 0);
+        }
     }
 }
 
-TEST_CASE(GdnSingleCommit, swap_snapshot_protocol_matches_parent_state) {
-    int swapped_runs = 0;
-    for (uint64_t seed = 1; seed <= 64; ++seed) {
-        Protocol run(seed, /*keep_base=*/true, /*swap=*/true);
-        run.run(300);
-        CHECK(run.ok);
-        CHECK(run.checks > 300);
-        if (run.commit.swapped) swapped_runs++;
-    }
-    CHECK(swapped_runs > 0);   // runs end on either parity
-}
-
-TEST_CASE(GdnSingleCommit, swap_without_keep_base_is_the_parent) {
-    for (uint64_t seed = 1; seed <= 16; ++seed) {
-        Protocol run(seed, /*keep_base=*/false, /*swap=*/true);
-        run.run(200);
-        CHECK(run.ok);
-        CHECK(!run.commit.swapped);
-        CHECK_EQUAL(run.commit.ssm_copies, run.parent.ssm_copies);
+TEST_CASE(GdnSingleCommit, parts_without_keep_base_are_the_parent) {
+    const bool parts[][2] = {{true, false}, {false, true}, {true, true}};   // {swap, replay}
+    for (const auto & part : parts) {
+        for (uint64_t seed = 1; seed <= 16; ++seed) {
+            Protocol run(seed, /*keep_base=*/false, /*swap=*/part[0], /*single_replay=*/part[1]);
+            run.run(200);
+            CHECK(run.ok);
+            CHECK(!run.commit.swapped);
+            CHECK_EQUAL(run.commit.replay_commits, 0);
+            CHECK_EQUAL(run.commit.ssm_copies, run.parent.ssm_copies);
+        }
     }
 }
 
@@ -511,37 +488,40 @@ TEST_CASE(GdnSingleCommit, each_accept_count_commits_with_one_ssm_copy) {
     // commit_n = 1 .. 16 after a 16-token verify, the all-accepted case
     // included. Parent: snapshot copy, in-graph write, rollback copy (none
     // when all accepted). KEEP_BASE: snapshot copy and the rollback copy.
-    // KEEP_BASE and SWAP_SNAPSHOT: the rollback copy only.
-    for (int c = 1; c <= 16; ++c) {
-        for (int mode = 0; mode < 2; ++mode) {
-            Protocol run(1000 + (uint64_t)c, /*keep_base=*/true, /*swap=*/mode == 1);
-            const std::vector<u64> t = tokens_of(run.rng, 16);
-            run.snapshot();
-            run.verify(t, /*capture=*/true);
-            CHECK(run.commit.book.commit_pending);
-            run.parent.rollback(c);
-            REQUIRE(run.commit.rollback(c, 16));
-            run.expect_same("rollback_to");
-            CHECK(!run.commit.book.commit_pending);
-            CHECK(run.ok);
-            CHECK_EQUAL(run.parent.ssm_copies, c < 16 ? 3 : 2);
-            CHECK_EQUAL(run.commit.ssm_copies, mode == 1 ? 1 : 2);
-            // The pre-step state survives in the snapshot for a repair.
-            run.restore_and_replay(t, c - 1);
-            CHECK(run.ok);
+    // KEEP_BASE and SWAP_SNAPSHOT: the rollback copy only. SINGLE_REPLAY: no
+    // checkpoint copy; the snapshot copy only without SWAP_SNAPSHOT, nothing
+    // with it; one replay commit.
+    for (bool replay : {false, true}) {
+        for (int c = 1; c <= 16; ++c) {
+            for (int mode = 0; mode < 2; ++mode) {
+                Protocol run((replay ? 2000 : 1000) + (uint64_t)c, /*keep_base=*/true,
+                             /*swap=*/mode == 1, replay);
+                const std::vector<u64> t = tokens_of(run.rng, 16);
+                run.snapshot();
+                run.verify(t, /*capture=*/true);
+                CHECK(run.commit.book.commit_pending);
+                CHECK_EQUAL(run.commit.book.replay_pending, replay);
+                run.parent.rollback(c);
+                REQUIRE(run.commit.rollback(c, 16));
+                run.expect_same("rollback_to");
+                CHECK(!run.commit.book.commit_pending);
+                CHECK(!run.commit.book.replay_pending);
+                CHECK(run.ok);
+                if (!replay) CHECK_EQUAL(run.parent.ssm_copies, c < 16 ? 3 : 2);
+                CHECK_EQUAL(run.commit.ssm_copies,
+                            replay ? (mode == 1 ? 0 : 1) : (mode == 1 ? 1 : 2));
+                CHECK_EQUAL(run.commit.replay_commits, replay ? 1 : 0);
+                // The pre-step state survives in the snapshot for a repair.
+                run.restore_and_replay(t, c - 1);
+                CHECK(run.ok);
+            }
         }
     }
 }
 
 // ── SINGLE_REPLAY ───────────────────────────────────────────────────────
 
-TEST_CASE(GdnSingleCommit, single_replay_inherits_keep_base_and_needs_the_grouped_route) {
-    CHECK(gp::single_replay_inherited_reason(true, nullptr) == nullptr);
-    CHECK(gp::single_replay_inherited_reason(false, nullptr) != nullptr);
-    CHECK(gp::single_replay_inherited_reason(true, "DDTree mode") != nullptr);
-    CHECK(std::strcmp(gp::single_replay_inherited_reason(true, "DDTree mode"),
-                      "DDTree mode") == 0);
-
+TEST_CASE(GdnSingleCommit, single_replay_needs_the_grouped_route) {
     gp::ReplayFacts r;
     r.grouped_cols = true;
     r.n_tokens = 16;
@@ -560,27 +540,33 @@ TEST_CASE(GdnSingleCommit, single_replay_inherits_keep_base_and_needs_the_groupe
     CHECK(gp::single_replay_block_reason(r) != nullptr);
 }
 
-TEST_CASE(GdnSingleCommit, replay_plan_commits_from_the_log) {
-    for (int q = 2; q <= 16; ++q) {
-        for (bool deferred : {false, true}) {
-            gp::StateBook book;
-            gp::on_keep_base_verify(book, q, /*replay=*/true);
-            book.snapshot_deferred = deferred;
-            for (int c = 1; c <= q; ++c) {
-                const gp::RollbackPlan p = gp::plan_rollback(book, c, q);
-                CHECK(p.valid);
-                CHECK(!p.shortcut);
-                CHECK(p.from_replay);
-                CHECK_EQUAL(p.ssm_index, c - 1);    // c transitions
-                CHECK_EQUAL(p.copy_conv, c < q);
-                // Out of place into the spare with a deferred snapshot, else
-                // in place after the parent's snapshot copy.
-                CHECK_EQUAL(p.into_spare, deferred);
+TEST_CASE(GdnSingleCommit, rollback_plan_commits_every_count) {
+    // After a keep-base verify, with the checkpoints or the replay log.
+    for (bool replay : {false, true}) {
+        for (int q = 2; q <= 16; ++q) {
+            for (bool deferred : {false, true}) {
+                gp::StateBook book;
+                gp::on_keep_base_verify(book, q, replay);
+                book.snapshot_deferred = deferred;
+                for (int c = 1; c <= q; ++c) {
+                    const gp::RollbackPlan p = gp::plan_rollback(book, c, q);
+                    CHECK(p.valid);
+                    CHECK(!p.shortcut);
+                    CHECK_EQUAL(p.from_replay, replay);
+                    CHECK_EQUAL(p.ssm_index, c - 1);    // c transitions
+                    // All accepted: the verify already left the last conv window.
+                    CHECK_EQUAL(p.copy_conv, c < q);
+                    // Out of place into the spare with a deferred snapshot, else
+                    // in place after the parent's snapshot copy.
+                    CHECK_EQUAL(p.into_spare, deferred);
+                }
+                // cur_pos moved since the verify: refuse, the caller replays.
+                CHECK(!gp::plan_rollback(book, 1, q + 1).valid);
+                gp::finish_rollback(book, gp::plan_rollback(book, 1, q));
+                CHECK(!book.commit_pending);
+                CHECK(!book.replay_pending);
+                CHECK(!book.snapshot_deferred);
             }
-            CHECK(!gp::plan_rollback(book, 1, q + 1).valid);
-            gp::finish_rollback(book, gp::plan_rollback(book, 1, q));
-            CHECK(!book.commit_pending);
-            CHECK(!book.replay_pending);
         }
     }
     // A checkpoint verify after a replay one plans a copy again.
@@ -597,69 +583,4 @@ TEST_CASE(GdnSingleCommit, replay_plan_commits_from_the_log) {
     gp::drop_pending(book);
     CHECK(!book.replay_pending);
     CHECK(!gp::plan_rollback(book, 3, 8).from_replay);
-}
-
-TEST_CASE(GdnSingleCommit, single_replay_protocol_matches_parent_state) {
-    int commits = 0;
-    for (uint64_t seed = 1; seed <= 64; ++seed) {
-        Protocol run(seed, /*keep_base=*/true, /*swap=*/false, /*single_replay=*/true);
-        run.run(300);
-        CHECK(run.ok);
-        CHECK(run.checks > 300);
-        CHECK(!run.commit.swapped);
-        commits += run.commit.replay_commits;
-    }
-    CHECK(commits > 0);
-}
-
-TEST_CASE(GdnSingleCommit, single_replay_with_swap_protocol_matches_parent_state) {
-    int commits = 0;
-    int swapped_runs = 0;
-    for (uint64_t seed = 1; seed <= 64; ++seed) {
-        Protocol run(seed, /*keep_base=*/true, /*swap=*/true, /*single_replay=*/true);
-        run.run(300);
-        CHECK(run.ok);
-        CHECK(run.checks > 300);
-        commits += run.commit.replay_commits;
-        if (run.commit.swapped) swapped_runs++;
-    }
-    CHECK(commits > 0);
-    CHECK(swapped_runs > 0);
-}
-
-TEST_CASE(GdnSingleCommit, single_replay_without_keep_base_is_the_parent) {
-    for (uint64_t seed = 1; seed <= 16; ++seed) {
-        Protocol run(seed, /*keep_base=*/false, /*swap=*/false, /*single_replay=*/true);
-        run.run(200);
-        CHECK(run.ok);
-        CHECK_EQUAL(run.commit.replay_commits, 0);
-        CHECK_EQUAL(run.commit.ssm_copies, run.parent.ssm_copies);
-    }
-}
-
-TEST_CASE(GdnSingleCommit, each_accept_count_commits_from_the_replay_log) {
-    // commit_n = 1 .. 16 after a 16-token verify, the all-accepted case
-    // included. SINGLE_REPLAY: no checkpoint copy; the snapshot copy only
-    // without SWAP_SNAPSHOT, nothing with it; one replay commit.
-    for (int c = 1; c <= 16; ++c) {
-        for (int mode = 0; mode < 2; ++mode) {
-            Protocol run(2000 + (uint64_t)c, /*keep_base=*/true, /*swap=*/mode == 1,
-                         /*single_replay=*/true);
-            const std::vector<u64> t = tokens_of(run.rng, 16);
-            run.snapshot();
-            run.verify(t, /*capture=*/true);
-            CHECK(run.commit.book.commit_pending);
-            CHECK(run.commit.book.replay_pending);
-            run.parent.rollback(c);
-            REQUIRE(run.commit.rollback(c, 16));
-            run.expect_same("rollback_to");
-            CHECK(!run.commit.book.commit_pending);
-            CHECK(!run.commit.book.replay_pending);
-            CHECK(run.ok);
-            CHECK_EQUAL(run.commit.ssm_copies, mode == 1 ? 0 : 1);
-            CHECK_EQUAL(run.commit.replay_commits, 1);
-            run.restore_and_replay(t, c - 1);
-            CHECK(run.ok);
-        }
-    }
 }

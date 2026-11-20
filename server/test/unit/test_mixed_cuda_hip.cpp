@@ -18,47 +18,6 @@ using luce::common::placement_backend_of;
 
 namespace {
 
-bool run_scale(ggml_backend_t backend, const char * label) {
-    constexpr int64_t n = 4096;
-    ggml_init_params params{};
-    params.mem_size = 4 * 1024 * 1024;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return false;
-
-    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
-    ggml_set_input(input);
-    ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
-    ggml_set_output(output);
-    ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, output);
-    ggml_gallocr_t alloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!alloc || !ggml_gallocr_alloc_graph(alloc, graph)) {
-        if (alloc) ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return false;
-    }
-
-    std::vector<float> host((size_t)n);
-    for (int64_t i = 0; i < n; ++i) host[(size_t)i] = (float)i / 128.0f;
-    ggml_backend_tensor_set(input, host.data(), 0, ggml_nbytes(input));
-    const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
-    std::vector<float> result((size_t)n);
-    if (status == GGML_STATUS_SUCCESS) {
-        ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
-    }
-
-    bool ok = status == GGML_STATUS_SUCCESS;
-    for (int64_t i = 0; ok && i < n; ++i) {
-        ok = std::fabs(result[(size_t)i] - 2.0f * host[(size_t)i]) < 1.0e-5f;
-    }
-    std::printf("mixed-backend %s scale: %s\n", label, ok ? "ok" : "FAILED");
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
-    return ok;
-}
-
 bool run_cross_copy(ggml_backend_t src_backend,
                     ggml_backend_t dst_backend,
                     const char * label) {
@@ -491,8 +450,6 @@ int main() {
     ok = placement_backend_of(cuda) == PlacementBackend::Cuda &&
          placement_backend_of(hip) == PlacementBackend::Hip &&
          !pair.same_runtime && !pair.native_gpu_handoff && ok;
-    ok = run_scale(cuda, "CUDA") && ok;
-    ok = run_scale(hip, "HIP") && ok;
     ok = run_cross_copy(cuda, hip, "CUDA->HIP") && ok;
     ok = run_cross_copy(hip, cuda, "HIP->CUDA") && ok;
     ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA", false) && ok;

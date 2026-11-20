@@ -19,53 +19,29 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.out = Path(self.temp.name) / "out"
 
-    def test_prefill_first_policy_rejects_out_of_range_values(self) -> None:
-        for value in (
-            "-1",
-            "1025",
-            "18446744073709551616",
-            "999999999999999999999999999999999999",
-        ):
-            env = os.environ.copy()
-            env.update(
-                MODEL="/dev/null",
-                SERVER_BIN="/bin/true",
-                OUT=str(self.out),
-                PREFILL_FIRST_BURST_STEPS=value,
-            )
-            result = subprocess.run(
-                [str(RUNNER)], env=env, text=True, capture_output=True, check=False
-            )
-            with self.subTest(value=value):
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(
-                    "PREFILL_FIRST_BURST_STEPS must be an integer in range 0..1024",
-                    result.stderr,
+    def test_policy_rejects_out_of_range_values(self) -> None:
+        huge = ("18446744073709551616", "999999999999999999999999999999999999")
+        cases = (
+            ("PREFILL_FIRST_BURST_STEPS", ("-1", "1025", *huge),
+             "PREFILL_FIRST_BURST_STEPS must be an integer in range 0..1024"),
+            ("IDLE_PREFILL_TOKENS", ("0", "16385", *huge),
+             "IDLE_PREFILL_TOKENS must be an integer in range 1..16384"),
+        )
+        for variable, values, message in cases:
+            for value in values:
+                env = os.environ.copy()
+                env.update(
+                    MODEL="/dev/null",
+                    SERVER_BIN="/bin/true",
+                    OUT=str(self.out),
+                    **{variable: value},
                 )
-
-    def test_idle_prefill_budget_rejects_zero_and_above_effective_cap(self) -> None:
-        for value in (
-            "0",
-            "16385",
-            "18446744073709551616",
-            "999999999999999999999999999999999999",
-        ):
-            env = os.environ.copy()
-            env.update(
-                MODEL="/dev/null",
-                SERVER_BIN="/bin/true",
-                OUT=str(self.out),
-                IDLE_PREFILL_TOKENS=value,
-            )
-            result = subprocess.run(
-                [str(RUNNER)], env=env, text=True, capture_output=True, check=False
-            )
-            with self.subTest(value=value):
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(
-                    "IDLE_PREFILL_TOKENS must be an integer in range 1..16384",
-                    result.stderr,
+                result = subprocess.run(
+                    [str(RUNNER)], env=env, text=True, capture_output=True, check=False
                 )
+                with self.subTest(variable=variable, value=value):
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(message, result.stderr)
 
     def test_policy_range_edges_are_accepted(self) -> None:
         # Each accepted edge must pass its own guard and stop at a later one,

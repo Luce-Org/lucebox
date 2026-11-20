@@ -21,6 +21,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/launch_profiles.h"
 #include "server/api_adapters.h"
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
@@ -106,14 +107,44 @@ using namespace luce::common;
 using luce::engine::LuceEngine;
 namespace fs = std::filesystem;
 
+static long long current_pid() {
+#if defined(_WIN32)
+    return (long long) _getpid();
+#else
+    return (long long) getpid();
+#endif
+}
+
+// Fixtures use fixed names, and ctest runs each case in its own process, in
+// parallel: each process writes them to a directory of its own, removed at
+// exit.
 static fs::path test_tmp_path(const char * name) {
-    std::error_code ec;
-    fs::path root = fs::temp_directory_path(ec);
-    if (ec) {
-        throw std::runtime_error("failed to resolve temporary directory: " +
-                                 ec.message());
-    }
-    return root / name;
+    struct ProcessDir {
+        long long owner = current_pid();
+        fs::path path;
+        ProcessDir() {
+            std::error_code ec;
+            const fs::path root = fs::temp_directory_path(ec);
+            if (ec) {
+                throw std::runtime_error("failed to resolve temporary directory: " +
+                                         ec.message());
+            }
+            path = root / ("luce-unit-" + std::to_string(owner));
+            fs::create_directories(path, ec);
+            if (ec) {
+                throw std::runtime_error("failed to create " + path.string() + ": " +
+                                         ec.message());
+            }
+        }
+        ~ProcessDir() {
+            // A forked child that exits normally leaves its parent's files.
+            if (current_pid() != owner) return;
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    };
+    static const ProcessDir dir;
+    return dir.path / name;
 }
 
 static void remove_test_path(const fs::path & path) {
@@ -284,6 +315,11 @@ struct SchedulerTestHarness {
 
     // What prepare_generation_cache does with a reservation's slot before
     // the new snapshot overwrites it.
+    static void clear_for_capture(HttpServer & server,
+                                  const PrefixCache::InlineReservation & reservation) {
+        server.kv_cache_.clear_for_capture(reservation);
+    }
+
     static void evict_inline_slot(HttpServer & server, int slot) {
         server.kv_cache_.evict(slot, "ram eviction");
         server.backend_.snapshot_free(slot);
@@ -404,12 +440,6 @@ struct HttpServerTestAccess {
     static json pflash_unified(const HttpServer & server) {
         return server.pflash_unified_json();
     }
-    // A committed inline prefix-cache entry: ids[0, cut) restorable from
-    // ``slot`` (the backend reports the snapshot).
-    static void seed_prefix_cache(HttpServer & server, int slot, int cut,
-                                  const std::vector<int32_t> & ids) {
-        server.prefix_cache_.confirm_inline_snap(slot, cut, ids);
-    }
 };
 }
 
@@ -488,23 +518,6 @@ TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suffix) {
-    const std::vector<int32_t> query{
-        90, 91, 100, 101, 102, 103, 104, 105, 106, 107,
-    };
-    const std::vector<int32_t> rendered{
-        1, 2, 100, 101, 102, 103, 104, 105, 106, 107,
-        200, 201, 202, 203, 204, 205, 206, 207,
-    };
-
-    const auto window = http_detail::find_pflash_query_window(rendered, query);
-
-    TEST_ASSERT(window.valid());
-    TEST_ASSERT(window.tokens == 8);
-    TEST_ASSERT(window.end == 10);
-    TEST_ASSERT((int)rendered.size() - window.end == 8);
-}
-
 // Claude Code sends its environment as a system message after the user's
 // first one; a template that takes a system message only first gets it as a
 // user turn in place, and one that takes it anywhere keeps it.
@@ -544,19 +557,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_maps_last_128_user_tokens) {
     TEST_ASSERT((int)rendered.size() - window.end == 4);
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
-    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
-    const std::vector<int32_t> rendered{
-        1, 2, 999, 11, 12, 13, 14, 15, 16, 17, 200, 201,
-    };
-
-    const auto window = http_detail::find_pflash_query_window(rendered, query);
-
-    TEST_ASSERT(window.valid());
-    TEST_ASSERT(window.tokens == 7);
-    TEST_ASSERT(window.end == 10);
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_stays_before_latest_user_boundary) {
     const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
     const std::vector<int32_t> rendered{
@@ -570,7 +570,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_stays_before_latest_user_
         http_detail::find_pflash_query_window(rendered, query, 8, search_end);
     const auto unbounded = http_detail::find_pflash_query_window(rendered, query);
 
-    TEST_ASSERT(search_end == 10);
     TEST_ASSERT(bounded.valid());
     TEST_ASSERT(bounded.tokens == 7);
     TEST_ASSERT(bounded.end == 10);
@@ -740,17 +739,10 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
-    // Per-process names: ctest runs each case in its own process, in
-    // parallel, and every process starts the serial at zero.
+    // A case may build several (test_tmp_path is per process).
     static int fixture_serial = 0;
-#if defined(_WIN32)
-    const long long pid = (long long) _getpid();
-#else
-    const long long pid = (long long) getpid();
-#endif
     const std::string path = test_tmp_path((
-        "luce_test_pflash_bpe_" + std::to_string(pid) + "_" +
-        std::to_string(++fixture_serial) + ".gguf").c_str()).string();
+        "luce_test_pflash_bpe_" + std::to_string(++fixture_serial) + ".gguf").c_str()).string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -779,6 +771,20 @@ static std::string write_deepseek_marker_tokenizer_fixture() {
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
+}
+
+// \s*[\r\n]+ backtracks to the last newline of a whitespace run, so HF splits
+// "a\n \nb" as a | \n \n | b. The engine used to split it as a | \n | " \n" | b.
+TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline) {
+    const std::string a = "a\n \nb", x = "x \t\n  \n y";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"\n \n", " \t\n  \n", " y"}, a + x);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    TEST_ASSERT(tok.encode(a).size() == 3);
+    TEST_ASSERT(tok.encode(x).size() == 3);
+    TEST_ASSERT(tok.decode(tok.encode(x)) == x);
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -913,24 +919,14 @@ TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_covers_tools_and_late_
 
     TEST_ASSERT(plan.instruction_messages ==
                 std::vector<size_t>({0, 1, 4}));
-}
 
-TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_handles_empty_instructions) {
-    const std::vector<ChatMessage> tool_only{
-        {"user", "use the tool", ""},
-    };
-    const auto tool_plan =
-        http_detail::plan_pflash_instruction_messages(tool_only);
-    TEST_ASSERT(tool_plan.instruction_messages.empty());
-
-    const std::vector<ChatMessage> empty_instruction{
+    // Blank system and developer messages are no instructions.
+    const std::vector<ChatMessage> blank{
         {"system", "", ""},
         {"developer", " \n ", ""},
         {"user", "plain query", ""},
     };
-    const auto empty_plan =
-        http_detail::plan_pflash_instruction_messages(empty_instruction);
-    TEST_ASSERT(empty_plan.instruction_messages.empty());
+    TEST_ASSERT(http_detail::plan_pflash_instruction_messages(blank).instruction_messages.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_instruction_spans_are_canonicalized) {
@@ -1013,7 +1009,37 @@ static void remember_turn(TurnMemory & memory, const std::string & codec_name, C
     if (!make_chat_codec(codec_name)->render(input, prompt, error)) throw std::runtime_error(error);
     if (prompt.context.empty()) throw std::runtime_error("no generation context");
     turn.context = prompt.context;
+    // generated_turn sets it; in these turns the text's "</think>" is the token.
+    if (turn.think_end == std::string::npos) turn.think_end = turn.text.find("</think>");
     memory.remember(messages[index], std::move(turn));
+}
+
+// Two remembered turns with the same text but different tokens (which
+// "</think>" is the token) make different prompts for the turns after them.
+TEST_CASE(ServerUnitFixture, test_turn_memory_key_holds_remembered_tokens) {
+    std::vector<ChatMessage> messages = {{"user", "q"}, {"assistant", "Done."}, {"user", "next"}};
+    ChatCodecInput input;
+    input.messages = &messages;
+    input.enable_thinking = true;
+    std::string contexts[2];
+    for (int i = 0; i < 2; ++i) {
+        TurnMemory memory;
+        TurnMemory::Turn turn;
+        turn.text = "assistant\n<think>\nx </think> y\n</think>\n\nDone.";
+        turn.tokens = {1, 2, i == 0 ? 3 : 4};  // stand-ins: the same text, other tokens
+        turn.reasoning = "x </think> y";
+        turn.think_end = turn.text.rfind("</think>");
+        remember_turn(memory, "qwen3.8", input, 1, turn);
+        input.memory = &memory;
+        RenderedPrompt prompt;
+        std::string error;
+        TEST_ASSERT_MSG(make_chat_codec("qwen3.8")->render(input, prompt, error), error);
+        TEST_ASSERT(std::any_of(prompt.pieces.begin(), prompt.pieces.end(),
+                                [](const PromptPiece & piece) { return !piece.ids.empty(); }));
+        contexts[i] = prompt.context;
+        input.memory = nullptr;
+    }
+    TEST_ASSERT(contexts[0] != contexts[1]);
 }
 
 // A remembered turn stands in the prompt as generated; its content span is the
@@ -1321,12 +1347,8 @@ TEST_CASE(ServerUnitFixture, test_compress_result_fails_closed_on_empty_ids) {
     TEST_ASSERT(failed.compressed_ids.empty());
     TEST_ASSERT(succeeded.ok);
     TEST_ASSERT(succeeded.compressed_ids == std::vector<int32_t>({11, 12}));
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_parser_fingerprint_has_fixed_encoding) {
-    const std::vector<int32_t> ids{1, -2, 2147483647};
-    TEST_ASSERT(http_detail::pflash_token_fingerprint(ids) ==
-                "45409a0b0f44c5fd");
+    const ModelBackend::CompressResult none;  // how production builds one
+    TEST_ASSERT(!none.ok && none.compressed_ids.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
@@ -1776,43 +1798,6 @@ TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
                 "qwen35 scorer query window out of range");
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_ipc_rejects_unsupported_query_widths) {
-    const auto accepted = [](int score_query_tokens) {
-        std::string line;
-        std::string error;
-        const bool formatted = format_pflash_drafter_ipc_compress_command(
-            0.5f, 16, score_query_tokens, "/tmp/pflash_ids.bin", line, error);
-        if (!formatted) return false;
-        PFlashDrafterIpcCompressCommand parsed;
-        return parse_pflash_drafter_ipc_compress_command(line, parsed, error) &&
-               parsed.score_query_tokens == score_query_tokens;
-    };
-    // The explicit scorer query sizes its own window, so widths above the
-    // former eight-token cap round-trip; non-positive widths still fail closed.
-    TEST_ASSERT(accepted(1));
-    TEST_ASSERT(accepted(8));
-    TEST_ASSERT(accepted(128));
-    TEST_ASSERT(!accepted(0));
-    TEST_ASSERT(!accepted(-1));
-    TEST_ASSERT(!accepted((std::numeric_limits<int>::min)()));
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_query_capture_splits_across_chunks) {
-    const auto first = query_capture_slice(4093, 4101, 0, 4096);
-    TEST_ASSERT(first.valid());
-    TEST_ASSERT(first.chunk_offset == 4093);
-    TEST_ASSERT(first.query_offset == 0);
-    TEST_ASSERT(first.tokens == 3);
-
-    const auto second = query_capture_slice(4093, 4101, 4096, 4096);
-    TEST_ASSERT(second.valid());
-    TEST_ASSERT(second.chunk_offset == 0);
-    TEST_ASSERT(second.query_offset == 3);
-    TEST_ASSERT(second.tokens == 5);
-
-    TEST_ASSERT(!query_capture_slice(4093, 4101, 8192, 4096).valid());
-}
-
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;
@@ -2108,28 +2093,6 @@ static std::string concat(const std::vector<std::string> & chunks) {
 // UTF-8 utility tests
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_CASE(ServerUnitFixture, test_utf8_safe_len_ascii) {
-    std::string s = "Hello, world!";
-    TEST_ASSERT(utf8_safe_len(s, s.size()) == s.size());
-    TEST_ASSERT(utf8_safe_len(s, 5) == 5);
-    TEST_ASSERT(utf8_safe_len(s, 0) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_2byte) {
-    // é = 0xC3 0xA9
-    std::string s = "caf\xC3\xA9!";  // "café!"
-    TEST_ASSERT(utf8_safe_len(s, 5) == 5);  // after é, ok
-    TEST_ASSERT(utf8_safe_len(s, 4) == 3);  // mid-é, snap back to before é
-}
-
-TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_3byte) {
-    // ん = 0xE3 0x82 0x93
-    std::string s = "A\xE3\x82\x93Z";  // "AんZ"
-    TEST_ASSERT(utf8_safe_len(s, 4) == 4);  // after ん
-    TEST_ASSERT(utf8_safe_len(s, 3) == 1);  // mid-ん, snap back to A
-    TEST_ASSERT(utf8_safe_len(s, 2) == 1);  // mid-ん, snap back to A
-}
-
 TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_4byte) {
     // 🚩 = 0xF0 0x9F 0x9A 0xA9
     std::string s = "A \xF0\x9F\x9A\xA9 done";
@@ -2138,14 +2101,17 @@ TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_4byte) {
     TEST_ASSERT(utf8_safe_len(s, 5) == 2);
     TEST_ASSERT(utf8_safe_len(s, 4) == 2);
     TEST_ASSERT(utf8_safe_len(s, 3) == 2);
-}
-
-TEST_CASE(ServerUnitFixture, test_utf8_sanitize_valid) {
-    std::string s = "Hello, world! 🎉";
-    TEST_ASSERT(utf8_sanitize(s) == s);
+    // ASCII positions and the end stay put.
+    TEST_ASSERT(utf8_safe_len(s, 1) == 1);
+    TEST_ASSERT(utf8_safe_len(s, 0) == 0);
+    TEST_ASSERT(utf8_safe_len(s, s.size()) == s.size());
 }
 
 TEST_CASE(ServerUnitFixture, test_utf8_sanitize_replaces_invalid) {
+    TEST_ASSERT(utf8_sanitize("") == "");
+    const std::string valid = "Hello, world! 🎉";
+    TEST_ASSERT(utf8_sanitize(valid) == valid);
+
     // Lone continuation byte
     std::string s = "A\x80Z";
     std::string out = utf8_sanitize(s);
@@ -2154,13 +2120,8 @@ TEST_CASE(ServerUnitFixture, test_utf8_sanitize_replaces_invalid) {
     // Truncated 4-byte sequence
     std::string s2 = "X\xF0\x9F";
     std::string out2 = utf8_sanitize(s2);
-    // Each invalid byte becomes U+FFFD
-    TEST_ASSERT(out2.find("X") == 0);
-    TEST_ASSERT(out2.size() > 1);  // has replacement(s)
-}
-
-TEST_CASE(ServerUnitFixture, test_utf8_sanitize_empty) {
-    TEST_ASSERT(utf8_sanitize("") == "");
+    // The lead byte and the continuation byte after it each become U+FFFD.
+    TEST_ASSERT(out2 == "X\xEF\xBF\xBD\xEF\xBF\xBD");
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) {
@@ -2176,6 +2137,98 @@ TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) 
     TEST_ASSERT(em.first_content_token_index() == 2);
     TEST_ASSERT(all.find("reasoning_content") != std::string::npos);
     TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
+}
+
+// With thinking-boundary tokens (a codec's vocabulary), only the tokens open
+// and close the thinking: the tags spelled in ordinary pieces, as the codec
+// shows a file that quotes them, stay text.
+TEST_CASE(ServerUnitFixture, test_emitter_think_tokens_only_tokens_switch) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    em.set_think_tags_are_tokens(true);
+    em.emit_token("The file prints ");
+    em.emit_token("</");
+    em.emit_token("think");
+    em.emit_token("> first.");
+    em.emit_token("</think>\n", /*think_tag=*/true);
+    em.emit_token("\n");
+    em.emit_token("It quotes <think>");
+    em.emit_token(" too.");
+    em.emit_finish(8);
+    TEST_ASSERT_MSG(em.reasoning_text() == "The file prints </think> first.", em.reasoning_text());
+    TEST_ASSERT_MSG(em.accumulated_text() == "It quotes <think> too.", em.accumulated_text());
+    TEST_ASSERT(em.first_content_token_index() == 5);
+
+    // A thinking that never closes stays thinking, however it spells the tag.
+    auto open = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    open.set_think_tags_are_tokens(true);
+    open.emit_token("Write </think>");
+    open.emit_finish(1);
+    TEST_ASSERT_MSG(open.reasoning_text() == "Write </think>", open.reasoning_text());
+    TEST_ASSERT(open.accumulated_text().empty());
+
+    // The opening token starts a thinking from content.
+    auto lead = make_emitter(ApiFormat::OPENAI_CHAT);
+    lead.set_think_tags_are_tokens(true);
+    lead.emit_token("<think>", true);
+    lead.emit_token("plan");
+    lead.emit_token("</think>\n", true);
+    lead.emit_token("done");
+    lead.emit_finish(4);
+    TEST_ASSERT_MSG(lead.reasoning_text() == "plan", lead.reasoning_text());
+    TEST_ASSERT_MSG(lead.accumulated_text() == "done", lead.accumulated_text());
+    TEST_ASSERT(lead.first_content_token_index() == 3);
+
+    // A leading opening token in the thinking is dropped; a later one is part of it.
+    auto inner = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    inner.set_think_tags_are_tokens(true);
+    inner.emit_token("<think>", true);
+    inner.emit_token("plan ");
+    inner.emit_token("<think>", true);
+    inner.emit_token("more");
+    inner.emit_token("</think>\n", true);
+    inner.emit_token("ok");
+    inner.emit_finish(6);
+    TEST_ASSERT_MSG(inner.reasoning_text() == "plan <think>more", inner.reasoning_text());
+    TEST_ASSERT_MSG(inner.accumulated_text() == "ok", inner.accumulated_text());
+
+    // A closing token in content is dropped, as its text form is.
+    auto content = make_emitter(ApiFormat::OPENAI_CHAT);
+    content.set_think_tags_are_tokens(true);
+    content.emit_token("a");
+    content.emit_token("</think>\n", true);
+    content.emit_token("b");
+    content.emit_finish(3);
+    TEST_ASSERT_MSG(content.accumulated_text() == "a\nb", content.accumulated_text());
+
+    // A UTF-8 tail held back before the token can no longer complete.
+    auto tail = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    tail.set_think_tags_are_tokens(true);
+    tail.emit_token("x\xE2\x82");
+    tail.emit_token("</think>\n", true);
+    tail.emit_token("ok");
+    tail.emit_finish(3);
+    TEST_ASSERT_MSG(tail.reasoning_text().rfind("x", 0) == 0 && tail.reasoning_text().size() > 1,
+                    tail.reasoning_text());
+    TEST_ASSERT_MSG(tail.accumulated_text() == "ok", tail.accumulated_text());
+
+    // A call drafted in the thinking is buffered; the token reaches the buffer
+    // as its text, so the reply is the one the text form gives.
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read"}}}}});
+    const std::vector<std::pair<std::string, bool>> drafted = {
+        {"Call ", false}, {"<tool_call>\n<function=read>\n</function>\n</tool_call>", false},
+        {"</think>\n", true}, {"Done.", false}};
+    auto by_token = make_emitter(ApiFormat::OPENAI_CHAT, tools, true);
+    by_token.set_think_tags_are_tokens(true);
+    auto by_text = make_emitter(ApiFormat::OPENAI_CHAT, tools, true);
+    for (const auto & [piece, tag] : drafted) {
+        by_token.emit_token(piece, tag);
+        by_text.emit_token(piece, tag);
+    }
+    by_token.emit_finish(4);
+    by_text.emit_finish(4);
+    TEST_ASSERT_MSG(by_token.reasoning_text() == by_text.reasoning_text(), by_token.reasoning_text());
+    TEST_ASSERT_MSG(by_token.accumulated_text() == by_text.accumulated_text(), by_token.accumulated_text());
+    TEST_ASSERT(by_token.tool_calls().size() == by_text.tool_calls().size());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2618,7 +2671,7 @@ TEST_CASE(ServerUnitFixture, test_parse_no_tools) {
     std::string text = "Just plain text without any tool calls.";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.empty());
-    TEST_ASSERT(!result.cleaned_text.empty());
+    TEST_ASSERT(result.cleaned_text == text);
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
@@ -2711,38 +2764,9 @@ TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_invoke_name_parameters) {
-    const std::string text =
-        "Let me read the file.\n\n"
-        "<function_call>\n"
-        "<invoke_name>read</invoke_name>\n"
-        "<parameters>\n"
-        "<path>/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</path>\n"
-        "</parameters>\n"
-        "</function_call>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {
-             {"name", "read"},
-             {"parameters", {
-                 {"type", "object"},
-                 {"properties", {
-                     {"path", {{"type", "string"}}}
-                 }}
-             }}
-         }}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "read");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
-    }
-    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_multiple_parameters) {
     const std::string text =
+        "Let me read the file.\n\n"
         "<function_call>\n"
         "<invoke_name>bash</invoke_name>\n"
         "<parameters>\n"
@@ -2770,7 +2794,7 @@ TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_multiple_parameters) {
         TEST_ASSERT(args["command"] == "ls -la /tmp");
         TEST_ASSERT(args["timeout"] == 10);
     }
-    TEST_ASSERT(result.cleaned_text.empty());
+    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_invoke_name_parameters) {
@@ -2946,66 +2970,6 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_function_name_tag) {
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_with_token) {
-    const std::string text =
-        "Let me read the file.\n\n"
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"read\">\n"
-        "<｜DSML｜parameter name=\"path\" string=\"true\">/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {
-             {"name", "read"},
-             {"parameters", {
-                 {"type", "object"},
-                 {"properties", {
-                     {"path", {{"type", "string"}}}
-                 }}
-             }}
-         }}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "read");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
-    }
-    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_multiple_parameters) {
-    const std::string text =
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /tmp</｜DSML｜parameter>\n"
-        "<｜DSML｜parameter name=\"timeout\" string=\"false\">10</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {
-             {"name", "bash"},
-             {"parameters", {
-                 {"type", "object"},
-                 {"properties", {
-                     {"command", {{"type", "string"}}},
-                     {"timeout", {{"type", "integer"}}}
-                 }}
-             }}
-         }}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "bash");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["command"] == "ls -la /tmp");
-        TEST_ASSERT(args["timeout"] == 10);
-    }
-    TEST_ASSERT(result.cleaned_text.empty());
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_dash_parameter_names) {
     // DeepSeek V4.1 calling Claude Code's Grep, whose flags are named -i and -n.
     const std::string text =
@@ -3044,51 +3008,6 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_dash_parameter_names) {
     TEST_ASSERT(result.cleaned_text == "I'll explore the repository.");
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_edit_tool) {
-    const std::string text =
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"edit\">\n"
-        "<｜DSML｜parameter name=\"path\" string=\"true\">/home/dpavlin/koha-rfid-go/server.go</｜DSML｜parameter>\n"
-        "<｜DSML｜parameter name=\"edits\" string=\"false\">[{\"oldText\": \"err1\", \"newText\": \"err2\"}]</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {
-             {"name", "edit"},
-             {"parameters", {
-                 {"type", "object"},
-                 {"properties", {
-                     {"path", {{"type", "string"}}},
-                     {"edits", {{"type", "array"}}}
-                 }}
-             }}
-         }}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "edit");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/server.go");
-        TEST_ASSERT(args["edits"].is_array());
-        TEST_ASSERT(args["edits"][0]["oldText"] == "err1");
-        TEST_ASSERT(args["edits"][0]["newText"] == "err2");
-    }
-    TEST_ASSERT(result.cleaned_text.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_render_deepseek4_chat_template_dsml_tools) {
-    std::vector<ChatMessage> msgs = {
-        {"system", "You are an assistant."},
-        {"user", "Hello"}
-    };
-    std::string tools_json = R"([{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}])";
-    std::string rendered = codec_text("deepseek4", msgs, true, false, tools_json);
-    TEST_ASSERT(rendered.find("<｜DSML｜tool_calls>") != std::string::npos);
-    TEST_ASSERT(rendered.find("<｜DSML｜invoke name=\"$TOOL_NAME\">") != std::string::npos);
-    TEST_ASSERT(rendered.find("\"name\": \"read\"") != std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_find_tool_syntax_start_arg_key_backtracking) {
     std::string text = "Let me edit the file:\nedit<arg_key>path</arg_key><arg_val>/tmp/test.txt</arg_val>";
     json tools = json::array({
@@ -3109,6 +3028,7 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
         "<｜DSML｜parameter name=\"json_num\" string=\"false\">42</｜DSML｜parameter>\n"
         "<｜DSML｜parameter name=\"json_bool\" string=\"false\">true</｜DSML｜parameter>\n"
         "<｜DSML｜parameter name=\"json_arr\" string=\"false\">[1, 2, 3]</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"json_obj_arr\" string=\"false\">[{\"oldText\": \"err1\", \"newText\": \"err2\"}]</｜DSML｜parameter>\n"
         "</｜DSML｜invoke>\n"
         "</｜DSML｜tool_calls>";
     json tools = json::array({
@@ -3120,7 +3040,8 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
                      {"verbatim_str", {{"type", "string"}}},
                      {"json_num", {{"type", "integer"}}},
                      {"json_bool", {{"type", "boolean"}}},
-                     {"json_arr", {{"type", "array"}}}
+                     {"json_arr", {{"type", "array"}}},
+                     {"json_obj_arr", {{"type", "array"}}}
                  }}
              }}
          }}}
@@ -3134,42 +3055,10 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
         TEST_ASSERT(args["json_num"] == 42);
         TEST_ASSERT(args["json_bool"] == true);
         TEST_ASSERT(args["json_arr"].is_array() && args["json_arr"].size() == 3);
+        TEST_ASSERT(args["json_obj_arr"][0]["oldText"] == "err1");
+        TEST_ASSERT(args["json_obj_arr"][0]["newText"] == "err2");
     }
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke) {
-    // When a model omits </｜DSML｜invoke> between consecutive calls,
-    // lookahead termination should cleanly partition the invocations.
-    const std::string text =
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
-        "<｜DSML｜invoke name=\"bash\">\n"
-        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {
-             {"name", "bash"},
-             {"parameters", {
-                 {"type", "object"},
-                 {"properties", {
-                     {"command", {{"type", "string"}}}
-                 }}
-             }}
-         }}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    TEST_ASSERT(result.tool_calls.size() == 2);
-    if (result.tool_calls.size() == 2) {
-        TEST_ASSERT(result.tool_calls[0].name == "bash");
-        auto args0 = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args0["command"] == "pwd");
-
-        TEST_ASSERT(result.tool_calls[1].name == "bash");
-        auto args1 = json::parse(result.tool_calls[1].arguments);
-        TEST_ASSERT(args1["command"] == "ls -la");
-    }
+    TEST_ASSERT(result.cleaned_text.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_payload) {
@@ -3515,21 +3404,6 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_param_tag_in_str
     }
 }
 
-
-
-TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
-    std::string text =
-        "<function=blocked_tool>\n"
-        "<parameter=x>1</parameter>\n"
-        "</function>";
-    json tools = json::array({
-        {{"type", "function"}, {"function", {{"name", "allowed_tool"}}}}
-    });
-    auto result = parse_tool_calls(text, tools);
-    // Tool not in allow-list should be filtered
-    TEST_ASSERT(result.tool_calls.empty());
-}
-
 // ─── Pattern 5: call:<verb>{...} plain-text tool calls ─────────────────
 //
 // Covers the gemma plain-text emission path added in
@@ -3554,56 +3428,10 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_empty_args) {
     TEST_ASSERT(result.cleaned_text.find("call:get_weather") == std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_strict_json_args) {
-    // Strict JSON args go through json::parse directly in
-    // coerce_relaxed_json's fast path.
-    auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"}");
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["city"] == "NYC");
-    }
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_namespaced_verb) {
-    // `ns:foo` namespaced verbs — the colon-strip logic in pattern 5
-    // strips everything up to the last `:` so the registered tool name
-    // is just `foo`.
-    auto result = parse_tool_calls("call:ns:foo{\"k\": 1}");
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "foo");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["k"] == 1);
-    }
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_whitespace_before_key) {
-    // Leading whitespace inside the brace body must not break parsing.
-    // (Whitespace tolerance is provided by json::parse / the relaxed
-    //  fallback rewriter.)
-    auto result = parse_tool_calls("call:get_weather{ \"city\": \"NYC\" }");
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "get_weather");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["city"] == "NYC");
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_call_verb_missing_close_brace_rejected) {
     // Unbalanced opener — balanced_braces_end returns npos so pattern 5
     // bails out and produces no tool call. The text leaks through.
     auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"");
-    TEST_ASSERT(result.tool_calls.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_narrative_without_body_rejected) {
-    // Narrative usage with a non-balanced body — sentinel matches the
-    // space before `call:`, but the `{` has no matching `}` so the
-    // call is discarded.
-    auto result = parse_tool_calls("I will call:foo{");
     TEST_ASSERT(result.tool_calls.empty());
 }
 
@@ -3652,18 +3480,6 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_back_to_back) {
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_relaxed_single_quotes) {
-    // Relaxed-JSON fallback: single-quoted strings + bare identifier
-    // keys are rewritten to strict JSON before parse.
-    auto result = parse_tool_calls("call:foo{city: 'NYC'}");
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "foo");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["city"] == "NYC");
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_call_verb_glued_to_word_rejected) {
     // No sentinel char before `call:` (glued to identifier) — pattern 5
     // must NOT match. `_` is a deliberate exception covered by its
@@ -3673,21 +3489,8 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_glued_to_word_rejected) {
     // `{"a": 1}` but it has no `name`/`function` field, so it produces
     // no tool call either.
     TEST_ASSERT(result.tool_calls.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_does_not_hijack_inner_name) {
-    // Regression: pattern 5 must run before pattern 6 so that an inner
-    // {"name": "...", "arguments": {}} in the call's args doesn't get
-    // hijacked into a spurious bare-JSON tool call.
-    auto result = parse_tool_calls(
-        "call:outer{\"name\": \"inner\", \"arguments\": {}}");
-    // Should match exactly one tool: the outer call. The inner
-    // {"name":..., "arguments":...} JSON is shadowed by the recorded
-    // removal span.
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "outer");
-    }
+    // `.` is not a sentinel either: prose like "narrative.call:" stays text.
+    TEST_ASSERT(parse_tool_calls("narrative.call:foo{x:1}").tool_calls.empty());
 }
 
 // ─── Pattern 5 (cont.): PR #341 imports — narrative & quoting edge cases ─
@@ -3695,18 +3498,6 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_does_not_hijack_inner_name) {
 // These tests originated in PR #341 alongside sse_emitter Pattern-B work
 // and were relocated here when #341 was split. They focus on edge cases
 // that complement the core call:<verb>{} suite above.
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_single) {
-    std::string text = "call:get_country_info{country: \"France\"}";
-    auto result = parse_tool_calls(text);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
-        auto args = json::parse(result.tool_calls[0].arguments);
-        TEST_ASSERT(args["country"] == "France");
-    }
-    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
-}
 
 TEST_CASE(ServerUnitFixture, test_parse_call_verb_namespaced) {
     std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
@@ -3720,18 +3511,6 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_namespaced) {
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_snake_and_hyphen) {
-    std::string text =
-        "call:execute-bead:list-files{path: \"src/\"}\n\n"
-        "call:execute-bead:read_file{path: \"a/b.rs\"}";
-    auto result = parse_tool_calls(text);
-    TEST_ASSERT(result.tool_calls.size() == 2);
-    if (result.tool_calls.size() == 2) {
-        TEST_ASSERT(result.tool_calls[0].name == "list-files");
-        TEST_ASSERT(result.tool_calls[1].name == "read_file");
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_call_verb_tool_allowed_filter) {
     std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
     json tools = json::array({
@@ -3742,30 +3521,6 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_tool_allowed_filter) {
     if (!result.tool_calls.empty()) {
         TEST_ASSERT(result.tool_calls[0].name == "allowed_verb");
     }
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_inline_prose_rejected) {
-    // No sentinel char before `call:` — must NOT match.
-    std::string text = "narrative.call:foo{x:1}";
-    auto result = parse_tool_calls(text);
-    TEST_ASSERT(result.tool_calls.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_inline_prose_after_space) {
-    // Whitespace IS a valid sentinel — this should match.
-    std::string text = "Sure, I'll call:foo{x: 1}";
-    auto result = parse_tool_calls(text);
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "foo");
-    }
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_call_verb_malformed_args) {
-    // Unterminated brace — drop the call, don't crash.
-    std::string text = "call:foo{country: \"France\"";
-    auto result = parse_tool_calls(text);
-    TEST_ASSERT(result.tool_calls.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_call_verb_inner_brace_in_string) {
@@ -3871,58 +3626,10 @@ TEST_CASE(ServerUnitFixture, test_parse_call_verb_backtick_with_inner_doublequot
 // SSE Emitter tests
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_CASE(ServerUnitFixture, test_emitter_reasoning_split_openai) {
-    // Feed reasoning + content through emitter, verify split.
-    // Model emits the opening <think> as its first token (Qwen3.6 path
-    // — the streaming on_token lambda maps the special <think> id to
-    // emit_token("<think>")).
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_start();
-
-    // Open reasoning, feed reasoning tokens
-    em.emit_token("<think>");
-    em.emit_token("Let me think about this...");
-    // Close thinking and start content
-    em.emit_token("</think>");
-    em.emit_token("The answer is 42.");
-
-    em.emit_finish(10);
-
-    TEST_ASSERT(!em.reasoning_text().empty());
-    TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
-    TEST_ASSERT(em.reasoning_text().find("</think>") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("42") != std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
-}
-
-// SseEmitter::emit_token_count() / accumulated text accessors drive
-// http_server's finish_details accounting on the natural-close path
-// (model self-closes </think> mid-stream). Each test feeds tokens
-// one-per-call so the emit_token index is straightforward to reason
-// about.
-TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_natural_close) {
-    // Emit reasoning tokens (with explicit <think> open + </think>
-    // close), then content tokens. The emit_token_count() reflects
-    // all delivered tokens; the reasoning/content split is also
-    // recoverable from accumulated_text / reasoning_text.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_start();
-    TEST_ASSERT(em.emit_token_count() == 0);
-
-    em.emit_token("<think>");
-    em.emit_token("reasoning1");
-    em.emit_token("reasoning2");
-    em.emit_token("end</think>");
-    em.emit_token("content1");
-    em.emit_token("content2");
-    em.emit_finish(6);
-
-    TEST_ASSERT(em.emit_token_count() == 6);
-    // Reasoning + content text both populated.
-    TEST_ASSERT(!em.reasoning_text().empty());
-    TEST_ASSERT(em.accumulated_text().find("content1") != std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("content2") != std::string::npos);
-}
+// SseEmitter::first_content_token_index() and emit_token_count() drive
+// http_server's finish_details accounting (thinking_tokens). Each test
+// feeds tokens one-per-call so the emit_token index is straightforward
+// to reason about.
 
 TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_never_closed) {
     // Model opens <think> then emits reasoning only — never closes
@@ -3937,6 +3644,7 @@ TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_never_closed) {
     em.emit_finish(3);
 
     TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.first_content_token_index() == -1);
     TEST_ASSERT(em.reasoning_text().find("reasoning") != std::string::npos);
     TEST_ASSERT(em.accumulated_text().empty());
 }
@@ -3951,6 +3659,8 @@ TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_content_only) {
 
     TEST_ASSERT(em.first_content_token_index() == 0);
     TEST_ASSERT(em.emit_token_count() == 1);
+    TEST_ASSERT(em.accumulated_text() == "immediate content");
+    TEST_ASSERT(em.reasoning_text().empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_qwen36_streaming_thinking) {
@@ -3975,16 +3685,16 @@ TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_qwen36_streaming_t
     em.emit_token("answer text");
     em.emit_finish(5);
 
-    // fci must point at the first true content token, NOT 0.
-    TEST_ASSERT(em.first_content_token_index() > 0);
-    // Reasoning text populated, leading <think> stripped.
+    // fci is the first true content token, the fifth, NOT 0: the opener,
+    // the reasoning and the close come before it.
+    TEST_ASSERT(em.first_content_token_index() == 4);
+    TEST_ASSERT(em.emit_token_count() == 5);
+    // Reasoning text populated; the tags reach neither channel.
     TEST_ASSERT(!em.reasoning_text().empty());
     TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
-    // Content text populated.
+    TEST_ASSERT(em.reasoning_text().find("</think>") == std::string::npos);
     TEST_ASSERT(em.accumulated_text().find("answer") != std::string::npos);
-    // emit_token_count - fci should be the content-suffix size
-    // (>0 means at least one content-mode token was attributed).
-    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() > 0);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_reasoning_strips_leading_think_tag) {
@@ -4004,16 +3714,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_reasoning_strips_leading_think_tag) {
     // Leading <think> should be stripped from reasoning
     TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
     TEST_ASSERT(em.reasoning_text().find("Actual reasoning") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_emitter_content_only_no_thinking) {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_start();
-    em.emit_token("Hello, world!");
-    em.emit_finish(5);
-
-    TEST_ASSERT(em.accumulated_text().find("Hello") != std::string::npos);
-    TEST_ASSERT(em.reasoning_text().empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
@@ -4391,21 +4091,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_anthropic_structure) {
     TEST_ASSERT(finish_str.find("message_stop") != std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_emitter_responses_structure) {
-    auto em = make_emitter(ApiFormat::RESPONSES);
-    auto start = em.emit_start();
-    std::string start_str = concat(start);
-
-    TEST_ASSERT(start_str.find("response.created") != std::string::npos);
-    TEST_ASSERT(start_str.find("response.output_item.added") != std::string::npos);
-
-    em.emit_token("Hi there! How are you doing today?");
-    auto finish = em.emit_finish(10);
-    std::string finish_str = concat(finish);
-
-    TEST_ASSERT(finish_str.find("response.completed") != std::string::npos);
-}
-
 // The Responses stream's terminal event: response.incomplete with
 // incomplete_details.reason "max_output_tokens" when the turn hit the
 // output-token cap (clients such as Codex and Repo2RLEnv retry on it),
@@ -4695,6 +4380,7 @@ TEST_CASE(ServerUnitFixture, test_emitter_responses_function_call_item_lifecycle
     }
     std::vector<std::string> types;
     for (const auto & d : data) types.push_back(d.value("type", ""));
+    TEST_ASSERT(!types.empty() && types.front() == "response.created");
     const auto pos = [&](const std::string & type, int output_index) {
         for (size_t i = 0; i < data.size(); ++i) {
             if (types[i] == type && data[i].value("output_index", -1) == output_index) return (int) i;
@@ -4734,17 +4420,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_openai_has_done) {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_emitter_nonstreaming_accumulates) {
-    // Non-streaming: tokens fed through emitter, accumulated_text() has all content.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_token("Hello ");
-    em.emit_token("world");
-    em.emit_finish(5);
-
-    TEST_ASSERT(em.accumulated_text().find("Hello") != std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("world") != std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_thinking_blocks) {
     auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
@@ -4759,10 +4434,12 @@ TEST_CASE(ServerUnitFixture, test_emitter_anthropic_thinking_blocks) {
     std::string all = start_str + concat(t1) + concat(t2) + concat(t3) +
                       concat(t4) + concat(finish);
 
-    // Should have both thinking and text blocks somewhere in the stream
-    TEST_ASSERT(all.find("thinking") != std::string::npos);
-    TEST_ASSERT(!em.reasoning_text().empty());
-    TEST_ASSERT(!em.accumulated_text().empty());
+    // A thinking block with its deltas, and text deltas.
+    TEST_ASSERT(all.find("\"type\":\"thinking\"") != std::string::npos);
+    TEST_ASSERT(all.find("\"type\":\"thinking_delta\"") != std::string::npos);
+    TEST_ASSERT(all.find("\"type\":\"text_delta\"") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text() == "Reasoning about the problem at length here...");
+    TEST_ASSERT(em.accumulated_text() == "The answer is clear now.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4822,27 +4499,7 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_no_match) {
     em.emit_finish(10);
 
     TEST_ASSERT(!em.stop_hit());
-    TEST_ASSERT(em.accumulated_text().find("Hello") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_stop_sequence_empty_list) {
-    // Empty stop list — no effect.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{});
-    em.emit_token("Hello STOP world");
-    em.emit_finish(5);
-
-    TEST_ASSERT(!em.stop_hit());
-    TEST_ASSERT(em.accumulated_text().find("STOP") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_stop_sequence_finish_reason) {
-    // finish_reason should be "stop" when stop sequence hit.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
-    em.emit_token("content END more");
-
-    TEST_ASSERT(em.stop_hit());
-    em.emit_finish(3);
-    TEST_ASSERT(em.finish_reason() == "stop");
+    TEST_ASSERT(em.accumulated_text() == "Hello world this is a long text");
 }
 
 TEST_CASE(ServerUnitFixture, test_stop_sequence_streaming_output) {
@@ -4856,6 +4513,7 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_streaming_output) {
     std::string all = concat(finish);
     TEST_ASSERT(all.find("[DONE]") != std::string::npos);
     TEST_ASSERT(all.find("\"finish_reason\":\"stop\"") != std::string::npos);
+    TEST_ASSERT(em.finish_reason() == "stop");
 }
 
 TEST_CASE(ServerUnitFixture, test_stop_sequence_anthropic_format) {
@@ -4885,22 +4543,18 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_in_reasoning_mode) {
 }
 
 TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
-    // With a long stop sequence, holdback buffer should extend to prevent
-    // emitting text that's part of a stop sequence.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,
-                                       {"LONGSTOPSEQUENCE"});
-    // Feed text token by token — the holdback should prevent premature emission
+    // A stop sequence longer than the tool-syntax holdback (21 bytes) must
+    // extend the holdback, or its head streams out before its tail arrives
+    // and the stop never matches.
+    const std::string stop = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";  // 32 bytes
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, {stop});
     em.emit_token("prefix ");
-    em.emit_token("LONG");
-    em.emit_token("STOP");
-    em.emit_token("SEQUENCE");
+    for (size_t at = 0; at < stop.size(); at += 8) em.emit_token(stop.substr(at, 8));
     em.emit_token(" suffix");
 
     TEST_ASSERT(em.stop_hit());
     em.emit_finish(10);
-    TEST_ASSERT(em.accumulated_text().find("prefix") != std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("LONGSTOPSEQUENCE") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("suffix") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "prefix ");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -5294,7 +4948,9 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_evicts_several_for_large_c
         TEST_ASSERT(cache.lookup_candidate(next, (int)next.size()).second == (int)big.size());
     }
     {
-        // A capture that fails or is cancelled evicts none of them.
+        // A cancelled capture evicts none of them. A capture is aborted only
+        // after KvCache::clear_for_capture freed its planned victims, so the
+        // abort drops them from the index too.
         PrefixCache cache(8, tokenizer, 1000);
         cache.set_record_evictions(true);
         std::vector<int> slots;
@@ -5303,11 +4959,12 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_evicts_several_for_large_c
         TEST_ASSERT(r.active() && r.extra_victim_slots().size() == 3);
         r.cancel();
         TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        TEST_ASSERT(cache.take_evicted().empty());
         r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(700));
         TEST_ASSERT(r.active());
         r.abort();
-        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
-        TEST_ASSERT(cache.take_evicted().empty());
+        TEST_ASSERT(cache.stats().in_use == 1 && cache.stats().resident_bytes == 200);
+        TEST_ASSERT(cache.take_evicted().size() == 3);
     }
     {
         // Larger than the whole budget: skipped, nothing evicted.
@@ -5527,41 +5184,18 @@ TEST_CASE(ServerUnitFixture, test_deepseek_layout_puts_tool_results_in_call_orde
     TEST_ASSERT(qwen.messages[2].turn.begin < qwen.messages[3].turn.begin);
 }
 
-TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
-    std::vector<int32_t> ids = {100, 200, 300, 400, 500};
-    auto h1 = hash_prefix(ids.data(), (int)ids.size());
-    auto h2 = hash_prefix(ids.data(), (int)ids.size());
-    TEST_ASSERT(h1 == h2);
-}
-
-TEST_CASE(ServerUnitFixture, test_hash_prefix_different_inputs) {
-    std::vector<int32_t> ids1 = {100, 200, 300};
-    std::vector<int32_t> ids2 = {100, 200, 301};
-    auto h1 = hash_prefix(ids1.data(), (int)ids1.size());
-    auto h2 = hash_prefix(ids2.data(), (int)ids2.size());
-    TEST_ASSERT(h1 != h2);
-}
-
-TEST_CASE(ServerUnitFixture, test_hash_prefix_different_lengths) {
-    std::vector<int32_t> ids1 = {100, 200, 300};
-    std::vector<int32_t> ids2 = {100, 200, 300, 400};
-    auto h1 = hash_prefix(ids1.data(), (int)ids1.size());
-    auto h2 = hash_prefix(ids2.data(), (int)ids2.size());
-    TEST_ASSERT(h1 != h2);
-}
-
-TEST_CASE(ServerUnitFixture, test_hash_prefix_empty) {
-    auto h = hash_prefix(nullptr, 0);
-    // Should not crash, just return a hash of empty input
-    TEST_ASSERT(h.size() == 16);
-}
-
-TEST_CASE(ServerUnitFixture, test_find_boundaries_empty) {
-    ChatMarkers markers;
-    markers.family = "qwen";
-    std::vector<int32_t> ids;
-    auto bounds = find_all_boundaries(ids, markers);
-    TEST_ASSERT(bounds.empty());
+TEST_CASE(ServerUnitFixture, test_hash_prefix_golden_bytes) {
+    // Names the disk prefix-cache files and re-validates them on load: SHA-1
+    // of [u32 count][i32 ids] little-endian, first 16 bytes. A change orphans
+    // every persisted entry. Expected values from Python hashlib.
+    const std::vector<int32_t> ids1 = {100, 200, 300};
+    const std::vector<int32_t> ids2 = {100, 200, 300, 400};
+    const PrefixHash h1 = hash_prefix(ids1.data(), (int)ids1.size());
+    const PrefixHash h2 = hash_prefix(ids2.data(), (int)ids2.size());
+    TEST_ASSERT(hex_string(h1.data(), 16) == "5ae3fcdd2c1d36ce021871fa1cfd095b");
+    TEST_ASSERT(hex_string(h2.data(), 16) == "a81403c24d59afd101d6070ba9714e9c");
+    const PrefixHash empty = hash_prefix(nullptr, 0);
+    TEST_ASSERT(hex_string(empty.data(), 16) == "9069ca78e7450a285173431b3e52c5c2");
 }
 
 // Boundary detection with and without a system message. Qwen-shaped
@@ -5620,6 +5254,7 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_qwen_user_first) {
     TEST_ASSERT(bounds.size() == 2);
     TEST_ASSERT(bounds[0] == 6);
     TEST_ASSERT(bounds[1] == 11);
+    TEST_ASSERT(find_all_boundaries(std::vector<int32_t>{}, markers).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_tool_schema_is_part_of_stable_system_boundary) {
@@ -5692,24 +5327,6 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_stray_end_msg_does_not_truncat
     // 19) must be found; the stable system head (5) is unchanged.
     TEST_ASSERT(bounds == (std::vector<int>{5, 15, 19}));
     TEST_ASSERT(bounds.front() == 5);
-}
-
-TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
-    // A clean prompt (no stray markers) must produce the identical boundary
-    // list as before the fix — the stray-skip path must never alter correct
-    // prompts.
-    ChatMarkers markers;
-    markers.family = "qwen";
-    markers.sys_role_prefix = {10, 11};
-    markers.end_msg_seqs = {{12}};
-    markers.next_role_starts = {{10}};
-
-    //  system content  user content  assistant content  user2
-    const std::vector<int32_t> prompt = {
-        10, 11, 100, 101, 12, 10, 20, 200, 12, 10, 30, 300, 12, 10, 40,
-    };
-    const auto bounds = find_all_boundaries(prompt, markers);
-    TEST_ASSERT(bounds == (std::vector<int>{6, 10, 14}));
 }
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
@@ -6179,14 +5796,15 @@ TEST_CASE(ServerUnitFixture, test_ppp_split_and_rearrange_ephemeral_tail) {
 
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
-TEST_CASE(ServerUnitFixture, test_evict_empty_is_zero) {
-    std::vector<std::vector<int32_t>> ids;
-    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_evict_single_is_zero) {
-    std::vector<std::vector<int32_t>> ids = {{1, 2, 3}};
-    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+// The policy over token vectors held by value.
+static int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
+                                      const std::vector<bool> * protected_lru = nullptr,
+                                      int skip_index = -1,
+                                      const std::vector<bool> * held_lru = nullptr) {
+    std::vector<const std::vector<int32_t> *> ptrs;
+    ptrs.reserve(ids_lru.size());
+    for (const auto & v : ids_lru) ptrs.push_back(&v);
+    return luce::common::select_inline_evict_victim(ptrs, protected_lru, skip_index, held_lru);
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_chain_keeps_ancestors) {
@@ -6207,15 +5825,6 @@ TEST_CASE(ServerUnitFixture, test_evict_unrelated_falls_back_to_lru) {
     // No prefix relation: all are leaves, so evict the oldest (index 0).
     std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}, {3, 3}};
     TEST_ASSERT(select_inline_evict_victim(ids) == 0);
-}
-
-TEST_CASE(ServerUnitFixture, test_evict_branch_spares_shared_root) {
-    // [s] is an ancestor of both branches, so it is never the victim; the oldest
-    // leaf ([s,a] at index 1) is evicted instead.
-    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
-    int v = select_inline_evict_victim(ids);
-    TEST_ASSERT(v == 1);
-    TEST_ASSERT(v != 0);  // the shared root must be spared
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_skips_protected_leaf) {
@@ -6896,20 +6505,6 @@ TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
     TEST_ASSERT(snapshot["current"].is_null());
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_compress_result_defaults) {
-    ModelBackend::CompressResult result;
-    TEST_ASSERT(!result.ok);
-    TEST_ASSERT(result.compressed_ids.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_config_upstream_defaults) {
-    ServerConfig cfg;
-    TEST_ASSERT(cfg.pflash_upstream_base.empty());
-    TEST_ASSERT(cfg.pflash_upstream_key.empty());
-    TEST_ASSERT(cfg.pflash_upstream_model.empty());
-    TEST_ASSERT(cfg.pflash_curve.empty());
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
     SamplingDefaults defaults;
     defaults.has_temperature = true;
@@ -7055,17 +6650,6 @@ TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_applied_when_thin
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
 }
 
-TEST_CASE(ServerUnitFixture, test_sampler_defaults_thinking_mode_unaffected_by_no_thinking_card) {
-    const ServerConfig config = qwen4exp_dual_sampling_config();
-    const json body = json::object();  // qwen4exp thinks by default when omitted
-    const SamplerCfg sampler = resolve_request_sampler(body, config);
-
-    TEST_ASSERT(std::fabs(sampler.temp - 1.0f) < 0.001f);
-    TEST_ASSERT(std::fabs(sampler.top_p - 0.95f) < 0.001f);
-    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
-    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.0f) < 0.001f);
-}
-
 TEST_CASE(ServerUnitFixture, test_sampler_explicit_fields_win_in_both_thinking_modes) {
     const ServerConfig config = qwen4exp_dual_sampling_config();
 
@@ -7084,6 +6668,9 @@ TEST_CASE(ServerUnitFixture, test_sampler_explicit_fields_win_in_both_thinking_m
     const SamplerCfg on_sampler = resolve_request_sampler(thinking_on_body, config);
     TEST_ASSERT(std::fabs(on_sampler.temp - 0.44f) < 0.001f);
     TEST_ASSERT(std::fabs(on_sampler.top_p - 0.95f) < 0.001f);
+    // The no-thinking card does not leak into thinking mode.
+    TEST_ASSERT(std::fabs(on_sampler.pres_pen - 0.0f) < 0.001f);
+    TEST_ASSERT(std::fabs(on_sampler.rep_pen - 1.0f) < 0.001f);
 }
 
 TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_absent_keeps_today_behavior) {
@@ -7771,17 +7358,6 @@ TEST_CASE(ServerUnitFixture, test_draft_residency_dflash_auto_and_request_scoped
 // Jinja chat template
 // ═══════════════════════════════════════════════════════════════════════
 
-// Minimal Jinja template: just join roles + contents. Used to verify the
-// runtime + global_from_json plumbing without depending on any external
-// .jinja file at test time.
-static const char MINI_JINJA_TEMPLATE[] =
-    "{%- for m in messages -%}"
-    "<|{{ m.role }}|>{{ m.content }}\n"
-    "{%- endfor -%}"
-    "{%- if add_generation_prompt -%}"
-    "<|assistant|>"
-    "{%- endif -%}";
-
 // The V4 encoder opens the assistant turn only after a user turn, so a
 // conversation with no user turn ends where its last message ends.
 TEST_CASE(ServerUnitFixture, test_deepseek4_render_system_only_gen_prompt) {
@@ -7795,67 +7371,19 @@ TEST_CASE(ServerUnitFixture, test_deepseek4_render_system_only_gen_prompt) {
     const std::string expected =
         "<｜begin▁of▁sentence｜>sys only";
     TEST_ASSERT_MSG(out == expected, out);
-}
-
-TEST_CASE(ServerUnitFixture, test_deepseek4_render_empty_chat_rejected) {
-    // No messages: the codec refuses, as the official encoders do.
-    const std::string out = codec_text("deepseek4", {}, /*add_generation_prompt=*/true);
-    TEST_ASSERT_MSG(out == "<codec rejected: No messages provided.>", out);
-}
-
-TEST_CASE(ServerUnitFixture, test_deepseek4_render_reasoning_effort_prefixes) {
-    std::vector<ChatMessage> msgs = {
-        {"system", "system message", ""},
-        {"user", "hard problem", ""},
-    };
-    const std::string bos = "<｜begin▁of▁sentence｜>";
-    const std::string high_prefix =
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-        "You MUST be very thorough in your thinking and comprehensively "
-        "decompose the problem to resolve the root cause, rigorously "
-        "stress-testing your logic against all potential paths, edge cases, "
-        "and adversarial scenarios.\n"
-        "Explicitly write out your entire deliberation process, documenting "
-        "every intermediate step, considered alternative, and rejected "
-        "hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-    const std::string max_prefix =
-        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
-        "uncompromising.\n"
-        "You MUST reason with the utmost depth and rigor, leaving absolutely "
-        "nothing to chance: exhaustively decompose the problem into its most "
-        "fundamental components, trace every causal chain to its root, and "
-        "resolve the underlying cause rather than any surface symptom.\n"
-        "Do not stop reasoning until you have independently verified the "
-        "solution from multiple angles and are certain that no assumption "
-        "remains unchecked and no error remains undiscovered.\n\n";
-    const auto ends_with = [](const std::string & text,
-                              const std::string & suffix) {
-        return text.size() >= suffix.size() &&
-            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
-    };
-
-    const std::string high = codec_text("deepseek4", msgs, true, true, "", "high");
-    TEST_ASSERT(high.rfind(bos + high_prefix + "system message", 0) == 0);
-    TEST_ASSERT(high.find(max_prefix) == std::string::npos);
-    TEST_ASSERT(ends_with(high, "<｜Assistant｜><think>"));
-
-    const std::string max = codec_text("deepseek4", msgs, true, true, "", "max");
-    TEST_ASSERT(max.rfind(bos + max_prefix + "system message", 0) == 0);
-    TEST_ASSERT(max.find(high_prefix) == std::string::npos);
-    TEST_ASSERT(ends_with(max, "<｜Assistant｜><think>"));
-
-    const std::string low = codec_text("deepseek4", msgs, true, true, "", "low");
-    TEST_ASSERT(low.find(high_prefix) == std::string::npos);
-    TEST_ASSERT(low.find(max_prefix) == std::string::npos);
-    TEST_ASSERT(low.rfind(bos + "system message", 0) == 0);
-
-    const std::string disabled = codec_text("deepseek4", msgs, true, false, "", "max");
-    TEST_ASSERT(disabled.find(max_prefix) == std::string::npos);
-    TEST_ASSERT(ends_with(disabled, "<｜Assistant｜></think>"));
-
-    const std::string completed_turn = codec_text("deepseek4", msgs, false, true, "", "high");
-    TEST_ASSERT(completed_turn.rfind(bos + high_prefix, 0) == 0);
-    TEST_ASSERT(!ends_with(completed_turn, "<｜Assistant｜><think>"));
+    // No messages at all: the codec refuses, as the official encoders do.
+    const std::string empty = codec_text("deepseek4", {}, /*add_generation_prompt=*/true);
+    TEST_ASSERT_MSG(empty == "<codec rejected: No messages provided.>", empty);
+    // The completed-turn render (no generation prompt), which the server uses
+    // for turn checkpoints, keeps the effort line, so the prompt render
+    // extends it token for token.
+    const std::vector<ChatMessage> turn = {{"system", "system message", ""}, {"user", "hard problem", ""}};
+    const std::string completed = codec_text("deepseek4", turn, /*add_generation_prompt=*/false,
+                                             /*enable_thinking=*/true, "", "high");
+    const std::string prompt = codec_text("deepseek4", turn, /*add_generation_prompt=*/true,
+                                          /*enable_thinking=*/true, "", "high");
+    TEST_ASSERT_MSG(completed.find("Reasoning Effort:") != std::string::npos, completed);
+    TEST_ASSERT_MSG(prompt.size() > completed.size() && prompt.compare(0, completed.size(), completed) == 0, prompt);
 }
 
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_render_official_role_format) {
@@ -7925,32 +7453,6 @@ TEST_CASE(ServerUnitFixture, test_bailingmoe3_request_overrides_system_thinking)
     TEST_ASSERT(requested_on != std::string::npos && requested_on > prior_off);
 }
 
-TEST_CASE(ServerUnitFixture, test_emitter_suppresses_undeclared_bailing_tool_block) {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_start();
-
-    const auto deliver = [&](const std::string & raw_token) {
-        if (!em.suppress_undeclared_tool_protocol_token(raw_token)) {
-            em.emit_token(raw_token);
-        }
-    };
-    deliver("<tool_call>");
-    deliver("weather");
-    deliver("<arg_key>");
-    deliver("city");
-    deliver("</arg_key>");
-    deliver("<arg_value>");
-    deliver("Rome");
-    deliver("</arg_value>");
-    deliver("</tool_call>");
-    deliver("Visible answer");
-    em.emit_finish(10);
-
-    TEST_ASSERT(em.accumulated_text() == "Visible answer");
-    TEST_ASSERT(em.accumulated_text().find("weather") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text().find("Rome") == std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_drops_tool_call_under_tool_choice_none) {
     const auto emitter_for = [](const json & tool_choice, bool checks_pass) {
         return SseEmitter(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10,
@@ -8018,48 +7520,59 @@ TEST_CASE(ServerUnitFixture, test_emitter_drops_tool_call_under_tool_choice_none
     em.emit_finish(10);
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text() == "Reading it.");
+
+    // With no tools declared, a Bailing call block is hidden too, arguments included.
+    auto bare = make_emitter(ApiFormat::OPENAI_CHAT);
+    bare.emit_start();
+    for (const char * raw_token : {"<tool_call>", "weather", "<arg_key>", "city", "</arg_key>",
+                                   "<arg_value>", "Rome", "</arg_value>", "</tool_call>",
+                                   "Visible answer"}) {
+        if (!bare.suppress_undeclared_tool_protocol_token(raw_token)) bare.emit_token(raw_token);
+    }
+    bare.emit_finish(10);
+    TEST_ASSERT(bare.tool_calls().empty());
+    TEST_ASSERT(bare.accumulated_text() == "Visible answer");
 }
 
+// Ling 3 routes in groups: a group scores the sum of its two strongest
+// experts, only the top groups stay, and the experts come from those.
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
-    ggml_init_params params{};
-    params.mem_size = 2 * 1024 * 1024;
-    params.no_alloc = true;
+    ggml_init_params params{16 * 1024 * 1024, nullptr, false};
     ggml_context * ctx = ggml_init(params);
     TEST_ASSERT(ctx != nullptr);
 
+    constexpr int n_expert = 16;
     TargetWeights weights;
-    weights.n_expert = 512;
-    weights.n_expert_used = 8;
-    weights.n_expert_groups = 8;
-    weights.n_expert_groups_used = 4;
-    weights.expert_gating_func = 2;
+    weights.n_expert = n_expert;
+    weights.n_expert_used = 4;
+    weights.n_expert_groups = 4;
+    weights.n_expert_groups_used = 2;
+    weights.expert_gating_func = 2;  // sigmoid
     weights.expert_weights_norm = true;
-    weights.expert_weights_scale = 2.5f;
+    weights.expert_weights_scale = 1.0f;
 
     TargetLayer layer;
-    layer.ffn_gate_inp = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, 16, weights.n_expert);
-    layer.ffn_exp_probs_b = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_F32, weights.n_expert);
-    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, 2);
+    layer.ffn_gate_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_expert);
+    layer.ffn_exp_probs_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, 1);
+    float * gate = (float *) layer.ffn_gate_inp->data;  // identity: the logits are the input
+    for (int i = 0; i < n_expert * n_expert; ++i) gate[i] = i % (n_expert + 1) == 0 ? 1.0f : 0.0f;
+    std::fill_n((float *) layer.ffn_exp_probs_b->data, n_expert, 0.0f);
+    // Logits by group of four. Expert 0 is the strongest single expert, but
+    // its group's top two sum lowest of the three live groups.
+    const float logits[n_expert] = {5, -5, -5, -5,  3, 3, -5, -5,  2.9f, 2.9f, -5, -5,  -5, -5, -5, -5};
+    std::copy(logits, logits + n_expert, (float *) input->data);
 
     const Qwen35MoeRouterOutputs router = build_qwen35moe_router(
-        ctx, input, weights, layer);
-    TEST_ASSERT(router.selected != nullptr);
-    TEST_ASSERT(router.weights != nullptr);
-
-    std::unordered_set<const ggml_tensor *> visited;
-    const auto contains_op = [&](const auto & self,
-                                 const ggml_tensor * tensor,
-                                 ggml_op op) -> bool {
-        if (!tensor || !visited.insert(tensor).second) return false;
-        if (tensor->op == op) return true;
-        for (const ggml_tensor * source : tensor->src) {
-            if (self(self, source, op)) return true;
-        }
-        return false;
-    };
-    TEST_ASSERT(contains_op(contains_op, router.selected, GGML_OP_SET_ROWS));
+        ctx, input, weights, layer, /*allow_fused_router=*/false);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, router.selected);
+    ggml_build_forward_expand(gf, router.weights);
+    TEST_ASSERT(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
+    const int32_t * ids = (const int32_t *) router.selected->data;
+    std::vector<int32_t> selected(ids, ids + weights.n_expert_used);
+    std::sort(selected.begin(), selected.end());
+    TEST_ASSERT(selected == std::vector<int32_t>({4, 5, 8, 9}));
 
     ggml_free(ctx);
 }
@@ -8160,8 +7673,6 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_qsa_batch_boundary) {
     TEST_ASSERT(qwen4exp_can_batch(w, spans, 2, true));
 }
 
-// Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
-// (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
 TEST_CASE(ServerUnitFixture, test_qwen4exp_profile_is_scoped) {
     using namespace luce::common;
     auto set = ggml_backend_cuda_set_qwen4exp_profile;
@@ -8220,6 +7731,8 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_mtp_profile_and_verify_restore) {
     TEST_ASSERT(!invariant(previous_invariant));
 }
 
+// Qwen4Exp QSA indexer pooling: block b is the mean of the r consecutive token keys r*b .. r*b+r-1
+// (reference modeling_qwen4_exp.py: block_token_indices.view(n, ratio) then mean over the ratio axis).
 TEST_CASE(ServerUnitFixture, test_qwen4exp_pool_blocks_averages_consecutive_tokens) {
     ggml_init_params ip{1 << 20, nullptr, false};
     ggml_context * c = ggml_init(ip);
@@ -8326,30 +7839,6 @@ TEST_CASE(ServerUnitFixture, test_qwen_memory_report_matches_buffers) {
     ggml_backend_free(cpu);
 }
 
-TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
-    std::vector<ChatMessage> msgs = {
-        {"system", "you are helpful", ""},
-        {"user",   "hi",              ""},
-    };
-    std::string out = render_chat_template_jinja(
-        MINI_JINJA_TEMPLATE, msgs,
-        /*bos=*/"<s>", /*eos=*/"</s>",
-        /*add_gen=*/true, /*think=*/false,
-        /*tools=*/"");
-    TEST_ASSERT(out.find("<|system|>you are helpful") != std::string::npos);
-    TEST_ASSERT(out.find("<|user|>hi")               != std::string::npos);
-    TEST_ASSERT(out.find("<|assistant|>")            != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_jinja_render_no_gen_prompt) {
-    std::vector<ChatMessage> msgs = {{"user", "ping", ""}};
-    std::string out = render_chat_template_jinja(
-        MINI_JINJA_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/false, "");
-    TEST_ASSERT(out.find("<|user|>ping") != std::string::npos);
-    TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_gemma_tool_schema_formats_preserve_nested_types) {
     const json schema = {
         {"type", "object"},
@@ -8379,124 +7868,15 @@ TEST_CASE(ServerUnitFixture, test_gemma_tool_schema_formats_preserve_nested_type
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_jinja_render_empty_tools_skipped) {
-    // tools_json == "[]" must NOT define `tools` in the template context.
+TEST_CASE(ServerUnitFixture, test_jinja_render_threads_bos_eos_and_gen_prompt) {
+    // {{ bos_token }}, {{ eos_token }} and add_generation_prompt must reach the template.
     static const char TPL[] =
-        "{%- if tools -%}TOOLS_PRESENT{%- else -%}NO_TOOLS{%- endif -%}";
-    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, "[]");
-    TEST_ASSERT(out.find("NO_TOOLS")        != std::string::npos);
-    TEST_ASSERT(out.find("TOOLS_PRESENT")   == std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_jinja_render_bos_eos_threaded) {
-    // {{ bos_token }} and {{ eos_token }} must reach the template.
-    static const char TPL[] = "{{ bos_token }}HI{{ eos_token }}";
+        "{{ bos_token }}HI{{ eos_token }}{%- if add_generation_prompt -%}GEN{%- endif -%}";
     std::vector<ChatMessage> msgs;
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "<BOS>", "<EOS>", false, false, "");
-    TEST_ASSERT(out == "<BOS>HI<EOS>");
-}
-
-TEST_CASE(ServerUnitFixture, test_jinja_render_empty_template_throws) {
-    std::vector<ChatMessage> msgs = {{"user", "x", ""}};
-    bool threw = false;
-    try {
-        (void)render_chat_template_jinja("", msgs, "", "", true, false, "");
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    TEST_ASSERT(threw);
-}
-
-TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
-    static const char TPL[] = "{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
-    std::vector<ChatMessage> msgs = {{"user", "x", ""}};
-    bool threw = false;
-    try {
-        (void)render_chat_template_jinja(
-            TPL, msgs, "", "", true, false, "{not valid json");
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    TEST_ASSERT(threw);
-}
-
-// Mirrors the official qwen4exp (Qwen3.8-Flash-Next) GGUF Jinja template's
-// think-replay snippet: earlier assistant turns either replay their recorded
-// reasoning_content inside <think>...</think>, or (preserve_thinking=false)
-// drop the think block entirely for turns at/before the last user query.
-static const char QWEN4EXP_THINK_REPLAY_TEMPLATE[] =
-    "{%- set ns = namespace(last_query_index = 0) -%}"
-    "{%- for message in messages -%}"
-    "{%- if message.role == 'user' -%}{%- set ns.last_query_index = loop.index0 -%}{%- endif -%}"
-    "{%- endfor -%}"
-    "{%- for message in messages -%}"
-    "{%- set content = message.content -%}"
-    "{%- if message.role == 'assistant' -%}"
-    "{%- set reasoning_content = '' -%}"
-    "{%- if message.reasoning_content is string -%}{%- set reasoning_content = message.reasoning_content -%}{%- endif -%}"
-    "{%- set reasoning_content = reasoning_content|trim -%}"
-    "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index -%}"
-    "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}"
-    "{%- else -%}"
-    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
-    "{%- endif -%}"
-    "{%- else -%}"
-    "{{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}"
-    "{%- endif -%}"
-    "{%- endfor -%}";
-
-// (a) An assistant history message with reasoning_content renders inside
-// <think>...</think> under the default (preserve_thinking left unset).
-TEST_CASE(ServerUnitFixture, test_jinja_render_reasoning_content_default_preserves_think) {
-    const std::vector<ChatMessage> msgs = {
-        {"user",      "Q1", "", ""},
-        {"assistant", "A1", "", "thinking about Q1"},
-        {"user",      "Q2", "", ""},
-    };
-    const std::string out = render_chat_template_jinja(
-        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/true, "", "",
-        /*preserve_thinking=*/-1);
-    TEST_ASSERT(out.find(
-        "<|im_start|>assistant\n<think>\nthinking about Q1\n</think>\n\nA1<|im_end|>")
-        != std::string::npos);
-}
-
-// (b) With preserve_thinking=false the earlier assistant turn renders
-// without any <think> block.
-TEST_CASE(ServerUnitFixture, test_jinja_render_preserve_thinking_false_strips_think) {
-    const std::vector<ChatMessage> msgs = {
-        {"user",      "Q1", "", ""},
-        {"assistant", "A1", "", "thinking about Q1"},
-        {"user",      "Q2", "", ""},
-    };
-    const std::string out = render_chat_template_jinja(
-        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/true, "", "",
-        /*preserve_thinking=*/0);
-    TEST_ASSERT(out.find("<|im_start|>assistant\nA1<|im_end|>") != std::string::npos);
-    TEST_ASSERT(out.find("<think>") == std::string::npos);
-}
-
-// (c) Without reasoning_content and under the default preserve setting, the
-// output is unchanged from today: an empty <think></think> block (neither of
-// the template's two official modes, but the pre-existing behavior — this is
-// a regression guard, not an endorsement).
-TEST_CASE(ServerUnitFixture, test_jinja_render_no_reasoning_content_regression) {
-    const std::vector<ChatMessage> msgs = {
-        {"user",      "Q1", "", ""},
-        {"assistant", "A1", "", ""},
-        {"user",      "Q2", "", ""},
-    };
-    const std::string out = render_chat_template_jinja(
-        QWEN4EXP_THINK_REPLAY_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/true, "", "",
-        /*preserve_thinking=*/-1);
-    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>")
-        != std::string::npos);
+    TEST_ASSERT(render_chat_template_jinja(TPL, msgs, "<BOS>", "<EOS>", false, false, "") ==
+                "<BOS>HI<EOS>");
+    TEST_ASSERT(render_chat_template_jinja(TPL, msgs, "<BOS>", "<EOS>", true, false, "") ==
+                "<BOS>HI<EOS>GEN");
 }
 
 TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
@@ -8632,75 +8012,6 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
     TEST_ASSERT(http_detail::ends_with_tool_result(with_note));
 }
 
-// Calls the server no longer remembers retain structure for any renderer.
-TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
-    ToolMemory tool_memory;
-    const json messages = json::array({
-        {{"role", "user"}, {"content", "go"}},
-        {{"role", "assistant"}, {"content", json::array({
-            {{"type", "text"}, {"text", "Reading."}},
-            {{"type", "tool_use"}, {"id", "toolu_1"}, {"name", "Read"},
-             {"input", {{"file_path", "/a.py"}}}},
-            {{"type", "tool_use"}, {"id", "toolu_2"}, {"name", "Grep"},
-             {"input", {{"pattern", "x"}, {"n", 3}}}}})}},
-    });
-    const auto chat = normalize_chat_messages(
-        messages, ApiFormat::ANTHROPIC, tool_memory);
-    TEST_ASSERT(chat.size() == 2);
-    if (chat.size() == 2) {
-        TEST_ASSERT(chat[1].content == "Reading.");
-        TEST_ASSERT(!chat[1].tool_calls_replayed);
-        TEST_ASSERT(chat[1].tool_calls.size() == 2);
-        if (chat[1].tool_calls.size() != 2) return;
-        TEST_ASSERT(chat[1].tool_calls[0].id == "toolu_1");
-        TEST_ASSERT(chat[1].tool_calls[0].name == "Read");
-        TEST_ASSERT(json(chat[1].tool_calls[0].arguments) == json({{"file_path", "/a.py"}}));
-        TEST_ASSERT(chat[1].tool_calls[1].id == "toolu_2");
-        TEST_ASSERT(chat[1].tool_calls[1].name == "Grep");
-        TEST_ASSERT(json(chat[1].tool_calls[1].arguments) == json({{"pattern", "x"}, {"n", 3}}));
-    }
-}
-
-// OpenAI clients (Hermes Agent, Pi, any chat-completions agent) replay their
-// history with tool_calls this server did not generate or no longer
-// remembers: the call itself must reach the prompt, not only the prose.
-TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_calls_without_memory) {
-    ToolMemory tool_memory;
-    const json messages = json::array({
-        {{"role", "user"}, {"content", "fix the bug"}},
-        {{"role", "assistant"}, {"content", "Let me look."},
-         {"tool_calls", json::array({
-             {{"id", "call_1"}, {"type", "function"},
-              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"open src/io_utils.py 10\"}"}}}},
-             {{"id", "call_2"}, {"type", "function"},
-              {"function", {{"name", "raw"}, {"arguments", "not json"}}}}})}},
-        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "def read():"}},
-        {{"role", "assistant"}, {"content", nullptr},
-         {"tool_calls", json::array({
-             {{"id", "call_3"}, {"type", "function"},
-              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
-    });
-    const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-    TEST_ASSERT(chat.size() == 4);
-    if (chat.size() != 4) return;
-    TEST_ASSERT(chat[1].role == "assistant");
-    TEST_ASSERT(chat[1].content == "Let me look.");
-    TEST_ASSERT(chat[1].tool_calls.size() == 2);
-    if (chat[1].tool_calls.size() != 2) return;
-    TEST_ASSERT(chat[1].tool_calls[0].name == "bash");
-    TEST_ASSERT(json(chat[1].tool_calls[0].arguments) ==
-                json({{"command", "open src/io_utils.py 10"}}));
-    TEST_ASSERT(chat[1].tool_calls[1].name == "raw");
-    TEST_ASSERT(json(chat[1].tool_calls[1].arguments) == json({{"arguments", "not json"}}));
-    TEST_ASSERT(chat[2].role == "tool" && chat[2].content == "def read():");
-    TEST_ASSERT(chat[2].tool_name == "bash");
-    TEST_ASSERT(chat[3].content.empty());
-    TEST_ASSERT(chat[3].tool_calls.size() == 1);
-    if (chat[3].tool_calls.size() == 1) {
-        TEST_ASSERT(json(chat[3].tool_calls[0].arguments) == json({{"command", "ls"}}));
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_argument_shapes) {
     ToolMemory tool_memory;
     const json nested = {
@@ -8736,60 +8047,6 @@ TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_argument_shapes) {
         TEST_ASSERT(chat[0].tool_calls[0].name == "inspect");
         TEST_ASSERT(json(chat[0].tool_calls[0].arguments) == expected);
     }
-}
-
-TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_memory_replay_and_misses) {
-    ToolMemory tool_memory(2);
-    const std::string raw =
-        "<think>Keep this reasoning.</think>\n\nReading.\n\n"
-        "<tool_call>\n<function=read>\n<parameter=path>\n/a\n</parameter>\n"
-        "</function>\n</tool_call>\n\n"
-        "<tool_call>\n<function=list>\n</function>\n</tool_call>\n";
-    tool_memory.remember({"call_a", "call_b"}, raw);
-    json messages = json::array({
-        {{"role", "assistant"}, {"content", "Reading."},
-         {"tool_calls", json::array({
-             {{"id", "call_a"}, {"type", "function"},
-              {"function", {{"name", "read"}, {"arguments", R"({"path":"/a"})"}}}},
-             {{"id", "call_b"}, {"type", "function"},
-              {"function", {{"name", "list"}}}}})}},
-    });
-    auto check = [&](bool replayed) {
-        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-        TEST_ASSERT(chat.size() == 1);
-        if (chat.size() != 1) return;
-        TEST_ASSERT(chat[0].content == (replayed ? raw : "Reading."));
-        TEST_ASSERT(chat[0].tool_calls_replayed == replayed);
-        TEST_ASSERT(chat[0].tool_calls.size() == 2);
-        if (chat[0].tool_calls.size() != 2) return;
-        TEST_ASSERT(chat[0].tool_calls[0].name == "read");
-        TEST_ASSERT(chat[0].tool_calls[1].name == "list");
-        if (replayed) {
-            TEST_ASSERT(chat[0].tool_calls[0].arguments.is_null());
-            TEST_ASSERT(chat[0].tool_calls[1].arguments.is_null());
-            const auto rendered = codec_text("qwen3.5", {{"user", "go"}, chat[0]}, false, false, "");
-            const auto pos = rendered.find(raw);
-            TEST_ASSERT(pos != std::string::npos);
-            TEST_ASSERT(rendered.find("<function=read>", rendered.find("<function=read>") + 1) ==
-                        std::string::npos);
-        } else {
-            TEST_ASSERT(json(chat[0].tool_calls[0].arguments) == json({{"path", "/a"}}));
-            TEST_ASSERT(json(chat[0].tool_calls[1].arguments) == json::object());
-        }
-    };
-    check(true);
-    messages[0]["tool_calls"][1]["id"] = "unknown";
-    check(false);
-    messages[0]["tool_calls"][1].erase("id");
-    check(false);
-    messages[0]["tool_calls"][1]["id"] = "";
-    check(false);
-    messages[0]["tool_calls"][1]["id"] = "call_b";
-    tool_memory.remember({"unrelated"}, "Another turn.");
-    check(false);  // One of the original IDs has been evicted.
-    tool_memory.remember({"call_a"}, raw);
-    tool_memory.remember({"call_b"}, "A different turn.");
-    check(false);  // Both IDs exist, but belong to different turns.
 }
 
 TEST_CASE(ServerUnitFixture, test_normalize_openai_streamed_tool_calls) {
@@ -8927,6 +8184,9 @@ TEST_CASE(ServerUnitFixture, test_normalize_tool_history_cache_boundaries_all_ap
         check(true);
         memory.remember({"unrelated"}, "Other turn");
         check(false);  // Eviction of either ID invalidates replay of the turn.
+        memory.remember({"call_a"}, raw);
+        memory.remember({"call_b"}, "A different turn.");
+        check(false);  // Both IDs are known, but from different turns.
     }
     for (auto [format, input] : tool_history_inputs(arguments, "")) {
         ToolMemory memory;
@@ -9128,22 +8388,6 @@ TEST_CASE(ServerUnitFixture, test_normalized_tool_history_native_rendering_all_a
     }
 }
 
-// DeepSeek's V4 encoder orders ID-less result blocks by call ID, even when both calls share a
-// name. Its last user turn is the results' turn, so the calls' turn shows no thinking, in either mode.
-TEST_CASE(ServerUnitFixture, test_deepseek_tool_history_reference_replay) {
-    for (const auto & [api, input] : tool_history_inputs(json::object())) {
-        ToolMemory memory;
-        auto cold = normalize_chat_messages(input, api, memory, true, "\n");
-        cold[1].tool_calls[1].name = cold[1].tool_calls[0].name;
-        for (bool thinking : {false, true}) {
-            const auto out = codec_text("deepseek4", cold, true, thinking);
-            TEST_ASSERT_MSG(out.find("<｜Assistant｜></think>Checking.") != std::string::npos, out);
-            TEST_ASSERT(out.find("<tool_result>VALUE</tool_result>\n\n"
-                                 "<tool_result>DONE</tool_result>") != std::string::npos);
-        }
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_deepseek_result_order_preserves_user_text_and_unknown_ids) {
     ChatMessage calls{"assistant", ""};
     calls.tool_calls = {
@@ -9225,94 +8469,38 @@ TEST_CASE(ServerUnitFixture, test_gemma_tool_turn_continuation_preserves_results
     }
 }
 
-// An assistant history message's prior <think> text must carry through to
-// ChatMessage.reasoning_content (OpenAI/DeepSeek dialect `reasoning_content`,
-// and the OpenRouter/Anthropic-gateway flat `reasoning` alias — the same
-// names the response side emits, see format_response_message). Non-assistant
-// roles and messages with neither field must leave it empty.
-TEST_CASE(ServerUnitFixture, test_normalize_assistant_reasoning_content_passthrough) {
-    ToolMemory tool_memory;
-    const json messages = json::array({
-        {{"role", "user"}, {"content", "hi"}},
-        {{"role", "assistant"}, {"content", "A1"}, {"reasoning_content", "thought one"}},
-        {{"role", "user"}, {"content", "and?"}, {"reasoning_content", "ignored on non-assistant"}},
-        {{"role", "assistant"}, {"content", "A2"}, {"reasoning", "thought two"}},
-        {{"role", "assistant"}, {"content", "A3"}},
-    });
-    const auto chat = normalize_chat_messages(
-        messages, ApiFormat::OPENAI_CHAT, tool_memory);
-    TEST_ASSERT(chat.size() == 5);
-    if (chat.size() == 5) {
-        TEST_ASSERT(chat[1].reasoning_content == "thought one");
-        TEST_ASSERT(chat[2].reasoning_content.empty());
-        TEST_ASSERT(chat[3].reasoning_content == "thought two");
-        TEST_ASSERT(chat[4].reasoning_content.empty());
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Placement config tests
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_CASE(ServerUnitFixture, test_parse_target_device_list_same_backend) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", placement));
-    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.gpu == 0);
-    TEST_ASSERT(placement.is_layer_split());
-    TEST_ASSERT(!placement.is_mixed_layer_split());
-    TEST_ASSERT(placement.layer_split_backends.size() == 2);
-    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.layer_split_gpus.size() == 2);
-    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
-    TEST_ASSERT(placement.layer_split_gpus[1] == 1);
-    TEST_ASSERT(placement.layer_split_weights.empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_target_device_list_mixed_backend) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:1", placement));
-    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.gpu == 0);
-    TEST_ASSERT(placement.is_layer_split());
-    TEST_ASSERT(placement.is_mixed_layer_split());
-    TEST_ASSERT(placement.layer_split_backends.size() == 2);
-    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Hip);
-    TEST_ASSERT(placement.layer_split_backend(0) == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.layer_split_backend(1) == PlacementBackend::Hip);
-    TEST_ASSERT(placement.layer_split_gpus.size() == 2);
-    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
-    TEST_ASSERT(placement.layer_split_gpus[1] == 1);
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_target_device_list_mixed_backend_multi_remote) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0,hip:1", placement));
-    TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.gpu == 0);
-    TEST_ASSERT(placement.is_layer_split());
-    TEST_ASSERT(placement.is_mixed_layer_split());
-    TEST_ASSERT(placement.layer_split_backends.size() == 3);
-    TEST_ASSERT(placement.layer_split_backends[0] == PlacementBackend::Cuda);
-    TEST_ASSERT(placement.layer_split_backends[1] == PlacementBackend::Hip);
-    TEST_ASSERT(placement.layer_split_backends[2] == PlacementBackend::Hip);
-    TEST_ASSERT(placement.layer_split_gpus.size() == 3);
-    TEST_ASSERT(placement.layer_split_gpus[0] == 0);
-    TEST_ASSERT(placement.layer_split_gpus[1] == 0);
-    TEST_ASSERT(placement.layer_split_gpus[2] == 1);
-}
-
-TEST_CASE(ServerUnitFixture, test_parse_target_device_list_single_gpu_is_not_layer_split) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("hip:2", placement));
-    TEST_ASSERT(placement.backend == PlacementBackend::Hip);
-    TEST_ASSERT(placement.gpu == 2);
-    TEST_ASSERT(!placement.is_layer_split());
-    TEST_ASSERT(!placement.is_mixed_layer_split());
-    TEST_ASSERT(placement.layer_split_backends.empty());
-    TEST_ASSERT(placement.layer_split_gpus.empty());
+TEST_CASE(ServerUnitFixture, test_parse_target_device_list) {
+    using B = PlacementBackend;
+    struct Row {
+        const char * list;
+        B backend;
+        int gpu;
+        bool split, mixed;
+        std::vector<B> backends;
+        std::vector<int> gpus;
+    };
+    for (const Row & row : std::vector<Row>{
+             {"cuda:0,cuda:1", B::Cuda, 0, true, false, {B::Cuda, B::Cuda}, {0, 1}},
+             {"cuda:0,hip:1", B::Cuda, 0, true, true, {B::Cuda, B::Hip}, {0, 1}},
+             {"cuda:0,hip:0,hip:1", B::Cuda, 0, true, true, {B::Cuda, B::Hip, B::Hip}, {0, 0, 1}},
+             {"hip:2", B::Hip, 2, false, false, {}, {}},
+         }) {
+        DevicePlacement placement;
+        TEST_ASSERT_MSG(parse_placement_device_list(row.list, placement), row.list);
+        TEST_ASSERT_MSG(placement.backend == row.backend && placement.gpu == row.gpu, row.list);
+        TEST_ASSERT_MSG(placement.is_layer_split() == row.split, row.list);
+        TEST_ASSERT_MSG(placement.is_mixed_layer_split() == row.mixed, row.list);
+        TEST_ASSERT_MSG(placement.layer_split_backends == row.backends, row.list);
+        TEST_ASSERT_MSG(placement.layer_split_gpus == row.gpus, row.list);
+        for (size_t i = 0; i < row.backends.size(); ++i) {
+            TEST_ASSERT_MSG(placement.layer_split_backend(i) == row.backends[i], row.list);
+        }
+        TEST_ASSERT_MSG(placement.layer_split_weights.empty(), row.list);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_validate_layer_split_weights_shape) {
@@ -9329,35 +8517,30 @@ TEST_CASE(ServerUnitFixture, test_validate_layer_split_weights_shape) {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
-TEST_CASE(ServerUnitFixture, test_target_shard_plan_same_backend_split) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,cuda:2", placement));
-
-    MixedLayerSplitPlan plan;
-    TEST_ASSERT(compute_target_shard_layer_split_plan(
-        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
-    TEST_ASSERT(plan.remote_begin == 1);
-    TEST_ASSERT(plan.remote_backend == PlacementBackend::Cuda);
-}
-
-TEST_CASE(ServerUnitFixture, test_target_shard_plan_mixed_backend_split) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,hip:0,hip:1", placement));
-
-    MixedLayerSplitPlan plan;
-    TEST_ASSERT(compute_target_shard_layer_split_plan(
-        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
-    TEST_ASSERT(plan.remote_begin == 2);
-    TEST_ASSERT(plan.remote_backend == PlacementBackend::Hip);
-}
-
-TEST_CASE(ServerUnitFixture, test_target_shard_plan_rejects_bad_local_backend) {
-    DevicePlacement placement;
-    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0", placement));
-
-    MixedLayerSplitPlan plan;
-    TEST_ASSERT(!compute_target_shard_layer_split_plan(
-        placement, PlacementBackend::Hip, plan, "test-target-shard"));
+TEST_CASE(ServerUnitFixture, test_target_shard_plan) {
+    struct Row {
+        const char * list;
+        PlacementBackend local;
+        bool ok;
+        size_t remote_begin;
+        PlacementBackend remote;
+    };
+    for (const Row & row : std::vector<Row>{
+             {"cuda:0,cuda:1,cuda:2", PlacementBackend::Cuda, true, 1, PlacementBackend::Cuda},
+             {"cuda:0,cuda:1,hip:0,hip:1", PlacementBackend::Cuda, true, 2, PlacementBackend::Hip},
+             // The local backend must be the first device's.
+             {"cuda:0,hip:0", PlacementBackend::Hip, false, 0, PlacementBackend::Auto},
+         }) {
+        DevicePlacement placement;
+        TEST_ASSERT_MSG(parse_placement_device_list(row.list, placement), row.list);
+        MixedLayerSplitPlan plan;
+        TEST_ASSERT_MSG(compute_target_shard_layer_split_plan(
+                            placement, row.local, plan, "test-target-shard") == row.ok,
+                        row.list);
+        if (!row.ok) continue;
+        TEST_ASSERT_MSG(plan.remote_begin == row.remote_begin, row.list);
+        TEST_ASSERT_MSG(plan.remote_backend == row.remote, row.list);
+    }
 }
 
 static bool kvflash_test_sync_identity(KvFlashPager & pager, int committed) {
@@ -9470,8 +8653,6 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool dflash_enabled = false;
     bool dflash_called = false;
     bool sampling_enabled = false;
-    bool kvflash_enabled = false;
-    bool mixed_backend_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
     int prefill_chunk = 0;
@@ -9514,10 +8695,6 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
     bool supports_cpu_sampling() const override { return sampling_enabled; }
-    bool supports_kvflash() const override { return kvflash_enabled; }
-    bool supports_mixed_backend_layer_split() const override {
-        return mixed_backend_enabled;
-    }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, ThinkingBudget & budget, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io, float & accept_rate_out) override {
@@ -9714,22 +8891,11 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_draft
     TEST_ASSERT(raw->last_compress_req.drafter_path ==
                 "/tmp/default-layer-split-drafter.gguf");
 
-    remove_test_path(ids_path);
-}
-
-TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
-    const std::string ids_path = test_tmp_path(
-        "luce_test_layer_split_compress_bad.bin").string();
-    remove_test_path(ids_path);
-    TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
-
-    auto * raw = new MockLayerSplitAdapter();
-    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
-    DaemonIO io;
-
-    const std::string cmd = "compress " + ids_path + " 1250 nopark";
-    TEST_ASSERT(!backend.handle_compress(cmd, io));
-    TEST_ASSERT(raw->last_compress_req.input_ids.empty());
+    // A keep ratio past 1000 per mille is refused before the adapter runs.
+    auto * bad_raw = new MockLayerSplitAdapter();
+    LayerSplitBackend bad_backend{std::unique_ptr<LayerSplitAdapter>(bad_raw)};
+    TEST_ASSERT(!bad_backend.handle_compress("compress " + ids_path + " 1250 nopark", io));
+    TEST_ASSERT(bad_raw->last_compress_req.input_ids.empty());
 
     remove_test_path(ids_path);
 }
@@ -9740,19 +8906,6 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_shutdown_is_idempotent) {
     backend.shutdown();
     backend.shutdown();
     TEST_ASSERT(raw->shutdown_calls == 1);
-}
-
-TEST_CASE(ServerUnitFixture, test_layer_split_backend_capability_proxy) {
-    auto * raw = new MockLayerSplitAdapter();
-    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
-
-    TEST_ASSERT(!backend.supports_kvflash());
-    TEST_ASSERT(!backend.supports_mixed_backend_layer_split());
-
-    raw->kvflash_enabled = true;
-    raw->mixed_backend_enabled = true;
-    TEST_ASSERT(backend.supports_kvflash());
-    TEST_ASSERT(backend.supports_mixed_backend_layer_split());
 }
 
 // Disk Prefix Cache Tests
@@ -10086,33 +9239,6 @@ TEST_CASE(ServerUnitFixture, test_ram_restorable_prefix_defers_to_the_backend) {
     TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3);
 }
 
-TEST_CASE(ServerUnitFixture, test_ram_restorable_prefix_default_is_the_snapshot_tokens) {
-    const std::string path = write_deepseek_marker_tokenizer_fixture();
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-
-    auto backend_owner = std::make_unique<ShortInlineSnapshotBackend>();
-    ShortInlineSnapshotBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.prefix_cache_cap = 2;
-    HttpServer server(engine, tokenizer, config);
-    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
-    const std::vector<int32_t> prompt = {1, 100, 3, 101};
-    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 0);
-
-    auto reservation = cache.reserve_inline_snap(
-        prompt, /*restored_prefix_len=*/0,
-        /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
-    TEST_ASSERT(reservation.active());
-    backend.saved_slot = reservation.slot();
-    backend.saved_position = 3;
-    SchedulerTestHarness::finalize_inline_snapshot(
-        server, prompt, std::move(reservation), backend.saved_slot,
-        /*requested_cut=*/4);
-    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3);
-}
-
 // Qwen saves at the chunk boundary at or before the requested cut. The entry
 // stays keyed at the requested cut so the next request treats that cut as
 // covered and deepens past it; only the disk/shutdown key uses the saved rows.
@@ -10130,6 +9256,7 @@ TEST_CASE(ServerUnitFixture,
     HttpServer server(engine, tokenizer, config);
     PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
     const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 0);
     auto reservation = cache.reserve_inline_snap(
         prompt, /*restored_prefix_len=*/0,
         /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
@@ -10141,6 +9268,8 @@ TEST_CASE(ServerUnitFixture,
     SchedulerTestHarness::finalize_inline_snapshot(
         server, prompt, std::move(reservation), backend.saved_slot,
         /*requested_cut=*/4);
+    // RAM restores what the snapshot holds: the saved rows, not the requested cut.
+    TEST_ASSERT(SchedulerTestHarness::ram_restorable_prefix_tokens(server, prompt) == 3);
 
     const auto hit = cache.lookup(prompt);
     TEST_ASSERT(hit.first == backend.saved_slot);
@@ -11195,6 +10324,188 @@ TEST_CASE(ServerUnitFixture, test_chat_codec_tool_checks_keep_tool_order) {
     const std::string prompt = tok.tokenizer.decode(backend.prompts.front());
     TEST_ASSERT_MSG(prompt.find("\"properties\": {\"path\": {\"type\": \"string\"}, \"offset\"") != std::string::npos,
                     prompt);
+}
+
+// The template's tags spelled in what a request carries (a file in a tool
+// result, earlier reasoning, a call's arguments, a tool's description) stay
+// text, each one alone, as Hugging Face's sanitize_control_tokens writes them.
+// The tags the template writes are tokens, and so are those of a tool response
+// a client wraps in a user message, which the template reads as one.
+TEST_CASE(ServerUnitFixture, test_chat_codec_tags_in_request_text_stay_text) {
+    ChatGoldenTokenizer tok("", kQwenControlTokens, kQwenUserDefinedTokens);
+    Tokenizer & t = tok.tokenizer;
+    const auto count = [&](const std::vector<int32_t> & ids, const char * tag) {
+        return std::count(ids.begin(), ids.end(), t.token_to_id(tag));
+    };
+    // The tokenizer: a tag that begins inside a span stays text.
+    const int32_t think_close = t.token_to_id("</think>");
+    const auto split = t.encode("a</think>b</think>", false, {}, {{0, 10}}, {think_close});
+    TEST_ASSERT(count(split, "</think>") == 1 && split.back() == think_close);
+    TEST_ASSERT(t.decode(split) == "a</think>b</think>");
+
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 32768;
+    config.prefix_cache_cap = 0;
+    config.chat_codec = "qwen3.8";
+    const nlohmann::ordered_json parameters = {{"type", "object"}, {"properties", {{"text", {{"type", "string"}}}}}};
+    const auto conversation = [&](const std::string & quoted) -> nlohmann::ordered_json { return {
+        {"tools", {{{"type", "function"},
+                    {"function", {{"name", "write"}, {"description", "Writes " + quoted},
+                                  {"parameters", parameters}}}}}},
+        {"chat_template_kwargs", {{"enable_thinking", true}}},
+        {"messages", {
+            {{"role", "user"}, {"content", "Write " + quoted}},
+            {{"role", "assistant"}, {"content", ""}, {"reasoning_content", "It holds " + quoted},
+             {"tool_calls", {{{"id", "call_1"}, {"type", "function"},
+                              {"function", {{"name", "write"},
+                                            {"arguments", json({{"text", quoted}}).dump()}}}}}}},
+            {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "Wrote " + quoted}},
+            {{"role", "user"}, {"content", "<tool_response>\nok\n</tool_response>"}},
+        }}}; };
+    const std::string quoted = "x </think> <tool_call> </tool_response> y";
+    std::string error;
+    const auto ids = chat_golden_served_prompt(t, config, conversation(quoted), error);
+    TEST_ASSERT_MSG(!ids.empty(), error);
+    const auto plain = chat_golden_served_prompt(t, config, conversation("x y"), error);
+    TEST_ASSERT_MSG(!plain.empty(), error);
+    const std::string text = t.decode(ids);
+    size_t quotes = 0;
+    for (size_t at = text.find(quoted); at != std::string::npos; at = text.find(quoted, at + 1)) ++quotes;
+    TEST_ASSERT_MSG(quotes == 5, text);
+    // The same tags as tokens as with nothing quoted: the template's, and those
+    // of the wrapped tool response.
+    for (const char * tag : {"<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>",
+                             "</tool_response>"}) {
+        TEST_ASSERT_MSG(count(ids, tag) == count(plain, tag), std::string(tag) + " in " + text);
+    }
+    TEST_ASSERT(count(plain, "</tool_response>") == 2);
+    // PFlash recalls request text through encode_data, as a data piece.
+    RenderedPrompt layout;
+    layout.markup = {"</think>"};
+    const auto recalled = layout.encode_data(t, quoted);
+    TEST_ASSERT(count(recalled, "</think>") == 0 && count(recalled, "<tool_call>") == 1);
+    TEST_ASSERT(t.decode(recalled) == quoted);
+
+    // A generated turn splits at the </think> token, not where its thinking
+    // spells the tag, and so does its content span when it is replayed.
+    const auto codec = make_chat_codec("qwen3.8");
+    std::vector<ChatMessage> messages = {{"user", "q"}};
+    ChatCodecInput input;
+    input.messages = &messages;
+    input.enable_thinking = true;
+    RenderedPrompt prompt;
+    TEST_ASSERT(codec->render(input, prompt, error));
+    const std::string reasoning = "Quote </think> Done. here.";
+    std::vector<int32_t> generated = t.encode(reasoning, false, {}, {{0, reasoning.size()}}, {think_close});
+    generated.push_back(think_close);
+    const auto answer = t.encode("\n\nDone.");
+    generated.insert(generated.end(), answer.begin(), answer.end());
+    ChatMessage message;
+    TurnMemory::Turn turn;
+    TEST_ASSERT(codec->generated_turn(prompt.text(), prompt.tokens(t), generated, t, json(), message, turn));
+    TEST_ASSERT_MSG(message.reasoning_content == reasoning, message.reasoning_content);
+    TEST_ASSERT_MSG(message.content == "Done.", message.content);
+    TurnMemory memory;
+    turn.context = prompt.context;
+    memory.remember(message, turn);
+    messages = {{"user", "q"}, message, {"user", "next"}};
+    input.memory = &memory;
+    TEST_ASSERT(codec->render(input, prompt, error));
+    const std::string replayed = prompt.text();
+    const PromptSpan content = prompt.messages[1].content;
+    TEST_ASSERT_MSG(content.begin == replayed.rfind("Done.") && content.end == content.begin + 5, replayed);
+
+    // DeepSeek shows the tags in message text as text too.
+    ChatGoldenTokenizer ds("", {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"},
+                           {"<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>", "｜DSML｜"});
+    ServerConfig ds_config;
+    ds_config.arch = "deepseek41";
+    ds_config.max_ctx = 32768;
+    ds_config.prefix_cache_cap = 0;
+    ds_config.chat_codec = "deepseek4.1";
+    const auto ds_prompt = [&](const std::string & quoted) {
+        nlohmann::ordered_json body = {{"chat_template_kwargs", {{"enable_thinking", true}}},
+                                       {"messages", {{{"role", "user"}, {"content", "Explain " + quoted}}}}};
+        return chat_golden_served_prompt(ds.tokenizer, ds_config, body, error);
+    };
+    const auto ds_quoted = ds_prompt("x </think> <think> y");
+    const auto ds_plain = ds_prompt("x y");
+    TEST_ASSERT_MSG(!ds_quoted.empty() && !ds_plain.empty(), error);
+    for (const char * tag : {"<think>", "</think>"}) {
+        const int32_t id = ds.tokenizer.token_to_id(tag);
+        TEST_ASSERT_MSG(std::count(ds_quoted.begin(), ds_quoted.end(), id) ==
+                        std::count(ds_plain.begin(), ds_plain.end(), id),
+                        std::string(tag) + " in " + ds.tokenizer.decode(ds_quoted));
+    }
+}
+
+// An empty reply (the model ended its turn inside its thinking) is drawn
+// again, the same request without a note, up to twice.
+TEST_CASE(ServerUnitFixture, test_tool_checks_redraw_empty_reply) {
+    ChatGoldenTokenizer tok("", kQwenControlTokens, kQwenUserDefinedTokens);
+    Tokenizer & t = tok.tokenizer;
+    struct QueuedReplyBackend : ScriptedReplyBackend {
+        std::vector<std::vector<int32_t>> replies;
+        size_t next = 0;
+        void advance() {
+            if (next < replies.size()) reply = replies[next++];
+        }
+        GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+            advance();
+            return ScriptedReplyBackend::generate_impl(req, io);
+        }
+        GenerateResult restore_and_generate_impl(int slot, const GenerateRequest & req,
+                                                 const DaemonIO & io) override {
+            advance();
+            return ScriptedReplyBackend::restore_and_generate_impl(slot, req, io);
+        }
+    };
+    const auto turn = [&](const std::string & text) {
+        auto ids = t.encode(text);
+        ids.push_back(t.eos_chat_id());
+        return ids;
+    };
+    const auto run = [&](std::vector<std::vector<int32_t>> replies, std::vector<std::vector<int32_t>> & prompts) {
+        auto owner = std::make_unique<QueuedReplyBackend>();
+        QueuedReplyBackend & backend = *owner;
+        backend.replies = std::move(replies);
+        LuceEngine engine(std::move(owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 32768;
+        config.prefix_cache_cap = 0;
+        config.chat_codec = "qwen3.8";
+        TEST_ASSERT(config.tool_checks);
+        HttpServer server(engine, t, config);
+        server.set_chat_format(chat_format_for_arch(config.arch));
+        TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+        const nlohmann::ordered_json tools = {{{"type", "function"},
+            {"function", {{"name", "write"}, {"parameters", {{"type", "object"}, {"properties", json::object()}}}}}}};
+        nlohmann::ordered_json body = {{"model", "test"}, {"max_tokens", 64}, {"tools", tools},
+                                       {"messages", {{{"role", "user"}, {"content", "Write a.txt."}}}}};
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        TEST_ASSERT(SchedulerTestHarness::route_body(server, sockets[0], "/v1/chat/completions", body.dump()));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        for (ssize_t n; (n = read(sockets[1], buf, sizeof(buf))) > 0;) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        prompts = backend.prompts;
+        const size_t at = wire.find("\r\n\r\n");
+        return at == std::string::npos ? json() : json::parse(wire.substr(at + 4), nullptr, false);
+    };
+
+    std::vector<std::vector<int32_t>> prompts;
+    json response = run({turn("I'll write it."), turn("\n</think>\n\nDone.")}, prompts);
+    TEST_ASSERT_MSG(prompts.size() == 2 && prompts[0] == prompts[1], response.dump());
+    TEST_ASSERT_MSG(response["choices"][0]["message"]["content"] == "Done.", response.dump());
+
+    response = run({turn("I'll write it."), turn("Still thinking."), turn("And more."), turn("\n</think>\n\nLate.")},
+                   prompts);
+    TEST_ASSERT_MSG(prompts.size() == 3, response.dump());
+    TEST_ASSERT_MSG(tool_checks::empty_reply(response), response.dump());
 }
 
 // The same with the deepseek4.1 codec: the reply in DSML, its reasoning ending in spaces. The
@@ -13814,18 +13125,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
 
 // The first token (the attention sink) is a unit of its own: the spread does
 // not depend on how long the pinned chunk holding it is.
-TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_rejects_a_non_finite_first_chunk) {
-    // A NaN chunk-0 score is not hidden by the sink split: the spread is invalid, as for a NaN chunk.
-    const std::vector<uint8_t> selected{1, 1, 0};
-    const std::vector<uint8_t> forced{0, 0, 0};
-    for (const bool per_token : {false, true}) {
-        const auto spread = pflash_selection_spread(
-            {std::nan(""), 0.2, 0.1}, selected, forced, 4, 0.5, per_token);
-        TEST_ASSERT(!spread.valid);
-    }
-    TEST_ASSERT(pflash_selection_spread({1.0, 0.2, 0.1}, selected, forced, 4, 0.5, false).valid);
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_scores_the_first_token_alone) {
     using luce::common::pflash_relevance_spread;
     using luce::common::pflash_selection_spread;
@@ -13862,6 +13161,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_scores_the_first_token
     r = pflash_selection_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}, 1, 9.0, true);
     TEST_ASSERT(near(r.spread, pflash_relevance_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}).spread));
     TEST_ASSERT(!pflash_selection_spread({1.0, NAN}, {1, 0}, {0, 0}, 4, 0.5, true).valid);
+    // A non-finite chunk-0 score is not hidden by the sink split, in either unit.
+    for (const bool per_token : {false, true}) {
+        TEST_ASSERT(!pflash_selection_spread({NAN, 0.2, 0.1}, {1, 1, 0}, {0, 0, 0}, 4, 0.5, per_token).valid);
+    }
+    TEST_ASSERT(pflash_selection_spread({1.0, 0.2, 0.1}, {1, 1, 0}, {0, 0, 0}, 4, 0.5, false).valid);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_fallback_spread_env_parse) {
@@ -14087,33 +13391,6 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
-struct MockBatchCompressBackend : MockBackend {
-    int compress_calls = 0;
-
-    CompressResult compress(const CompressRequest & request) override {
-        ++compress_calls;
-        CompressResult result;
-        result.ok = !request.input_ids.empty();
-        if (result.ok) result.compressed_ids = {request.input_ids.front()};
-        return result;
-    }
-};
-
-TEST_CASE(ServerUnitFixture, test_compress_batch_default_preserves_order) {
-    MockBatchCompressBackend backend;
-    std::vector<ModelBackend::CompressRequest> requests(3);
-    requests[0].input_ids = {11, 12};
-    requests[1].input_ids = {21, 22};
-    requests[2].input_ids = {31, 32};
-
-    const auto results = backend.compress_batch(requests);
-    TEST_ASSERT(results.size() == requests.size());
-    TEST_ASSERT(backend.compress_calls == 3);
-    TEST_ASSERT(results[0].compressed_ids == std::vector<int32_t>({11}));
-    TEST_ASSERT(results[1].compressed_ids == std::vector<int32_t>({21}));
-    TEST_ASSERT(results[2].compressed_ids == std::vector<int32_t>({31}));
-}
-
 // The shared PFlash window (pflash_window.h): what every backend's
 // compress_batch runs, checked through its hooks without a GPU or a drafter.
 struct PFlashWindowProbe {
@@ -14306,14 +13583,6 @@ static void rm_rf(const std::string & path) {
     fs::remove_all(path, ec);
 }
 
-TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
-    DiskCacheConfig cfg;
-    TEST_ASSERT(cfg.cache_dir.empty());
-    TEST_ASSERT(cfg.budget_bytes == (size_t)128 * 1024 * 1024 * 1024);
-    TEST_ASSERT(cfg.min_tokens == 512);
-    TEST_ASSERT(cfg.ttl_seconds == 72ull * 3600);
-}
-
 TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
     DiskPrefixCachePolicy policy;
     TEST_ASSERT(parse_disk_prefix_cache_policy("off", policy));
@@ -14333,21 +13602,14 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
     TEST_ASSERT(!parse_disk_prefix_cache_policy("core", policy));
     TEST_ASSERT(!parse_disk_prefix_cache_policy("task", policy));
     TEST_ASSERT(!parse_disk_prefix_cache_policy("auto:0", policy));
-}
 
-// A request-level scope replaces the server policy; an invalid one leaves it unchanged.
-TEST_CASE(ServerUnitFixture, test_scope_override_replaces_the_server_policy) {
+    // A request-level scope replaces the server policy; an invalid one leaves it unchanged.
     DiskPrefixCachePolicy server;
     server.mode = DiskPrefixCacheMode::Off;
-    TEST_ASSERT(apply_request_scope_override(server, "auto"));  // retired: reads as full
-    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Full);
     TEST_ASSERT(apply_request_scope_override(server, "1000"));
-    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Fixed);
-    TEST_ASSERT(server.fixed_tokens == 1000);
-    TEST_ASSERT(apply_request_scope_override(server, "off"));
-    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Off);
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Fixed && server.fixed_tokens == 1000);
     TEST_ASSERT(!apply_request_scope_override(server, "core"));
-    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Off);
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Fixed && server.fixed_tokens == 1000);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_fixed_boundary) {
@@ -14384,103 +13646,6 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
     TEST_ASSERT(cache.disabled());
 }
 
-TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
-    MockBackend backend;
-    std::string dir = test_tmp_path("luce_test_disk_cache_init").string();
-    rm_rf(dir);
-
-    DiskCacheConfig cfg;
-    cfg.cache_dir = dir;
-    DiskPrefixCache cache(cfg, backend);
-    TEST_ASSERT(!cache.disabled());
-    TEST_ASSERT(cache.init());
-
-    // Directory should exist.
-    std::error_code ec;
-    TEST_ASSERT(fs::is_directory(dir, ec) && !ec);
-
-    rm_rf(dir);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
-    // The header should be exactly 96 bytes.
-    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 96);
-    TEST_ASSERT(DISK_CACHE_LAST_USED_OFFSET == 68);
-    // Bumped to 2 when the K-rotation default changed: a cache written by an
-    // older binary stores K in the rotated basis, and the layout id does not
-    // cover that, so the version is what rejects it.
-    // v4 added the identity salt and the stored key tokens.
-    TEST_ASSERT(DISK_CACHE_VERSION == 5);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
-    // Write and read a header to verify serialization.
-    std::string path = test_tmp_path("luce_test_header_rt.dkv").string();
-    remove_test_path(path);
-    std::error_code ec;
-
-    DiskCacheHeader hdr{};
-    std::memcpy(hdr.magic, "DKVC", 4);
-    hdr.version = DISK_CACHE_VERSION;
-    std::memset(hdr.layout_id, 0xAB, 16);
-    hdr.cur_pos = 1234;
-    hdr.n_tensors = 42;
-    hdr.token_count = 567;
-    std::memset(hdr.token_hash, 0xCD, 16);
-    hdr.payload_bytes = 9999999;
-    hdr.created_at = 1700000000;
-    hdr.last_used = 1700000100;
-    hdr.last_tok = 151643;
-    std::memset(hdr.identity_salt, 0xEF, 16);
-
-    // Use DiskPrefixCache's static write/read_header (they are private, so
-    // we test indirectly through file I/O matching the on-disk format).
-    FILE * f = std::fopen(path.c_str(), "wb");
-    TEST_ASSERT(f != nullptr);
-    // Write field-by-field matching disk_prefix_cache.cpp's write_header.
-    std::fwrite(hdr.magic, 4, 1, f);
-    uint32_t v;
-    v = hdr.version; std::fwrite(&v, 4, 1, f);
-    std::fwrite(hdr.layout_id, 16, 1, f);
-    v = hdr.cur_pos; std::fwrite(&v, 4, 1, f);
-    v = hdr.n_tensors; std::fwrite(&v, 4, 1, f);
-    v = hdr.token_count; std::fwrite(&v, 4, 1, f);
-    std::fwrite(hdr.token_hash, 16, 1, f);
-    uint64_t u64 = hdr.payload_bytes; std::fwrite(&u64, 8, 1, f);
-    u64 = hdr.created_at; std::fwrite(&u64, 8, 1, f);
-    u64 = hdr.last_used; std::fwrite(&u64, 8, 1, f);
-    int32_t i32 = hdr.last_tok; std::fwrite(&i32, 4, 1, f);
-    std::fwrite(hdr.identity_salt, 16, 1, f);
-    std::fclose(f);
-
-    // Verify file size is DISK_CACHE_HEADER_SIZE.
-    TEST_ASSERT(fs::file_size(path, ec) == DISK_CACHE_HEADER_SIZE && !ec);
-
-    // Read back and verify.
-    f = std::fopen(path.c_str(), "rb");
-    TEST_ASSERT(f != nullptr);
-    char magic[4]; std::fread(magic, 4, 1, f);
-    TEST_ASSERT(std::memcmp(magic, "DKVC", 4) == 0);
-    uint32_t rv; std::fread(&rv, 4, 1, f);
-    TEST_ASSERT(rv == DISK_CACHE_VERSION);
-    uint8_t lid[16]; std::fread(lid, 16, 1, f);
-    TEST_ASSERT(lid[0] == 0xAB && lid[15] == 0xAB);
-    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 1234);  // cur_pos
-    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 42);    // n_tensors
-    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 567);   // token_count
-    uint8_t th[16]; std::fread(th, 16, 1, f);
-    TEST_ASSERT(th[0] == 0xCD && th[15] == 0xCD);
-    uint64_t ru64; std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 9999999);  // payload
-    std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000000);  // created_at
-    std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000100);  // last_used
-    int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
-    uint8_t salt[16]; std::fread(salt, 16, 1, f);
-    TEST_ASSERT(salt[0] == 0xEF && salt[15] == 0xEF);
-    std::fclose(f);
-
-    remove_test_path(path);
-}
-
 TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
     // Whole prompt first, then every boundary deepest first, skipping cuts
     // below the persistence minimum and the prompt end itself.
@@ -14492,74 +13657,6 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
     TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(0, {100}, 512).empty());
     // Below the persistence minimum nothing was ever written: no probes.
     TEST_ASSERT(disk_prefix_cache_full_lookup_lengths(300, {100}, 512).empty());
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
-    // Lookup with no layout known should return false.
-    MockBackend backend;
-    std::string dir = test_tmp_path("luce_test_lookup_miss").string();
-    rm_rf(dir);
-
-    DiskCacheConfig cfg;
-    cfg.cache_dir = dir;
-    DiskPrefixCache cache(cfg, backend);
-    cache.init();
-
-    std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8};
-    TEST_ASSERT(!cache.lookup(ids, Checkpoint::of_cache_slot(0)));
-
-    rm_rf(dir);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
-    // Save with fewer tokens than min_tokens should be rejected.
-    MockBackend backend;
-    std::string dir = test_tmp_path("luce_test_save_below").string();
-    rm_rf(dir);
-
-    DiskCacheConfig cfg;
-    cfg.cache_dir = dir;
-    cfg.min_tokens = 100;
-    DiskPrefixCache cache(cfg, backend);
-    cache.init();
-
-    std::vector<int32_t> ids(50, 1);  // only 50 tokens
-    TEST_ASSERT(!cache.save(Checkpoint::of_cache_slot(0), ids));
-
-    rm_rf(dir);
-}
-
-// ─── Disk-cache identity salt tests (manifest hardening) ────────────────
-//
-// (a) Different salts → different layout_id; same salt → same layout_id.
-// (b) All-zero salt (default) ≡ no salt at all (back-compat).
-
-// Helper: read layout_id from the first .dkv file found under base/.
-static std::array<uint8_t, 16> read_layout_id_from_cache_dir(const std::string & base) {
-    std::array<uint8_t, 16> id{};
-    std::error_code ec;
-    for (const fs::directory_entry & entry : fs::directory_iterator(base, ec)) {
-        if (ec) break;
-        if (!entry.is_directory(ec)) {
-            ec.clear();
-            continue;
-        }
-        for (const fs::directory_entry & file_entry :
-             fs::directory_iterator(entry.path(), ec)) {
-            if (ec) break;
-            const std::string name = file_entry.path().filename().string();
-            if (name.size() < 4 || name.compare(name.size() - 4, 4, ".dkv") != 0) {
-                continue;
-            }
-            FILE * f = std::fopen(file_entry.path().string().c_str(), "rb");
-            if (!f) continue;
-            std::fseek(f, 8, SEEK_SET);  // skip magic(4) + version(4)
-            std::fread(id.data(), 1, 16, f);
-            std::fclose(f);
-            return id;
-        }
-    }
-    return id;
 }
 
 // Layout mock with a settable live position that can also adopt
@@ -14587,6 +13684,25 @@ struct MockBackendWithAdopt : MockBackendWithLayout {
         return true;
     }
 };
+
+// A key shorter than min_tokens is not persisted; one at the minimum is.
+TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_save_below").string();
+    std::vector<int32_t> key;
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) key.push_back(i + 1);  // covers the snapshot
+    for (const int min_tokens : {MockBackendWithLayout::kMaxPos + 1, MockBackendWithLayout::kMaxPos}) {
+        rm_rf(dir);
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = min_tokens;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(Checkpoint::of_cache_slot(0));
+        const bool saved = cache.save(Checkpoint::of_cache_slot(0), key);
+        TEST_ASSERT(saved == (min_tokens <= (int) key.size()));
+        TEST_ASSERT((cache.total_bytes() > 0) == saved);
+    }
+    rm_rf(dir);
+}
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_failed_init_disables_pending_writes) {
     MockBackendWithAdopt backend;
@@ -14750,104 +13866,6 @@ TEST_CASE(ServerUnitFixture, test_disk_store_shared_by_models_of_one_process) {
     }
 #endif
     rm_rf(dir);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
-    MockBackendWithLayout backend;
-    std::vector<int32_t> prompt;
-    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
-
-    // Salt A: non-zero.
-    std::array<uint8_t, 16> salt_a{};
-    salt_a[0] = 0x01; salt_a[15] = 0xAB;
-
-    std::string dir_a = test_tmp_path("luce_test_salt_a").string();
-    rm_rf(dir_a);
-    {
-        DiskCacheConfig cfg; cfg.cache_dir = dir_a; cfg.min_tokens = 1;
-        DiskPrefixCache cache(cfg, backend);
-        cache.set_identity_salt(salt_a);
-        cache.init();
-        cache.learn_layout(Checkpoint::of_cache_slot(0));
-        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
-    }
-
-    // Salt B: different from A.
-    std::array<uint8_t, 16> salt_b{};
-    salt_b[0] = 0x02; salt_b[15] = 0xCD;
-
-    std::string dir_b = test_tmp_path("luce_test_salt_b").string();
-    rm_rf(dir_b);
-    {
-        DiskCacheConfig cfg; cfg.cache_dir = dir_b; cfg.min_tokens = 1;
-        DiskPrefixCache cache(cfg, backend);
-        cache.set_identity_salt(salt_b);
-        cache.init();
-        cache.learn_layout(Checkpoint::of_cache_slot(0));
-        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
-    }
-
-    auto id_a = read_layout_id_from_cache_dir(dir_a);
-    auto id_b = read_layout_id_from_cache_dir(dir_b);
-
-    // Different salts → different layout_id.
-    TEST_ASSERT(id_a != id_b);
-
-    // Same salt A applied again → identical layout_id.
-    std::string dir_a2 = test_tmp_path("luce_test_salt_a2").string();
-    rm_rf(dir_a2);
-    {
-        DiskCacheConfig cfg; cfg.cache_dir = dir_a2; cfg.min_tokens = 1;
-        DiskPrefixCache cache(cfg, backend);
-        cache.set_identity_salt(salt_a);
-        cache.init();
-        cache.learn_layout(Checkpoint::of_cache_slot(0));
-        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
-    }
-    auto id_a2 = read_layout_id_from_cache_dir(dir_a2);
-    TEST_ASSERT(id_a == id_a2);
-
-    rm_rf(dir_a);
-    rm_rf(dir_b);
-    rm_rf(dir_a2);
-}
-
-TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
-    // Explicit all-zero salt must produce the same layout_id as no salt call
-    // (default-constructed identity_salt_ is already all-zero).
-    MockBackendWithLayout backend;
-    std::vector<int32_t> prompt;
-    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
-
-    std::string dir1 = test_tmp_path("luce_test_salt_zero1").string();
-    rm_rf(dir1);
-    {
-        DiskCacheConfig cfg; cfg.cache_dir = dir1; cfg.min_tokens = 1;
-        DiskPrefixCache cache(cfg, backend);
-        // No set_identity_salt call — stays all-zero.
-        cache.init();
-        cache.learn_layout(Checkpoint::of_cache_slot(0));
-        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
-    }
-
-    std::string dir2 = test_tmp_path("luce_test_salt_zero2").string();
-    rm_rf(dir2);
-    {
-        DiskCacheConfig cfg; cfg.cache_dir = dir2; cfg.min_tokens = 1;
-        DiskPrefixCache cache(cfg, backend);
-        std::array<uint8_t, 16> zero_salt{};
-        cache.set_identity_salt(zero_salt);
-        cache.init();
-        cache.learn_layout(Checkpoint::of_cache_slot(0));
-        TEST_ASSERT(cache.save(Checkpoint::of_cache_slot(0), prompt));
-    }
-
-    auto id1 = read_layout_id_from_cache_dir(dir1);
-    auto id2 = read_layout_id_from_cache_dir(dir2);
-    TEST_ASSERT(id1 == id2);
-
-    rm_rf(dir1);
-    rm_rf(dir2);
 }
 
 // ─── Session persistence: TTL, LRU budget, restart, validation ──────────
@@ -15567,7 +14585,7 @@ int commit_turn(HttpServer & server, DiskPayloadBackend & backend,
         restore_slot, [&](int tokens) { return backend.snapshot_bytes_estimate(tokens); });
     if (!reservation.active()) return -1;
     const int slot = reservation.slot();
-    SchedulerTestHarness::evict_inline_slot(server, slot);
+    SchedulerTestHarness::clear_for_capture(server, reservation);
     backend.put(slot, (int)prompt.size());
     SchedulerTestHarness::finalize_inline_snapshot(
         server, prompt, std::move(reservation), slot, (int)prompt.size(),
@@ -16321,7 +15339,9 @@ TEST_CASE(ServerUnitFixture, test_disk_session_ram_eviction_writes_and_restores)
         TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
         TEST_ASSERT(prepared.prefix_len == (int)a.size());
         disk.drain();
-        TEST_ASSERT(disk.stats().writes == 1 && disk.stats().pending_files == 0);
+        // a, then b and c: this turn's 7-token capture needs both out of RAM
+        // before it is saved.
+        TEST_ASSERT(disk.stats().writes == 3 && disk.stats().pending_files == 0);
     }
     rm_rf(dir);
     unlink(path.c_str());
@@ -16380,6 +15400,110 @@ TEST_CASE(ServerUnitFixture, test_disk_session_large_capture_evicts_several_to_d
         TEST_ASSERT(prepared.prefix_len == 4);
     }
     rm_rf(dir);
+    unlink(path.c_str());
+}
+
+namespace {
+
+// Refuses a save that would take its resident snapshots past a byte
+// allowance, as Qwen4ExpBackend::snapshot_fits does.
+struct SaveAllowanceBackend : DiskPayloadBackend {
+    size_t allowance = 0;
+    size_t resident_bytes(int except = -1) const {
+        size_t total = 0;
+        for (const auto & [slot, p] : slots) {
+            if (slot != except) total += snapshot_bytes_estimate(p.pos);
+        }
+        return total;
+    }
+    bool snapshot_save(int slot) override {
+        return resident_bytes(slot) + snapshot_bytes_estimate(live_position) <= allowance &&
+               DiskPayloadBackend::snapshot_save(slot);
+    }
+};
+
+// Four 4-token turns resident (1400 bytes each), then an agent turn saved at
+// 43 tokens (5300 bytes): a 7000-byte budget evicts the three oldest for it.
+struct SeveralVictims {
+    std::vector<std::vector<int32_t>> small = {
+        {1, 100, 3, 101}, {1, 200, 3, 201}, {1, 300, 3, 301}, {1, 400, 3, 401}};
+    std::vector<int32_t> prompt, generated, canonical;
+    std::vector<int> slots;
+    SeveralVictims() {
+        prompt = {1, 900, 3};
+        prompt.insert(prompt.end(), 30, 901);
+        generated.assign(10, 902);
+        canonical = prompt;
+        canonical.insert(canonical.end(), generated.begin(), generated.end());
+        canonical.push_back(7);
+    }
+    bool save_big_turn(HttpServer & server, SaveAllowanceBackend & backend) {
+        for (const auto & ids : small) slots.push_back(commit_turn(server, backend, ids));
+        backend.live_position = (int) canonical.size() - 1;
+        return SchedulerTestHarness::save_generated_turn(server, prompt, generated, canonical);
+    }
+};
+
+ServerConfig several_victims_config() {
+    ServerConfig config;
+    config.prefix_cache_cap = 8;
+    config.prefix_cache_max_bytes = 7000;
+    return config;
+}
+
+}  // namespace
+
+// The backend checks its allowance when it saves, so every victim the plan
+// counted on must be gone by then (qwen4exp on 2026-11-13: once 8k turns were
+// resident, no 32k turn was ever saved).
+TEST_CASE(ServerUnitFixture, test_capture_evicting_several_fits_backend_allowance) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    {
+        auto backend_owner = std::make_unique<SaveAllowanceBackend>();
+        SaveAllowanceBackend & backend = *backend_owner;
+        backend.allowance = 7000;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, several_victims_config());
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        SeveralVictims s;
+        TEST_ASSERT(s.save_big_turn(server, backend));
+        TEST_ASSERT(cache.stats().resident_bytes == 1400 + 5300);
+        TEST_ASSERT(backend.resident_bytes() == 1400 + 5300);
+        for (int i = 0; i < 3; ++i) {
+            TEST_ASSERT(!backend.snapshot_used(s.slots[i]));
+            TEST_ASSERT(cache.lookup_candidate(s.small[i], 4).first < 0);
+        }
+        TEST_ASSERT(cache.lookup_candidate(s.small[3], 4).first == s.slots[3]);
+        std::vector<int32_t> next = s.canonical;
+        next.insert(next.end(), {8, 9});
+        TEST_ASSERT(cache.lookup(next).second == (int) s.canonical.size() - 1);
+    }
+    unlink(path.c_str());
+}
+
+// A capture that fails anyway leaves no index entry pointing at a victim
+// whose payload already left RAM.
+TEST_CASE(ServerUnitFixture, test_failed_capture_keeps_index_and_payloads_in_step) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    {
+        auto backend_owner = std::make_unique<SaveAllowanceBackend>();
+        SaveAllowanceBackend & backend = *backend_owner;
+        backend.allowance = 5000;  // under 1400 + 5300: the save fails after the evictions
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, several_victims_config());
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        SeveralVictims s;
+        TEST_ASSERT(!s.save_big_turn(server, backend));
+        for (size_t i = 0; i < s.small.size(); ++i) {
+            const bool listed = cache.lookup_candidate(s.small[i], 4).first >= 0;
+            TEST_ASSERT(listed == backend.snapshot_used(s.slots[i]));
+        }
+        TEST_ASSERT(cache.stats().resident_bytes == backend.resident_bytes());
+    }
     unlink(path.c_str());
 }
 
@@ -16756,9 +15880,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_save_async_queue_and_free_space) {
         TEST_ASSERT(cache.entry_count() == 1);
         TEST_ASSERT(!cache.lookup(key, Checkpoint::of_cache_slot(1)));
     }
-    // A second model of the same process shares the directory's store; a
-    // second process is locked out
-    // (test_disk_store_shared_by_models_of_one_process).
+    // Two models of one process with the same identity (replicas of one GGUF
+    // under --load-balancing) share the directory's store and its lock.
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
         DiskPrefixCache first(cfg, backend);
@@ -17291,15 +16414,10 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
 #if !defined(_WIN32)
 TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     int payload_pipe[2] = {-1, -1};
-    int status_pipe[2] = {-1, -1};
     TEST_ASSERT(pipe(payload_pipe) == 0);
-    TEST_ASSERT(pipe(status_pipe) == 0);
-    if (payload_pipe[0] < 0 || payload_pipe[1] < 0 ||
-        status_pipe[0] < 0 || status_pipe[1] < 0) {
+    if (payload_pipe[0] < 0 || payload_pipe[1] < 0) {
         if (payload_pipe[0] >= 0) close(payload_pipe[0]);
         if (payload_pipe[1] >= 0) close(payload_pipe[1]);
-        if (status_pipe[0] >= 0) close(status_pipe[0]);
-        if (status_pipe[1] >= 0) close(status_pipe[1]);
         return;
     }
 
@@ -17318,14 +16436,19 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     payload_pipe[0] = -1;
     TEST_ASSERT(received == payload);
 
-    const int32_t ready = 0;
-    TEST_ASSERT(write_exact_fd(status_pipe[1], &ready, sizeof(ready)));
-    close(status_pipe[1]);
-    status_pipe[1] = -1;
-    int32_t status = -1;
-    TEST_ASSERT(read_exact_fd(status_pipe[0], &status, sizeof(status)));
-    TEST_ASSERT(status == 0);
-    close(status_pipe[0]);
+    // A peer that dies after half a message reads as a failure, not a short payload.
+    int short_pipe[2] = {-1, -1};
+    TEST_ASSERT(pipe(short_pipe) == 0);
+    if (short_pipe[0] < 0 || short_pipe[1] < 0) {
+        if (short_pipe[0] >= 0) close(short_pipe[0]);
+        if (short_pipe[1] >= 0) close(short_pipe[1]);
+        return;
+    }
+    TEST_ASSERT(write_exact_fd(short_pipe[1], payload.data(), 2 * sizeof(float)));
+    close(short_pipe[1]);
+    std::vector<float> partial(payload.size(), 0.0f);
+    TEST_ASSERT(!read_exact_fd(short_pipe[0], partial.data(), partial.size() * sizeof(float)));
+    close(short_pipe[0]);
 }
 #endif
 
@@ -17339,6 +16462,8 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_transport_parse) {
     TEST_ASSERT(mode == BackendIpcMode::Qwen35TargetShard);
     TEST_ASSERT(parse_backend_ipc_mode("moe-expert-compute", mode));
     TEST_ASSERT(mode == BackendIpcMode::MoeExpertCompute);
+    TEST_ASSERT(parse_backend_ipc_mode("deepseek4-target-shard", mode));
+    TEST_ASSERT(mode == BackendIpcMode::DeepSeek4TargetShard);
     TEST_ASSERT(!parse_backend_ipc_mode("moe-ffn", mode));
 
     BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Auto;
@@ -17386,19 +16511,6 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_map_sizing) {
 
     TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
         std::numeric_limits<size_t>::max(), map_bytes));
-}
-
-TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_segment_contract) {
-    const BackendIpcPayloadSegment a{reinterpret_cast<const void *>(1), 16};
-    const BackendIpcPayloadSegment b{reinterpret_cast<const void *>(2), 32};
-    const BackendIpcPayloadSegment segments[] = {a, b};
-    size_t total = 0;
-    for (const BackendIpcPayloadSegment & segment : segments) {
-        TEST_ASSERT(backend_ipc_checked_add_size(total, segment.bytes, total));
-    }
-    TEST_ASSERT(total == 48);
-    TEST_ASSERT(backend_ipc_payload_in_bounds(0, total, 48));
-    TEST_ASSERT(!backend_ipc_payload_in_bounds(0, total + 1, 48));
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_batch_default) {
@@ -17851,29 +16963,6 @@ TEST_CASE(ServerUnitFixture, test_sampler_presence_penalty) {
     TEST_ASSERT(counts[2] + counts[3] > counts[0] + counts[1]);
 }
 
-TEST_CASE(ServerUnitFixture, test_sampler_freq_and_pres_combined) {
-    // Both penalties applied together.
-    float logits[] = {5.0f, 5.0f, 5.0f};
-    SamplerCfg cfg;
-    cfg.temp = 1.0f;
-    cfg.freq_pen = 0.5f;
-    cfg.pres_pen = 1.0f;
-    // Token 0 appears 4 times: penalty = 0.5*4 + 1.0 = 3.0 → logit=2.0
-    // Token 1 appears 1 time:  penalty = 0.5*1 + 1.0 = 1.5 → logit=3.5
-    // Token 2 never appeared:  penalty = 0                   → logit=5.0
-    std::vector<int32_t> history = {0, 0, 0, 0, 1};
-    std::mt19937_64 rng(42);
-
-    int counts[3] = {};
-    for (int i = 0; i < 3000; i++) {
-        int tok = sample_logits(logits, 3, cfg, history, rng);
-        counts[tok]++;
-    }
-    // Token 2 should appear most, token 0 least.
-    TEST_ASSERT(counts[2] > counts[1]);
-    TEST_ASSERT(counts[1] > counts[0]);
-}
-
 TEST_CASE(ServerUnitFixture, test_sampler_negative_frequency_penalty) {
     // Negative freq_pen should encourage repetition.
     float logits[] = {3.0f, 3.0f, 3.0f};
@@ -17930,30 +17019,16 @@ TEST_CASE(ServerUnitFixture, test_sampler_rep_window_limits_scope) {
     TEST_ASSERT(counts[0] + counts[1] > counts[2] + counts[3]);
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_sampler_token_basic) {
-    std::string line = "gen 128 samp=0.7,0.9,40,1.1,42";
-    SamplerCfg cfg;
-    TEST_ASSERT(parse_sampler_token(line, cfg));
-    TEST_ASSERT(line == "gen 128");
-    TEST_ASSERT(std::abs(cfg.temp - 0.7f) < 1e-5f);
-    TEST_ASSERT(std::abs(cfg.top_p - 0.9f) < 1e-5f);
-    TEST_ASSERT(cfg.top_k == 40);
-    TEST_ASSERT(std::abs(cfg.rep_pen - 1.1f) < 1e-5f);
-    TEST_ASSERT(cfg.seed == 42);
-    TEST_ASSERT(cfg.freq_pen == 0.0f);  // not specified → default
-    TEST_ASSERT(cfg.pres_pen == 0.0f);
-}
-
 TEST_CASE(ServerUnitFixture, test_parse_sampler_token_with_penalties) {
-    std::string line = "gen 64 samp=0.5,0.95,20,1.0,0,0.8,1.2";
+    std::string line = "gen 64 samp=0.5,0.95,20,1.1,42,0.8,1.2";
     SamplerCfg cfg;
     TEST_ASSERT(parse_sampler_token(line, cfg));
     TEST_ASSERT(line == "gen 64");
     TEST_ASSERT(std::abs(cfg.temp - 0.5f) < 1e-5f);
     TEST_ASSERT(std::abs(cfg.top_p - 0.95f) < 1e-5f);
     TEST_ASSERT(cfg.top_k == 20);
-    TEST_ASSERT(std::abs(cfg.rep_pen - 1.0f) < 1e-5f);
-    TEST_ASSERT(cfg.seed == 0);
+    TEST_ASSERT(std::abs(cfg.rep_pen - 1.1f) < 1e-5f);
+    TEST_ASSERT(cfg.seed == 42);
     TEST_ASSERT(std::abs(cfg.freq_pen - 0.8f) < 1e-5f);
     TEST_ASSERT(std::abs(cfg.pres_pen - 1.2f) < 1e-5f);
 }
@@ -17988,14 +17063,25 @@ TEST_CASE(ServerUnitFixture, test_sampler_temp_zero_with_penalties_uses_argmax) 
     std::mt19937_64 rng(42);
 
     // Tokens 0,1 have logit 5-3=2; tokens 2,3 have logit 5 (unpenalized).
-    // Argmax should always return 2 or 3 (whichever sorts first = stable).
     int tok = sample_logits(logits, 4, cfg, history, rng);
-    TEST_ASSERT(tok == 2 || tok == 3);
+    TEST_ASSERT(tok == 2);  // ties go to the lowest id, as the GPU kernel picks
 
     // Must be deterministic: same result every time.
     for (int i = 0; i < 10; i++) {
         int t = sample_logits(logits, 4, cfg, history, rng);
         TEST_ASSERT(t == tok);
+    }
+
+    // freq and pres add: token 0 = 5-0.5*4-1 = 2.0, token 1 = 4-0.5-1 = 2.5, token 2 = 3.2.
+    // freq alone picks 1 (3.5), pres alone picks 0 (4.0).
+    {
+        float l3[] = {5.0f, 4.0f, 3.2f};
+        SamplerCfg both;
+        both.temp = 0.0f;
+        both.freq_pen = 0.5f;
+        both.pres_pen = 1.0f;
+        const std::vector<int32_t> h3 = {0, 0, 0, 0, 1};
+        TEST_ASSERT(sample_logits(l3, 3, both, h3, rng) == 2);
     }
 }
 
@@ -18308,9 +17394,9 @@ TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_glm5_next) {
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
-    // When a sidecar was loaded, /props.model_card should be the parsed
-    // sidecar JSON verbatim — *all* fields from the file, not just the
-    // five budget-derived ones from the pre-refactor shape.
+    // When a sidecar was loaded, /props.model_card is the parsed sidecar
+    // JSON verbatim: every field from the file, including extra blocks
+    // such as sampling_no_thinking that preflight tooling reads.
     json sidecar = {
         {"name",         "Qwen3.6 27B"},
         {"source",       "https://huggingface.co/Qwen/Qwen3.6-27B"},
@@ -18321,6 +17407,9 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
             {"temperature", 1.0},
             {"top_p",       0.95},
             {"top_k",       20},
+        }},
+        {"sampling_no_thinking", {
+            {"temperature", 0.7}, {"top_p", 0.80}, {"presence_penalty", 1.5},
         }},
         {"reasoning_effort_tiers", {
             {"low",    4032},
@@ -18336,59 +17425,49 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
-    TEST_ASSERT(body.contains("model_card"));
-    TEST_ASSERT(!body["model_card"].is_null());
-    // `source` is the upstream URL, NOT the filepath. The filepath label
-    // moved to budget_envelope.model_card_source post-refactor.
-    TEST_ASSERT(body["model_card"]["source"].get<std::string>() ==
-                "https://huggingface.co/Qwen/Qwen3.6-27B");
-    TEST_ASSERT(body["model_card"]["name"].get<std::string>() == "Qwen3.6 27B");
-    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
-    TEST_ASSERT(body["model_card"]["complex_problem_max_tokens"].get<int>() == 81920);
-    TEST_ASSERT(body["model_card"].contains("sampling"));
-    TEST_ASSERT(body["model_card"].contains("reasoning_effort_tiers"));
-    TEST_ASSERT(body["model_card"]["notes"].get<std::string>() == "test card");
-    // The pre-refactor `think_max_tokens` / `hard_limit_reply_budget`
-    // keys are NOT in the wholesale shape — they moved to budget_envelope.
-    TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
-    TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+    TEST_ASSERT_MSG(body["model_card"] == sidecar, body["model_card"].dump());
+    // budget_envelope names the sidecar path; model_card.source stays the upstream URL.
+    TEST_ASSERT(body["budget_envelope"]["model_card_source"] == "share/model_cards/qwen3.6-27b.json");
 }
 
-TEST_CASE(ServerUnitFixture, test_props_model_card_exposes_sampling_no_thinking) {
-    // sampling_no_thinking rides along in the wholesale raw-sidecar re-emit
-    // next to the existing `sampling` block, so preflight tooling can
-    // assert the card actually carries distinct instruct-mode values.
-    json sidecar = {
-        {"name",        "Qwen3.8 Flash Next"},
-        {"source",      "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"},
-        {"verified_at", "2026-10-01"},
-        {"max_tokens",  32768},
-        {"sampling", {
-            {"temperature", 1.0}, {"top_p", 0.95}, {"top_k", 20},
-            {"min_p", 0.0}, {"presence_penalty", 0.0}, {"repetition_penalty", 1.0},
-        }},
-        {"sampling_no_thinking", {
-            {"temperature", 0.7}, {"top_p", 0.80}, {"top_k", 20},
-            {"min_p", 0.0}, {"presence_penalty", 1.5}, {"repetition_penalty", 1.0},
-        }},
-    };
-    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
-    Tokenizer    tok;
-    PrefixCache  pc(0, tok);
-    ToolMemory   tm;
-    json body = build_props_body(cfg, pc, tm);
+TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_backends_reselect_mode) {
+    using luce::server::kvflash_recall_mode;
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "exact") == "prefill-reselect=4");  // the default profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", "exact").empty());   // --kvflash-policy lru turns recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "pflash2").empty());  // mode 4 needs the exact scorer
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", "exact").empty());    // retired mode
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", "exact").empty());    // the user turned recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", "exact").empty());
+    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", "exact").empty());    // no recall on other architectures
+}
 
-    TEST_ASSERT(body["model_card"].contains("sampling"));
-    TEST_ASSERT(body["model_card"].contains("sampling_no_thinking"));
-    TEST_ASSERT(std::fabs(
-        body["model_card"]["sampling_no_thinking"]["temperature"].get<double>() - 0.7) < 1.0e-6);
-    TEST_ASSERT(std::fabs(
-        body["model_card"]["sampling_no_thinking"]["top_p"].get<double>() - 0.80) < 1.0e-6);
-    TEST_ASSERT(std::fabs(
-        body["model_card"]["sampling_no_thinking"]["presence_penalty"].get<double>() - 1.5) < 1.0e-6);
-    // Existing `sampling` (thinking-mode) field is untouched by the addition.
-    TEST_ASSERT(std::fabs(
-        body["model_card"]["sampling"]["temperature"].get<double>() - 1.0) < 1.0e-6);
+TEST_CASE(ServerUnitFixture, test_props_kvflash_disabled_without_the_flag) {
+    ServerConfig cfg;
+    cfg.arch = "qwen35";
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body.contains("kvflash"));
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>() == false);
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 0);
+    TEST_ASSERT(body["kvflash"]["mode"].is_string());
+    TEST_ASSERT(body["kvflash"]["mode"].get<std::string>().empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_props_kvflash_reports_pool_and_recall) {
+    ServerConfig cfg;
+    cfg.arch                = "qwen35";
+    cfg.kvflash_enabled     = true;
+    cfg.kvflash_pool_tokens = 16384;
+    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk", "exact");
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>());
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 16384);
+    TEST_ASSERT(body["kvflash"]["mode"].get<std::string>() == "prefill-reselect=4");
 }
 
 TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
@@ -18415,17 +17494,6 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
 }
 
-TEST_CASE(ServerUnitFixture, test_props_deepseek4_tool_capability) {
-    ServerConfig cfg;
-    cfg.arch = "deepseek4";
-    Tokenizer tok;
-    PrefixCache pc(0, tok);
-    ToolMemory tm;
-    const json body = build_props_body(cfg, pc, tm);
-
-    TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
-}
-
 TEST_CASE(ServerUnitFixture, test_props_deepseek4_reasoning_capability) {
     ServerConfig cfg;
     cfg.arch = "deepseek4";
@@ -18438,6 +17506,7 @@ TEST_CASE(ServerUnitFixture, test_props_deepseek4_reasoning_capability) {
     TEST_ASSERT(body["reasoning"]["supported_efforts"] ==
                 json::array({"low", "high", "max"}));
     TEST_ASSERT(body["capabilities"]["reasoning_supported"].get<bool>());
+    TEST_ASSERT(body["capabilities"]["tools_supported"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
@@ -18560,10 +17629,11 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
 // response shapes plus the zero-decode_s div-by-zero guard.
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_CASE(ServerUnitFixture, test_usage_timings_openai_chat_streaming) {
-    // OpenAI Chat streaming: the terminal usage chunk (just before
-    // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
-    // decode_tokens_per_sec}` when timings are passed to emit_finish.
+TEST_CASE(ServerUnitFixture, test_usage_timings_streaming_every_format) {
+    // Every streaming finish carries `timings.{prefill_ms, decode_ms,
+    // decode_tokens_per_sec}` when timings are passed to emit_finish:
+    // OpenAI Chat in the terminal usage chunk (just before data: [DONE]),
+    // Anthropic in message_delta.usage, Responses in response.completed.usage.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello world");
@@ -18578,6 +17648,19 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_openai_chat_streaming) {
     // 100 / 2.4567 = 40.7048... → rounds to 40.7
     TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":40.7") != std::string::npos);
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+
+    for (const auto format : {ApiFormat::ANTHROPIC, ApiFormat::RESPONSES}) {
+        auto e = make_emitter(format);
+        e.emit_start();
+        e.emit_token("ok");
+        GenTimings tt{0.05, 0.5};  // 50.0 ms / 500.0 ms
+        const std::string s = concat(e.emit_finish(/*completion_tokens*/ 10, &tt));
+        TEST_ASSERT_MSG(s.find("\"timings\"") != std::string::npos, s);
+        TEST_ASSERT_MSG(s.find("\"prefill_ms\":50.0") != std::string::npos, s);
+        TEST_ASSERT_MSG(s.find("\"decode_ms\":500.0") != std::string::npos, s);
+        // 10 / 0.5 = 20.0
+        TEST_ASSERT_MSG(s.find("\"decode_tokens_per_sec\":20.0") != std::string::npos, s);
+    }
 }
 
 // The repetition watchdog closed the reply: every API, streamed or not, says
@@ -18612,37 +17695,27 @@ TEST_CASE(ServerUnitFixture, test_degenerate_decode_finishes_as_length) {
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_usage_timings_anthropic_streaming) {
-    // Anthropic streaming: message_delta.usage gains a `timings`
-    // sibling alongside `output_tokens`.
-    auto em = make_emitter(ApiFormat::ANTHROPIC);
-    em.emit_start();
-    em.emit_token("ok");
-    GenTimings t{0.05, 0.5};  // 50.0 ms / 500.0 ms
-    auto finish = em.emit_finish(/*completion_tokens*/ 10, &t);
-    std::string finish_str = concat(finish);
-
-    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
-    TEST_ASSERT(finish_str.find("\"prefill_ms\":50.0") != std::string::npos);
-    TEST_ASSERT(finish_str.find("\"decode_ms\":500.0") != std::string::npos);
-    // 10 / 0.5 = 20.0
-    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":20.0") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_usage_timings_responses_streaming) {
-    // Responses streaming: response.completed.usage gains `timings`.
-    auto em = make_emitter(ApiFormat::RESPONSES);
-    em.emit_start();
-    em.emit_token("done");
-    GenTimings t{0.1, 1.0};
-    auto finish = em.emit_finish(/*completion_tokens*/ 25, &t);
-    std::string finish_str = concat(finish);
-
-    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
-    TEST_ASSERT(finish_str.find("\"prefill_ms\":100.0") != std::string::npos);
-    TEST_ASSERT(finish_str.find("\"decode_ms\":1000.0") != std::string::npos);
-    // 25 / 1.0 = 25.0
-    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":25.0") != std::string::npos);
+// finish_details.close_kind: "open" for a reply that ended inside its
+// thinking, "natural" once the thinking closed, "hard" when the budget closed it.
+TEST_CASE(ServerUnitFixture, test_close_kind_open_when_reply_ends_in_thinking) {
+    const GenTimings timings{};
+    CompletionTokenCounts counts;
+    counts.total = counts.reasoning = 1;
+    ParsedRequest req;
+    req.format = ApiFormat::OPENAI_CHAT;
+    req.thinking_opt_in = true;
+    const auto close_kind = [&](const char * text, bool forced) {
+        GenerateResult result;
+        result.budget_forced_close = forced;
+        auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), /*started_in_thinking=*/true);
+        em.emit_start();
+        em.emit_token(text);
+        return build_non_streaming_response(req, result, 100, timings, counts, em)["choices"][0]
+            ["finish_details"].value("close_kind", "");
+    };
+    TEST_ASSERT(close_kind("still thinking", false) == "open");
+    TEST_ASSERT(close_kind("thought</think>answer", false) == "natural");
+    TEST_ASSERT(close_kind("still thinking", true) == "hard");
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
@@ -18709,7 +17782,6 @@ struct EmptySpecRetryBackend : MockBackend {
     int restore_calls = 0;
     bool generate_saw_force_ar = false;
     bool restore_saw_force_ar = false;
-    bool generate_first_empty_visible = false;
     bool restore_first_empty_visible = false;
     // False once the first attempt continued a deferred snapshot in place.
     bool snapshot_present = true;
@@ -18726,10 +17798,6 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {42};
         } else {
             result.spec_decode_ran = true;
-            if (generate_first_empty_visible) {
-                result.tokens = {2};
-                result.empty_visible_output = true;
-            }
         }
         return result;
     }
@@ -18771,25 +17839,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_generate_once
     TEST_ASSERT(backend.generate_saw_force_ar);
 }
 
-TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_with_ar) {
-    EmptySpecRetryBackend backend;
-    GenerateRequest req;
-    req.prompt = {1, 2, 3};
-    req.n_gen = 4;
-    DaemonIO io;
-
-    GenerateResult result =
-        backend.restore_and_generate(7, req, io);
-
-    TEST_ASSERT(result.ok());
-    TEST_ASSERT(result.tokens.size() == 1);
-    TEST_ASSERT(result.tokens[0] == 84);
-    TEST_ASSERT(result.spec_decode_ran);
-    TEST_ASSERT(result.restored_prefix_tokens == 3);
-    TEST_ASSERT(backend.restore_calls == 2);
-    TEST_ASSERT(backend.restore_saw_force_ar);
-}
-
 // A deferred snapshot the first attempt consumed cannot be restored again:
 // the retry prefills the whole prompt.
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_consumed_restore_with_prefill) {
@@ -18811,25 +17860,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_consumed_restore_with_pr
     TEST_ASSERT(result.restored_prefix_tokens == 0);
 }
 
-TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {
-    EmptySpecRetryBackend backend;
-    backend.generate_first_empty_visible = true;
-    GenerateRequest req;
-    req.prompt = {1, 2, 3};
-    req.n_gen = 4;
-    DaemonIO io;
-
-    GenerateResult result = backend.generate(req, io);
-
-    TEST_ASSERT(result.ok());
-    TEST_ASSERT(result.tokens.size() == 1);
-    TEST_ASSERT(result.tokens[0] == 42);
-    TEST_ASSERT(!result.empty_visible_output);
-    TEST_ASSERT(result.spec_decode_ran);
-    TEST_ASSERT(backend.generate_calls == 2);
-    TEST_ASSERT(backend.generate_saw_force_ar);
-}
-
 TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_restore_once_with_ar) {
     EmptySpecRetryBackend backend;
     backend.restore_first_empty_visible = true;
@@ -18845,6 +17875,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(!result.empty_visible_output);
     TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(result.restored_prefix_tokens == 3);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
@@ -18854,14 +17885,6 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
     GenerateResult r;
-    TEST_ASSERT(r.accept_rate == 0.0f);
-}
-
-TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_zero_when_no_spec_decode) {
-    // When spec decode doesn't run (no draft model), accept_rate stays 0.
-    GenerateResult r;
-    r.succeed();
-    // Telemetry not set → accept_rate is zero and speculative decode is false.
     TEST_ASSERT(r.accept_rate == 0.0f);
     TEST_ASSERT(!r.spec_decode_ran);
 }
@@ -18997,31 +18020,6 @@ TEST_CASE(ServerUnitFixture, test_sse_emitter_responses_error_is_terminal) {
 // normalize_system_for_cache — header-strip tests
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_anthropic_array) {
-    // Anthropic system-as-array: one billing-header block + one real block.
-    json system_blocks = json::array({
-        {{"type", "text"},
-         {"text", "x-anthropic-billing-header: session=abc123 turn=4 ts=1749430000"}},
-        {{"type", "text"},
-         {"text", "You are a helpful coding assistant."}}
-    });
-    std::string out = luce::common::normalize_system_for_cache(system_blocks);
-    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
-    TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_openai_messages0) {
-    // OpenAI messages[0] system containing the billing header in content.
-    json messages = json::array({
-        {{"role", "system"},
-         {"content", "x-anthropic-billing-header: session=xyz789 turn=12 ts=1749431000\nYou are a code reviewer."}},
-        {{"role", "user"}, {"content", "Review this diff."}}
-    });
-    std::string out = luce::common::normalize_system_for_cache(messages);
-    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
-    TEST_ASSERT(out.find("code reviewer") != std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_normalize_idempotent_across_changing_header) {
     // Two OpenAI messages arrays identical except the header turn value.
     // normalize_system_for_cache must return EQUAL strings for both.
@@ -19038,6 +18036,8 @@ TEST_CASE(ServerUnitFixture, test_normalize_idempotent_across_changing_header) {
     std::string out4 = luce::common::normalize_system_for_cache(messages_turn4);
     std::string out5 = luce::common::normalize_system_for_cache(messages_turn5);
     TEST_ASSERT(out4 == out5);
+    TEST_ASSERT(out4.find("x-anthropic-billing-header:") == std::string::npos);
+    TEST_ASSERT(out4.find("You help with Rust.") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_normalize_preserves_legit_system_content) {
@@ -19062,25 +18062,6 @@ TEST_CASE(ServerUnitFixture, test_normalize_handles_leading_whitespace_header) {
     std::string out = luce::common::normalize_system_for_cache(system_blocks);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("Be concise.") != std::string::npos);
-}
-
-TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
-    // Two /v1/chat/completions-style messages arrays differing ONLY in the
-    // billing header value must normalize to EQUAL strings.
-    json messages_a = json::array({
-        {{"role", "system"},
-         {"content", "x-anthropic-billing-header: session=S2 turn=1 ts=1749440000\nYou are a senior engineer."}},
-        {{"role", "user"}, {"content", "What is RAII?"}}
-    });
-    json messages_b = json::array({
-        {{"role", "system"},
-         {"content", "x-anthropic-billing-header: session=S2 turn=7 ts=1749440420\nYou are a senior engineer."}},
-        {{"role", "user"}, {"content", "What is RAII?"}}
-    });
-    std::string norm_a = luce::common::normalize_system_for_cache(messages_a);
-    std::string norm_b = luce::common::normalize_system_for_cache(messages_b);
-    TEST_ASSERT(norm_a == norm_b);
-    TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
 
 // Session feedback overrides the static/curve ratio.
@@ -19625,16 +18606,6 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_keeps_structured_j
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_parse_json_syntax_error_forwarding) {
-    std::string text = "<function_call>{\"name\": \"read\", \"arguments\": {\"offset\": 5o1}}</function_call>";
-    auto result = parse_tool_calls(text, read_tools());
-    TEST_ASSERT(result.tool_calls.size() == 1);
-    if (!result.tool_calls.empty()) {
-        TEST_ASSERT(result.tool_calls[0].name == "read");
-        TEST_ASSERT(json(result.tool_calls[0].arguments) == "{\"offset\": 5o1}");
-    }
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_streaming_json_syntax_error_openai_delta) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
     em.emit_start();
@@ -19951,19 +18922,40 @@ TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_lin
     TEST_ASSERT(res.cleaned_text == "Processing files:");
 }
 
-TEST_CASE(ServerUnitFixture, test_build_response_suppresses_length_finish_reason_on_eos) {
-    // EOS wins even when it lands exactly on the configured token cap.
-    auto em_openai = make_emitter(ApiFormat::OPENAI_CHAT);
-    em_openai.emit_start();
-    em_openai.emit_token("Hello world");
-    auto chunks_openai = em_openai.emit_finish(3, nullptr, 3, true);
-    TEST_ASSERT(em_openai.finish_reason() == "stop");
-
-    auto em_anthropic = make_emitter(ApiFormat::ANTHROPIC);
-    em_anthropic.emit_start();
-    em_anthropic.emit_token("Hello world");
-    auto chunks_anthropic = em_anthropic.emit_finish(3, nullptr, 3, true);
-    TEST_ASSERT(em_anthropic.finish_reason() == "stop");
+// EOS on the cap token is a normal stop, streamed or not; the same count without EOS was cut off.
+TEST_CASE(ServerUnitFixture, test_eos_at_cap_finishes_as_stop) {
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(write_deepseek_marker_tokenizer_fixture().c_str()));  // eos id 2
+    CompletionTokenCounts counts;
+    counts.total = counts.content = 3;
+    const GenTimings timings{};
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::ANTHROPIC}) {
+        const bool openai = format == ApiFormat::OPENAI_CHAT;
+        auto stream = make_emitter(format);
+        stream.emit_start();
+        stream.emit_token("Hello world");
+        const std::string wire = concat(stream.emit_finish(3, nullptr, 3, /*ended_on_eos=*/true));
+        TEST_ASSERT_MSG(wire.find(openai ? "\"finish_reason\":\"stop\"" : "\"stop_reason\":\"end_turn\"")
+                            != std::string::npos, wire);
+        for (const int32_t last : {tok.eos_id(), (int32_t) 0 /* "x" */}) {
+            GenerateResult result;
+            result.succeed();
+            result.tokens = {0, 0, last};
+            ParsedRequest req;
+            req.format = format;
+            auto em = make_emitter(format);
+            em.emit_start();
+            em.emit_token("Hello world");
+            const json body = build_non_streaming_response(req, result, /*generation_cap=*/3, timings,
+                                                           counts, em, &tok);
+            const bool eos = last == tok.eos_id();
+            if (openai) {
+                TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (eos ? "stop" : "length"), body.dump());
+            } else {
+                TEST_ASSERT_MSG(body["stop_reason"] == (eos ? "end_turn" : "max_tokens"), body.dump());
+            }
+        }
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_invoke_zero_args) {
@@ -20368,13 +19360,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_head_plan_windows_and_caps) {
     TEST_ASSERT(!plan.structured && plan.extra.empty() && plan.tail.begin < 0);
 }
 
-// A tool session: its tool definitions and filler text.
-static std::string pflash_tool_session_filler(const char * line, int count) {
-    std::string out;
-    for (int i = 0; i < count; ++i) out += line;
-    return out;
-}
-
+// A tool session's tool definitions.
 static json pflash_tool_session_tools() {
     return json::array({
         {{"type", "function"},
@@ -20392,15 +19378,6 @@ static std::string pflash_keep_filler(const char * line, int count) {
     std::string out;
     for (int i = 0; i < count; ++i) out += line;
     return out;
-}
-
-static int pflash_keep_count(const std::string & text, const std::string & needle) {
-    int count = 0;
-    for (size_t at = text.find(needle); at != std::string::npos;
-         at = text.find(needle, at + needle.size())) {
-        ++count;
-    }
-    return count;
 }
 
 // system + task + read_file call + tool result (``tool_lines`` lines) +

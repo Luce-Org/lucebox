@@ -42,24 +42,8 @@ static std::string drain_peer(int fd) {
 }
 
 int main() {
-    // Happy path: everything fits the socket buffer in one flush.
-    {
-        int fds[2];
-        make_pair(fds);
-        ClientSendBuffer buffer;
-        CHECK(buffer.empty());
-        buffer.append("hello ");
-        buffer.append("world");
-        CHECK(buffer.pending() == 11);
-        CHECK(buffer.flush(fds[0]));
-        CHECK(buffer.empty());
-        CHECK(drain_peer(fds[1]) == "hello world");
-        close(fds[0]);
-        close(fds[1]);
-    }
-
-    // Backpressure: a payload larger than the socket buffer drains across
-    // flushes as the peer reads, and never blocks.
+    // Backpressure: appended pieces queue in order, and a payload larger than
+    // the socket buffer drains across flushes as the peer reads, never blocking.
     {
         int fds[2];
         make_pair(fds);
@@ -68,7 +52,10 @@ int main() {
         for (size_t i = 0; i < payload.size(); ++i) {
             payload[i] = static_cast<char>((i * 131 + 17) & 0xff);
         }
-        buffer.append(payload);
+        CHECK(buffer.empty());
+        buffer.append(payload.substr(0, 1000));
+        buffer.append(payload.substr(1000));
+        CHECK(buffer.pending() == payload.size());
         CHECK(buffer.flush(fds[0]));
         CHECK(!buffer.empty());          // socket buffer full, remainder pending
         std::string got;

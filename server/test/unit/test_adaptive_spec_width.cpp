@@ -21,11 +21,6 @@ bool near(float lhs, float rhs, float tolerance = 1e-6f) {
 }
 } // namespace
 
-TEST_CASE(AdaptiveSpecWidthFixture, starts_with_two_candidates) {
-    AdaptiveSpecWidth width(16);
-    CHECK(width.next_width() == 3);
-}
-
 TEST_CASE(AdaptiveSpecWidthFixture, clean_drafts_probe_upward) {
     AdaptiveSpecWidth width(8);
     CHECK(width.next_width() == 3);
@@ -211,35 +206,6 @@ TEST_CASE(AdaptiveSpecWidthFixture, floor_above_cap_clamps_to_cap) {
     CHECK(width.next_width_cost_aware({}, 99) == 3);
 }
 
-TEST_CASE(AdaptiveSpecWidthFixture, full_rejection_is_the_strongest_narrowing_signal) {
-    AdaptiveSpecWidth width(5, 2, true, 4.0f);
-    CHECK(width.next_width() == 5);
-    width.observe(1, 5); // only the seed survived
-    CHECK(near(width.accepted_candidates_ema(), 3.0f));
-    CHECK(width.next_width() == 4);
-    for (int step = 0; step < 6; ++step) {
-        width.observe(1, width.next_width());
-    }
-    CHECK(width.next_width() == 2);
-}
-
-TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_collapses_from_q5_to_q2_under_full_rejections) {
-    // The gfx1151 DS4 cost curve: q3 and q4 cost almost as much as q5.
-    AdaptiveSpecWidth width(5, 2, true);
-    width.set_relative_costs(kDs4StepCosts);
-    CHECK(width.next_width_cost_aware({}) == 5);
-    int full_rejections = 0;
-    while (width.next_width_cost_aware({}) != 2 && full_rejections < 32) {
-        const int offered = width.next_width_cost_aware({});
-        CHECK(offered >= 2);
-        CHECK(offered <= 5);
-        width.observe(1, offered);
-        ++full_rejections;
-    }
-    CHECK(width.next_width_cost_aware({}) == 2);
-    CHECK(full_rejections <= 8);
-}
-
 TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_skips_widths_without_a_usable_cost) {
     AdaptiveSpecWidth width(4);
     // Zero and negative entries leave q3 and q4 unseeded.
@@ -290,6 +256,7 @@ TEST_CASE(AdaptiveSpecWidthFixture, cost_aware_re_widens_from_q2_when_acceptance
     // DS4 gfx1151 relative step costs for widths 2..5.
     AdaptiveSpecWidth width(5, 2);
     width.set_relative_costs(kDs4StepCosts);
+    CHECK(width.next_width_cost_aware({}) == 5);
     // A prose-like regime: full rejections at q5 collapse the width to q2.
     for (int step = 0; step < 8 && width.next_width_cost_aware({}) != 2; ++step) {
         width.observe(1, width.next_width_cost_aware({}));

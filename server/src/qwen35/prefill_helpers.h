@@ -86,10 +86,13 @@ inline int qwen35_prefill_ubatch(int fallback) {
 // own earlier, not-yet-computed chunks. One chunk is the floor, which wins over
 // the pool clamp if the pool itself were smaller than a chunk (the pager's pool
 // is always a positive chunk multiple, so that precedence is only a contract).
-inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens) {
+// `pinned_tokens` (the preamble pins' rows) come off the pool first, with one chunk the pager keeps free: a batch
+// larger than the unpinned capacity would evict its own earlier chunks too.
+inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens, int pinned_tokens = 0) {
     if (chunk_tokens <= 0) return prefill_ubatch;
     int ub = std::max(prefill_ubatch, chunk_tokens);
     ub = (ub / chunk_tokens) * chunk_tokens;
+    if (pool_tokens > 0 && pinned_tokens > 0) pool_tokens = std::max(chunk_tokens, pool_tokens - pinned_tokens - chunk_tokens);
     if (pool_tokens > 0 && ub > pool_tokens) {
         ub = std::max(chunk_tokens, (pool_tokens / chunk_tokens) * chunk_tokens);
     }
@@ -174,7 +177,7 @@ inline bool kvflash_restore_consume_enabled() {
 // Rungs, all multiples of `grid` (= the S6 batch ends): the system/tools head
 // (rounded down), every `stride` tokens, and the grid point at or below the
 // prompt end. A head < 0 (unknown) leaves that rung out. S9b: `turn_cut` > 0
-// (the off-grid turn rung, see kvflash_turn_cut) is added when it is <= end.
+// (the off-grid turn rung, see kvflash_turn_cuts) is added when it is <= end.
 inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int grid, int stride,
                                                        int turn_cut = -1) {
     std::vector<int> out;
@@ -198,8 +201,8 @@ inline std::vector<int> kvflash_state_ladder_positions(int head, int end, int gr
 // header of `prompt`, i.e. Pend - k, where k is the length of the generation
 // suffix (the think block). The next turn's template re-renders the assistant
 // turn as `<|im_start|>assistant\n` + content, so its common prefix with this
-// prompt ends exactly here. -1 when there is no header, an id is unknown (< 0),
-// or the header ends the prompt (nothing after it, k = 0: no use).
+// prompt ends exactly here. Empty when there is no header or an id is unknown
+// (< 0); a header that ends the prompt (nothing after it, k = 0) is no use.
 inline std::vector<int> kvflash_turn_cuts(const std::vector<int32_t> & prompt, int32_t im_start,
                                           int32_t assistant, int32_t newline) {
     std::vector<int> out;
@@ -209,13 +212,6 @@ inline std::vector<int> kvflash_turn_cuts(const std::vector<int32_t> & prompt, i
             out.push_back(i);
     }
     return out;
-}
-
-// The last of them (the generation prompt of the turn), or -1.
-inline int kvflash_turn_cut(const std::vector<int32_t> & prompt, int32_t im_start,
-                            int32_t assistant, int32_t newline) {
-    const std::vector<int> c = kvflash_turn_cuts(prompt, im_start, assistant, newline);
-    return c.empty() ? -1 : c.back();
 }
 
 // Greatest checkpoint position C <= L, or -1. `positions` need not be sorted.

@@ -36,9 +36,15 @@ public:
     // encode message text this way and insert the control tokens by ID.
     std::vector<int32_t> encode(const std::string & text, bool match_control = true) const;
     // As above, with the added tokens in `literal` kept as ordinary text too
-    // (a codec's turn markers that the GGUF types user-defined).
+    // (a codec's turn markers that the GGUF types user-defined). The added
+    // tokens in `as_text` that begin inside one of `spans` (byte ranges of
+    // `text`, in order) are written as plain text, each one alone, as Hugging
+    // Face's sanitize_control_tokens writes a control token found in a
+    // message: the text around it splits there, as it would around the token.
     std::vector<int32_t> encode(const std::string & text, bool match_control,
-                                const std::vector<int32_t> & literal) const;
+                                const std::vector<int32_t> & literal,
+                                const std::vector<std::pair<size_t, size_t>> & spans = {},
+                                const std::vector<int32_t> & as_text = {}) const;
 
     // ─── Decode ──────────────────────────────────────────────────────
     // Convert a single token ID to its text representation.
@@ -91,7 +97,9 @@ private:
     std::vector<std::pair<std::string, int32_t>> user_added_tokens_;
     std::vector<int32_t> encode_matching(
         const std::string & text,
-        const std::vector<std::pair<std::string, int32_t>> & added) const;
+        const std::vector<std::pair<std::string, int32_t>> & added,
+        const std::vector<std::pair<size_t, size_t>> & spans,
+        const std::vector<int32_t> & as_text) const;
     std::vector<int32_t> control_ids_;  // sorted
 
     // Special token IDs

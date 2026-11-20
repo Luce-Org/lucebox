@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -67,7 +66,12 @@ bool run(ggml_backend_t backend) {
     ggml_backend_tensor_set(accepted, &acc, 0, sizeof acc);
     ggml_backend_tensor_set(slots, &slot, 0, sizeof slot);
 
+    const size_t scalar_before = ggml_backend_cuda_get_gdn_scalar_launch_count();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) return false;
+    if (ggml_backend_cuda_get_gdn_scalar_launch_count() - scalar_before != 1) {
+        std::puts("route: scalar kernel not taken");
+        return false;
+    }
     const ggml_tensor * logs[] = {log};
     ggml_tensor * states[] = {cstate};
     const ggml_tensor * ci[] = {conv_in};
@@ -95,10 +99,11 @@ bool run(ggml_backend_t backend) {
 }  // namespace
 
 int main() {
-    setenv("LUCE_GDN_NO_GROUPED_COLS", "1", 1);
+    const int prev_route = ggml_backend_cuda_set_gdn_route_override(0);  // pin the scalar kernel
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "GPU backend unavailable\n"); return 1; }
     const bool ok = run(backend);
+    ggml_backend_cuda_set_gdn_route_override(prev_route);
     ggml_backend_free(backend);
     std::puts(ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

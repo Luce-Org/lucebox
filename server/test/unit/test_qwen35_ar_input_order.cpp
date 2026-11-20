@@ -207,55 +207,34 @@ bool ar_step_inputs_survive_build(TinyTarget & t, StepGraph & sg, int committed,
     return embed_ok && pos_ok;
 }
 
+// The first AR step on `backend` (owned by the target) after the prompt's
+// final prefill chunk, or, with `after_verify`, after a verify block that
+// follows it.
+bool first_ar_step_keeps_inputs(ggml_backend_t backend, bool after_verify, const char * tag) {
+    TinyTarget t(backend);
+    if (!t.ok) return false;
+    StepGraph sg;
+    const bool ok = build_prefill_chunk(t, sg, 0, 8) &&
+                    (!after_verify || build_verify_block(t, sg, 8, 4)) &&
+                    ar_step_inputs_survive_build(t, sg, after_verify ? 12 : 8, tag);
+    step_graph_destroy(sg);
+    return ok;
+}
+
 }  // namespace
 
-// Control: an AR step after an AR step rebuilds the same shape and the
-// gallocr keeps the placement, so writing before the build goes unnoticed.
-TEST_CASE(Qwen35ArInputOrderFixture, same_shape_ar_step_keeps_inputs) {
-    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
-    TinyTarget t(ggml_backend_cpu_init());
-    REQUIRE(t.ok);
-    StepGraph sg;
-    REQUIRE(build_ar_step(t, sg, 8));
-    CHECK(ar_step_inputs_survive_build(t, sg, 9, "ar->ar cpu"));
-    step_graph_destroy(sg);
-}
-
 // The first AR step of a request follows the prompt's final prefill chunk.
-TEST_CASE(Qwen35ArInputOrderFixture, first_ar_step_after_prefill_keeps_inputs) {
+// Spec decode falls back to do_ar_decode after a verify block (AR hop, pool
+// exhaustion, end of the spec loop); the same graph object is shared. CUDA is
+// the backend the server runs: the gallocr plan is backend-independent apart
+// from alignment, so the placement moves there too.
+TEST_CASE(Qwen35ArInputOrderFixture, first_ar_step_keeps_inputs) {
     const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
-    TinyTarget t(ggml_backend_cpu_init());
-    REQUIRE(t.ok);
-    StepGraph sg;
-    REQUIRE(build_prefill_chunk(t, sg, 0, 8));
-    CHECK(ar_step_inputs_survive_build(t, sg, 8, "prefill->ar cpu"));
-    step_graph_destroy(sg);
-}
-
-// Spec decode falls back to do_ar_decode after a verify block (AR hop,
-// pool exhaustion, end of the spec loop); the same graph object is shared.
-TEST_CASE(Qwen35ArInputOrderFixture, first_ar_step_after_verify_block_keeps_inputs) {
-    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
-    TinyTarget t(ggml_backend_cpu_init());
-    REQUIRE(t.ok);
-    StepGraph sg;
-    REQUIRE(build_prefill_chunk(t, sg, 0, 8));
-    REQUIRE(build_verify_block(t, sg, 8, 4));
-    CHECK(ar_step_inputs_survive_build(t, sg, 12, "verify->ar cpu"));
-    step_graph_destroy(sg);
-}
-
+    CHECK(first_ar_step_keeps_inputs(ggml_backend_cpu_init(), false, "prefill->ar cpu"));
+    CHECK(first_ar_step_keeps_inputs(ggml_backend_cpu_init(), true, "verify->ar cpu"));
 #ifdef LUCE_BACKEND_CUDA
-// Same sequence on the backend the server runs: the gallocr plan is
-// backend-independent apart from alignment, so the placement moves here too.
-TEST_CASE(Qwen35ArInputOrderFixture, first_ar_step_after_prefill_keeps_inputs_cuda) {
-    if (ggml_backend_cuda_get_device_count() < 1) SKIP("no CUDA device");
-    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
-    TinyTarget t(ggml_backend_cuda_init(0));
-    REQUIRE(t.ok);
-    StepGraph sg;
-    REQUIRE(build_prefill_chunk(t, sg, 0, 8));
-    CHECK(ar_step_inputs_survive_build(t, sg, 8, "prefill->ar cuda"));
-    step_graph_destroy(sg);
-}
+    if (ggml_backend_cuda_get_device_count() > 0) {
+        CHECK(first_ar_step_keeps_inputs(ggml_backend_cuda_init(0), false, "prefill->ar cuda"));
+    }
 #endif
+}

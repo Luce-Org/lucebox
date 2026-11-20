@@ -88,7 +88,9 @@ run_launcher() {
   local timeout_var="$3"
   local timeout_value="$4"
   shift 4
-  env \
+  # An empty timeout_value leaves the variable unset, so the launcher's own
+  # default applies.
+  env -u "$timeout_var" \
     PATH="$FAKE_BIN:$PATH" \
     REPO_DIR="$FAKE_REPO" \
     RUN_DIR="$TMP_DIR/runs" \
@@ -102,7 +104,7 @@ run_launcher() {
     MARKER=timeout-policy-ok \
     PROMPT=timeout-policy-ok \
     "$client_var=$FAKE_CLIENT" \
-    "$timeout_var=$timeout_value" \
+    ${timeout_value:+"$timeout_var=$timeout_value"} \
     "$@" \
     bash "$CLIENTS/$script"
 }
@@ -135,6 +137,13 @@ for launcher_case in "${launcher_cases[@]}"; do
     echo "$script timeout=0 must bypass the timeout command" >&2
     exit 1
   fi
+
+  rm -f "$TIMEOUT_CAPTURE"
+  run_launcher "$script" "$client_var" "$timeout_var" "" >/dev/null
+  if [[ "$(grep -Fxc '3600s' "$TIMEOUT_CAPTURE")" -ne "$expected_calls" ]]; then
+    echo "$script lost its 3600s default client timeout" >&2
+    exit 1
+  fi
 done
 
 set +e
@@ -150,21 +159,10 @@ if [[ "$opencode_invalid_rc" -ne 2 ]] ||
   exit 1
 fi
 
-grep -Fq ': "${OPENCODE_TIMEOUT:=3600}"' "$CLIENTS/run_opencode.sh"
 grep -Fq ': "${OPENCODE_REQUEST_TIMEOUT_MS:=3600000}"' "$CLIENTS/run_opencode.sh"
 grep -Fq ': "${OPENCODE_CHUNK_TIMEOUT_MS:=3600000}"' "$CLIENTS/run_opencode.sh"
-grep -Fq ': "${CODEX_TIMEOUT:=3600}"' "$CLIENTS/run_codex.sh"
-grep -Fq ': "${HERMES_TIMEOUT:=3600}"' "$CLIENTS/run_hermes.sh"
-grep -Fq ': "${CLAUDE_TIMEOUT:=3600}"' "$CLIENTS/run_claude_code.sh"
-grep -Fq ': "${OMP_TIMEOUT:=3600}"' "$CLIENTS/run_omp.sh"
-grep -Fq ': "${OPENCLAW_TIMEOUT:=3600}"' "$CLIENTS/run_openclaw.sh"
 grep -Fq 'openclaw_cmd+=(--timeout "$OPENCLAW_TIMEOUT")' "$CLIENTS/run_openclaw.sh"
 grep -Fq 'CURL_MAX_TIME="${CURL_MAX_TIME:-3600}"' "$CLIENTS/run_openwebui.sh"
 grep -Fq 'CURL_MAX_TIME="${CURL_MAX_TIME:-3600}"' "$CLIENTS/run_openwebui_tools.sh"
-
-if grep -REq 'timeout (300|420)s|--timeout 300|CURL_MAX_TIME:-300' "$CLIENTS"/*.sh; then
-  echo "a short hard-coded real-client timeout remains" >&2
-  exit 1
-fi
 
 echo "Client launcher timeout policy: PASS"

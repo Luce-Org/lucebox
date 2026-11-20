@@ -297,6 +297,9 @@ struct Qwen4ExpSnapshot {
     // and PLE conv state, the MTP carry row), and a restore takes the K/V, QSA and MTP K/V rows from a deeper
     // whole snapshot of a prompt that extends this one.
     bool state_only = false;
+    // KVFlash past the pool: `strips` is the point state alone and the rows stay in the live pager, which a restore
+    // truncates to `cur_pos`. Valid only while the live cache extends `tokens` (the backend checks); no disk form.
+    bool rows_in_pager = false;
     int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
     int64_t kv_bucket_base = 0;
     std::vector<int32_t> ple_prev, tokens;
@@ -306,8 +309,11 @@ struct Qwen4ExpSnapshot {
 // `rows` false: a state-only snapshot's bytes, the same at every length.
 size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr, bool rows = true);
-// Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. A KVFlash cache saves while its
-// positions still sit in their identity slots (the context fits the pool).
+// True when a snapshot of `c` now would keep its rows in the live pager (KVFlash past the pool, or a relocated
+// prefix): it restores only over a live cache that still holds them, never into a cold one.
+bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c);
+// Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. Past a KVFlash pool the snapshot is
+// the point state alone (rows_in_pager).
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
                             Qwen4ExpSnapshot & s);
 // Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a

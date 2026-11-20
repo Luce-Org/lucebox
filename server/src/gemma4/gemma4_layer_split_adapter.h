@@ -64,10 +64,6 @@ public:
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
     bool supports_cpu_sampling() const override { return true; }
-    bool supports_kvflash() const override { return kvflash_active(); }
-    bool supports_mixed_backend_layer_split() const override {
-        return use_mixed_target_split();
-    }
 
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;

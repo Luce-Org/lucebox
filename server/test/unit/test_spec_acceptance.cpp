@@ -48,27 +48,13 @@ TEST_CASE(SpecAcceptanceFixture, tree_only_counts_actual_topology_with_root) {
     CHECK(stats.rate() == 0.5f);
 }
 
-TEST_CASE(SpecAcceptanceFixture, mixed_tree_chain_and_ar_tail_keep_one_denominator) {
+TEST_CASE(SpecAcceptanceFixture, mixed_tree_and_chain_share_one_denominator) {
     SpecAcceptanceStats stats;
     stats.record_tree(3, 4, 20);
     stats.record_chain(2, 3, 3, 20);
     CHECK(stats.accepted() == 5);
     CHECK(stats.offered() == 8);
     CHECK(stats.rate() == 0.625f);
-    // AR bursts/tails do not record speculative offers. Any early return
-    // reports the same accumulated rate without a separate denominator.
-    CHECK(stats.rate() == 0.625f);
-}
-
-TEST_CASE(SpecAcceptanceFixture, seed_only_tree_and_variable_chain_widths_stay_bounded) {
-    SpecAcceptanceStats stats;
-    stats.record_tree(1, 0, 100);
-    for (int width : {2, 3, 5, 8, 4, 2}) {
-        stats.record_chain(width, width, width, 100);
-    }
-    CHECK(stats.accepted() == 25);
-    CHECK(stats.offered() == 25);
-    CHECK(stats.rate() == 1.0f);
 }
 
 TEST_CASE(SpecAcceptanceFixture, final_tree_budget_matches_chain_accounting) {

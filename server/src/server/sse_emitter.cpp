@@ -292,8 +292,10 @@ std::vector<std::string> SseEmitter::emit_start() {
 
 // ─── emit_token ─────────────────────────────────────────────────────────
 
-std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
+std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece, bool think_tag) {
     if (terminal_ || stop_hit_) return {};  // already stopped
+    // With thinking-boundary tokens, only they open and close the thinking.
+    const bool boundary = think_tags_are_tokens_ && think_tag;
 
     // Track the first emit_token call whose mode-on-entry is CONTENT —
     // that's the first token attributed to the visible reply. Mode-on-
@@ -314,12 +316,23 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     // CONTENT-mode token after the natural </think> close.
     const bool entry_is_think_opener =
         mode_ == StreamMode::CONTENT &&
-        raw_piece.find(THINK_OPEN) != std::string::npos;
+        (think_tags_are_tokens_ ? boundary && raw_piece.rfind(THINK_OPEN, 0) == 0
+                                : raw_piece.find(THINK_OPEN) != std::string::npos);
     if (first_content_token_index_ < 0 && mode_ == StreamMode::CONTENT &&
         !entry_is_think_opener) {
         first_content_token_index_ = emit_token_count_;
     }
     emit_token_count_++;
+
+    std::vector<std::string> out;
+    if (boundary) {
+        // A held-back UTF-8 tail can no longer complete.
+        const std::string before = utf8_sanitize(utf8_tail_);
+        utf8_tail_.clear();
+        accumulated_raw_ += before + raw_piece;
+        take_think_tag(out, before, raw_piece);
+        return out;
+    }
 
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
     // First re-join any incomplete multi-byte tail held back from the previous
@@ -347,7 +360,6 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
     }
     std::string piece = utf8_sanitize(joined);
-    std::vector<std::string> out;
     accumulated_raw_ += piece;
     window_ += piece;
 
@@ -388,6 +400,55 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
     }
 
+    run_window(out);
+    return out;
+}
+
+// A real thinking-boundary token: the text before it is settled, as nothing
+// after the token can extend it, then the token switches the mode.
+void SseEmitter::take_think_tag(std::vector<std::string> & out, const std::string & before,
+                                const std::string & tag) {
+    window_ += before;
+    run_window(out);
+    if (mode_ == StreamMode::TOOL_BUFFER) {
+        // A buffered call splits on the text form at finish.
+        window_ += tag;
+        run_window(out);
+        return;
+    }
+    if (!window_.empty()) {
+        if (mode_ == StreamMode::REASONING) {
+            reasoning_text_ += window_;
+            emit_reasoning_delta(out, window_);
+        } else {
+            accumulated_content_ += window_;
+            emit_content_delta(out, window_);
+        }
+        window_.clear();
+    }
+    const bool close = tag.rfind(THINK_CLOSE, 0) == 0;
+    const size_t tag_len = close ? THINK_CLOSE_LEN : THINK_OPEN_LEN;
+    if (close) {
+        // In content it is dropped, as its text form is.
+        if (mode_ == StreamMode::REASONING) mode_ = StreamMode::CONTENT;
+    } else if (mode_ == StreamMode::CONTENT) {
+        mode_ = StreamMode::REASONING;
+        checked_think_prefix_ = true;
+    } else if (reasoning_text_.find_first_not_of(" \t\r\n") != std::string::npos) {
+        // Inside the thinking it is part of it, as its text form is; the
+        // leading one is dropped.
+        reasoning_text_ += THINK_OPEN;
+        emit_reasoning_delta(out, THINK_OPEN);
+    }
+    window_ += tag.substr(tag_len);
+    run_window(out);
+}
+
+size_t SseEmitter::find_text_tag(const char * tag) const {
+    return think_tags_are_tokens_ ? std::string::npos : window_.find(tag);
+}
+
+void SseEmitter::run_window(std::vector<std::string> & out) {
     // State machine loop — processes the window
     while (true) {
         if (mode_ == StreamMode::TOOL_BUFFER) {
@@ -419,7 +480,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             // Strip leading <think> tag from reasoning (ds4 pattern).
             // The model may emit whitespace before <think>, so we skip leading
             // whitespace first, then check for the tag.
-            if (!checked_think_prefix_) {
+            if (!checked_think_prefix_ && !think_tags_are_tokens_) {
                 // Skip leading whitespace to find potential <think> tag
                 size_t ws = 0;
                 while (ws < window_.size() && (window_[ws] == '\n' || window_[ws] == ' ' || window_[ws] == '\r'))
@@ -431,7 +492,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
                 checked_think_prefix_ = true;
             }
 
-            size_t idx = window_.find(THINK_CLOSE);
+            size_t idx = find_text_tag(THINK_CLOSE);
             size_t tool_idx = std::string::npos;
             bool tool_hit = has_request_tools(tools_) &&
                             find_tool_syntax_start(window_, tools_, tool_idx);
@@ -484,8 +545,8 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             window_.erase(0, first);
         }
         // Look for <think>, </think>, or supported tool-call starts.
-        size_t think_idx = window_.find(THINK_OPEN);
-        size_t think_close_idx = window_.find(THINK_CLOSE);
+        size_t think_idx = find_text_tag(THINK_OPEN);
+        size_t think_close_idx = find_text_tag(THINK_CLOSE);
         size_t tool_idx = std::string::npos;
         bool tool_hit = has_request_tools(tools_) &&
                         find_tool_syntax_start(window_, tools_, tool_idx);
@@ -563,8 +624,6 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
         break;
     }
-
-    return out;
 }
 
 // ─── Content delta emission (format-specific) ───────────────────────────

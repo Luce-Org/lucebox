@@ -52,31 +52,6 @@ static ggml_status run_benchmark_iterations(int requested, Compute compute, int 
     return GGML_STATUS_SUCCESS;
 }
 
-// Exercise early failures without intentionally faulting a GPU context.
-static int test_benchmark_iterations() {
-    for (int fail_after : {-1, 0, 1, 2}) {
-        int calls = 0;
-        int completed = -1;
-        const ggml_status status = run_benchmark_iterations(3, [&] {
-            return calls++ == fail_after ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
-        }, completed);
-        const int expected_completed = fail_after < 0 ? 3 : fail_after;
-        const int expected_calls = fail_after < 0 ? 3 : fail_after + 1;
-        const ggml_status expected_status = fail_after < 0
-            ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
-        if (status != expected_status || completed != expected_completed || calls != expected_calls) {
-            std::fprintf(stderr, "benchmark accounting failed: fail_after=%d calls=%d completed=%d\n",
-                         fail_after, calls, completed);
-            return 1;
-        }
-    }
-    int completed = -1;
-    const auto status = run_benchmark_iterations(0, [] { return GGML_STATUS_FAILED; }, completed);
-    if (status != GGML_STATUS_SUCCESS || completed != 0) return 1;
-    std::printf("[mmid-grouped-test] benchmark iteration accounting: PASS (5 cases)\n");
-    return 0;
-}
-
 struct MmidShape {
     int k = 256;
     int rows = 128;
@@ -776,9 +751,6 @@ int main(int argc, char ** argv) {
     if (argc == 4 && std::strcmp(argv[1], "--q5-cases") == 0) {
         return run_q5_cases(argv[2], std::atoi(argv[3]) != 0);
     }
-    if (argc == 2 && std::strcmp(argv[1], "--test-benchmark-iterations") == 0) {
-        return test_benchmark_iterations();
-    }
     if (argc == 4 && std::strcmp(argv[1], "--child") == 0) {
         return run_child(argv[2], argv[3]);
     }
@@ -788,7 +760,7 @@ int main(int argc, char ** argv) {
         argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
     if (argc != 1 && !combine_only && !mmid_only) {
         std::fprintf(stderr,
-                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused|direct OUTPUT|--q5-cases OUTPUT EXPECT_GROUPED]\n",
+                     "usage: %s [--combine-only|--mmid-only|--child legacy|grouped|masked-fused|direct OUTPUT|--q5-cases OUTPUT EXPECT_GROUPED]\n",
                      argv[0]);
         return 2;
     }

@@ -97,7 +97,6 @@ public:
     bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok) override;
     CompressResult compress(const CompressRequest & req) override;
-    std::vector<CompressResult> compress_batch(const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line, const common::DaemonIO & io) override;
     void free_drafter() override;
     bool try_handle_command(const std::string & line, const common::DaemonIO & io) override;
@@ -105,9 +104,7 @@ public:
     common::DFlashTarget * dflash_target() override;
     void release_scratch() override;
     bool supports_remote_draft() const override;
-    bool supports_kvflash() const override;
     bool pflash_gives_candidate_scores() const override { return inner_->pflash_gives_candidate_scores(); }
-    bool supports_mixed_backend_layer_split() const override;
     bool set_routing_collector(common::MoeRoutingCollector * collector) override;
     const common::MoeHybridRoutingStats * get_routing_stats() const override;
     bool spark_wants_bootstrap() const override;

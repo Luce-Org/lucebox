@@ -233,6 +233,10 @@ struct ServerConfig {
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
+    // /props.kvflash: set by server_main from --kvflash; recall is on when the mode is not empty.
+    bool        kvflash_enabled     = false;
+    int         kvflash_pool_tokens = 0;       // 0 = off or "auto" (sized by the backend)
+    std::string kvflash_recall_mode;           // launch_profiles.h kvflash_recall_mode
     std::string arch;                  // detected model arch (qwen35/36, laguna, gemma4, ...)
     std::string model_path;            // bargs.model_path
     std::string draft_path;            // bargs.draft_path (empty if no draft)
@@ -927,6 +931,9 @@ private:
         KvLease & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    // The chat codec shows thinking tags spelled in a message as text, and the
+    // vocabulary has the tokens (SseEmitter::set_think_tags_are_tokens).
+    bool think_tags_are_tokens() const;
     // Save the live post-generation state as an inline checkpoint of the
     // prompt plus those generated tokens that agree with `canonical` (the
     // conversation with this turn appended, as the next request renders it).

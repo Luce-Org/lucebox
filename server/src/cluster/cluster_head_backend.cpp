@@ -568,11 +568,6 @@ common::ModelBackend::CompressResult ClusterHeadBackend::compress(const Compress
     return inner_->compress(req);
 }
 
-std::vector<common::ModelBackend::CompressResult> ClusterHeadBackend::compress_batch(
-        const std::vector<CompressRequest> & requests) {
-    return inner_->compress_batch(requests);
-}
-
 bool ClusterHeadBackend::handle_compress(const std::string & line, const DaemonIO & io) {
     // DeepSeek4Backend::handle_compress is unsupported and mutates nothing,
     // so no BackendOp is sent; revisit if PFlash lands for DS4.
@@ -594,10 +589,6 @@ bool ClusterHeadBackend::supports_dflash_spec_decode() const {
 common::DFlashTarget * ClusterHeadBackend::dflash_target() { return inner_->dflash_target(); }
 void ClusterHeadBackend::release_scratch() { inner_->release_scratch(); }
 bool ClusterHeadBackend::supports_remote_draft() const { return inner_->supports_remote_draft(); }
-bool ClusterHeadBackend::supports_kvflash() const { return inner_->supports_kvflash(); }
-bool ClusterHeadBackend::supports_mixed_backend_layer_split() const {
-    return inner_->supports_mixed_backend_layer_split();
-}
 bool ClusterHeadBackend::set_routing_collector(common::MoeRoutingCollector * collector) {
     return inner_->set_routing_collector(collector);
 }

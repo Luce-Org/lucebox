@@ -1333,9 +1333,9 @@ size_t Qwen4ExpBackend::snapshot_bytes_estimate(int tokens) const {
 }
 
 size_t Qwen4ExpBackend::snapshot_state_bytes_estimate(int tokens) const {
-    // A KVFlash pool's rows are its slots: a snapshot exists only while they map positions one to one (a context
-    // within the pool), where a backup saves little, so its snapshots stay whole. Split mode keeps one row per
-    // position on either device, and a strip copy reaches both.
+    // No state-only backups under a KVFlash pool: within the pool a backup saves little, and past it a snapshot
+    // already holds its point state alone (rows_in_pager). Split mode keeps one row per position on either device,
+    // and a strip copy reaches both.
     return cache_.kvflash ? 0 : snapshot_bytes(tokens, /*rows=*/false);
 }
 
@@ -1361,16 +1361,22 @@ bool Qwen4ExpBackend::snapshot_state_only(int slot) const {
 }
 
 bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
+    // A state-only backup, and a snapshot past a KVFlash pool (its rows stay in the pager), hold their point state
+    // alone. -1 is a new snapshot of the live cache, as is the deferred one.
+    auto charge = [&](int i) {
+        const bool live = i < 0 || i == live_slot_;
+        const bool point_only = live ? qwen4exp_snapshot_rows_in_pager(cache_)
+                                     : snapshots_[i].state_only || snapshots_[i].rows_in_pager;
+        return snapshot_bytes(live ? cache_.cur_pos : snapshots_[i].cur_pos, /*rows=*/!point_only);
+    };
     size_t remaining = snapshot_budget_;
     for (int i = 0; i < kMaxSlots; ++i) {
         if (i == slot || i == replaced || !snapshot_used(i)) continue;
-        // A state-only backup holds its point state alone.
-        const size_t bytes = snapshot_state_only(i) ? snapshot_state_bytes_estimate(snapshot_cur_pos(i))
-                                                    : snapshot_bytes_estimate(snapshot_cur_pos(i));
+        const size_t bytes = charge(i);
         if (bytes > remaining) return false;
         remaining -= bytes;
     }
-    const size_t bytes = snapshot_bytes_estimate(cache_.cur_pos);
+    const size_t bytes = charge(-1);
     if (bytes <= remaining) return true;
     std::fprintf(stderr, "[qwen4exp-snap] pressure slot=%d bytes=%zu remaining=%zu allowance=%zu\n",
                  slot, bytes, remaining, snapshot_budget_);
@@ -1403,6 +1409,14 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
         // A state-only backup takes its rows from the deeper snapshot the request names; without it, recompute.
         const int kv = req.restore_kv_slot;
         const Qwen4ExpSnapshot * rows = kv >= 0 && kv < kMaxSlots && kv != slot ? &snapshots_[kv] : nullptr;
+        // Pager-held rows are the live cache's: only a live cache that extends the snapshot's tokens has them.
+        // ponytail: otherwise cold; falling back to the deepest whole snapshot needs the server to know, add if
+        // interleaved sessions on a pooled cache matter.
+        const auto & snap = snapshots_[slot];
+        if (snap.rows_in_pager && (tokens_.size() < snap.tokens.size() ||
+                                   !std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin()))) {
+            return generate_impl(req, io);
+        }
         if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;

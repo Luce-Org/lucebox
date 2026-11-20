@@ -33,10 +33,12 @@
   },
   "tokens": {
     "qwen3.8-27b/codec": {
-      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it",
+      "think_tags_in_content": "deliberate: thinking a client sends inline in an earlier turn's content is message text, so its <think> and </think> stay text, as Hugging Face's sanitize_control_tokens writes them; only the tags the template writes are tokens"
     },
     "qwen3.8-flash-next/codec": {
-      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it"
+      "control_text_in_user": "deliberate: control-token text the user typed (<|im_end|>, <|im_start|>) stays text instead of becoming the control token, so a message cannot close its turn or open another; Hugging Face tokenizers match it",
+      "think_tags_in_content": "deliberate: thinking a client sends inline in an earlier turn's content is message text, so its <think> and </think> stay text, as Hugging Face's sanitize_control_tokens writes them; only the tags the template writes are tokens"
     },
     "qwen3.8-flash-next/jinja": {
       "whitespace_edges": "follows from the text difference",
@@ -44,6 +46,7 @@
     },
     "deepseek-v4.1-flash/codec": {
       "control_text_in_user_ds": "deliberate: turn-marker text the user typed (<｜User｜>, <｜Assistant｜>) stays text instead of becoming the marker token, so a message cannot close its turn or open another; Hugging Face tokenizers match it (the V4.1 vocabulary types the markers user-defined, so the codec lists them as literal)",
+      "think_tags_in_content": "deliberate: thinking a client sends inline in an earlier turn's content is message text, so its <think> and </think> stay text, as Hugging Face's sanitize_control_tokens writes them; only the tags the template writes are tokens",
       "official_3": "follows from the text difference",
       "official_4": "follows from the text difference",
       "official_5": "follows from the text difference"
@@ -57,6 +60,7 @@
     },
     "deepseek-v4-flash/codec": {
       "control_text_in_user_ds": "deliberate: turn-marker text the user typed (<｜User｜>, <｜Assistant｜>) stays text instead of becoming the marker token, so a message cannot close its turn or open another; Hugging Face tokenizers match it (the V4 vocabulary types the markers user-defined, so the codec lists them as literal)",
+      "think_tags_in_content": "deliberate: thinking a client sends inline in an earlier turn's content is message text, so its <think> and </think> stay text, as Hugging Face's sanitize_control_tokens writes them; only the tags the template writes are tokens",
       "official_3": "follows from the text difference",
       "official_4": "follows from the text difference"
     },

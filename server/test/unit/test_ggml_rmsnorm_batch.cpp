@@ -94,20 +94,25 @@ TEST_CASE(GgmlRmsnormBatchFixture, rmsnorm_batch) {
         ggml_backend_tensor_get(output, output_data.data(), 0,
                                 output_data.size() * sizeof(float));
     }
-    bool finite = status == GGML_STATUS_SUCCESS;
-    for (float value : output_data) {
-        if (!std::isfinite(value)) {
-            std::fprintf(stderr, "non-finite output\n");
-            finite = false;
-            break;
+    // Host reference: x * rsqrt(mean(x^2) + eps) * w per token.
+    float max_err = status == GGML_STATUS_SUCCESS ? 0.0f : INFINITY;
+    for (int t = 0; status == GGML_STATUS_SUCCESS && t < n_tokens; ++t) {
+        const float * x = input_data.data() + (size_t)t * n_embd;
+        double sum_sq = 0.0;
+        for (int i = 0; i < n_embd; ++i) sum_sq += (double)x[i] * x[i];
+        const float inv = 1.0f / std::sqrt((float)(sum_sq / n_embd) + eps);
+        for (int i = 0; i < n_embd; ++i) {
+            const float want = x[i] * inv * weight_data[(size_t)i];
+            const float got = output_data[(size_t)t * n_embd + i];
+            max_err = std::isfinite(got) ? std::fmax(max_err, std::fabs(got - want)) : INFINITY;
         }
     }
-    std::printf("PASS device=%d peer=%s tokens=%d embd=%d\n",
-                device, peer ? "initialized" : "absent", n_tokens, n_embd);
+    std::printf("device=%d peer=%s tokens=%d embd=%d max_abs_err=%g\n",
+                device, peer ? "initialized" : "absent", n_tokens, n_embd, max_err);
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     if (peer) ggml_backend_free(peer);
     ggml_backend_free(backend);
-    REQUIRE(finite);
+    REQUIRE(max_err <= 1e-4f);  // fp32 on both sides: reduction-order slack only
 }

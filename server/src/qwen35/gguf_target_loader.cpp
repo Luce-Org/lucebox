@@ -562,6 +562,10 @@ bool load_target_gguf_partial(const std::string & path,
     out.im_start_id  = find_token_id(gctx, "<|im_start|>");
     out.assistant_id = find_token_id(gctx, "assistant");
     out.newline_id   = find_token_id(gctx, "\xC4\x8A");   // byte-level BPE "\n"
+    out.user_id      = find_token_id(gctx, "user");
+    out.system_id    = find_token_id(gctx, "system");
+    out.im_end_id    = find_token_id(gctx, "<|im_end|>");
+    out.tool_response_id = find_token_id(gctx, "<tool_response>");
 
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.

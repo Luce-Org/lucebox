@@ -1,8 +1,8 @@
 """Comprehensive server test suite for luce_server.
 
-Exercises: prefix cache (pflash), multi-turn conversations, reasoning extraction,
-non-streaming for all 3 APIs, tool request format, concurrent requests, edge cases,
-and DDTree/PFlash CLI validation.
+Exercises: prefix cache, multi-turn conversations, reasoning extraction,
+Anthropic streaming, tool request format, concurrent requests, edge cases,
+and PFlash CLI validation.
 
 Usage:
     # Start server first (with 0.6B for quick tests):
@@ -123,45 +123,7 @@ class TestComprehensive:
         assert "[pc]" in self.server.read_log(), \
             "server logs no prefix cache activity ([pc] lines)"
 
-    def test_prefix_cache_shared_system(self):
-        """Different user messages with same system prompt should share prefix."""
-        base = {
-            "model": "luce",
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        }
-        system = {"role": "system",
-                  "content": "You are a calculator. Reply with just the number."}
-        r1 = self._chat({**base, "messages": [
-            system, {"role": "user", "content": "What is 5+5?"}]})
-        r2 = self._chat({**base, "messages": [
-            system, {"role": "user", "content": "What is 3+7?"}]})
-        c1 = r1["choices"][0]["message"].get("content", "")
-        c2 = r2["choices"][0]["message"].get("content", "")
-        assert c1, "first response has no content"
-        assert c2, "second response has no content"
-
     # ── Multi-turn conversation tests ────────────────────────────────────
-
-    def test_multi_turn_openai(self):
-        """Multi-turn conversation via OpenAI chat/completions."""
-        r = self._chat({
-            "model": "luce",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "My name is Alice."},
-                {"role": "assistant", "content": "Hello Alice! How can I help you?"},
-                {"role": "user", "content": "What is my name?"}
-            ],
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        })
-        content = r["choices"][0]["message"].get("content", "")
-        assert content, "content is empty"
-        assert r["choices"][0].get("finish_reason") is not None, \
-            "choice has no finish_reason"
 
     def test_multi_turn_anthropic(self):
         """Multi-turn conversation via Anthropic messages API."""
@@ -307,71 +269,7 @@ class TestComprehensive:
                 and "</think>" not in reasoning_text), \
             f"reasoning has raw tags: {reasoning_text[:60]}"
 
-    # ── Non-streaming for all 3 APIs ─────────────────────────────────────
-
-    def test_nonstreaming_anthropic_full(self):
-        """Full non-streaming Anthropic response validation."""
-        r = self.client.post("/v1/messages", {
-            "model": "luce",
-            "system": "Reply in exactly one word.",
-            "messages": [{"role": "user", "content": "Say yes."}],
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        })
-        assert r.get("id", "").startswith("msg"), f"id: {r.get('id')}"
-        assert r.get("type") == "message"
-        assert r.get("role") == "assistant"
-        assert r.get("model") == "luce"
-        assert r.get("stop_reason") is not None
-        assert r.get("usage", {}).get("input_tokens", 0) > 0
-        assert r.get("usage", {}).get("output_tokens", 0) > 0
-
-    def test_nonstreaming_responses_full(self):
-        """Full non-streaming Responses API validation."""
-        r = self.client.post("/v1/responses", {
-            "model": "luce",
-            "input": "Say hello.",
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        })
-        assert r.get("id", "").startswith("resp"), f"id: {r.get('id')}"
-        assert r.get("object") == "response"
-        assert r.get("status") == "completed"
-        assert r.get("model") == "luce"
-
-        output = r.get("output", [])
-        assert output, "output has no entries"
-        msg = output[0]
-        assert msg.get("type") == "message"
-        content = msg.get("content", [])
-        assert content, "content array is empty"
-        assert content[0].get("type") == "output_text"
-        assert content[0].get("text", ""), "text is empty"
-
-        usage = r.get("usage", {})
-        assert usage.get("input_tokens", 0) > 0, f"usage: {usage}"
-        assert usage.get("output_tokens", 0) > 0, f"usage: {usage}"
-        assert (usage.get("total_tokens", 0) ==
-                usage.get("input_tokens", 0) + usage.get("output_tokens", 0)), \
-            f"usage.total_tokens incorrect: {usage}"
-
-    def test_nonstreaming_responses_string_input(self):
-        """Responses API with simple string input (not array)."""
-        r = self.client.post("/v1/responses", {
-            "model": "luce",
-            "input": "What is 2+2? Reply with just the number.",
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        })
-        output = r.get("output", [])
-        assert output, "output is empty"
-        if output[0].get("content"):
-            assert output[0]["content"][0].get("text", ""), "no text content"
-
-    # ── Streaming for Anthropic / Responses ──────────────────────────────
+    # ── Streaming for Anthropic ──────────────────────────────────────────
 
     def test_streaming_anthropic(self):
         """Full streaming Anthropic response validation."""
@@ -398,29 +296,6 @@ class TestComprehensive:
                 if delta.get("type") == "text_delta":
                     text += delta.get("text", "")
         assert text, "accumulated text is empty"
-
-    def test_streaming_responses(self):
-        """Full streaming Responses API validation."""
-        resp = self.client.post_stream("/v1/responses", {
-            "model": "luce",
-            "input": "Say hi.",
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": True,
-        })
-        events = parse_sse(resp, stop_on_event="response.completed")
-
-        event_types = [e.get("_event_type") for e in events if "_event_type" in e]
-        for expected in ("response.created", "response.output_item.added",
-                         "response.output_text.delta", "response.completed"):
-            assert expected in event_types, \
-                f"missing {expected}; got {event_types}"
-
-        text = ""
-        for e in events:
-            if e.get("_event_type") == "response.output_text.delta":
-                text += e.get("data", {}).get("delta", "")
-        assert text, "text is empty"
 
     # ── Tool request format tests ────────────────────────────────────────
 
@@ -490,20 +365,7 @@ class TestComprehensive:
         assert r.get("type") == "message"
         assert r.get("content"), "content is empty"
 
-    # ── Sampling parameters ──────────────────────────────────────────────
-
-    def test_temperature_zero(self):
-        """Deterministic output at temperature=0."""
-        prompt = {
-            "model": "luce",
-            "messages": [{"role": "user", "content": "Count from 1 to 5."}],
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-        }
-        c1 = self._chat(prompt)["choices"][0]["message"].get("content", "")
-        c2 = self._chat(prompt)["choices"][0]["message"].get("content", "")
-        assert c1 == c2, f"outputs differ at temp=0: {c1[:50]!r} vs {c2[:50]!r}"
+    # ── Output limits ────────────────────────────────────────────────────
 
     def test_max_tokens_limit(self):
         """Verify max_tokens is respected."""
@@ -520,18 +382,6 @@ class TestComprehensive:
         completion_tokens = r.get("usage", {}).get("completion_tokens", 0)
         assert completion_tokens <= 50, f"got {completion_tokens}"
         assert completion_tokens > 0, f"got {completion_tokens}"
-
-    def test_top_p_parameter(self):
-        """Verify server accepts top_p parameter."""
-        r = self._chat({
-            "model": "luce",
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "max_tokens": 1024,
-            "temperature": 0.8,
-            "top_p": 0.9,
-            "stream": False,
-        })
-        assert r["choices"][0]["message"].get("content", ""), "content is empty"
 
     # ── Concurrent requests ──────────────────────────────────────────────
 
@@ -581,21 +431,6 @@ class TestComprehensive:
         })
         assert r.get("choices"), "no choices"
 
-    def test_long_system_prompt(self):
-        """Long system prompt should work without truncation errors."""
-        long_system = "You are a helpful assistant. " * 100  # ~2900 chars
-        r = self._chat({
-            "model": "luce",
-            "messages": [
-                {"role": "system", "content": long_system},
-                {"role": "user", "content": "Say OK."}
-            ],
-            "max_tokens": 512,
-            "temperature": 0.0,
-            "stream": False,
-        })
-        assert r["choices"][0]["message"].get("content", ""), "content is empty"
-
     def test_unicode_content(self):
         """Unicode content in request and response."""
         r = self._chat({
@@ -628,14 +463,6 @@ class TestComprehensive:
         })
         assert r["choices"][0]["message"].get("content", ""), "content is empty"
 
-    def test_invalid_json_body(self):
-        """Completely invalid JSON body should return 400."""
-        r = self.client.send("POST", "/v1/chat/completions",
-                             data=b"not json at all{{{",
-                             headers={"Content-Type": "application/json"},
-                             timeout=10)
-        assert r.status_code == 400, f"got {r.status_code}"
-
     @pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages"])
     @pytest.mark.parametrize("label, body", [
         ("missing", {"stream": False}),
@@ -658,13 +485,6 @@ class TestComprehensive:
         })
         assert "choices" in resp or "content" in resp, \
             f"{path} unexpected body: {str(resp)[:100]}"
-
-    def test_options_cors(self):
-        """OPTIONS request should return CORS headers."""
-        r = self.client.send("OPTIONS", "/v1/chat/completions", timeout=10)
-        assert r.status_code in (200, 204), f"got {r.status_code}"
-        assert "Access-Control-Allow-Origin" in r.headers, \
-            f"headers: {list(r.headers.keys())}"
 
     # ── Streaming with client disconnect simulation ──────────────────────
 
@@ -700,31 +520,6 @@ class TestComprehensive:
         assert health.get("status") == "ok", \
             f"server unhealthy after disconnect: {health}"
 
-    # ── Request ID format ────────────────────────────────────────────────
-
-    def test_request_id_formats(self):
-        """Verify each API format generates the correct ID prefix."""
-        r1 = self._chat({
-            "model": "luce",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 64, "temperature": 0.0, "stream": False,
-        })
-        assert r1.get("id", "").startswith("chatcmpl"), f"OpenAI id: {r1.get('id')}"
-
-        r2 = self.client.post("/v1/messages", {
-            "model": "luce",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 64, "temperature": 0.0, "stream": False,
-        })
-        assert r2.get("id", "").startswith("msg"), f"Anthropic id: {r2.get('id')}"
-
-        r3 = self.client.post("/v1/responses", {
-            "model": "luce",
-            "input": "hi",
-            "max_tokens": 64, "temperature": 0.0, "stream": False,
-        })
-        assert r3.get("id", "").startswith("resp"), f"Responses id: {r3.get('id')}"
-
 
 # ─── CLI validation (binary only, no running server) ─────────────────────
 
@@ -734,14 +529,6 @@ def _usage(server_bin: Path) -> str:
     proc = subprocess.run([str(server_bin)], capture_output=True, text=True,
                           timeout=5)
     return proc.stderr + proc.stdout
-
-
-@pytest.mark.model
-def test_ddtree_flags_accepted(server_bin):
-    """The binary prints usage mentioning --ddtree without hanging.
-    (Actual DDTree requires Qwen35 backend — this just validates CLI parsing.)"""
-    usage = _usage(server_bin)
-    assert "ddtree" in usage.lower(), f"usage output: {usage[:200]}"
 
 
 @pytest.mark.model

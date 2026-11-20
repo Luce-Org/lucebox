@@ -181,7 +181,7 @@ int main() {
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     if (!gpu) {
         std::printf("SKIP: no CUDA/HIP device\n");
-        return 0;
+        return 77;
     }
 
     const std::vector<Case> cases = {
