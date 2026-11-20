@@ -2395,10 +2395,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     const bool adopt = plan == KvflashRestorePlan::AdoptDense;
     const bool full_reprefill = plan == KvflashRestorePlan::FullReprefill;
 
-    static const bool kv_trace = std::getenv("LUCE_KV_TRACE") != nullptr && std::atoi(std::getenv("LUCE_KV_TRACE")) != 0;
-    static const bool live_kv_delta_on = std::getenv("LUCE_LIVE_KV_DELTA") == nullptr || std::atoi(std::getenv("LUCE_LIVE_KV_DELTA")) != 0;
-    const auto t_kv_r0 = std::chrono::steady_clock::now();
-    bool did_live_kv_delta = false;
+
 
     if (live_restore) {
         clear_kv_rows_from(cache_, cache_.cur_pos);
@@ -2407,7 +2404,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
     } else {
         const bool live_kv_prefix =
-            live_kv_delta_on && !consume && !full_reprefill && !kvflash_active() &&
+            !consume && !full_reprefill && !kvflash_active() &&
             !cfg_.paged_attention && !req.images && !req.prompt.empty() &&
             live_kv_valid_ &&
             (int)live_kv_tokens_.size() >= snap_pos &&
@@ -2415,7 +2412,6 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             std::equal(req.prompt.begin(), req.prompt.begin() + snap_pos, live_kv_tokens_.begin());
 
         if (live_kv_prefix) {
-            did_live_kv_delta = true;
             clear_kv_rows_from(cache_, snap_pos);
             const bool skip_tf = live_target_feat_valid_ && cache_.target_feat != nullptr &&
                 cache_.target_feat_cap > 0 &&
@@ -2489,12 +2485,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
     }
     }
-    const auto t_kv_r1 = std::chrono::steady_clock::now();
-    if (kv_trace) {
-        std::fprintf(stderr, "[kv-trace][qwen35] slot=%d pos=%d live_restore=%d live_delta=%d restore_ms=%.2f\n",
-            slot, snap_pos, (int)live_restore, (int)did_live_kv_delta,
-            std::chrono::duration<double, std::milli>(t_kv_r1 - t_kv_r0).count());
-    }
+
 
     // Now generate from restored state
     sampler_ = req.sampler;

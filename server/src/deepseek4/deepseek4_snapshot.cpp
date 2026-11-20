@@ -594,11 +594,7 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
         std::fprintf(stderr, "[deepseek4] snapshot restore: HC copy failed\n");
         return false;
     }
-    static const bool delta_enabled = []() {
-        const char * e = std::getenv("LUCE_DS4_DELTA_RESTORE");
-        return !(e && std::atoi(e) == 0);
-    }();
-    const int eff_skip = (delta_enabled && compress_ratios && skip_prefix_tokens > 0)
+    const int eff_skip = (compress_ratios && skip_prefix_tokens > 0)
         ? std::min(skip_prefix_tokens, snap.cur_pos) : 0;
 
     for (size_t il = 0; il < cache.layers.size(); ++il) {

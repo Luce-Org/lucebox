@@ -1427,22 +1427,14 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
                                    !std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin()))) {
             return generate_impl(req, io);
         }
-        static const bool kv_trace = std::getenv("LUCE_KV_TRACE") != nullptr && std::atoi(std::getenv("LUCE_KV_TRACE")) != 0;
-        static const bool live_kv_delta_on = std::getenv("LUCE_LIVE_KV_DELTA") == nullptr || std::atoi(std::getenv("LUCE_LIVE_KV_DELTA")) != 0;
         const bool live_kv_prefix =
-            live_kv_delta_on && !snap.rows_in_pager && !cache_.kvflash &&
+            !snap.rows_in_pager && !cache_.kvflash &&
             cache_.cur_pos >= snap.cur_pos &&
             tokens_.size() >= snap.tokens.size() &&
             snap.tokens.size() == (size_t) snap.cur_pos &&
             cache_.kv_bucket_base == snap.kv_bucket_base &&
             std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin());
-        const auto t_r0 = std::chrono::steady_clock::now();
         if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows, live_kv_prefix)) return generate_impl(req, io);
-        if (kv_trace) {
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_r0).count();
-            std::fprintf(stderr, "[kv-trace][qwen4exp] slot=%d pos=%d live_delta=%d restore_ms=%.2f\n",
-                slot, snap.cur_pos, (int) live_kv_prefix, ms);
-        }
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
     }
