@@ -132,8 +132,8 @@ __global__ void paged_attn_rdna_wmma_kernel(
     __shared__ _Float16 KV_lds[BN * D];
     __shared__ int32_t  phys_lds[BN];
     __shared__ int32_t  tile_inv_lds;
-    __shared__ int32_t  blk_seq_lds[16];
-    __shared__ int32_t  blk_kv_lds[16];
+    __shared__ int32_t  blk_seq_lds[32];
+    __shared__ int32_t  blk_kv_lds[32];
 
     const int lane   = threadIdx.x;
     const int wave   = threadIdx.y;
