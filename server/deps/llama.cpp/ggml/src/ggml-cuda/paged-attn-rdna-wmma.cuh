@@ -733,11 +733,11 @@ __global__ void paged_attn_rdna_wmma_kernel(
 } // anonymous namespace
 
 static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static const int mode = []() {
-        const char * e = getenv("LUCE_RDNA_PAGED_WMMA");
-        return e ? atoi(e) : 1;
+    static const bool enabled = []() {
+        const char * e = getenv("LUCE_PAGED_WMMA");
+        return !(e && atoi(e) == 0);
     }();
-    if (mode == 0) {
+    if (!enabled) {
         return false;
     }
 
@@ -787,13 +787,11 @@ static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggm
     //   For non-tree prefill (n_rows > 16), only wins on single-seq; legacy paged_attn_wmma is competitive.
     // - Strix Halo (gfx1151): wins on tree verify, F16 decode, and Q8_0 prefill (n_rows > 16, 2.01x)!
     //   For Q8_0 single-row decode (n_rows <= 16), DP4A paged_attn_decode is faster -> defer!
-    if (mode == 1) {
-        if (!is_tree && is_r3 && k->type == GGML_TYPE_Q8_0 && n_rows <= 16) {
-            return false;
-        }
-        if (!is_tree && is_r4 && n_rows > 16) {
-            return false;
-        }
+    if (!is_tree && is_r3 && k->type == GGML_TYPE_Q8_0 && n_rows <= 16) {
+        return false;
+    }
+    if (!is_tree && is_r4 && n_rows > 16) {
+        return false;
     }
 
     int32_t tree_width = 0, tree_scratch_base = 0, tree_scratch_stride = 0;
@@ -955,6 +953,7 @@ static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggm
     }
 
     CUDA_CHECK(cudaGetLastError());
+    ggml_backend_cuda_record_paged_attn_wmma256_launch();
     return true;
 }
 

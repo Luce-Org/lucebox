@@ -577,12 +577,6 @@ __global__ void fattn_rdna_splitk_reduce(
 } // namespace
 
 static bool ggml_cuda_fattn_rdna_wmma_supported(const int device, const ggml_tensor * dst) {
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_RDNA_WMMA_FA");
-        return e == nullptr || std::atoi(e) != 0;
-    }();
-    if (!enabled) return false;
-
     const int cc = ggml_cuda_info().devices[device].cc;
     if (!GGML_CUDA_CC_IS_RDNA4(cc) && !GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
 
@@ -594,13 +588,9 @@ static bool ggml_cuda_fattn_rdna_wmma_supported(const int device, const ggml_ten
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) return false;
     if ((Q->ne[0] != 128 && Q->ne[0] != 256) || V->ne[0] != Q->ne[0]) return false;
-    // Allow small nq (DFlash2/MTP verify) when packed GQA rows >= min_rows (default 16)
-    static const int min_packed_rows = []() {
-        const char * e = std::getenv("LUCE_FA_MIN_ROWS");
-        return e ? std::atoi(e) : 16;
-    }();
+    // Allow small nq (DFlash2/MTP verify) when packed GQA rows >= 16
     const int64_t gqa = Q->ne[2] / K->ne[2];
-    if (Q->ne[1] * gqa < min_packed_rows) return false;
+    if (Q->ne[1] * gqa < 16) return false;
     if (Q->ne[1] < 4) return false; // keep specialized fattn-vec for pure nq=1..3 decode
     if (GGML_CUDA_CC_IS_RDNA3_5(cc) && K->type == GGML_TYPE_F16 && Q->ne[1] < 16) return false;
     if (mask && mask->type != GGML_TYPE_F16) return false;
