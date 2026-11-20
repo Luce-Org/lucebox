@@ -365,12 +365,6 @@ static void small_m_gemm_dispatch(
 
 static bool ggml_cuda_small_m_gemm_supported(
         const int device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_SMALL_M_GEMM");
-        return e ? std::atoi(e) != 0 : true;
-    }();
-    if (!enabled) return false;
-
     const int cc = ggml_cuda_info().devices[device].cc;
     if (!GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4(cc)) return false;
 

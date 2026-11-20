@@ -1007,12 +1007,8 @@ static bool mmb_general_fast_quant(const ggml_type t) {
 }
 
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const bool general_on = []() {
-        const char * e = std::getenv("LUCE_MMB_GENERAL");
-        return e == nullptr || std::atoi(e) != 0;
-    }();
     const bool q4x = mmb_enabled();
-    const bool gen = !q4x && general_on && mmb_arch() && mmb_general_fast_quant(src0->type);
+    const bool gen = !q4x && mmb_arch() && mmb_general_fast_quant(src0->type);
     if (!q4x && !gen) return false;
     const bool quant = mmb_quant_type(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16;

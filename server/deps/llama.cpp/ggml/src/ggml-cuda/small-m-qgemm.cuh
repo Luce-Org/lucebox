@@ -487,11 +487,6 @@ __global__ void small_m_qgemm_reduce_kernel(
 } // namespace
 
 static bool ggml_cuda_small_m_qgemm_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    static const int mode = []() {
-        const char * e = std::getenv("LUCE_SMALL_M_QGEMM");
-        return e ? std::atoi(e) : 1;
-    }();
-    if (mode == 0) return false;
     const bool is_r4 = GGML_CUDA_CC_IS_RDNA4(cc);
     const bool is_r35 = GGML_CUDA_CC_IS_RDNA3_5(cc);
     if (!is_r4 && !is_r35) return false;
@@ -504,12 +499,6 @@ static bool ggml_cuda_small_m_qgemm_supported(const int cc, const ggml_tensor * 
     const int64_t M = src0->ne[1];
     const int64_t T = src1->ne[1];
     if (K < 1024 || (K % 256) != 0 || M < 32) return false;
-    if (mode == 2) {
-        if (T < 9 || T > 64) return false;
-        return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q4_K ||
-               t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ2_XS || t == GGML_TYPE_Q3_K ||
-               t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ4_XS;
-    }
     // Concurrency T=17..64 (BN=32, 2x weight-register reuse):
     // - Q8_0 M<=512: 1.26x-2.24x on R9700, 2.00x-2.97x on Strix Halo!
     // - IQ2_S / IQ2_XS on R9700 T=17..32: 1.20x-1.30x!
