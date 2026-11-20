@@ -282,7 +282,9 @@ static void print_usage(const char * prog) {
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
-        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on; with --kvflash\n"
+        "                      the default is exact rollback and this flag opts in; greedy\n"
+        "                      output then differs from AR on some prompts)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --specla            Enable speculative linear-attention verification\n"
         "                       when supported (Qwen3.6 uses DDTree automatically)\n"
@@ -928,6 +930,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
+            bargs.fast_rollback_explicit = true;
         } else if (std::strcmp(argv[i], "--specla") == 0) {
             bargs.specla_mode = true;
             bargs.fast_rollback = true;
@@ -1411,16 +1414,24 @@ static void auto_drafter_bytes(const ModelOptions & model,
     // block, or a DDTree's nodes.
     // --specla turns DDTree on during backend planning, after this runs.
     const bool tree = args.ddtree_mode || args.specla_mode;
-    if (!args.fast_rollback && !tree) return;
     int block = args.draft_block_size > 0 ? args.draft_block_size
                                           : (int) gguf_draft_block_size(*args.draft_path);
     if (block <= 0) block = LUCE_DRAFT_BLOCK_SIZE;
     const int max_verify_tokens = tree ? std::max(block, args.ddtree_budget + 1) : block;
-    const bool kvflash = !model.kvflash_pool.empty() || std::getenv("LUCE_KVFLASH") != nullptr;
+    const char * env_pool = std::getenv("LUCE_KVFLASH");
+    const bool kvflash = !model.kvflash_pool.empty() || env_pool != nullptr;
+    // Under the pager fast rollback is opt-in (spec_fast_rollback_enabled), and
+    // exact restore attaches the two snapshots only. Only a fixed pool is known
+    // here to give a pager: "auto" can size to none, so it is charged the
+    // checkpoints, the larger of the two.
+    const bool pager = luce::common::kvflash_fixed_pool_requested(
+        model.kvflash_pool.empty() ? env_pool : model.kvflash_pool.c_str());
     rollback_bytes = gguf_rollback_cache_bytes(
         args.model_path, max_verify_tokens,
         luce::common::resolve_chain_rollback_policy().checkpoint_f32,
-        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash);
+        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash,
+        /*checkpoints=*/luce::common::spec_rollback_checkpoints(
+            pager, args.fast_rollback, args.fast_rollback_explicit, tree));
 }
 
 // --target-device auto: bind the model block to the placement the policy picks.

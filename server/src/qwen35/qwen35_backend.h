@@ -100,6 +100,7 @@ struct Qwen35Config {
 
     // Speculative decode strategy
     bool         fast_rollback   = true;
+    bool         fast_rollback_explicit = false;  // opts in to fast rollback under --kvflash
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
     // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
@@ -273,7 +274,9 @@ protected:
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
     // pflash drafter is loaded it becomes the reselect scorer (every
-    // kvflash_tau_ decoded tokens). Forces AR decode (no spec).
+    // kvflash_tau_ decoded tokens). With a draft model the serial path
+    // speculates too: spec steps stay AR-equivalent (see do_spec_decode);
+    // --ddtree with KVFlash is refused at startup.
     // Protected: the MoE subclass routes its pipelined decode loops and
     // hybrid prefill through the same pager/history/reselect state.
     KvFlashPager                   kvflash_pager_;
@@ -411,6 +414,7 @@ protected:
     // Spec: copy the staged verify query of position new_committed - 1 into
     // q_cap, so the next reselection reads AR's query. False when that row is
     // not staged (q_cap is left as is).
+    bool kvflash_q_cap_from_stage(int new_committed);
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
@@ -560,6 +564,12 @@ private:
     // A chunk starts at every absolute `restore_points` position (see
     // GenerateRequest::restore_points), so a snapshot at one is exact and a
     // restore from it reproduces a cold prefill.
+    // Gives the prefill-only cache the storage speculative decode rolls back
+    // with. Every speculative step snapshots the recurrent state, so the
+    // snapshot pair is always attached; the per-token checkpoint buffers
+    // (about 2.4 GB on Qwen3.8-27B at block size 16) only when fast rollback
+    // or DDTree capture into them.
+    bool attach_rollback_storage(int max_verify_tokens, bool enable_specla);
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
@@ -599,7 +609,8 @@ private:
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       bool * forced_close_out,
-                      bool * degenerate_close_out);
+                      bool * degenerate_close_out,
+                      size_t reselect_origin = SIZE_MAX);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
     // Allocates the next paged K/V row and uploads this step's block-table /

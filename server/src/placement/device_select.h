@@ -61,7 +61,8 @@ uint32_t gguf_draft_block_size(const std::string & draft_path);
 // with a drafter, not at load, so a placement that leaves them out loads and
 // then fails every request. Returns 0 for other families and unreadable files.
 uint64_t gguf_rollback_cache_bytes(const std::string & model_path, int max_verify_tokens,
-                                   bool checkpoint_f32, bool specla);
+                                   bool checkpoint_f32, bool specla,
+                                   bool checkpoints = true);
 
 // Weights, the estimated KV cache (0 when unknown), and a margin for compute
 // buffers, runtime overhead and any cache the estimate does not cover: a tenth
