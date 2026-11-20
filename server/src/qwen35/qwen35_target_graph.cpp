@@ -3224,15 +3224,15 @@ void clear_kv_rows_from(TargetCache & cache, int pos) {
 }
 
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
-                          bool skip_kv, const PrefixSnapshot * kv_from) {
+                          bool skip_kv, const PrefixSnapshot * kv_from,
+                          bool skip_target_feat) {
     if (snap.layout != PrefixSnapshot::Layout::dense) {
         set_last_error("restore_target_cache: snapshot is not dense");
         return false;
     }
-    // A state-only snapshot takes its attention rows from a deeper dense one.
     if (!snap.state_only) kv_from = nullptr;
-    if (snap.state_only &&
-        (skip_kv || !kv_from || kv_from == &snap || !kv_from->ctx ||
+    if (snap.state_only && !skip_kv &&
+        (!kv_from || kv_from == &snap || !kv_from->ctx ||
          kv_from->layout != PrefixSnapshot::Layout::dense || kv_from->is_pooled ||
          kv_from->state_only || kv_from->cur_pos < snap.cur_pos ||
          kv_from->kv_k_type != snap.kv_k_type || kv_from->max_ctx != snap.max_ctx)) {
@@ -3240,7 +3240,7 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
         return false;
     }
     const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
-    if (snap.is_pooled != skip_kv) {
+    if (snap.is_pooled && !skip_kv) {
         set_last_error("restore_target_cache: pooled/dense snapshot mismatch");
         return false;
     }
@@ -3327,8 +3327,8 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
         ggml_backend_tensor_copy(snap.conv_state_snap[i], cache.conv_state[i]);
     }
 
-    // target_feat: partial copy of stored rows.
-    if (cache.target_feat && snap.target_feat_snap) {
+    // target_feat: partial copy of stored rows (skip when live GPU target_feat already holds [0, snap_pos)).
+    if (!skip_target_feat && cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
         ggml_backend_tensor_set(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
     }

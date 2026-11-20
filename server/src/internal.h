@@ -706,7 +706,8 @@ bool snapshot_target_cache(const TargetWeights & w,
 // state-only `snap`; it is required for one and ignored otherwise.
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
                           bool skip_kv = false,
-                          const PrefixSnapshot * kv_from = nullptr);
+                          const PrefixSnapshot * kv_from = nullptr,
+                          bool skip_target_feat = false);
 
 // Free the attention KV of a snapshot (dense, or a paged checkpoint) and keep
 // the rest: the result is state-only and restores with the rows of a deeper

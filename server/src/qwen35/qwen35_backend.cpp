@@ -1445,6 +1445,9 @@ bool Qwen35Backend::snapshot_used(int slot) const {
 bool Qwen35Backend::restore_target_cache_from_snapshot(int slot, int kv_slot) {
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
+    live_kv_valid_ = false;
+    live_target_feat_valid_ = false;
+    live_kv_tokens_.clear();
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
     return restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
                                 snapshot_kv_source(slot, kv_slot));
@@ -2144,13 +2147,29 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         result.restored_prefix_tokens = live_cut;
         result.restore_cut_reported = true;
     } else {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
                                /*kv_offset=*/0, has_images ? &image_rows : nullptr,
                                req.restore_points);
     }
     if (committed < 0) {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
+    }
+    if (!has_images && rope_delta_ == 0 && !kvflash_active() && !cfg_.paged_attention &&
+        committed > 0 && committed <= (int)req.prompt.size()) {
+        live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + committed);
+        live_kv_valid_ = true;
+        live_target_feat_valid_ = (cache_.target_feat != nullptr && !draft_parked_);
+    } else {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
@@ -2342,30 +2361,63 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     const bool adopt = plan == KvflashRestorePlan::AdoptDense;
     const bool full_reprefill = plan == KvflashRestorePlan::FullReprefill;
 
+    static const bool kv_trace = std::getenv("LUCE_KV_TRACE") != nullptr && std::atoi(std::getenv("LUCE_KV_TRACE")) != 0;
+    static const bool live_kv_delta_on = std::getenv("LUCE_LIVE_KV_DELTA") == nullptr || std::atoi(std::getenv("LUCE_LIVE_KV_DELTA")) != 0;
+    const auto t_kv_r0 = std::chrono::steady_clock::now();
+    bool did_live_kv_delta = false;
+
     if (live_restore) {
-        // The live cache already is this snapshot (saved after the previous
-        // generation, nothing ran since). Only the rows past it differ from
-        // a restore: rejected drafts, which the padded decode span reads.
         clear_kv_rows_from(cache_, cache_.cur_pos);
+        if (live_kv_valid_ && (int)live_kv_tokens_.size() > cache_.cur_pos) {
+            live_kv_tokens_.resize(cache_.cur_pos);
+        }
     } else {
-        // Clear-then-restore: the step-invariant decode reads a 256-padded,
-        // mask-less FA span, so rows beyond the restored prefix must be ZERO,
-        // not leftovers from the previous request. cudaMemset is ~0.2ms.
-        if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-        if (full_reprefill) {
-            std::fprintf(stderr,
-                "[kvflash] snapshot (pos=%d) %s: full re-prefill "
-                "of %zu prompt tokens\n", snap_pos,
-                snap_pooled ? "not consumable" : "dense prefix cannot continue past the pool",
-                req.prompt.size());
-            reset_recurrent_state(cache_);
+        const bool live_kv_prefix =
+            live_kv_delta_on && !consume && !full_reprefill && !kvflash_active() &&
+            !cfg_.paged_attention && !req.images && !req.prompt.empty() &&
+            live_kv_valid_ &&
+            (int)live_kv_tokens_.size() >= snap_pos &&
+            (int)req.prompt.size() >= snap_pos &&
+            std::equal(req.prompt.begin(), req.prompt.begin() + snap_pos, live_kv_tokens_.begin());
+
+        if (live_kv_prefix) {
+            did_live_kv_delta = true;
+            clear_kv_rows_from(cache_, snap_pos);
+            const bool skip_tf = live_target_feat_valid_ && cache_.target_feat != nullptr;
+            const bool restored = restore_target_cache(
+                prefix_snapshots_[slot], cache_, /*skip_kv=*/true, /*kv_from=*/nullptr,
+                /*skip_target_feat=*/skip_tf);
+            if (!restored) {
+                live_kv_valid_ = false;
+                live_target_feat_valid_ = false;
+                live_kv_tokens_.clear();
+                std::fprintf(stderr, "[qwen35] live-kv delta restore slot=%d failed: %s\n",
+                             slot, luce_last_error());
+                cache_.cur_pos = 0;
+                result.fail(GenerateErrorCode::InvalidSnapshotSlot,
+                            std::string("snapshot restore failed: ") + luce_last_error());
+                out_io.emit(-1);
+                return result;
+            }
+            live_kv_tokens_.resize(snap_pos);
         } else {
-            // Decoding on a cache the restore did not fill yields garbage.
-            const bool restored = consume
-                ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
-                   kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
-                : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
-                                       snapshot_kv_source(slot, req.restore_kv_slot));
+            live_kv_valid_ = false;
+            live_target_feat_valid_ = false;
+            live_kv_tokens_.clear();
+            if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
+            if (full_reprefill) {
+                std::fprintf(stderr,
+                    "[kvflash] snapshot (pos=%d) %s: full re-prefill "
+                    "of %zu prompt tokens\n", snap_pos,
+                    snap_pooled ? "not consumable" : "dense prefix cannot continue past the pool",
+                    req.prompt.size());
+                reset_recurrent_state(cache_);
+            } else {
+                const bool restored = consume
+                    ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
+                       kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
+                    : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                           snapshot_kv_source(slot, req.restore_kv_slot));
             if (!restored) {
                 std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
                              slot, luce_last_error());
@@ -2390,7 +2442,20 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                     std::fflush(stdout);
                 }
             }
+            if (!consume && !kvflash_active() && !cfg_.paged_attention && !req.images &&
+                !req.prompt.empty() && (int)req.prompt.size() >= snap_pos) {
+                live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + snap_pos);
+                live_kv_valid_ = true;
+                live_target_feat_valid_ = (cache_.target_feat != nullptr && prefix_snapshots_[slot].target_feat_snap != nullptr);
+            }
         }
+    }
+    }
+    const auto t_kv_r1 = std::chrono::steady_clock::now();
+    if (kv_trace) {
+        std::fprintf(stderr, "[kv-trace][qwen35] slot=%d pos=%d live_restore=%d live_delta=%d restore_ms=%.2f\n",
+            slot, snap_pos, (int)live_restore, (int)did_live_kv_delta,
+            std::chrono::duration<double, std::milli>(t_kv_r1 - t_kv_r0).count());
     }
 
     // Now generate from restored state
@@ -2473,6 +2538,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+        if (live_kv_valid_ && !req.images && rope_delta_ == 0 && !kvflash_active() &&
+            committed > 0 && committed <= prompt_len) {
+            live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + committed);
+            if (draft_parked_) live_target_feat_valid_ = false;
+        }
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
         // The slot's snapshot covers more KV than the new prompt. This is
         // routine with agent clients (Letta, Hermes, ...) that edit or

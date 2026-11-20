@@ -524,7 +524,8 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 }
 
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
-                               const Qwen4ExpSnapshot * rows_from) {
+                               const Qwen4ExpSnapshot * rows_from,
+                               bool skip_live_kv) {
     if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
     if (s.rows_in_pager ? !c.kvflash || c.cur_pos < s.cur_pos : c.kvflash && s.cur_pos > c.kvflash->pool_tokens())
         return false;
@@ -568,11 +569,28 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     // Pager-held rows: drop the live positions past the snapshot instead; the point state is overwritten below.
     if (s.rows_in_pager) {
         c.kvflash->truncate(s.cur_pos);
+    } else if (skip_live_kv) {
+        auto clear_tail = [](ggml_tensor * t, int64_t from_row) {
+            if (!t || from_row < 0 || from_row >= t->ne[1]) return;
+            const size_t row_bytes = (size_t) (t->ne[1] - from_row) * t->nb[1];
+            for (int64_t h = 0; h < t->ne[2]; ++h) {
+                ggml_backend_tensor_memset(t, 0, (size_t) h * t->nb[2] + (size_t) from_row * t->nb[1], row_bytes);
+            }
+        };
+        for (auto * t : c.attn_k) clear_tail(t, s.cur_pos);
+        for (auto * t : c.attn_v) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_raw) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_k) clear_tail(t, s.indexer_blocks);
+        if (mtp) {
+            clear_tail(c.mtp_k, std::max(0, s.cur_pos - 1));
+            clear_tail(c.mtp_v, std::max(0, s.cur_pos - 1));
+        }
     } else {
         ggml_backend_buffer_clear(c.buf, 0);
         if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
     }
     for (const RestoreStrip & strip : target) {
+        if (skip_live_kv && strip.rows) continue;
         const int64_t n = (int64_t) (strip.bytes / ggml_type_size(strip.t->type)) * ggml_blck_size(strip.t->type);
         ggml_tensor * live = ggml_view_1d(views, strip.t, n, strip.off);
         ggml_backend_view_init(live);
