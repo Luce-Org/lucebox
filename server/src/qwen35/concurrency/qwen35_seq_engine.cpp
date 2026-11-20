@@ -75,6 +75,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
+    restored_kv_checkpoint_.assign(static_cast<size_t>(n_slots), -1);
+    restored_kv_tokens_.assign(static_cast<size_t>(n_slots), 0);
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
 
     embed_rows_cap_ = static_cast<size_t>(
@@ -529,6 +531,10 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         const SamplerCfg & sampler) {
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
+        if (result.slot >= 0 && (size_t)result.slot < restored_kv_checkpoint_.size()) {
+            restored_kv_checkpoint_[(size_t)result.slot] = -1;
+            restored_kv_tokens_[(size_t)result.slot] = 0;
+        }
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
         reset_slot_draft_kv(result.slot);
@@ -587,6 +593,17 @@ int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
 }
 
 void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
+    {
+        const int drop_idx = checkpoint_index(checkpoint);
+        if (drop_idx >= 0) {
+            for (size_t s = 0; s < restored_kv_checkpoint_.size(); ++s) {
+                if (restored_kv_checkpoint_[s] == drop_idx) {
+                    restored_kv_checkpoint_[s] = -1;
+                    restored_kv_tokens_[s] = 0;
+                }
+            }
+        }
+    }
     const int index = checkpoint_index(checkpoint);
     if (index >= 0 &&
         b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens) {
@@ -599,6 +616,17 @@ size_t Qwen35SeqEngine::estimate_prefix_state_bytes(int tokens) const {
 }
 
 bool Qwen35SeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
+    {
+        const int drop_idx = checkpoint_index(checkpoint);
+        if (drop_idx >= 0) {
+            for (size_t s = 0; s < restored_kv_checkpoint_.size(); ++s) {
+                if (restored_kv_checkpoint_[s] == drop_idx) {
+                    restored_kv_checkpoint_[s] = -1;
+                    restored_kv_tokens_[s] = 0;
+                }
+            }
+        }
+    }
     const int index = checkpoint_index(checkpoint);
     return index >= 0 &&
         b_.prefix_snapshots_[index].layout == PrefixSnapshot::Layout::paged &&
@@ -676,6 +704,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
                     "cold admission failed after stale prefix restore";
             }
         } else {
+            const int kv_src_idx = kv_from ? kv_index : restore_index;
+            if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+                restored_kv_checkpoint_[(size_t)slot] = kv_src_idx;
+                restored_kv_tokens_[(size_t)slot] = plan.restore.tokens;
+            }
             result.prefix_store.restored = plan.restore;
             std::fprintf(stderr,
                 "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
@@ -687,6 +720,10 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
         result.prefix_store.restore_elapsed_us = restore_elapsed_us;
         if (result.status != AdmitResult::Status::admitted) return result;
     } else {
+        if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+            restored_kv_checkpoint_[(size_t)slot] = -1;
+            restored_kv_tokens_[(size_t)slot] = 0;
+        }
         reset_recurrent_slot(b_.cache_, slot);
     }
 
@@ -721,10 +758,22 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
     }
     const auto capture_started = std::chrono::steady_clock::now();
     PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
+    const PrefixSnapshot * base_kv = nullptr;
+    if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+        const int bidx = restored_kv_checkpoint_[(size_t)slot];
+        const int btok = restored_kv_tokens_[(size_t)slot];
+        if (bidx >= 0 && bidx != checkpoint && btok > 0 && btok < ticket.checkpoint.tokens) {
+            const PrefixSnapshot & cand = b_.prefix_snapshots_[bidx];
+            if (cand.ctx && cand.layout == PrefixSnapshot::Layout::paged &&
+                !cand.state_only && cand.cur_pos >= btok) {
+                base_kv = &cand;
+            }
+        }
+    }
     if (!replace_paged_target_cache(
             b_.cache_, slot, sequence.block_table,
             (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot,
-            &b_.displaced_snapshots_[checkpoint])) {
+            &b_.displaced_snapshots_[checkpoint], base_kv)) {
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - capture_started).count();
@@ -733,6 +782,10 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
             event.error = "paged prefix capture failed";
         }
         return event;
+    }
+    if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+        restored_kv_checkpoint_[(size_t)slot] = checkpoint;
+        restored_kv_tokens_[(size_t)slot] = ticket.checkpoint.tokens;
     }
     event.status = PrefixStoreEvent::Status::saved;
     event.elapsed_us =
@@ -1331,36 +1384,36 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         result.error = "fixed chain embedding failed";
         return result;
     }
-    ggml_backend_tensor_set(
-        graph.inp_embed, embeddings.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.inp_embed, embeddings.data(), 0,
         sizeof(float) * embeddings.size());
-    ggml_backend_tensor_set(
-        graph.positions, positions.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.positions, positions.data(), 0,
         sizeof(int32_t) * positions.size());
-    ggml_backend_tensor_set(
-        graph.parent_ids, parents.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.parent_ids, parents.data(), 0,
         sizeof(int32_t) * parents.size());
-    ggml_backend_tensor_set(
-        graph.tree_sizes, tree_sizes.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.tree_sizes, tree_sizes.data(), 0,
         sizeof(int32_t) * tree_sizes.size());
     if (detail::target_paged_tree_active_slots_need_upload(graph)) {
-        ggml_backend_tensor_set(
-            graph.active_slot_ids, mapped_slots.data(), 0,
+        ggml_backend_tensor_set_async(
+        b_.target_backend_,             graph.active_slot_ids, mapped_slots.data(), 0,
             sizeof(int32_t) * mapped_slots.size());
     }
-    ggml_backend_tensor_set(
-        graph.state_slot_ids, state_slots.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.state_slot_ids, state_slots.data(), 0,
         sizeof(int32_t) * state_slots.size());
-    ggml_backend_tensor_set(
-        graph.paged_query_seq_ids, query_slots.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.paged_query_seq_ids, query_slots.data(), 0,
         sizeof(int32_t) * query_slots.size());
     if (graph.paged_query_positions) {
-        ggml_backend_tensor_set(
-            graph.paged_query_positions, query_positions.data(), 0,
+        ggml_backend_tensor_set_async(
+        b_.target_backend_,             graph.paged_query_positions, query_positions.data(), 0,
             sizeof(int32_t) * query_positions.size());
     }
-    ggml_backend_tensor_set(
-        graph.kv_write_rows, write_rows.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.kv_write_rows, write_rows.data(), 0,
         sizeof(int64_t) * write_rows.size());
     ggml_backend_tensor_set(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
@@ -1559,14 +1612,14 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             append.position + static_cast<int>(proposal.accepted);
     }
 
-    ggml_backend_tensor_set(
-        graph.accepted_prefixes, accepted_prefixes.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.accepted_prefixes, accepted_prefixes.data(), 0,
         sizeof(int32_t) * accepted_prefixes.size());
-    ggml_backend_tensor_set(
-        graph.commit_slot_ids, commit_slots.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.commit_slot_ids, commit_slots.data(), 0,
         sizeof(int32_t) * commit_slots.size());
-    ggml_backend_tensor_set(
-        graph.commit_rows, commit_rows.data(), 0,
+    ggml_backend_tensor_set_async(
+        b_.target_backend_,         graph.commit_rows, commit_rows.data(), 0,
         sizeof(int64_t) * commit_rows.size());
     ggml_backend_tensor_set(
         graph.feature_commit_rows, feature_commit_rows.data(), 0,
@@ -2256,6 +2309,10 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
 }
 
 void Qwen35SeqEngine::retire(int slot) {
+    if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+        restored_kv_checkpoint_[(size_t)slot] = -1;
+        restored_kv_tokens_[(size_t)slot] = 0;
+    }
     offload_.discard(slot);
     clear_slot_images(slot);
     if (!slots_.is_active(slot)) return;

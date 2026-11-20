@@ -766,7 +766,8 @@ bool snapshot_paged_target_cache(
     const std::vector<uint32_t> & block_table,
     int block_size,
     int token_count,
-    PrefixSnapshot & snap);
+    PrefixSnapshot & snap,
+    const PrefixSnapshot * base_kv = nullptr);
 
 // Atomically replace a paged snapshot. The incumbent remains valid when
 // allocation, layout validation, or any staged copy fails.
@@ -777,7 +778,8 @@ bool replace_paged_target_cache(
     int block_size,
     int token_count,
     PrefixSnapshot & destination,
-    PrefixSnapshot * displaced = nullptr);
+    PrefixSnapshot * displaced = nullptr,
+    const PrefixSnapshot * base_kv = nullptr);
 
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and
