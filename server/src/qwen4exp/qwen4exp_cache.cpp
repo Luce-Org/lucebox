@@ -447,7 +447,7 @@ struct RestoreStrip {
 bool held_strips(const Qwen4ExpCache & c, const Qwen4ExpSnapshot & s, bool mtp, std::vector<RestoreStrip> & out) {
     out.clear();
     snapshot_strips(c, s.cur_pos, s.indexer_blocks, mtp, [&](ggml_tensor * t, size_t off, size_t bytes, bool rows) {
-        if (!rows || !s.state_only) out.push_back({t, off, bytes, rows, nullptr});
+        if (!rows || !(s.state_only || s.rows_in_pager)) out.push_back({t, off, bytes, rows, nullptr});
     });
     // A snapshot that has the draft layer, restored without it, leaves its trailing strips out.
     if (out.size() > s.strips.size() || (out.size() < s.strips.size()) != (s.mtp && !mtp)) return false;
@@ -485,17 +485,24 @@ void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s) {
     s = {};
 }
 
+bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c) {
+    return c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos);
+}
+
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
                             Qwen4ExpSnapshot & s) {
     free_qwen4exp_snapshot(s);
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
-    if (c.kvflash && !c.kvflash->identity_prefix_covers(c.cur_pos)) return false;
+    // Past the pool (or once paging relocated the prefix) the rows are the pager's: keep the point state alone.
+    const bool pager = qwen4exp_snapshot_rows_in_pager(c);
     size_t count = 0;
-    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor *, size_t, size_t, bool) { ++count; });
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true,
+                    [&](ggml_tensor *, size_t, size_t, bool rows) { count += !(pager && rows); });
     s.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
     if (!s.ctx) return false;
     s.strips.reserve(count);
-    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor * t, size_t off, size_t bytes, bool) {
+    snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor * t, size_t off, size_t bytes, bool rows) {
+        if (pager && rows) return;
         const int64_t n = bytes / ggml_type_size(t->type) * ggml_blck_size(t->type);
         auto * live = ggml_view_1d(s.ctx, t, n, off);
         auto * copy = ggml_new_tensor_1d(s.ctx, t->type, n);
@@ -506,6 +513,7 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);   // its layers' last K/V writes
     for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, store, live, copy);
     ggml_backend_synchronize(backend);
+    s.rows_in_pager = pager;
     s.cur_pos = c.cur_pos;
     s.indexer_blocks = c.indexer_blocks;
     s.mtp = c.mtp_k != nullptr;
@@ -518,7 +526,8 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
                                const Qwen4ExpSnapshot * rows_from) {
     if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
-    if (c.kvflash && s.cur_pos > c.kvflash->pool_tokens()) return false;
+    if (s.rows_in_pager ? !c.kvflash || c.cur_pos < s.cur_pos : c.kvflash && s.cur_pos > c.kvflash->pool_tokens())
+        return false;
     // A state-only snapshot's rows come from a whole snapshot at least as deep, of a prompt that extends its own.
     if (!s.state_only) {
         rows_from = nullptr;
@@ -556,8 +565,13 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     // Clear masked suffixes too: stable QSA scores the entire bucket. Stacked slot
     // states are not in c.buf; the snapshot rewrites this slot's slabs in full.
     // Only a donor's leading rows are copied, so the rows past them are zero as after a whole restore.
-    ggml_backend_buffer_clear(c.buf, 0);
-    if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
+    // Pager-held rows: drop the live positions past the snapshot instead; the point state is overwritten below.
+    if (s.rows_in_pager) {
+        c.kvflash->truncate(s.cur_pos);
+    } else {
+        ggml_backend_buffer_clear(c.buf, 0);
+        if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
+    }
     for (const RestoreStrip & strip : target) {
         const int64_t n = (int64_t) (strip.bytes / ggml_type_size(strip.t->type)) * ggml_blck_size(strip.t->type);
         ggml_tensor * live = ggml_view_1d(views, strip.t, n, strip.off);
@@ -579,7 +593,7 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     c.spec_pos = -1;
     c.spec_tokens = 0;
     // The restored rows sit in their identity slots; the pager maps them so.
-    if (c.kvflash && !layer_split_kvflash_sync_identity(*c.kvflash, s.cur_pos, c.kvflash->pool_tokens(), "qwen4exp")) {
+    if (c.kvflash && !s.rows_in_pager && !layer_split_kvflash_sync_identity(*c.kvflash, s.cur_pos, c.kvflash->pool_tokens(), "qwen4exp")) {
         reset_qwen4exp_state(backend, c);
         return false;
     }
@@ -665,7 +679,7 @@ std::string qwen4exp_disk_layout(const Qwen4ExpCache & c) {
 // `take`: export_qwen4exp_snapshot's snapshot, handed over (take_qwen4exp_snapshot).
 static OwnedSnapshot qwen4exp_disk_form(const std::string & layout, const Qwen4ExpSnapshot & s,
                                         Qwen4ExpSnapshot * take) {
-    if (layout.empty() || !s.ctx || !s.buf || s.state_only || s.cur_pos <= 0) return {};
+    if (layout.empty() || !s.ctx || !s.buf || s.state_only || s.rows_in_pager || s.cur_pos <= 0) return {};
     const size_t size = ggml_backend_buffer_get_size(s.buf);
     auto * base = (uint8_t *) ggml_backend_buffer_get_base(s.buf);
     std::vector<int32_t> meta = {kQwen4ExpDiskVersion, s.cur_pos, s.indexer_blocks, s.mtp ? 1 : 0, s.mtp_prev_pos};
