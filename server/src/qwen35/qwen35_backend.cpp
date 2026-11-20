@@ -2417,7 +2417,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         if (live_kv_prefix) {
             did_live_kv_delta = true;
             clear_kv_rows_from(cache_, snap_pos);
-            const bool skip_tf = live_target_feat_valid_ && cache_.target_feat != nullptr;
+            const bool skip_tf = live_target_feat_valid_ && cache_.target_feat != nullptr &&
+                cache_.target_feat_cap > 0 &&
+                cache_.cur_pos <= cache_.target_feat_cap &&
+                (int)live_kv_tokens_.size() <= cache_.target_feat_cap &&
+                snap_pos <= cache_.target_feat_cap;
             const bool restored = restore_target_cache(
                 prefix_snapshots_[slot], cache_, /*skip_kv=*/true, /*kv_from=*/nullptr,
                 /*skip_target_feat=*/skip_tf);

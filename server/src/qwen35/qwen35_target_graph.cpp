@@ -3219,7 +3219,8 @@ bool snapshot_target_cache(const TargetWeights & w,
 
     if (cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
-        if (can_delta && ancestor->target_feat_snap && ancestor->target_feat_snap->type == snap.target_feat_snap->type) {
+        if (can_delta && cache.target_feat_cap > 0 && snap_pos <= cache.target_feat_cap &&
+            ancestor->target_feat_snap && ancestor->target_feat_snap->type == snap.target_feat_snap->type) {
             const size_t a_feat = std::min(feat_nbytes, ggml_nbytes(ancestor->target_feat_snap));
             std::memcpy(snap.target_feat_snap->data, ancestor->target_feat_snap->data, a_feat);
             copy_d2h(cache.target_feat, (char *)snap.target_feat_snap->data + a_feat, a_feat, feat_nbytes - a_feat);

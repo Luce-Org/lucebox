@@ -765,7 +765,7 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
         if (bidx >= 0 && bidx != checkpoint && btok > 0 && btok < ticket.checkpoint.tokens) {
             const PrefixSnapshot & cand = b_.prefix_snapshots_[bidx];
             if (cand.ctx && cand.layout == PrefixSnapshot::Layout::paged &&
-                !cand.state_only && cand.cur_pos >= btok) {
+                !cand.state_only && cand.cur_pos > 0 && cand.cur_pos <= btok) {
                 base_kv = &cand;
             }
         }
