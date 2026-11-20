@@ -100,7 +100,9 @@ bool deepseek4_snapshot_declare_at(ggml_context * ctx,
 // allocated snapshot tensors and set `out.cur_pos`.
 bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
                              const DeepSeek4SnapshotAux * aux,
-                             DeepSeek4Snapshot & out);
+                             DeepSeek4Snapshot & out,
+                             ggml_backend_t cache_backend = nullptr,
+                             bool sync_backend = true);
 
 // declare + allocate on `snapshot_backend` + fill, in a context owned by `out`.
 // `aux == nullptr` produces a snapshot without the aux sidecar (not
@@ -108,13 +110,18 @@ bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out,
-                             const DeepSeek4SnapshotAux * aux = nullptr);
+                             const DeepSeek4SnapshotAux * aux = nullptr,
+                             ggml_backend_t cache_backend = nullptr);
 
 // A state-only `snap` takes its compressed and index rows from `rows_from`,
 // a whole snapshot of a prompt that extends it.
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache,
-                                const DeepSeek4Snapshot * rows_from = nullptr);
+                                const DeepSeek4Snapshot * rows_from = nullptr,
+                                ggml_backend_t cache_backend = nullptr,
+                                int skip_prefix_tokens = 0,
+                                const std::vector<uint32_t> * compress_ratios = nullptr,
+                                bool sync_backend = true);
 
 // Free the compressed and index rows of a snapshot that owns its storage and
 // keep the rest (DeepSeek4Snapshot::state_only). Row i of those tensors

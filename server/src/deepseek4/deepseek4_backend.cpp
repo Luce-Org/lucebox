@@ -3080,7 +3080,7 @@ bool DeepSeek4Backend::init() {
                 // Text staging is an optimization: keep serving without it.
                 for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
                 image_staging_caches_.clear();
-                free_deepseek4_cache(cache_);  // paged text serving does not use it
+                free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;  // paged text serving does not use it
                 std::fprintf(stderr, "[deepseek4] staging caches do not fit (%d x ctx=%d): text prompts "
                                      "prefill in the batch\n", cfg_.max_concurrency, max_ctx);
             }
@@ -4174,7 +4174,7 @@ void DeepSeek4Backend::release_target_state(bool keep_snapshots) {
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
-    free_deepseek4_cache(cache_);
+    free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
     expert_runtime_.reset();
     expert_cache_.destroy();
     stream_engine_.destroy();
@@ -4321,7 +4321,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             std::fprintf(stderr,
                          "[deepseek4] unpark: failed to recreate KV cache (ctx=%d)\n",
                          max_ctx);
-            free_deepseek4_cache(cache_);
+            free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
             release_vision();
             free_deepseek4_weights(w_);
             expert_cache_.destroy();
@@ -4338,7 +4338,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 
         if (env_flag_enabled("LUCE_DS4_MOE_TP") &&
             !init_moe_tensor_parallel()) {
-            free_deepseek4_cache(cache_);
+            free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
             release_vision();
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
@@ -4581,6 +4581,15 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (kv_offset == 0) {
         cache_has_images_ = images != nullptr;
         reset_deepseek4_cache(cache_);
+        live_tokens_.clear();
+        live_tokens_valid_ = (images == nullptr);
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
+    } else if (images != nullptr || cache_has_images_) {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
@@ -4782,6 +4791,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                         expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get(),
                         replay ? replay_cut + 1 : -1, with_tail ? &replay_tail : nullptr)) {
                     std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+                    live_tokens_.clear();
+                    live_tokens_valid_ = false;
+                    live_source_gen_ = 0;
+                    live_source_pos_ = 0;
                     return -1;
                 }
                 if (with_tail) {
@@ -4799,6 +4812,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                     add_step_tel(tel_acc, step_tel);
                     steps += (int) bands.size();
                 }
+                if (live_tokens_valid_ && !images && pos <= (int) live_tokens_.size()) {
+                    live_tokens_.resize((size_t) pos);
+                    live_tokens_.insert(live_tokens_.end(), tokens.data() + i, tokens.data() + i + span);
+                } else {
+                    live_tokens_.clear();
+                    live_tokens_valid_ = false;
+                }
+                if (pos < live_source_pos_) live_source_pos_ = pos;
                 pos += span;
                 i += span;
                 continue;
@@ -4971,6 +4992,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         if (!ok) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+            live_source_gen_ = 0;
+            live_source_pos_ = 0;
             return -1;
         }
         if (timing) {
@@ -4980,6 +5005,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (need_logits) {
             last_logits_ = std::move(logits);
         }
+        if (live_tokens_valid_ && !images && pos <= (int) live_tokens_.size()) {
+            live_tokens_.resize((size_t) pos);
+            live_tokens_.insert(live_tokens_.end(), tokens.data() + i, tokens.data() + i + n_tok);
+        } else {
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+        }
+        if (pos < live_source_pos_) live_source_pos_ = pos;
         pos += n_tok;
         last_logits_pos_ = cache_.cur_pos;
         i += n_tok;
@@ -5618,7 +5651,7 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
     aux_in.n_logits = last_logits_.size();
     aux_in.spec_feat = feat_tail.empty() ? nullptr : feat_tail.data();
     aux_in.n_spec_feat = feat_tail.size();
-    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot], &aux_in)) {
+    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot], &aux_in, backend_)) {
         return false;
     }
 
@@ -5626,6 +5659,16 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
         auto & aux = snapshot_aux_[slot];
         aux.last_logits = last_logits_;
         aux.spec_feat_window = std::move(feat_tail);
+        aux.gen = next_snap_gen_++;
+        if (live_tokens_valid_ && (int) live_tokens_.size() >= cache_.cur_pos) {
+            aux.tokens.assign(live_tokens_.begin(), live_tokens_.begin() + cache_.cur_pos);
+            aux.has_tokens = true;
+        } else {
+            aux.tokens.clear();
+            aux.has_tokens = false;
+        }
+        live_source_gen_ = aux.gen;
+        live_source_pos_ = cache_.cur_pos;
         aux.used = true;
     } catch (const std::bad_alloc &) {
         snapshot_free(slot);
@@ -5872,6 +5915,9 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
             ggml_backend_tensor_get(snap.spec_feat_snap, aux.spec_feat_window.data(),
                                     0, aux.spec_feat_window.size() * sizeof(float));
         }
+        aux.gen = next_snap_gen_++;
+        aux.tokens.clear();
+        aux.has_tokens = false;
         aux.used = true;
     } catch (const std::bad_alloc &) {
         return reject("out of memory");
@@ -5903,13 +5949,43 @@ bool DeepSeek4Backend::snapshot_restore(int slot, int rows_slot) {
         return false;
     }
 
-    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from)) {
+    int skip_tokens = 0;
+    const auto & aux = snapshot_aux_[slot];
+    if (!cache_has_images_) {
+        if (live_tokens_valid_ && aux.has_tokens) {
+            const int max_cmp = std::min({cache_.cur_pos, snapshots_[slot].cur_pos,
+                                          (int) live_tokens_.size(), (int) aux.tokens.size()});
+            int lcp = 0;
+            while (lcp < max_cmp && live_tokens_[(size_t) lcp] == aux.tokens[(size_t) lcp]) {
+                ++lcp;
+            }
+            skip_tokens = std::max(skip_tokens, lcp);
+        }
+        if (live_source_gen_ != 0 && live_source_gen_ == aux.gen) {
+            skip_tokens = std::max(skip_tokens, std::min({live_source_pos_, cache_.cur_pos, snapshots_[slot].cur_pos}));
+        }
+    }
+    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from, backend_,
+                                    skip_tokens, &w_.compress_ratios)) {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
         return false;
     }
     last_logits_ = std::move(restored_logits);
     spec_feat_window_ = std::move(restored_features);
     last_logits_pos_ = cache_.cur_pos;
     cache_has_images_ = false;
+    if (aux.has_tokens) {
+        live_tokens_ = aux.tokens;
+        live_tokens_valid_ = true;
+    } else {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+    }
+    live_source_gen_ = aux.gen;
+    live_source_pos_ = cache_.cur_pos;
     return true;
 }
 
@@ -6032,7 +6108,7 @@ void DeepSeek4Backend::shutdown() {
     free_deepseek4_paged_cache(paged_cache_);
     for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
     image_staging_caches_.clear();
-    free_deepseek4_cache(cache_);
+    free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
     expert_runtime_.reset();
     expert_cache_.destroy();
     stream_engine_.destroy();
