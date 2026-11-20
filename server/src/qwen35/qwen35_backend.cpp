@@ -3114,7 +3114,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // QK policy: pool the post-RoPE keys of chunks this batch sealed
         // (they are resident — sealed inside the protected tail window).
-        if (kvflash_active() && kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+        // Pooled prefill only: a dense prefill has no pager mapping until
+        // kvflash_sync_prefill builds it at the end and pools every chunk.
+        if (kvf_paged && kvflash_qk_policy_) kvflash_qk_pool_to(committed);
 
         // Sync draft-side features if active.
         if (remote_draft_.active() && !draft_parked_) {
