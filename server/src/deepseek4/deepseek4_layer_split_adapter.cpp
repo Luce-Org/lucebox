@@ -10,6 +10,7 @@
 #include "deepseek4_snapshot.h"
 #include "common/layer_split_runtime.h"
 #include "common/gguf_inspect.h"
+#include "common/platform_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-cuda.h"
@@ -37,10 +38,6 @@ static uint64_t split_elapsed_us(SplitClock::time_point start,
     return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-static bool env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
-}
 
 static int env_int(const char * name, int fallback) {
     const char * value = std::getenv(name);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "platform_env.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -21,11 +23,6 @@ struct ChainRollbackPolicy {
     int fast_rollback_threshold = 1;
     bool diagnostics = false;
 };
-
-inline bool env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
 
 // Layer-split fast rollback needs exact F32 per-token checkpoints. Keep the
 // feature, its capture work, and its additional memory behind one shared

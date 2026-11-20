@@ -21,6 +21,7 @@
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
+#include "common/platform_env.h"
 #include "luce.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/model_capabilities.h"
@@ -1334,15 +1335,6 @@ json require_messages_array(const json & body) {
     return body["messages"];
 }
 
-static bool env_flag_enabled(const char * name) {
-    const char * raw = std::getenv(name);
-    if (!raw || !*raw) return false;
-    std::string value(raw);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return value != "0" && value != "false" && value != "no" &&
-           value != "off";
-}
 
 static const json * find_tool_function(const json & tools,
                                        const std::string & name) {
