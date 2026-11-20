@@ -161,6 +161,16 @@ public:
     // policy and clamps its output cap against this value after admission.
     virtual int max_context() const = 0;
 
+    // The KV pool's capacity and the tokens no slot holds or has reserved,
+    // published for a caller choosing an engine (GET /props "load"): a free
+    // slot of a shared pool does not promise room for a long prompt. Both 0
+    // when the engine keeps no pool.
+    struct KvPoolTokens {
+        int64_t total = 0;
+        int64_t free = 0;
+    };
+    virtual KvPoolTokens kv_pool_tokens() const { return {}; }
+
     struct AdmitResult {
         enum class Status {
             admitted,

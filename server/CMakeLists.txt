@@ -2803,6 +2803,7 @@ if(LUCE_TESTS)
             test/unit/test_adaptive_keep_ratio.cpp
             test/unit/test_skip_park_guard.cpp
             test/unit/test_admission.cpp
+            test/unit/test_engine_load.cpp
             test/unit/test_restore_delta.cpp
             test/unit/test_restore_bounds.cpp
             test/unit/test_chain_rollback_policy.cpp

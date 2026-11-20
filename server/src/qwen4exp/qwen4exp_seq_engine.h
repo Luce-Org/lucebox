@@ -70,6 +70,7 @@ public:
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
+    KvPoolTokens kv_pool_tokens() const override { return slots_.kv_pool_tokens(); }
     AdmitResult admit(uint64_t request_id, const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
     bool supports_prefix_store() const override { return prefix_allowance_ > 0; }

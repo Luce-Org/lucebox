@@ -80,6 +80,13 @@ class HeldEngine final : public SeqEngine {
 public:
     int slot_count() const override { return 2; }
     int max_context() const override { return 64; }
+    // A 128-token pool: each resident slot holds 32 tokens, a parked one none.
+    KvPoolTokens kv_pool_tokens() const override {
+        std::lock_guard<std::mutex> lock(mu);
+        int resident = 0;
+        for (size_t i = 0; i < active.size(); ++i) resident += active[i] && !suspended[i];
+        return {128, 128 - 32 * resident};
+    }
     bool token_is_eos(int32_t token) const override { return token == 2; }
     StepPlanLimits step_plan_limits(int) const override { return {2, 64, 128}; }
     AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt,
@@ -391,7 +398,7 @@ public:
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
                            bool reverse_priority = false, size_t offload_bytes = 0,
-                           const char * first_output = "q") {
+                           const char * first_output = "q", int model_queue_limit = -1) {
         load_tokenizer(first_tok, false, first_output);
         load_tokenizer(second_tok, true, "s");
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
@@ -409,6 +416,7 @@ public:
         config.model_name = "qwen";
         config.max_ctx = 64;
         config.routing_queue_limit = queue_limit;
+        config.queue_limit = model_queue_limit;
         config.decode_kv_offload_bytes = offload_bytes;
         config.default_max_tokens = 4;
         config.prefix_cache_cap = 0;
@@ -477,6 +485,17 @@ public:
         client.send("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n");
         return response_body(client.read());
     }
+    // Polls the listener's /props until `busy` slots are taken and `waiting`
+    // requests wait; returns that load.
+    json wait_engine_load(int busy, int waiting) {
+        const auto deadline = Clock::now() + 5s;
+        for (;;) {
+            json load = get("/props")["load"];
+            if (load["slots_busy"] == busy && load["waiting"] == waiting) return load;
+            ROUTING_CHECK(Clock::now() < deadline);
+            std::this_thread::yield();
+        }
+    }
     void wait_load(int first_count, int second_count) {
         const auto deadline = Clock::now() + 5s;
         for (;;) {
@@ -491,6 +510,19 @@ public:
 json chat(const char * model = "qwen", bool stream = false) {
     return {{"model", model}, {"stream", stream}, {"max_tokens", 4},
             {"messages", {{{"role", "user"}, {"content", "x"}}}}};
+}
+
+// One model served alone, as a box runs it, with --queue-limit `limit`
+// (negative: none). `single`: the single-request worker instead of slots.
+struct OneModel : RunningModels {
+    explicit OneModel(int limit, bool single = false)
+        : RunningModels(false, single, false, 0, false, 0, "q", limit) {}
+};
+
+json chat_saying(const char * content) {
+    json body = chat();
+    body["messages"][0]["content"] = content;
+    return body;
 }
 } // namespace
 
@@ -877,7 +909,6 @@ TEST_CASE(ModelRoutingFixture, test_kv_busy_falls_back_before_stream_headers_and
     ROUTING_CHECK(stream.find("\"model\":\"ds4\"") != std::string::npos);
     ROUTING_CHECK(stream.find("data: [DONE]") != std::string::npos);
     models.wait_load(0, 0);
-    ROUTING_CHECK(models.first.engine.admissions == 0);
     ROUTING_CHECK(models.second.engine.prompts[0] == std::vector<int32_t>({1, 3}));
     ROUTING_CHECK(models.second.engine.temperatures[0] == 0.7f);
 }
@@ -990,10 +1021,9 @@ TEST_CASE(ModelRoutingFixture, test_single_model_permanent_capacity_is_client_er
     for (bool stream : {false, true}) {
         response_body(models.post(chat("qwen", stream)).read(), 400);
     }
-    ROUTING_CHECK(models.first.engine.admissions == 0);
 }
 
-// Disabled balancing must not start a peer or let a client alias change identity.
+// Disabled balancing must not route or let a client alias change identity.
 TEST_CASE(ModelRoutingFixture, test_single_model_run_does_not_enable_balancing) {
     RunningModels models(false, false, false);
     ROUTING_CHECK(!models.get("/props").contains("routing"));
@@ -1002,7 +1032,6 @@ TEST_CASE(ModelRoutingFixture, test_single_model_run_does_not_enable_balancing) 
     auto request = chat(); request.erase("model");
     ROUTING_CHECK(response_body(models.post(request).read())["model"] == "qwen");
     ROUTING_CHECK(response_body(models.post(chat("ds4")).read())["model"] == "qwen");
-    ROUTING_CHECK(models.second.engine.admissions == 0);
 }
 
 // Protect priority reversal and removal of secondary-name pinning. The old
@@ -1265,6 +1294,170 @@ TEST_CASE(ModelRoutingFixture, test_offload_budget_and_restore_errors_fail_one_r
         ROUTING_CHECK(models.first.engine.retirements == 2);
         ROUTING_CHECK(models.first.engine.kv_offload_state(1).bytes == 0);
     }
+}
+
+// --queue-limit: one request past the line is refused at the gate, before it
+// is tokenized (the over-long prompt gets 503, not the 400 of the context
+// check), in each API's shape, streaming or not. It leaves no trace: the
+// line, the engine and the counts are as before, and every request let in is
+// served. Model metadata and residency answer throughout.
+TEST_CASE(ModelRoutingFixture, test_queue_limit_refuses_past_the_line_before_tokenizing) {
+    OneModel model(1);
+    auto & engine = model.first.engine;
+    auto a = model.post(chat());
+    auto b = model.post(chat());
+    engine.wait_admissions(2);  // both slots prefill until finish()
+    auto queued = model.post(chat());
+    json load = model.wait_engine_load(2, 1);
+    ROUTING_CHECK(load["slots"] == 2 && load["queue_limit"] == 1);
+    ROUTING_CHECK(load["kv_tokens"] == 128 && load["kv_free_tokens"] == 64);
+
+    auto refused = [&](const json & body, const std::string & path) {
+        const auto response = model.post(body, path).read();
+        ROUTING_CHECK(response.find("\r\nRetry-After: 1\r\n") != std::string::npos);
+        return response_body(response, 503);
+    };
+    for (bool stream : {false, true}) {
+        const auto body = refused(chat("qwen", stream), "/v1/chat/completions");
+        ROUTING_CHECK(body["error"]["type"] == "server_error");
+        ROUTING_CHECK(body["error"]["code"] == "queue_full");
+        const auto anthropic = refused(chat("qwen", stream), "/v1/messages");
+        ROUTING_CHECK(anthropic["type"] == "error");
+        ROUTING_CHECK(anthropic["error"]["type"] == "overloaded_error");
+        ROUTING_CHECK(anthropic["request_id"].get<std::string>().rfind("msg", 0) == 0);
+        const json responses = {{"model", "qwen"}, {"stream", stream},
+                                {"input", "x"}, {"max_output_tokens", 4}};
+        ROUTING_CHECK(refused(responses, "/v1/responses")["error"]["code"] == "queue_full");
+    }
+    auto too_long = chat();
+    too_long["messages"][0]["content"] = std::string(100, 'x');
+    ROUTING_CHECK(refused(too_long, "/v1/chat/completions")["error"]["code"] == "queue_full");
+
+    ROUTING_CHECK(response_body(
+        model.post(chat(), "/v1/messages/count_tokens").read())["input_tokens"] == 1);
+    ROUTING_CHECK(model.get("/health")["status"] == "ok");
+    ROUTING_CHECK(model.get("/v1/models")["data"].size() == 1);
+    model.get("/v1/residency");
+    load = model.get("/props")["load"];
+    ROUTING_CHECK(load["slots_busy"] == 2 && load["waiting"] == 1);
+
+    engine.finish();
+    for (Socket * client : {&a, &b, &queued}) {
+        ROUTING_CHECK(response_body(client->read())["model"] == "qwen");
+    }
+    load = model.wait_engine_load(0, 0);
+    ROUTING_CHECK(load["kv_free_tokens"] == 128);
+    ROUTING_CHECK(engine.admissions == 3 && engine.retirements == 3);
+}
+
+// A request with tool checks waits in one place, from the gate into its
+// passes: it counts once against the limit, like any other request.
+TEST_CASE(ModelRoutingFixture, test_queue_limit_counts_a_tool_checked_request_once) {
+    OneModel model(1);
+    auto & engine = model.first.engine;
+    json checked = chat();
+    checked["tools"] = json::parse(R"([{"type": "function", "function": {"name": "ls",
+        "parameters": {"type": "object", "properties": {}}}}])");
+    auto a = model.post(chat());
+    auto b = model.post(chat());
+    engine.wait_admissions(2);
+    auto queued = model.post(checked);
+    model.wait_engine_load(2, 1);
+    response_body(model.post(checked).read(), 503);
+    ROUTING_CHECK(model.get("/props")["load"]["waiting"] == 1);
+    engine.finish();
+    for (Socket * client : {&a, &b, &queued}) {
+        ROUTING_CHECK(response_body(client->read())["model"] == "qwen");
+    }
+    model.wait_engine_load(0, 0);
+}
+
+// A refusal leaves the line in order: the request the engine deferred for KV
+// keeps the head and takes the next slot before the one queued behind it.
+TEST_CASE(ModelRoutingFixture, test_queue_limit_keeps_the_order_of_the_line) {
+    OneModel model(1);
+    auto & engine = model.first.engine;
+    auto a = model.post(chat_saying("x"));
+    engine.wait_admissions(1);
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        engine.capacity_busy = true;  // the free slot has no KV for the next request
+    }
+    auto c = model.post(chat_saying("y"));
+    {
+        std::unique_lock<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.cv.wait_for(lock, 5s, [&] { return engine.attempts >= 2; }));
+    }
+    // Two wait under a limit of one: c found a slot free and was let in, and
+    // waits there for KV. The engine holds slots + limit.
+    auto d = model.post(chat_saying("s"));
+    model.wait_engine_load(1, 2);
+    response_body(model.post(chat_saying("q")).read(), 503);
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        engine.capacity_busy = false;
+    }
+    engine.wait_admissions(2);
+    engine.finish();
+    for (Socket * client : {&a, &c, &d}) {
+        ROUTING_CHECK(response_body(client->read())["model"] == "qwen");
+    }
+    ROUTING_CHECK(engine.prompts == std::vector<std::vector<int32_t>>({{1}, {3}, {4}}));
+    model.wait_engine_load(0, 0);
+}
+
+// The single-request worker is one slot whose cache is the whole context,
+// taken while a request runs; the limit counts the queue behind it.
+TEST_CASE(ModelRoutingFixture, test_single_request_worker_reports_one_slot_and_limits_its_queue) {
+    OneModel model(1, true);
+    auto & backend = model.first_single;
+    json load = model.get("/props")["load"];
+    ROUTING_CHECK(load["slots"] == 1 && load["slots_busy"] == 0 && load["waiting"] == 0);
+    ROUTING_CHECK(load["kv_tokens"] == 64 && load["kv_free_tokens"] == 64);
+    auto running = model.post(chat());
+    backend.wait_calls(1);
+    auto queued = model.post(chat("qwen", true));
+    load = model.wait_engine_load(1, 1);
+    ROUTING_CHECK(load["kv_free_tokens"] == 0);
+    response_body(model.post(chat("qwen", true)).read(), 503);
+    backend.finish();
+    ROUTING_CHECK(response_body(running.read())["model"] == "qwen");
+    ROUTING_CHECK(queued.read().find("data: [DONE]") != std::string::npos);
+    load = model.wait_engine_load(0, 0);
+    ROUTING_CHECK(load["kv_free_tokens"] == 64);
+    ROUTING_CHECK(backend.calls == 2);
+}
+
+// Without --queue-limit nothing is refused: requests past the slots wait,
+// and /props counts them.
+TEST_CASE(ModelRoutingFixture, test_no_queue_limit_by_default) {
+    OneModel model(-1);
+    auto & engine = model.first.engine;
+    std::vector<Socket> clients;
+    for (int i = 0; i < 5; ++i) clients.push_back(model.post(chat("qwen", i % 2 == 1)));
+    engine.wait_admissions(2);
+    ROUTING_CHECK(model.wait_engine_load(2, 3)["queue_limit"].is_null());
+    engine.finish();
+    for (auto & client : clients) ROUTING_CHECK(client.read().rfind("HTTP/1.1 200 ", 0) == 0);
+    model.wait_engine_load(0, 0);
+    ROUTING_CHECK(engine.admissions == 5);
+}
+
+// /props reads the load without the scheduler: it answers while a step runs.
+TEST_CASE(ModelRoutingFixture, test_load_answers_while_a_step_runs) {
+    OneModel model(-1);
+    auto & engine = model.first.engine;
+    auto a = model.post(chat());
+    engine.wait_admissions(1);
+    {
+        std::unique_lock<std::mutex> lock(engine.mu);
+        engine.block_step = true;
+        ROUTING_CHECK(engine.cv.wait_for(lock, 5s, [&] { return engine.inside_block; }));
+    }
+    const json load = model.get("/props")["load"];
+    ROUTING_CHECK(load["slots_busy"] == 1 && load["kv_free_tokens"] == 96);
+    engine.finish();
+    ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
 }
 
 #undef ROUTING_CHECK
