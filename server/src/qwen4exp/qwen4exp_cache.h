@@ -315,7 +315,7 @@ bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c);
 // Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. Past a KVFlash pool the snapshot is
 // the point state alone (rows_in_pager).
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
-                            Qwen4ExpSnapshot & s);
+                            Qwen4ExpSnapshot & s, const Qwen4ExpSnapshot * ancestor = nullptr);
 // Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
 // concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
 // when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps

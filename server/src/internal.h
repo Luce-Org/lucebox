@@ -668,6 +668,7 @@ struct PrefixSnapshot {
     // lives in kvflash_blob (valid iff is_pooled). Plain dense path only.
     bool                 is_pooled    = false;
     std::vector<uint8_t> kvflash_blob;
+    std::vector<int32_t> tokens; // exact prefix tokens saved in this snapshot (for delta save)
 
     // State only (drop_prefix_snapshot_kv): the recurrent and conv state, the
     // decode seed and the drafter features at cur_pos, with no attention KV.
@@ -695,7 +696,9 @@ bool snapshot_target_cache(const TargetWeights & w,
                            PrefixSnapshot & snap,
                            bool skip_kv = false,
                            const std::vector<uint8_t> * kvflash_blob = nullptr,
-                           bool skip_target_feat = false);  // no drafter: omit the feature ring
+                           bool skip_target_feat = false,
+                           ggml_backend_t src_backend = nullptr,
+                           const PrefixSnapshot * ancestor = nullptr);  // no drafter: omit the feature ring
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =

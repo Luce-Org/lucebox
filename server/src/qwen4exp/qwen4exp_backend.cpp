@@ -1255,7 +1255,17 @@ bool Qwen4ExpBackend::snapshot_save_replacing(int slot, int source) {
     }
     if (!snapshot_fits(slot)) return false;
     auto & s = snapshots_[slot];
-    if (!save_qwen4exp_snapshot(backend_, snap_backend_, cache_, s)) return false;
+    const Qwen4ExpSnapshot * ancestor = nullptr;
+    for (int i = 0; i < kMaxSlots; ++i) {
+        if (i == slot) continue;
+        const auto & cand = snapshots_[i];
+        if (!cand.buf || cand.state_only || cand.rows_in_pager || cand.cur_pos <= 0 ||
+            cand.cur_pos > cache_.cur_pos || cand.indexer_blocks > cache_.indexer_blocks) continue;
+        if (cand.tokens.size() != (size_t) cand.cur_pos || cand.tokens.size() > tokens_.size()) continue;
+        if (!std::equal(cand.tokens.begin(), cand.tokens.end(), tokens_.begin())) continue;
+        if (!ancestor || cand.cur_pos > ancestor->cur_pos) ancestor = &cand;
+    }
+    if (!save_qwen4exp_snapshot(backend_, snap_backend_, cache_, s, ancestor)) return false;
     s.tokens = tokens_;
     s.logits = logits_;
     std::fprintf(stderr, "[qwen4exp-snap] slot=%d pos=%d bytes=%zu\n",

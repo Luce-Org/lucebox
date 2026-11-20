@@ -3103,7 +3103,9 @@ bool snapshot_target_cache(const TargetWeights & w,
                            PrefixSnapshot & snap,
                            bool skip_kv,
                            const std::vector<uint8_t> * kvflash_blob,
-                           bool skip_target_feat) {
+                           bool skip_target_feat,
+                           ggml_backend_t src_backend,
+                           const PrefixSnapshot * ancestor) {
     if (cache.n_seq_slots > 1) {
         set_last_error("snapshot_target_cache: multi-slot caches are unsupported");
         return false;
@@ -3150,8 +3152,23 @@ bool snapshot_target_cache(const TargetWeights & w,
                      ggml_backend_name(backend));
     }
 
-    // Copy KV strip-by-strip (right-sized snapshot is smaller than cache).
-    // skip_kv: KV is carried by the pager blob instead.
+    const bool host_dst = snap.buf && ggml_backend_buffer_is_host(snap.buf);
+    const bool use_async = (src_backend != nullptr) && host_dst;
+    const bool can_delta = !skip_kv && host_dst && ancestor && ancestor != &snap &&
+                           ancestor->ctx && ancestor->buf && !ancestor->is_pooled && !ancestor->state_only &&
+                           ancestor->cur_pos > 0 && ancestor->cur_pos <= snap_pos &&
+                           ggml_backend_buffer_is_host(ancestor->buf) &&
+                           (int)ancestor->attn_k_snap.size() == n_full_attn &&
+                           (int)ancestor->attn_v_snap.size() == n_full_attn;
+    auto copy_d2h = [&](ggml_tensor * src, void * dst_ptr, size_t src_off, size_t nbytes) {
+        if (nbytes == 0) return;
+        if (use_async) {
+            ggml_backend_tensor_get_async(src_backend, src, dst_ptr, src_off, nbytes);
+        } else {
+            ggml_backend_tensor_get(src, dst_ptr, src_off, nbytes);
+        }
+    };
+
     for (int i = 0; i < (skip_kv ? 0 : n_full_attn); i++) {
         ggml_tensor * sk = cache.attn_k[i];
         ggml_tensor * dk = snap.attn_k_snap[i];
@@ -3160,32 +3177,58 @@ bool snapshot_target_cache(const TargetWeights & w,
         if (!sk || !dk || !sv || !dv) continue;
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        ggml_tensor * ak = can_delta ? ancestor->attn_k_snap[i] : nullptr;
+        ggml_tensor * av = can_delta ? ancestor->attn_v_snap[i] : nullptr;
+        const size_t ak_strip = (ak && ak->type == dk->type && ak->nb[1] == sk->nb[1]) ? (size_t)ancestor->cur_pos * sk->nb[1] : 0;
+        const size_t av_strip = (av && av->type == dv->type && av->nb[1] == sv->nb[1]) ? (size_t)ancestor->cur_pos * sv->nb[1] : 0;
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
             size_t src_off = (size_t)kh * sk->nb[2];
             size_t dst_off = (size_t)kh * dk->nb[2];
-            ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
+            if (ak_strip > 0 && ak_strip <= k_strip) {
+                std::memcpy((char *)dk->data + dst_off, (const char *)ak->data + (size_t)kh * ak->nb[2], ak_strip);
+                copy_d2h(sk, (char *)dk->data + dst_off + ak_strip, src_off + ak_strip, k_strip - ak_strip);
+            } else {
+                copy_d2h(sk, (char *)dk->data + dst_off, src_off, k_strip);
+            }
         }
         for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
             size_t src_off = (size_t)kh * sv->nb[2];
             size_t dst_off = (size_t)kh * dv->nb[2];
-            ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+            if (av_strip > 0 && av_strip <= v_strip) {
+                std::memcpy((char *)dv->data + dst_off, (const char *)av->data + (size_t)kh * av->nb[2], av_strip);
+                copy_d2h(sv, (char *)dv->data + dst_off + av_strip, src_off + av_strip, v_strip - av_strip);
+            } else {
+                copy_d2h(sv, (char *)dv->data + dst_off, src_off, v_strip);
+            }
         }
     }
 
-    // SSM/conv: full copy (fixed-size, same shapes).
     for (int i = 0; i < n_delta; i++) {
         if (!cache.ssm_state[i] || !snap.ssm_state_snap[i] ||
             !cache.conv_state[i] || !snap.conv_state_snap[i]) {
             continue;
         }
-        ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
-        ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
+        if (use_async) {
+            ggml_backend_tensor_get_async(src_backend, cache.ssm_state[i],  snap.ssm_state_snap[i]->data,  0, ggml_nbytes(snap.ssm_state_snap[i]));
+            ggml_backend_tensor_get_async(src_backend, cache.conv_state[i], snap.conv_state_snap[i]->data, 0, ggml_nbytes(snap.conv_state_snap[i]));
+        } else {
+            ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
+            ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
+        }
     }
 
-    // target_feat: partial copy of first min(snap_pos, cap) rows.
     if (cache.target_feat && snap.target_feat_snap) {
         const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
-        ggml_backend_tensor_get(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+        if (can_delta && ancestor->target_feat_snap && ancestor->target_feat_snap->type == snap.target_feat_snap->type) {
+            const size_t a_feat = std::min(feat_nbytes, ggml_nbytes(ancestor->target_feat_snap));
+            std::memcpy(snap.target_feat_snap->data, ancestor->target_feat_snap->data, a_feat);
+            copy_d2h(cache.target_feat, (char *)snap.target_feat_snap->data + a_feat, a_feat, feat_nbytes - a_feat);
+        } else {
+            copy_d2h(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+        }
+    }
+    if (use_async) {
+        ggml_backend_synchronize(src_backend);
     }
 
     snap.cur_pos         = snap_pos;
@@ -3198,6 +3241,7 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.state_only      = false;
     if (skip_kv && kvflash_blob) snap.kvflash_blob = *kvflash_blob;
     else                         snap.kvflash_blob.clear();
+    snap.tokens.clear();
 
     return true;
 }

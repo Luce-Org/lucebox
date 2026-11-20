@@ -1391,9 +1391,28 @@ bool Qwen35Backend::snapshot_save(int slot) {
     const bool deferred_here = live_snapshot_deferred_ &&
         slot == live_snapshot_slot_ && cache_.cur_pos == live_snapshot_pos_;
     materialize_live_snapshot();
-    const bool ok = deferred_here && prefix_snapshots_[slot].ctx
-        ? true
-        : snapshot_target_cache(w_, cache_, snap_backend_, prefix_snapshots_[slot]);
+    auto find_anc = [&](int dst_slot) -> const PrefixSnapshot * {
+        if (!live_kv_valid_ || (int)live_kv_tokens_.size() != cache_.cur_pos) return nullptr;
+        const PrefixSnapshot * best = nullptr;
+        for (int a = 0; a < PREFIX_SLOTS; ++a) {
+            if (a == dst_slot) continue;
+            const auto & cand = prefix_snapshots_[a];
+            if (!cand.ctx || !cand.buf || cand.is_pooled || cand.state_only ||
+                cand.cur_pos <= 0 || cand.cur_pos > cache_.cur_pos) continue;
+            if ((int)cand.tokens.size() != cand.cur_pos) continue;
+            if (!std::equal(cand.tokens.begin(), cand.tokens.end(), live_kv_tokens_.begin())) continue;
+            if (!best || cand.cur_pos > best->cur_pos) best = &cand;
+        }
+        return best;
+    };
+    bool ok = deferred_here && prefix_snapshots_[slot].ctx;
+    if (!ok) {
+        ok = snapshot_target_cache(w_, cache_, snap_backend_, prefix_snapshots_[slot],
+                                   false, nullptr, false, target_backend_, find_anc(slot));
+        if (ok && live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+            prefix_snapshots_[slot].tokens = live_kv_tokens_;
+        }
+    }
     live_snapshot_slot_ = ok && !generating_ ? slot : -1;
     return ok;
 }
@@ -1419,11 +1438,26 @@ void Qwen35Backend::materialize_live_snapshot() {
     if (!live_snapshot_deferred_) return;
     live_snapshot_deferred_ = false;
     const int slot = live_snapshot_slot_;
+    const PrefixSnapshot * anc = nullptr;
+    if (live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+        for (int a = 0; a < PREFIX_SLOTS; ++a) {
+            if (a == slot) continue;
+            const auto & cand = prefix_snapshots_[a];
+            if (!cand.ctx || !cand.buf || cand.is_pooled || cand.state_only ||
+                cand.cur_pos <= 0 || cand.cur_pos > cache_.cur_pos) continue;
+            if ((int)cand.tokens.size() != cand.cur_pos) continue;
+            if (!std::equal(cand.tokens.begin(), cand.tokens.end(), live_kv_tokens_.begin())) continue;
+            if (!anc || cand.cur_pos > anc->cur_pos) anc = &cand;
+        }
+    }
     if (cache_.cur_pos != live_snapshot_pos_ ||
         !snapshot_target_cache(w_, cache_, snap_backend_,
-                               prefix_snapshots_[slot])) {
+                               prefix_snapshots_[slot], false, nullptr, false,
+                               target_backend_, anc)) {
         free_prefix_snapshot(prefix_snapshots_[slot]);
         live_snapshot_slot_ = -1;
+    } else if (live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+        prefix_snapshots_[slot].tokens = live_kv_tokens_;
     }
 }
 
