@@ -109,6 +109,7 @@ profile and the requirements checked at startup.
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFIX_CACHE_MAX_MIB` | auto | Container-entrypoint equivalent of `--prefix-cache-max-mib`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
+| `LUCE_QUEUE_LIMIT` | unset (no limit) | Container-entrypoint equivalent of `--queue-limit`; not read directly by the native binary. |
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
 | `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
 | `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name (unset: for a single model, the first of its card's default profiles whose GPUs, in HIP order, start the visible ones with the memory it needs; `none`: no profile), and extra `luce_server` flags split on whitespace. |
@@ -398,6 +399,7 @@ profile and the requirements checked at startup.
 - `LUCE_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `LUCE_PREFIX_CACHE_MAX_MIB` - scripts/entrypoint.sh (maps to `--prefix-cache-max-mib`)
 - `LUCE_PROFILE` - scripts/entrypoint.sh (maps to `--profile`)
+- `LUCE_QUEUE_LIMIT` - scripts/entrypoint.sh (maps to `--queue-limit`)
 - `LUCE_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp

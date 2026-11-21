@@ -11,10 +11,53 @@ backend (qwen35, qwen3, gemma4, laguna).
 | Method | Path | Description | Status |
 |--------|------|-------------|--------|
 | GET | `/health`, `/` | Health check | ✅ |
+| GET | `/props` | Server settings, capabilities and the load now | ✅ |
 | GET | `/v1/models` | List available models | ✅ |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions | ✅ |
 | POST | `/v1/messages` | Anthropic Messages | ✅ |
 | POST | `/v1/responses` | OpenAI Responses API | ✅ |
+
+---
+
+## Load and Queue Limit
+
+`GET /props` reports what the engine is serving now under `load`, for a caller
+that picks between engines. It reads counters the serving thread publishes, so
+it answers while slots decode.
+
+```json
+"load": {"slots": 4, "slots_busy": 4, "waiting": 2, "queue_limit": 8,
+         "kv_tokens": 204800, "kv_free_tokens": 51200}
+```
+
+- `slots`, `slots_busy`: the decode slots (`--max-concurrency`, 1 for a
+  one-request server) and those holding a request, parked ones included.
+- `waiting`: generation requests let in that hold no slot: being tokenized,
+  queued, waiting for KV or a shared prefix, being compressed, or between two
+  passes of the tool checks.
+- `queue_limit`: `--queue-limit`, or `null` without one.
+- `kv_tokens`, `kv_free_tokens`: the KV pool and what no slot holds or has
+  reserved. Slots that share a paged pool can leave a slot free and too little
+  KV for a long prompt. A one-request server reports its context, free while
+  idle. `null` when the engine reports no pool.
+
+`--queue-limit N` (container: `LUCE_QUEUE_LIMIT`) bounds the requests that
+wait while every slot is taken; by default nothing is refused. Past it a
+generation request is refused at once, before it is tokenized, with `503`,
+`Retry-After: 1` and the API's own error body (streaming requests too: no
+stream has started):
+
+- Chat Completions and Responses: `{"error": {"type": "server_error", "code": "queue_full", "message": ...}}`
+- Messages: `{"type": "error", "error": {"type": "overloaded_error", "message": ...}, "request_id": ...}`
+
+A request is refused only when the engine already holds a request for every
+slot and `N` more, decoding or waiting, so it holds at most
+`--max-concurrency + N` requests. A slot left free while the request at the
+head of the line waits for KV is that request's, so `waiting` can pass `N` by
+the free slots. A request with tool checks counts once, from the gate to its
+reply. `/health`, `/props`, `/v1/models`, `/v1/residency` and token counting
+are never refused. With several models behind one listener,
+`--routing-queue-limit` bounds the waiting instead.
 
 ---
 

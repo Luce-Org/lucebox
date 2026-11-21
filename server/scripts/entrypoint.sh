@@ -31,6 +31,8 @@
 #                             with LUCE_PREFILL_DRAFTER and PFLASH_SCORING_HEAD_GGUF)
 #   LUCE_PREFILL_KEEP, LUCE_PREFILL_THRESHOLD, LUCE_PREFILL_DRAFTER
 #   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFIX_CACHE_MAX_MIB, LUCE_PREFILL_CACHE_SLOTS
+#   LUCE_QUEUE_LIMIT          requests that may wait while every slot is busy;
+#                             past them a request gets 503 (default: no limit)
 #   LUCE_DEFAULT_MAX_TOKENS, LUCE_MODEL_NAME, LUCE_THINK_MAX, LUCE_FA_WINDOW,
 #   LUCE_MMPROJ
 # Other LUCE_* variables reach luce_server unchanged.
@@ -354,6 +356,7 @@ if [ -n "$DRAFT_ARG" ]; then
     [ "$MODEL_ARCH" = deepseek4 ] || CMD+=(--ddtree --ddtree-budget "$LUCE_BUDGET")
 fi
 [ -n "${LUCE_DEFAULT_MAX_TOKENS:-}" ] && CMD+=(--default-max-tokens "$LUCE_DEFAULT_MAX_TOKENS")
+[ -n "${LUCE_QUEUE_LIMIT:-}" ]        && CMD+=(--queue-limit "$LUCE_QUEUE_LIMIT")
 [ -n "${LUCE_MODEL_NAME:-}" ]         && CMD+=(--model-name "$LUCE_MODEL_NAME")
 [ -n "${LUCE_MMPROJ:-}" ]             && CMD+=(--mmproj "$LUCE_MMPROJ")
 [ -n "${LUCE_CACHE_TYPE_K:-}" ]       && CMD+=(--cache-type-k "$LUCE_CACHE_TYPE_K")
