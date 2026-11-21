@@ -211,6 +211,8 @@ private:
 
     // Emit the text the tool parser left around the calls in tool_buffer_.
     void emit_tool_buffer_text(std::vector<std::string> & out, const std::string & text);
+    void emit_thinking_then_content(std::vector<std::string> & out, const std::string & reasoning,
+                                    const std::string & content);
 
     // Run the state machine over window_.
     void run_window(std::vector<std::string> & out);
