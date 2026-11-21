@@ -152,6 +152,9 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
     const char * s = text.c_str();
     const size_t len = text.size();
     size_t pos = 0;
+    // \p{M} joins letter runs except in the GLM4 split.
+    const bool marks_join = pre_type_ != PreTokenizer::GLM4;
+    auto letter_or_mark = [&](uint32_t c) { return is_letter(c) || (marks_join && is_mark(c)); };
 
     auto peek_cp = [&](size_t p, int * cplen) -> uint32_t {
         if (p >= len) { *cplen = 0; return 0; }
@@ -202,8 +205,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
                 c = peek_cp(p, &cl);
             }
             // One or more letter/mark chars
-            if (cl > 0 && (is_letter(c) || is_mark(c))) {
-                while (cl > 0 && (is_letter(c) || is_mark(c))) {
+            if (cl > 0 && letter_or_mark(c)) {
+                while (cl > 0 && letter_or_mark(c)) {
                     p += cl;
                     c = peek_cp(p, &cl);
                 }
@@ -237,8 +240,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
             // One or more non-whitespace, non-letter, non-mark, non-digit
             size_t punc_start = p;
-            while (cl > 0 && !is_whitespace(c) && !is_letter(c) &&
-                   !is_mark(c) && !is_digit(c)) {
+            while (cl > 0 && !is_whitespace(c) && !letter_or_mark(c) &&
+                   !is_digit(c)) {
                 p += cl;
                 c = peek_cp(p, &cl);
             }
@@ -653,6 +656,8 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         const char * pre = gguf_get_val_str(gctx, pre_key);
         if (pre && std::strcmp(pre, "qwen35") == 0) {
             pre_type_ = PreTokenizer::QWEN35;
+        } else if (pre && (std::strcmp(pre, "glm4") == 0 || std::strcmp(pre, "glm5") == 0)) {
+            pre_type_ = PreTokenizer::GLM4;
         } else {
             pre_type_ = PreTokenizer::QWEN2;
         }
@@ -693,7 +698,8 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 
     std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35"
+                     : pre_type_ == PreTokenizer::GLM4 ? "glm4" : "qwen2",
                  is_sentencepiece_ ? "yes" : "no");
     return true;
 }

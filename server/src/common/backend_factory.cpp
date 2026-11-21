@@ -16,6 +16,7 @@
 #include "gemma4_layer_split_adapter.h"
 #include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
+#include "glm5_backend.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
 
@@ -104,6 +105,7 @@ LUCE_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 LUCE_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("deepseek41", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("glm5-next", Glm5BackendConfig,     NoLayerSplitConfig);
 
 // These sit outside the bundle because the field-presence trait cannot
 // separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
@@ -157,6 +159,8 @@ static_assert(std::is_same_v<
     decltype(DeepSeek4BackendConfig{}.model_path), std::string>);
 static_assert(std::is_same_v<
     decltype(DeepSeek4LayerSplitAdapterConfig{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Glm5BackendConfig{}.model_path), std::string>);
 
 std::unique_ptr<ModelBackend> construct_backend(
     const BackendPlan & plan) {
@@ -439,6 +443,21 @@ std::unique_ptr<ModelBackend> construct_backend(
         auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] LayerSplitBackend(deepseek4) init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "glm5-next") {
+        // --target-devices splits the layers in-process.
+        Glm5BackendConfig cfg;
+        cfg.model_path = model.path;
+        cfg.device = placement.target;
+        cfg.stream_fd = execution.stream_fd;
+        cfg.chunk = execution.chunk;
+
+        auto backend = std::make_unique<Glm5Backend>(std::move(cfg));
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] Glm5Backend init failed\n");
             return nullptr;
         }
         return backend;

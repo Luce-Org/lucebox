@@ -3543,7 +3543,9 @@ bool HttpServer::render_messages_to_text(
                 config_.chat_template_src, chat_messages, bos, eos,
                 add_generation_prompt,
                 req.thinking_enabled, tools_json,
-                config_.arch == "qwen4exp" ? qwen4exp_template_effort(req.reasoning_effort) : std::string(),
+                config_.arch == "qwen4exp"    ? qwen4exp_template_effort(req.reasoning_effort)
+                : config_.arch == "glm5-next" ? glm5_template_effort(req.reasoning_effort)
+                                              : std::string(),
                 req.preserve_thinking);
         } catch (const std::exception & e) {
             error = std::string("chat template (jinja) render failed: ") + e.what();
