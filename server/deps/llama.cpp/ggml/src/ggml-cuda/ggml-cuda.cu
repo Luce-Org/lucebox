@@ -9642,7 +9642,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_I32 &&
                    op->src[0]->ne[0] >= 1 && op->src[0]->ne[0] <= 1024 &&
                    ggml_is_matrix(op->src[0]) && op->src[0]->nb[0] == sizeof(int32_t) &&
-                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]);
+                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2])));
         case GGML_OP_DS4_INDEXER_MASK:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_I32 &&
