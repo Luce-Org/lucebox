@@ -119,6 +119,7 @@ struct BackendArgs {
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
     bool            fast_rollback    = true;
+    bool            fast_rollback_explicit = false;  // --fast-rollback given (opts in under --kvflash)
     bool            seq_verify       = false;
     bool            specla_mode      = false;
     int             specla_top_k     = 4;
