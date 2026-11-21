@@ -323,6 +323,8 @@ private:
     std::vector<int32_t>     active_slot_ids_;
     std::vector<int32_t>     state_slot_ids_;
     std::vector<int32_t>     seq_lens_;
+    std::vector<int> restored_kv_checkpoint_;
+    std::vector<int> restored_kv_tokens_;
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;

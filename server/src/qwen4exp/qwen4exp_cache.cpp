@@ -490,7 +490,7 @@ bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c) {
 }
 
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
-                            Qwen4ExpSnapshot & s) {
+                            Qwen4ExpSnapshot & s, const Qwen4ExpSnapshot * ancestor) {
     free_qwen4exp_snapshot(s);
     if (c.cur_pos <= 0 || (c.mtp_k && c.mtp_prev_pos != c.cur_pos - 1)) return false;
     // Past the pool (or once paging relocated the prefix) the rows are the pager's: keep the point state alone.
@@ -501,18 +501,60 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     s.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
     if (!s.ctx) return false;
     s.strips.reserve(count);
+    struct SaveMeta { ggml_tensor * t; size_t off; size_t bytes; bool rows; };
+    std::vector<SaveMeta> metas;
+    metas.reserve(count);
     snapshot_strips(c, c.cur_pos, c.indexer_blocks, true, [&](ggml_tensor * t, size_t off, size_t bytes, bool rows) {
         if (pager && rows) return;
         const int64_t n = bytes / ggml_type_size(t->type) * ggml_blck_size(t->type);
         auto * live = ggml_view_1d(s.ctx, t, n, off);
         auto * copy = ggml_new_tensor_1d(s.ctx, t->type, n);
         s.strips.emplace_back(live, copy);
+        metas.push_back({t, off, bytes, rows});
     });
     s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, store);
     if (!s.buf) { free_qwen4exp_snapshot(s); return false; }
     if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);   // its layers' last K/V writes
-    for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, store, live, copy);
+
+    // Delta snapshot save: when saving a prefix extending an existing host-RAM ancestor snapshot,
+    // memcpy the shared [0, anc_bytes) KV/indexer rows in system RAM and DMA only the new tail rows from GPU.
+    std::vector<RestoreStrip> anc_strips;
+    const bool can_delta = !pager && ancestor && ancestor != &s && ancestor->buf &&
+                           !ancestor->state_only && !ancestor->rows_in_pager &&
+                           ancestor->cur_pos > 0 && ancestor->cur_pos <= c.cur_pos &&
+                           ancestor->indexer_blocks <= c.indexer_blocks &&
+                           ggml_backend_buffer_is_host(s.buf) && ggml_backend_buffer_is_host(ancestor->buf) &&
+                           held_strips(c, *ancestor, ancestor->mtp && c.mtp_k != nullptr, anc_strips);
+    ggml_context * delta_ctx = can_delta ? ggml_init({(2 * count + 2) * ggml_tensor_overhead(), nullptr, true}) : nullptr;
+    for (size_t i = 0; i < s.strips.size(); ++i) {
+        auto [live, copy] = s.strips[i];
+        const auto & m = metas[i];
+        bool did_delta = false;
+        if (can_delta && delta_ctx && m.rows) {
+            for (const auto & a : anc_strips) {
+                if (a.rows && a.t == m.t && a.off == m.off && a.bytes > 0 && a.bytes <= m.bytes &&
+                    a.src && a.src->type == copy->type) {
+                    std::memcpy(copy->data, a.src->data, a.bytes);
+                    const size_t tail = m.bytes - a.bytes;
+                    if (tail > 0) {
+                        const int64_t tn = tail / ggml_type_size(m.t->type) * ggml_blck_size(m.t->type);
+                        auto * d_live = ggml_view_1d(delta_ctx, m.t, tn, m.off + a.bytes);
+                        auto * d_copy = ggml_view_1d(delta_ctx, copy, tn, a.bytes);
+                        d_live->buffer = m.t->buffer;
+                        d_copy->buffer = copy->buffer;
+                        ggml_backend_tensor_copy_async(backend, store, d_live, d_copy);
+                    }
+                    did_delta = true;
+                    break;
+                }
+            }
+        }
+        if (!did_delta) {
+            ggml_backend_tensor_copy_async(backend, store, live, copy);
+        }
+    }
     ggml_backend_synchronize(backend);
+    if (delta_ctx) ggml_free(delta_ctx);
     s.rows_in_pager = pager;
     s.cur_pos = c.cur_pos;
     s.indexer_blocks = c.indexer_blocks;
@@ -524,7 +566,8 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 }
 
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
-                               const Qwen4ExpSnapshot * rows_from) {
+                               const Qwen4ExpSnapshot * rows_from,
+                               bool skip_live_kv) {
     if (!s.buf || !c.buf || s.cur_pos <= 0 || s.cur_pos > c.max_ctx) return false;
     if (s.rows_in_pager ? !c.kvflash || c.cur_pos < s.cur_pos : c.kvflash && s.cur_pos > c.kvflash->pool_tokens())
         return false;
@@ -568,11 +611,28 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     // Pager-held rows: drop the live positions past the snapshot instead; the point state is overwritten below.
     if (s.rows_in_pager) {
         c.kvflash->truncate(s.cur_pos);
+    } else if (skip_live_kv) {
+        auto clear_tail = [](ggml_tensor * t, int64_t from_row) {
+            if (!t || from_row < 0 || from_row >= t->ne[1]) return;
+            const size_t row_bytes = (size_t) (t->ne[1] - from_row) * t->nb[1];
+            for (int64_t h = 0; h < t->ne[2]; ++h) {
+                ggml_backend_tensor_memset(t, 0, (size_t) h * t->nb[2] + (size_t) from_row * t->nb[1], row_bytes);
+            }
+        };
+        for (auto * t : c.attn_k) clear_tail(t, s.cur_pos);
+        for (auto * t : c.attn_v) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_raw) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_k) clear_tail(t, s.indexer_blocks);
+        if (mtp) {
+            clear_tail(c.mtp_k, std::max(0, s.cur_pos - 1));
+            clear_tail(c.mtp_v, std::max(0, s.cur_pos - 1));
+        }
     } else {
         ggml_backend_buffer_clear(c.buf, 0);
         if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
     }
     for (const RestoreStrip & strip : target) {
+        if (skip_live_kv && strip.rows) continue;
         const int64_t n = (int64_t) (strip.bytes / ggml_type_size(strip.t->type)) * ggml_blck_size(strip.t->type);
         ggml_tensor * live = ggml_view_1d(views, strip.t, n, strip.off);
         ggml_backend_view_init(live);

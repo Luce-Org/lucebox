@@ -161,8 +161,8 @@ public:
         return true;
     }
 
-    bool snapshot_kv() override { return deepseek4_snapshot_save(cache_, snap_backend_, snap_); }
-    bool restore_kv() override { return deepseek4_snapshot_restore(snap_, cache_); }
+    bool snapshot_kv() override { return deepseek4_snapshot_save(cache_, snap_backend_, snap_, nullptr, backend_); }
+    bool restore_kv() override { return deepseek4_snapshot_restore(snap_, cache_, nullptr, backend_); }
 
     bool is_eos(int token) const override { return deepseek4_is_eos_tok(token, w_); }
 

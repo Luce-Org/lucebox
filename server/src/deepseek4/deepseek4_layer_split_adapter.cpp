@@ -440,6 +440,10 @@ void DeepSeek4LayerSplitAdapter::reset_request_state() {
     }
 
     prefill_last_logits_.clear();
+    live_tokens_.clear();
+    live_tokens_valid_ = true;
+    live_source_gen_ = 0;
+    live_source_pos_ = 0;
 }
 
 bool DeepSeek4LayerSplitAdapter::run_forward(
@@ -485,11 +489,32 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
                 shard.layer_begin, shard.layer_end,
                 shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+            live_source_gen_ = 0;
+            live_source_pos_ = 0;
             return false;
         }
         if (timing) add_step_tel(tel_acc, step_tel);
     }
 
+    if (base_pos == 0) {
+        live_tokens_.assign(tokens.begin(), tokens.end());
+        live_tokens_valid_ = true;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
+    } else {
+        if (live_tokens_valid_ && base_pos <= (int) live_tokens_.size()) {
+            live_tokens_.resize((size_t) base_pos);
+            live_tokens_.insert(live_tokens_.end(), tokens.begin(), tokens.end());
+        } else {
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+        }
+        if (base_pos < live_source_pos_) {
+            live_source_pos_ = base_pos;
+        }
+    }
     cur_pos_ = base_pos + n_tokens;
     last_tok = tokens.back();
     last_tok_ = last_tok;
@@ -559,6 +584,23 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
     }
     const uint64_t remote_forward_us = split_elapsed_us(remote_t0, SplitClock::now());
 
+    if (base_pos == 0) {
+        live_tokens_.assign(tokens.begin(), tokens.end());
+        live_tokens_valid_ = true;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
+    } else {
+        if (live_tokens_valid_ && base_pos <= (int) live_tokens_.size()) {
+            live_tokens_.resize((size_t) base_pos);
+            live_tokens_.insert(live_tokens_.end(), tokens.begin(), tokens.end());
+        } else {
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+        }
+        if (base_pos < live_source_pos_) {
+            live_source_pos_ = base_pos;
+        }
+    }
     cur_pos_ = base_pos + n_tokens;
     last_tok = resp.last_tok >= 0 ? resp.last_tok : tokens.back();
     last_tok_ = last_tok;
@@ -784,10 +826,17 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     for (size_t i = 0; i < shards_.size(); ++i) {
         snap.shards[i].ctx = ctx;
         snap.shards[i].buf = buf;
-        if (!deepseek4_snapshot_fill(shards_[i].cache, &empty_aux, snap.shards[i])) {
+        if (!deepseek4_snapshot_fill(shards_[i].cache, &empty_aux, snap.shards[i],
+                                     shards_[i].backend, /*sync_backend=*/false)) {
+            for (size_t j = 0; j <= i; ++j) {
+                if (shards_[j].backend) ggml_backend_synchronize(shards_[j].backend);
+            }
             snapshot_free(slot);
             return false;
         }
+    }
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        if (shards_[i].backend) ggml_backend_synchronize(shards_[i].backend);
     }
     if (use_mixed_target_split() && !remote_target_shard_.snapshot_save(slot)) {
         snapshot_free(slot);
@@ -806,6 +855,16 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     snap.last_tok = last_tok_;
     snap.hc_state = hc_state_;
     snap.prefill_last_logits = prefill_last_logits_;
+    snap.gen = next_snap_gen_++;
+    if (live_tokens_valid_ && (int) live_tokens_.size() >= cur_pos_) {
+        snap.tokens.assign(live_tokens_.begin(), live_tokens_.begin() + cur_pos_);
+        snap.has_tokens = true;
+    } else {
+        snap.tokens.clear();
+        snap.has_tokens = false;
+    }
+    live_source_gen_ = snap.gen;
+    live_source_pos_ = cur_pos_;
     snap.used = true;
     return true;
 }
@@ -889,6 +948,9 @@ bool DeepSeek4LayerSplitAdapter::snapshot_adopt(int slot, ggml_context * ctx,
     adopted.used = true;
     adopted.ctx = ctx;
     adopted.buf = buf;
+    adopted.gen = next_snap_gen_++;
+    adopted.tokens.clear();
+    adopted.has_tokens = false;
 
     snapshot_free(slot);
     snapshots_[(size_t) slot] = std::move(adopted);
@@ -911,6 +973,9 @@ void DeepSeek4LayerSplitAdapter::snapshot_free(int slot) {
     snap.last_tok = -1;
     snap.hc_state.clear();
     snap.prefill_last_logits.clear();
+    snap.tokens.clear();
+    snap.has_tokens = false;
+    snap.gen = 0;
     snap.used = false;
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
     if (use_mixed_target_split()) {
@@ -939,19 +1004,57 @@ int DeepSeek4LayerSplitAdapter::snapshot_cur_pos(int slot) const {
 bool DeepSeek4LayerSplitAdapter::snapshot_restore(int slot) {
     if (!snapshot_used(slot)) return false;
     const auto & snap = snapshots_[slot];
+    int skip_tokens = 0;
+    if (live_tokens_valid_ && snap.has_tokens) {
+        const int max_cmp = std::min({cur_pos_, snap.cur_pos, (int) live_tokens_.size(), (int) snap.tokens.size()});
+        int lcp = 0;
+        while (lcp < max_cmp && live_tokens_[(size_t) lcp] == snap.tokens[(size_t) lcp]) {
+            ++lcp;
+        }
+        skip_tokens = std::max(skip_tokens, lcp);
+    }
+    if (live_source_gen_ != 0 && live_source_gen_ == snap.gen) {
+        skip_tokens = std::max(skip_tokens, std::min({live_source_pos_, cur_pos_, snap.cur_pos}));
+    }
     for (size_t i = 0; i < shards_.size(); ++i) {
         if (snap.shards[i].cur_pos != snap.cur_pos ||
-            !deepseek4_snapshot_restore(snap.shards[i], shards_[i].cache)) {
+            !deepseek4_snapshot_restore(snap.shards[i], shards_[i].cache, nullptr,
+                                        shards_[i].backend, skip_tokens,
+                                        &shards_[i].weights.compress_ratios,
+                                        /*sync_backend=*/false)) {
+            for (size_t j = 0; j <= i; ++j) {
+                if (shards_[j].backend) ggml_backend_synchronize(shards_[j].backend);
+            }
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+            live_source_gen_ = 0;
+            live_source_pos_ = 0;
             return false;
         }
     }
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        if (shards_[i].backend) ggml_backend_synchronize(shards_[i].backend);
+    }
     if (use_mixed_target_split() && !remote_target_shard_.snapshot_restore(slot)) {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
         return false;
     }
     cur_pos_ = snap.cur_pos;
     last_tok_ = snap.last_tok;
     hc_state_ = snap.hc_state;
     prefill_last_logits_ = snap.prefill_last_logits;
+    if (snap.has_tokens) {
+        live_tokens_ = snap.tokens;
+        live_tokens_valid_ = true;
+    } else {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+    }
+    live_source_gen_ = snap.gen;
+    live_source_pos_ = snap.cur_pos;
     return true;
 }
 

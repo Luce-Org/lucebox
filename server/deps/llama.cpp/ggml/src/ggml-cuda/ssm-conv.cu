@@ -299,6 +299,72 @@ static __global__ void ssm_conv_step_f32(const float * __restrict__ x, const int
     }
 }
 
+template <int K, int TILE_T>
+static __global__ void ssm_conv_step_tiled_f32(
+        const float * __restrict__ x, const int x_nb1, const int x_nb2,
+        const float * __restrict__ w, const int w_nb1,
+        const float * __restrict__ state, const int st_nb1, const int st_nb2,
+        float * __restrict__ y, const int y_nb1, const int y_nb2,
+        const int C, const int T) {
+    const int c  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int s  = blockIdx.y;
+    const int t0 = blockIdx.z * TILE_T;
+    if (c >= C || t0 >= T) return;
+
+    const float * xs = (const float *) ((const char *) x + (size_t) s * x_nb2) + c;
+    const float * st = (const float *) ((const char *) state + (size_t) s * st_nb2 + (size_t) c * st_nb1);
+    float *       ys = (float *) ((char *) y + (size_t) s * y_nb2) + c;
+    const float * wc = (const float *) ((const char *) w + (size_t) c * w_nb1);
+
+    const int xs_stride = x_nb1 / sizeof(float);
+    const int ys_stride = y_nb1 / sizeof(float);
+
+    float wt[K];
+    float win[K];
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        wt[k] = wc[k];
+    }
+#pragma unroll
+    for (int j = 0; j < K - 1; j++) {
+        const int prev_t = t0 - (K - 1) + j;
+        win[j] = (prev_t < 0) ? st[K - 1 + prev_t] : xs[(size_t) prev_t * xs_stride];
+    }
+
+    const int t1 = min(T, t0 + TILE_T);
+    for (int t = t0; t < t1; t++) {
+        const float xt = xs[(size_t) t * xs_stride];
+        win[K - 1] = xt;
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            acc += win[k] * wt[k];
+        }
+        ys[(size_t) t * ys_stride] = ggml_cuda_op_silu_single(acc);
+#pragma unroll
+        for (int j = 0; j < K - 1; j++) {
+            win[j] = win[j + 1];
+        }
+    }
+}
+
+template <int K>
+static __global__ void ssm_conv_step_state_f32(
+        const float * __restrict__ x, const int x_nb1, const int x_nb2,
+        float * __restrict__ state, const int st_nb1, const int st_nb2,
+        const int C, const int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int s = blockIdx.y;
+    if (c >= C) return;
+    const float * xs = (const float *) ((const char *) x + (size_t) s * x_nb2) + c;
+    float *       st = (float *) ((char *) state + (size_t) s * st_nb2 + (size_t) c * st_nb1);
+    const int xs_stride = x_nb1 / sizeof(float);
+#pragma unroll
+    for (int j = 0; j < K - 1; j++) {
+        st[j] = xs[(size_t) (T - (K - 1) + j) * xs_stride];
+    }
+}
+
 static void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x  = dst->src[0];
     const ggml_tensor * w  = dst->src[1];
@@ -326,13 +392,28 @@ static void ggml_cuda_op_ssm_conv_step(ggml_backend_cuda_context & ctx, ggml_ten
 
     auto launch = [&](auto KK) {
         constexpr int kK = decltype(KK)::value;
-        ssm_conv_step_f32<kK><<<blocks, threads, 0, stream>>>(
-            (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
-            (const float *) w->data, (int) w->nb[1],
-            (float *) st->data, (int) st->nb[1], (int) st->nb[2],
-            (float *) dst->data, (int) dst->nb[1], (int) dst->nb[2],
-            ci ? (float *) ci->data : nullptr, ci ? (int) ci->nb[1] : 0, ci ? (int) ci->nb[2] : 0,
-            C, T);
+        if (ci == nullptr && T >= 64) {
+            constexpr int TILE_T = 32;
+            const dim3 tblocks((unsigned) ((C + threads - 1) / threads), (unsigned) S, (unsigned) ((T + TILE_T - 1) / TILE_T));
+            ssm_conv_step_tiled_f32<kK, TILE_T><<<tblocks, threads, 0, stream>>>(
+                (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
+                (const float *) w->data, (int) w->nb[1],
+                (const float *) st->data, (int) st->nb[1], (int) st->nb[2],
+                (float *) dst->data, (int) dst->nb[1], (int) dst->nb[2],
+                C, T);
+            ssm_conv_step_state_f32<kK><<<blocks, threads, 0, stream>>>(
+                (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
+                (float *) st->data, (int) st->nb[1], (int) st->nb[2],
+                C, T);
+        } else {
+            ssm_conv_step_f32<kK><<<blocks, threads, 0, stream>>>(
+                (const float *) x->data, (int) x->nb[1], (int) x->nb[2],
+                (const float *) w->data, (int) w->nb[1],
+                (float *) st->data, (int) st->nb[1], (int) st->nb[2],
+                (float *) dst->data, (int) dst->nb[1], (int) dst->nb[2],
+                ci ? (float *) ci->data : nullptr, ci ? (int) ci->nb[1] : 0, ci ? (int) ci->nb[2] : 0,
+                C, T);
+        }
     };
     switch (K) {
         case 3: launch(std::integral_constant<int, 3>{}); break;
