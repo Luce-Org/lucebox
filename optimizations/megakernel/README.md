@@ -114,6 +114,7 @@ git clone https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub
 uv sync --extra megakernel
 uv run --directory megakernel python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
+uv run --directory optimizations/megakernel python count_kernel_launches.py  # measures CUDA kernel launches/token vs HF Transformers
 ```
 
 The legacy standalone flow still works from inside `optimizations/megakernel/`: create a
@@ -151,6 +152,7 @@ sudo nvidia-smi -pl 220    # or whatever your target wattage
 | `setup.py` | Build configuration (arch auto-detect, Blackwell gating) |
 | `final_bench.py` | Benchmark (prefill + decode, 10 warmup + 20 timed runs averaged — use this for published numbers) |
 | `bench_pp_tg.py` | Quick single-run benchmark with correctness check (not warmed, under-reports prefill) |
+| `count_kernel_launches.py` | Measure CUDA compute kernel launches per decoded token (megakernel vs. HuggingFace Transformers) |
 | `RESULTS.md` | Full benchmark results and DVFS sweep |
 | `kernel_gb10_nvfp4.cu` | Blackwell-only: NVFP4 persistent decode megakernel |
 | `prefill_megakernel.cu` | Blackwell-only: single-dispatch prefill megakernel |
