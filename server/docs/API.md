@@ -68,6 +68,9 @@ same cached conversation, so it works for any model the server runs.
 2. A turn that calls two or more different tools at once is planned again: the
    calls would run together, so the model is asked to make now only the ones
    that need nothing from the others. The new turn is used if it makes calls.
+   A call to the Lucebox gateway's advisor (`lucebox_advisor`,
+   `mcp__lucebox__advisor` and the other MCP names) is not counted: the gateway
+   answers it, and it needs nothing from the other calls.
 3. A final answer after tool results gets one check per user request: the model
    goes through the request part by part against the tool results. The new
    turn replaces the answer only if it makes tool calls that have not already

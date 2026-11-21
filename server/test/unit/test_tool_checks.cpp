@@ -139,6 +139,17 @@ static void test_replan() {
         call("call_1", "get_order", "{\"id\":1}"), call("call_2", "get_order", "{\"id\":2}")}))));
     CHECK(needs_replan(assistant_calls(json::array({
         call("call_1", "get_order", "{\"id\":1}"), call("call_2", "send_email", "{}")}))));
+    // The Lucebox advisor's call is not counted: one other tool beside it goes out as is.
+    for (const char * name : {"lucebox_advisor", "mcp__lucebox__advisor", "MCP__Lucebox__Advisor"}) {
+        CHECK(!needs_replan(assistant_calls(json::array({
+            call("call_1", name, "{\"question\":\"q\"}"), call("call_2", "bash", "{\"command\":\"ls\"}")}))));
+        CHECK(needs_replan(assistant_calls(json::array({
+            call("call_1", name, "{}"), call("call_2", "bash", "{}"), call("call_3", "read", "{}")}))));
+    }
+    // A bare "advisor" may be an app's own tool: counted.
+    CHECK(needs_replan(assistant_calls(json::array({
+        call("call_1", "advisor", "{}"), call("call_2", "bash", "{}")}))));
+    CHECK(!advisor_call("lucebox_advisor_v2") && !advisor_call("my_advisor"));
 }
 
 static json completion(const json & message, const char * finish_reason) {

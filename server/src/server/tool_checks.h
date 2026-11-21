@@ -102,7 +102,13 @@ bool empty_reply(const json & response);
 // on by `draw`, so the sample can differ. The log says empty=redrawn|kept.
 json redraw(const json & request, int draw);
 
-// The reply calls two or more different tools.
+// The Lucebox gateway's advisor tool, under the names apps give it: lucebox_advisor
+// (the gateway's own), mcp__lucebox__advisor (pi, Hermes, Codex) and the other MCP
+// prefixes. Never a bare "advisor", which may be an app's own tool.
+bool advisor_call(const std::string & name);
+
+// The reply calls two or more different tools, the advisor's not counted: the
+// gateway answers that call itself, and it needs nothing from the other calls.
 bool needs_replan(const json & reply);
 
 // Returns true if the reply calls a tool even though the request set
