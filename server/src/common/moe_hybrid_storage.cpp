@@ -186,6 +186,116 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
     return ggml_new_tensor(ctx, src->type, 4, ne);
 }
 
+// Copies chosen experts of one file tensor into consecutive experts of a
+// stack. With a reader (and the offset-zero mapping it reads), the experts are
+// read from the file on several threads once flush() runs; otherwise they are
+// copied out of the mapping at once.
+class ExpertCopier {
+public:
+    ExpertCopier(const void * mapping, const TensorFileReader * reader, std::string * err)
+        : file_base_(static_cast<const uint8_t *>(mapping)), reader_(mapping ? reader : nullptr), err_(err) {}
+
+    bool copy(ggml_tensor * stack, const ExpertTensorFileData & src,
+              const std::vector<int32_t> & ids, size_t expert_bytes) {
+        if (!reader_ || !src.data || ids.empty() || expert_bytes == 0) {
+            if (!read_expert_slices_from_mem(src.data, src.size, ids, expert_bytes, slice_buf_, err_)) {
+                return false;
+            }
+            if (!slice_buf_.empty()) ggml_backend_tensor_set(stack, slice_buf_.data(), 0, slice_buf_.size());
+            return true;
+        }
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const size_t rel = expert_bytes * (size_t)ids[i];
+            if (rel + expert_bytes > src.size) {
+                if (err_) *err_ = "expert slice out of bounds in file";
+                return false;
+            }
+            const uint64_t file_offset = (uint64_t)(src.data - file_base_) + rel;
+            // Consecutive experts are consecutive in the file and the stack:
+            // one span, read in whole pieces instead of one small read per
+            // expert.
+            if (!spans_.empty() && spans_.back().tensor == stack &&
+                spans_.back().tensor_offset + spans_.back().size == expert_bytes * i &&
+                spans_.back().file_offset + spans_.back().size == file_offset) {
+                spans_.back().size += expert_bytes;
+                continue;
+            }
+            spans_.push_back({stack, expert_bytes * i, file_offset, expert_bytes});
+        }
+        return true;
+    }
+
+    bool flush() {
+        if (spans_.empty()) return true;
+        const bool ok = reader_->load(spans_, err_);
+        spans_.clear();
+        return ok;
+    }
+
+private:
+    const uint8_t * file_base_;
+    const TensorFileReader * reader_;
+    std::string * err_;
+    std::vector<TensorFileSpan> spans_;
+    std::vector<uint8_t> slice_buf_;
+};
+
+// Allocates a layer's hot stack on `backend`, sized for the placed experts
+// plus its spare cache slots (dst.hot_active + dst.cache_slots), and copies
+// the placed experts into it.
+static bool materialize_hot_layer(MoeHybridLayerStorage & dst, const MoeLayerDesc & desc,
+                                  const LayerExpertFileData & fd, ggml_backend_t backend,
+                                  ExpertCopier & copier, int il, std::string * err) {
+    const int hot_alloc = dst.hot_active + dst.cache_slots;
+    ggml_init_params ip{};
+    ip.mem_size   = 24 * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    dst.hot_ctx = ggml_init(ip);
+    if (!dst.hot_ctx) {
+        if (err) *err = "failed to init hot_ctx";
+        return false;
+    }
+    if (dst.fused_gate_up) {
+        dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_up_exps, hot_alloc);
+        dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_alloc);
+    } else {
+        dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_exps, hot_alloc);
+        dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, desc.ffn_up_exps, hot_alloc);
+        dst.down_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_alloc);
+    }
+    dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, backend);
+    if (!dst.hot_buf) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+            "failed to allocate hot expert GPU buffer (layer %d, %d hot experts)", il, dst.hot_active);
+        if (err) *err = msg;
+        return false;
+    }
+    if (dst.fused_gate_up) {
+        return copier.copy(dst.gate_up_hot, fd.gate_up_exps, dst.hot_expert_ids, dst.gate_up_expert_bytes) &&
+               copier.copy(dst.down_hot, fd.down_exps, dst.hot_expert_ids, dst.down_expert_bytes);
+    }
+    return copier.copy(dst.gate_hot, fd.gate_exps, dst.hot_expert_ids, dst.gate_expert_bytes) &&
+           copier.copy(dst.up_hot, fd.up_exps, dst.hot_expert_ids, dst.up_expert_bytes) &&
+           copier.copy(dst.down_hot, fd.down_exps, dst.hot_expert_ids, dst.down_expert_bytes);
+}
+
+void free_hot_stack(MoeHybridLayerStorage & layer) {
+    if (layer.hot_buf) {
+        ggml_backend_buffer_free(layer.hot_buf);
+        layer.hot_buf = nullptr;
+    }
+    if (layer.hot_ctx) {
+        ggml_free(layer.hot_ctx);
+        layer.hot_ctx = nullptr;
+    }
+    layer.gate_hot = nullptr;
+    layer.up_hot = nullptr;
+    layer.down_hot = nullptr;
+    layer.gate_up_hot = nullptr;
+}
+
 } // namespace
 
 void MoeHybridStorage::release_graph_caches() {
@@ -203,32 +313,49 @@ void MoeHybridStorage::release_graph_caches() {
     }
 }
 
+void MoeHybridStorage::release_prefill_arenas() {
+    for (ggml_gallocr_t * alloc : {&prefill_route_alloc, &prefill_hot_alloc, &prefill_cold_alloc}) {
+        if (*alloc) {
+            ggml_gallocr_free(*alloc);
+            *alloc = nullptr;
+        }
+    }
+}
+
+void MoeHybridStorage::release_hot_experts() {
+    // Registry entries point into the hot buffers, and the cached graphs and
+    // prefill arenas may hold their addresses: all go before the buffers.
+    for (MoeHybridLayerStorage & layer : layers) {
+        unregister_mix_tensor(layer.gate_hot);
+        unregister_mix_tensor(layer.up_hot);
+        unregister_mix_tensor(layer.down_hot);
+        unregister_mix_tensor(layer.gate_up_hot);
+    }
+    release_prefill_arenas();
+    release_graph_caches();
+    for (MoeHybridLayerStorage & layer : layers) {
+        free_hot_stack(layer);
+        // Swapped-in experts went with the stack; the placed set returns
+        // with rematerialize_moe_hybrid_hot_experts().
+        for (int32_t global : layer.spare_global) {
+            if (global >= 0 && (size_t) global < layer.hot_local_by_global.size()) {
+                layer.hot_local_by_global[(size_t) global] = -1;
+            }
+        }
+        layer.spare_global.assign(layer.spare_global.size(), -1);
+        layer.spare_lru.assign(layer.spare_lru.size(), 0);
+        layer.reset_expert_vram_mask((int) layer.hot_local_by_global.size());
+    }
+}
+
 MoeHybridStorage::~MoeHybridStorage() {
     // Registry entries point into the owner buffers, so remove them before the
     // buffers can be released or their addresses reused.
     unregister_mix_tensors();
-    if (prefill_route_alloc) {
-        ggml_gallocr_free(prefill_route_alloc);
-        prefill_route_alloc = nullptr;
-    }
-    if (prefill_hot_alloc) {
-        ggml_gallocr_free(prefill_hot_alloc);
-        prefill_hot_alloc = nullptr;
-    }
-    if (prefill_cold_alloc) {
-        ggml_gallocr_free(prefill_cold_alloc);
-        prefill_cold_alloc = nullptr;
-    }
+    release_prefill_arenas();
     release_graph_caches();
     for (auto & layer : layers) {
-        if (layer.hot_buf) {
-            ggml_backend_buffer_free(layer.hot_buf);
-            layer.hot_buf = nullptr;
-        }
-        if (layer.hot_ctx) {
-            ggml_free(layer.hot_ctx);
-            layer.hot_ctx = nullptr;
-        }
+        free_hot_stack(layer);
         if (layer.cold_buf) {
             ggml_backend_buffer_free(layer.cold_buf);
             layer.cold_buf = nullptr;
@@ -237,10 +364,6 @@ MoeHybridStorage::~MoeHybridStorage() {
             ggml_free(layer.cold_ctx);
             layer.cold_ctx = nullptr;
         }
-        layer.gate_hot = nullptr;
-        layer.up_hot = nullptr;
-        layer.down_hot = nullptr;
-        layer.gate_up_hot = nullptr;
         layer.gate_cold = nullptr;
         layer.up_cold = nullptr;
         layer.down_cold = nullptr;
@@ -637,47 +760,11 @@ bool build_moe_hybrid_storage_from_file(
                      "for a full expert stack\n");
     }
 
-    // With a reader, a layer's experts are read from the file at once, on
-    // several threads; otherwise they are copied out of the mapping.
-    const bool read_file = reader && readonly_file_mmap;
-    const auto * file_base = static_cast<const uint8_t *>(readonly_file_mmap);
-    std::vector<TensorFileSpan> spans;
-    std::vector<uint8_t> slice_buf;
+    ExpertCopier copier(readonly_file_mmap, reader, err);
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
         const LayerExpertFileData & fd = file_data[(size_t)il];
         MoeHybridLayerStorage & dst = out.layers[(size_t)il];
-        // Copies the experts `ids` of one file tensor into consecutive
-        // experts of `stack`.
-        const auto copy_experts = [&](ggml_tensor * stack, const ExpertTensorFileData & src,
-                                      const std::vector<int32_t> & ids, size_t expert_bytes) {
-            if (!read_file || !src.data || ids.empty() || expert_bytes == 0) {
-                if (!read_expert_slices_from_mem(src.data, src.size, ids, expert_bytes, slice_buf, err)) {
-                    return false;
-                }
-                if (!slice_buf.empty()) ggml_backend_tensor_set(stack, slice_buf.data(), 0, slice_buf.size());
-                return true;
-            }
-            for (size_t i = 0; i < ids.size(); ++i) {
-                const size_t rel = expert_bytes * (size_t)ids[i];
-                if (rel + expert_bytes > src.size) {
-                    if (err) *err = "expert slice out of bounds in file";
-                    return false;
-                }
-                const uint64_t file_offset = (uint64_t)(src.data - file_base) + rel;
-                // Consecutive experts are consecutive in the file and the
-                // stack: one span, read in whole pieces instead of one small
-                // read per expert.
-                if (!spans.empty() && spans.back().tensor == stack &&
-                    spans.back().tensor_offset + spans.back().size == expert_bytes * i &&
-                    spans.back().file_offset + spans.back().size == file_offset) {
-                    spans.back().size += expert_bytes;
-                    continue;
-                }
-                spans.push_back({stack, expert_bytes * i, file_offset, expert_bytes});
-            }
-            return true;
-        };
         dst.cold_backend = out.cold_backend;
         dst.cold_backend_kind = out.cold_backend_kind;
 
@@ -726,48 +813,14 @@ bool build_moe_hybrid_storage_from_file(
         const int cold_count = (int)dst.cold_expert_ids.size();
         const int spare = (cold_count > 0 && cache_slots > 0)
                           ? std::min(cache_slots, cold_count) : 0;
-        const int hot_alloc = hot_count + spare;
         dst.hot_active  = hot_count;
         dst.cache_slots = spare;
         dst.spare_global.assign((size_t)spare, -1);
         dst.spare_lru.assign((size_t)spare, 0);
 
-        // Allocate hot expert tensors on GPU
-        if (hot_count > 0 && cfg.materialize_hot_experts) {
-            ggml_init_params ip{};
-            ip.mem_size   = 24 * ggml_tensor_overhead();
-            ip.mem_buffer = nullptr;
-            ip.no_alloc   = true;
-            dst.hot_ctx = ggml_init(ip);
-            if (!dst.hot_ctx) {
-                if (err) *err = "failed to init hot_ctx";
-                return false;
-            }
-            if (hot_count > 0 && dst.fused_gate_up) {
-                dst.gate_up_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_up_exps, hot_alloc);
-                dst.down_hot    = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_alloc);
-            } else if (hot_count > 0) {
-                dst.gate_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_gate_exps, hot_alloc);
-                dst.up_hot   = new_like_with_expert_count(dst.hot_ctx, desc.ffn_up_exps, hot_alloc);
-                dst.down_hot = new_like_with_expert_count(dst.hot_ctx, desc.ffn_down_exps, hot_alloc);
-            }
-            dst.hot_buf = ggml_backend_alloc_ctx_tensors(dst.hot_ctx, gpu_backend);
-            if (!dst.hot_buf) {
-                char msg[128];
-                std::snprintf(msg, sizeof(msg),
-                    "failed to allocate hot expert GPU buffer (layer %d, %d hot experts)", il, hot_count);
-                if (err) *err = msg;
-                return false;
-            }
-
-            if (hot_count > 0 && dst.fused_gate_up) {
-                if (!copy_experts(dst.gate_up_hot, fd.gate_up_exps, dst.hot_expert_ids, dst.gate_up_expert_bytes)) return false;
-                if (!copy_experts(dst.down_hot, fd.down_exps, dst.hot_expert_ids, dst.down_expert_bytes)) return false;
-            } else if (hot_count > 0) {
-                if (!copy_experts(dst.gate_hot, fd.gate_exps, dst.hot_expert_ids, dst.gate_expert_bytes)) return false;
-                if (!copy_experts(dst.up_hot, fd.up_exps, dst.hot_expert_ids, dst.up_expert_bytes)) return false;
-                if (!copy_experts(dst.down_hot, fd.down_exps, dst.hot_expert_ids, dst.down_expert_bytes)) return false;
-            }
+        if (hot_count > 0 && cfg.materialize_hot_experts &&
+            !materialize_hot_layer(dst, desc, fd, gpu_backend, copier, il, err)) {
+            return false;
         }
 
         // Allocate cold expert tensors on the selected cold backend.
@@ -800,18 +853,15 @@ bool build_moe_hybrid_storage_from_file(
             }
 
             if (dst.fused_gate_up) {
-                if (!copy_experts(dst.gate_up_cold, fd.gate_up_exps, dst.cold_expert_ids, dst.gate_up_expert_bytes)) return false;
-                if (!copy_experts(dst.down_cold, fd.down_exps, dst.cold_expert_ids, dst.down_expert_bytes)) return false;
+                if (!copier.copy(dst.gate_up_cold, fd.gate_up_exps, dst.cold_expert_ids, dst.gate_up_expert_bytes)) return false;
+                if (!copier.copy(dst.down_cold, fd.down_exps, dst.cold_expert_ids, dst.down_expert_bytes)) return false;
             } else {
-                if (!copy_experts(dst.gate_cold, fd.gate_exps, dst.cold_expert_ids, dst.gate_expert_bytes)) return false;
-                if (!copy_experts(dst.up_cold, fd.up_exps, dst.cold_expert_ids, dst.up_expert_bytes)) return false;
-                if (!copy_experts(dst.down_cold, fd.down_exps, dst.cold_expert_ids, dst.down_expert_bytes)) return false;
+                if (!copier.copy(dst.gate_cold, fd.gate_exps, dst.cold_expert_ids, dst.gate_expert_bytes)) return false;
+                if (!copier.copy(dst.up_cold, fd.up_exps, dst.cold_expert_ids, dst.up_expert_bytes)) return false;
+                if (!copier.copy(dst.down_cold, fd.down_exps, dst.cold_expert_ids, dst.down_expert_bytes)) return false;
             }
         }
-        if (!spans.empty()) {
-            if (!reader->load(spans, err)) return false;
-            spans.clear();
-        }
+        if (!copier.flush()) return false;
         // Only the mmap-retaining wrapper supplies proven file-mapping bounds.
         // All synchronous hot/cold uploads have returned, and both temporary
         // slice buffers are gone. Retain the mapping for future streaming reads.
@@ -911,6 +961,45 @@ MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_
         }
     }
     return r;
+}
+
+bool rematerialize_moe_hybrid_hot_experts(ggml_backend_t gpu_backend,
+                                          const std::vector<MoeLayerDesc> & layer_descs,
+                                          MoeHybridStorage & storage,
+                                          std::string * err,
+                                          const TensorFileReader * reader) {
+    if (!storage.materialized_hot_experts) return true;
+    if (!storage.has_mmap() || storage.layer_regions.size() != storage.layers.size() ||
+        layer_descs.size() != storage.layers.size()) {
+        if (err) *err = "hot experts come back from the retained file mapping, which this storage lacks";
+        return false;
+    }
+    const auto * base = static_cast<const uint8_t *>(storage.mmap_data);
+    const auto file_data = [base](const ExpertFileRegion & region) {
+        return region.size > 0 ? ExpertTensorFileData{base + region.offset, region.size} : ExpertTensorFileData{};
+    };
+    ExpertCopier copier(storage.mmap_data, reader, err);
+    for (size_t il = 0; il < storage.layers.size(); ++il) {
+        MoeHybridLayerStorage & dst = storage.layers[il];
+        if (dst.hot_expert_ids.empty()) continue;
+        if (dst.hot_buf) {
+            if (err) *err = "hot experts are already resident";
+            return false;
+        }
+        const LayerExpertRegions & regions = storage.layer_regions[il];
+        LayerExpertFileData fd;
+        fd.gate_exps = file_data(regions.gate_exps);
+        fd.up_exps = file_data(regions.up_exps);
+        fd.down_exps = file_data(regions.down_exps);
+        fd.gate_up_exps = file_data(regions.gate_up_exps);
+        if (!materialize_hot_layer(dst, layer_descs[il], fd, gpu_backend, copier, (int) il, err)) {
+            return false;
+        }
+        for (int32_t expert : dst.hot_expert_ids) dst.set_expert_hot(expert);
+    }
+    // One read for every layer: each read starts the reader's threads, and
+    // with them their staging for the copies to the GPU, anew.
+    return copier.flush();
 }
 
 bool build_moe_hybrid_storage_from_file_with_mmap(

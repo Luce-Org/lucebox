@@ -1049,6 +1049,16 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     std::string *               err = nullptr,
     ggml_backend_t              cold_gpu_backend = nullptr);
 
+// Brings back the hot expert stacks MoeHybridStorage::release_hot_experts()
+// freed, on `backend`, from the storage's retained mapping of `path`; the
+// shapes come from the (reloaded) weights.
+bool rematerialize_deepseek4_moe_hybrid_hot_experts(
+    const std::string &         path,
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    MoeHybridStorage &          storage,
+    std::string *               err = nullptr);
+
 // Attach each compact GPU owner tensor to the learned decode-table rows for
 // the global experts stored in that tensor.
 bool register_deepseek4_moe_hybrid_mix_tables(

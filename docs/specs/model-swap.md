@@ -1,8 +1,8 @@
 # Fast model switching on R9700 + Strix Halo
 
-Status: implemented for Qwen3.8 Flash Next (`qwen4exp`) and dense Qwen 3.5/3.8
-(`qwen35`), measured on R9700 + Strix Halo; DeepSeek V4/V4.1 (`deepseek4`)
-releases every GPU and is not measured yet.
+Status: implemented for Qwen3.8 Flash Next (`qwen4exp`), dense Qwen 3.5/3.8
+(`qwen35`) and DeepSeek V4/V4.1 (`deepseek4`, one request at a time), all
+measured on R9700 + Strix Halo.
 
 ## Problem
 
@@ -84,7 +84,22 @@ backends use for their own drafter juggling):
 | --- | --- | --- |
 | `qwen4exp` split (Flash Next) | keeps the 71.73 GiB expert stacks, each cache's iGPU-side K/V and the host token embeddings | yes |
 | `qwen35` (Qwen 3.8 27B), one request at a time, drafter on the target | same as a full release (everything is on the R9700) | yes |
-| `deepseek4`, one request at a time | not yet: releases every GPU | yes, keeping the prefix snapshots |
+| `deepseek4` split (`ds41-halo`), one request at a time | keeps the cold expert stacks (with their locked host memory), the streamed expert cache and the expert placement | yes, keeping the prefix snapshots |
+
+DeepSeek V4.1's split layout puts the dense weights, the hot experts, the KV
+cache and the drafter on the target, and the cold expert stacks on the expert
+device's own backend, with the experts in neither streamed from the SSD into
+a cache beside them. A release of the target frees the first group and the
+hot stacks' graph caches, and keeps the cold stacks, the streamed expert
+cache, the expert maps and the file mapping both read. A reinstate loads the
+dense weights and the hot stacks on the kept placement (read from the file on
+several threads, in one pass over all layers), registers the mixed-quant
+decode tables again and rebuilds the cache and the drafter. The expert device
+is then checked against the serving headroom, not the load one: on an
+integrated GPU its free memory is the system's, which the model that ran
+meanwhile may have used. A release that names the expert device frees
+everything; a cluster rank always does, since its placement is agreed with
+its peers at load.
 
 ### 2. Faster weight upload
 
@@ -143,6 +158,12 @@ Why one process per model rather than several models in one process:
   the 71.73 GiB expert tier and Flash Next's iGPU-side KV. The R9700 is free
   for Qwen. That leaves about 40 GB of system memory for the system, both
   processes' host state, Qwen's prefix snapshots and the page cache.
+- **DeepSeek V4.1 (`ds41-halo`) released from the R9700, Qwen 27B resident:**
+  the Strix Halo keeps DeepSeek's cold expert stacks, which fill its carve and
+  continue in locked host memory, and the streamed expert cache in what the
+  carve has left. Locked memory cannot be reclaimed, so the room left for
+  Qwen's process, both prefix caches and the page cache is what DeepSeek's
+  start-up left (it keeps 4 GiB of host memory free beside the locked tier).
 - **Qwen 27B released, Flash Next resident:** Qwen keeps only its host
   snapshots. Its weights come back from the page cache when they are still
   there, otherwise from the SSD; either way the R9700's
@@ -210,6 +231,23 @@ with the flags above (2026-11-13):
 
 Greedy output is identical on both models across switch cycles.
 
+DeepSeek V4.1 Flash (`ds41-halo`, one request at a time, DSpark drafter,
+204,800-token context) and Qwen 3.8 27B in one group, same box (2026-11-15):
+
+| Switch | Releasing every GPU | Keeping the expert tier |
+| --- | --- | --- |
+| Qwen 3.8 27B to DeepSeek V4.1 | 66-101 s reinstate | 12.2-16.6 s reinstate (dense 5-9 s, hot experts 3.7-4.5 s, drafter 3.1-3.5 s), first reply 17-25 s |
+| DeepSeek V4.1 to Qwen 3.8 27B | | 7.4-8.1 s reinstate |
+| Releasing DeepSeek's R9700 part | 4.4-4.8 s | 0.05-0.11 s |
+| DeepSeek first start in the group | 80-104 s | |
+
+While released, DeepSeek keeps 104-107 GiB on the Strix Halo (its carve and
+13.6-16.6 GiB of locked host memory). A 29.5K-token conversation's next turn
+after switching away and back restores its prefix on both models (Qwen 8.6 s
+instead of 43 s). Greedy output is identical across switch cycles; a release
+of every GPU sizes the expert placement again from the memory free then, so
+its output can differ from before.
+
 What sets these times:
 
 - **The R9700's link.** One to four writers of staged copies reach 3.45 GB/s;
@@ -231,8 +269,10 @@ What sets these times:
   and about 5 GiB while Qwen runs (part of Flash Next's dense weights). Needs
   members to agree on how much each may keep, and weight buffers split by
   layer.
-- `deepseek4`: release only the R9700 and keep the Strix Halo expert tier,
-  then measure against Qwen 3.8 27B.
+- `deepseek4`: its reinstate moves 26 GB over the R9700's link (dense weights,
+  hot experts, drafter, KV cache), at best about 8 s; the three uploads run one
+  after another today (about 12 s). Beside Qwen 3.8 27B on a 128 GB box only
+  about 10 GiB of system memory stays available, and the box swaps.
 - Swapping with `--max-concurrency` > 1 on `qwen35`, and paged serving.
 - An SSD session cache for concurrent serving, and one disk budget shared by
   the members of a group.
