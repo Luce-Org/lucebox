@@ -121,6 +121,7 @@ struct Glm5Weights {
     int   hc_mult  = 0;
     int   hc_iters = 0;
     float hc_eps   = 0.0f;
+    bool  hc_fused = false;  // GPU only
 
     // FFN
     int   n_ff          = 0;
@@ -141,10 +142,12 @@ struct Glm5Weights {
 };
 
 // Loads a GGUF or the first shard of a split one; layer_device[il] picks each layer's backend.
+// embd_backend: where the token embedding goes (default: the first layer's device).
 bool load_glm5_model(const std::string & path,
                      const std::vector<ggml_backend_t> & backends,
                      const std::vector<int> & layer_device,
-                     Glm5Weights & out);
+                     Glm5Weights & out,
+                     ggml_backend_t embd_backend = nullptr);
 
 void free_glm5_model(Glm5Weights & w);
 

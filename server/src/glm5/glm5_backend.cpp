@@ -79,10 +79,12 @@ bool Glm5Backend::plan_layers() {
 }
 
 bool Glm5Backend::load_weights() {
-    if (!load_glm5_model(cfg_.model_path, backends_, layer_device_, w_)) {
+    // Embedding on the host.
+    if (!load_glm5_model(cfg_.model_path, backends_, layer_device_, w_, cpu_)) {
         std::fprintf(stderr, "[glm5] model load failed: %s\n", luce_last_error());
         return false;
     }
+    w_.hc_fused = !cfg_.cpu_only;
     return true;
 }
 

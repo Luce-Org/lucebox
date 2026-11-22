@@ -399,9 +399,14 @@ std::vector<size_t> read_glm5_layer_bytes(const std::string & path) {
 }
 
 bool load_glm5_model(const std::string & path,
-                     const std::vector<ggml_backend_t> & backends,
+                     const std::vector<ggml_backend_t> & layer_backends,
                      const std::vector<int> & layer_device,
-                     Glm5Weights & out) {
+                     Glm5Weights & out,
+                     ggml_backend_t embd_backend) {
+    // Optional embedding backend, after the layer devices.
+    std::vector<ggml_backend_t> backends = layer_backends;
+    if (embd_backend) backends.push_back(embd_backend);
+
     std::vector<std::unique_ptr<Shard>> shards;
     if (!open_shards(path, shards, /*want_mmap=*/true)) return false;
 
@@ -414,13 +419,13 @@ bool load_glm5_model(const std::string & path,
         return false;
     }
     for (int il = 0; il < out.n_layer; ++il) {
-        if (layer_device[il] < 0 || layer_device[il] >= (int) backends.size()) {
+        if (layer_device[il] < 0 || layer_device[il] >= (int) layer_backends.size()) {
             set_last_error("glm5: layer " + std::to_string(il) + " placed on a missing device");
             return false;
         }
         out.layers[il].device = layer_device[il];
     }
-    out.embd_device = layer_device.front();
+    out.embd_device = embd_backend ? (int) backends.size() - 1 : layer_device.front();
     out.head_device = layer_device.back();
 
     std::vector<TensorSpec> specs;

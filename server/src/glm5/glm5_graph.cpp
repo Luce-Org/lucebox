@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace luce::common {
@@ -30,7 +31,16 @@ struct HcPre {
     ggml_tensor * post = nullptr;  // [hc, T]        weight of the sub-block output per stream
     ggml_tensor * comb = nullptr;  // [hc(dst), hc(src), T]
     ggml_tensor * xt   = nullptr;  // [hc, n_embd, T] the residual, streams first
+    // Fused path.
+    ggml_tensor * split = nullptr;  // [(2+hc)*hc, T] pre|post|comb
+    ggml_tensor * x2d   = nullptr;  // [hc*n_embd, T]
 };
+
+// DS4 HC kernels (GPU only); GLM5_HC_UNFUSED=1 uses the reference ops.
+bool use_fused_hc(const Glm5Weights & w) {
+    static const bool off = std::getenv("GLM5_HC_UNFUSED") != nullptr;
+    return w.hc_fused && !off && w.hc_mult == 4 && std::fabs(w.hc_eps - 1e-6f) < 1e-12f;
+}
 
 // comb [dst, src, T]: softmax over dst, then alternating row/column normalization.
 ggml_tensor * hc_sinkhorn(ggml_context * ctx, ggml_tensor * comb, int iters, float eps) {
@@ -65,6 +75,18 @@ HcPre build_hc_pre(ggml_context * ctx, const Glm5Weights & w, ggml_tensor * x,
     ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc * E, T);
     ggml_tensor * mixes = ggml_mul_mat(ctx, fn, ggml_rms_norm(ctx, flat, w.rms_eps));  // [(2+hc)*hc, T]
 
+    if (use_fused_hc(w)) {
+        const int64_t mix_dim = (2 + hc) * hc;
+        ggml_tensor * out = ggml_ds4_hc_pre(ctx, mixes, base, flat, hc, w.hc_iters,
+                                            scale[0], scale[1], scale[2]);
+        const size_t row = (size_t) (E + mix_dim) * sizeof(float);
+        HcPre r;
+        r.cur = ggml_cont(ctx, ggml_view_2d(ctx, out, E, T, row, 0));
+        r.split = ggml_view_2d(ctx, out, mix_dim, T, row, (size_t) E * sizeof(float));
+        r.x2d = flat;
+        return r;
+    }
+
     auto part = [&](int off, int n) {
         return ggml_cont(ctx, ggml_view_2d(ctx, mixes, n, T, mixes->nb[1],
                                            (size_t) off * ggml_element_size(mixes)));
@@ -96,6 +118,10 @@ ggml_tensor * build_hc_post(ggml_context * ctx, const Glm5Weights & w, ggml_tens
     const int hc = w.hc_mult;
     const int64_t E = w.n_embd;
     const int64_t T = f->ne[1];
+
+    if (pre.split) {
+        return ggml_reshape_3d(ctx, ggml_ds4_hc_post(ctx, pre.x2d, f, pre.split, hc), E, hc, T);
+    }
 
     ggml_tensor * comb_t = ggml_cont(ctx, ggml_permute(ctx, pre.comb, 1, 0, 2, 3));  // [src, dst, T]
     ggml_tensor * mixed = ggml_mul_mat(ctx, pre.xt, comb_t);                         // [E, dst, T]
