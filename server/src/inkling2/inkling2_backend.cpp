@@ -114,30 +114,35 @@ bool Inkling2Backend::load_all() {
         if (std::strcmp(env_kv, "f16") == 0 || std::strcmp(env_kv, "F16") == 0) kv_type = GGML_TYPE_F16;
     }
 
-    // Determine max_ctx (auto-fit to available VRAM/GTT when <= 0 or fit_ctx).
-    int max_ctx = cfg_.device.max_ctx;
+    // Determine max_ctx (reuse frozen first-load layout on reinstate so host-RAM
+    // prefix snapshots remain valid; otherwise auto-fit when <= 0 or fit_ctx).
+    int max_ctx = fitted_max_ctx_;
     if (max_ctx <= 0) {
-        max_ctx = weights_.context_length > 0 ? std::min(weights_.context_length, 65536) : 32768;
-    }
-    if (cfg_.device.fit_ctx) {
-        // Fit context comfortably to available memory (with Split-KV when expert_backend is present).
-        size_t tfree = 0, ttotal = 0;
-        ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &tfree, &ttotal);
-        size_t efree = 0, etotal = 0;
-        if (expert_backend_) {
-            ggml_backend_cuda_get_device_memory(cfg_.expert_device->gpu, &efree, &etotal);
+        max_ctx = cfg_.device.max_ctx;
+        if (max_ctx <= 0) {
+            max_ctx = weights_.context_length > 0 ? std::min(weights_.context_length, 65536) : 32768;
         }
-        const size_t n_global = weights_.global_slots.size();
-        const size_t kv_row_b = ggml_row_size(kv_type, weights_.head_dim);
-        const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b
-                                   + (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
-        const size_t reserve = (size_t) 4 << 30;
-        const size_t usable = (tfree > reserve ? tfree - reserve : 0)
-                            + (expert_backend_ && efree > reserve ? efree - reserve : 0);
-        if (bytes_per_tok > 0) {
-            const int fit = (int) std::min<size_t>((size_t) max_ctx, usable / bytes_per_tok);
-            max_ctx = std::max(4096, (fit / 256) * 256);
+        if (cfg_.device.fit_ctx) {
+            // Fit context comfortably to available memory (with Split-KV when expert_backend is present).
+            size_t tfree = 0, ttotal = 0;
+            ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &tfree, &ttotal);
+            size_t efree = 0, etotal = 0;
+            if (expert_backend_) {
+                ggml_backend_cuda_get_device_memory(cfg_.expert_device->gpu, &efree, &etotal);
+            }
+            const size_t n_global = weights_.global_slots.size();
+            const size_t kv_row_b = ggml_row_size(kv_type, weights_.head_dim);
+            const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b
+                                       + (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
+            const size_t reserve = (size_t) 4 << 30;
+            const size_t usable = (tfree > reserve ? tfree - reserve : 0)
+                                + (expert_backend_ && efree > reserve ? efree - reserve : 0);
+            if (bytes_per_tok > 0) {
+                const int fit = (int) std::min<size_t>((size_t) max_ctx, usable / bytes_per_tok);
+                max_ctx = std::max(4096, (fit / 256) * 256);
+            }
         }
+        fitted_max_ctx_ = max_ctx;
     }
 
     if (!create_inkling2_cache(backend_, expert_backend_, weights_, max_ctx, chunk_, kv_type, cache_, err)) {
@@ -148,13 +153,17 @@ bool Inkling2Backend::load_all() {
     return true;
 }
 
-void Inkling2Backend::release_all() {
-    for (auto & s : snapshots_) free_snapshot(s);
+void Inkling2Backend::release_device_state() {
     last_logits_.clear();
     free_inkling2_cache(cache_);
     free_inkling2_weights(weights_);
     if (backend_) ggml_backend_cuda_trim_pool(backend_);
     if (expert_backend_) ggml_backend_cuda_trim_pool(expert_backend_);
+}
+
+void Inkling2Backend::release_all() {
+    for (auto & s : snapshots_) free_snapshot(s);
+    release_device_state();
 }
 
 bool Inkling2Backend::init() {
@@ -188,6 +197,7 @@ void Inkling2Backend::print_ready_banner() const {
 
 bool Inkling2Backend::park(ParkTarget target) {
     if (target != ParkTarget::TargetModel && target != ParkTarget::All) return false;
+    if (released_) return false;
     if (parked_) return true;
     release_all();
     parked_ = true;
@@ -209,9 +219,63 @@ ModelBackend::Residency Inkling2Backend::residency() const {
     Residency r;
     r.gpus.push_back(cfg_.device.gpu);
     if (cfg_.expert_device.has_value()) r.gpus.push_back(cfg_.expert_device->gpu);
-    r.supported = false;
-    r.reason = "inkling2: GPU release not yet enabled";
+    if (!backend_) {
+        r.reason = "inkling2: not initialized";
+        return r;
+    }
+    r.supported = true;
+    auto buf_size = [](ggml_backend_buffer_t b) -> size_t {
+        return b ? ggml_backend_buffer_get_size(b) : 0;
+    };
+    if (released_ || parked_) {
+        r.released = r.gpus;
+        r.bytes.assign(r.gpus.size(), 0);
+        return r;
+    }
+    const size_t target_bytes =
+        buf_size(weights_.buf) + buf_size(weights_.derived_buf) +
+        buf_size(weights_.dspark.buf) + buf_size(cache_.buf) +
+        buf_size(cache_.dspark_kv_buf);
+    r.bytes.push_back(target_bytes);
+    if (cfg_.expert_device.has_value()) {
+        const size_t expert_bytes =
+            buf_size(weights_.expert_buf) + buf_size(cache_.remote_buf);
+        r.bytes.push_back(expert_bytes);
+    }
     return r;
+}
+
+bool Inkling2Backend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    if (!backend_) {
+        error = "inkling2: not initialized";
+        return false;
+    }
+    if (parked_) {
+        error = "inkling2: parked";
+        return false;
+    }
+    auto touches = [&](int gpu) {
+        return gpus.empty() || std::find(gpus.begin(), gpus.end(), gpu) != gpus.end();
+    };
+    const bool hit_target = touches(cfg_.device.gpu);
+    const bool hit_expert = cfg_.expert_device.has_value() && touches(cfg_.expert_device->gpu);
+    if (!hit_target && !hit_expert) return true;
+    if (released_) return true;
+    release_device_state();
+    released_ = true;
+    return true;
+}
+
+bool Inkling2Backend::reinstate(std::string & error) {
+    if (!released_) return true;
+    if (!load_all()) {
+        release_device_state();
+        released_ = true;
+        error = "inkling2: reinstate load failed";
+        return false;
+    }
+    released_ = false;
+    return true;
 }
 
 // ─── Prefix Snapshots (Host RAM) ────────────────────────────────────────
@@ -234,7 +298,7 @@ size_t Inkling2Backend::snapshot_bytes_estimate(int tokens) const {
 }
 
 bool Inkling2Backend::snapshot_save(int slot) {
-    if (slot < 0 || slot >= kMaxSlots || parked_ || cache_.cur_pos <= 0) return false;
+    if (slot < 0 || slot >= kMaxSlots || parked_ || released_ || cache_.cur_pos <= 0) return false;
     // Skip snapshots when Split-KV remote pool is active (simplifies v1 snapshot path)
     if (cache_.remote_backend) return false;
 
@@ -315,7 +379,7 @@ int Inkling2Backend::snapshot_cur_pos(int slot) const {
 GenerateResult Inkling2Backend::restore_and_generate_impl(int slot,
                                                           const GenerateRequest & req,
                                                           const DaemonIO & io) {
-    if (!snapshot_used(slot) || parked_) {
+    if (!snapshot_used(slot) || parked_ || released_) {
         return generate_impl(req, io);
     }
     const Inkling2Snapshot & s = snapshots_[slot];
@@ -354,7 +418,7 @@ GenerateResult Inkling2Backend::restore_and_generate_impl(int slot,
 GenerateResult Inkling2Backend::generate_impl(const GenerateRequest & req,
                                               const DaemonIO & io) {
     last_logits_.clear();
-    if (!parked_) reset_inkling2_cache(cache_);
+    if (!parked_ && !released_) reset_inkling2_cache(cache_);
     return run(req, io, 0);
 }
 
@@ -364,8 +428,9 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     result.restored_prefix_tokens = restored;
     const DaemonIO io = raw_io.with_token_callback(req.on_token);
 
-    if (parked_) {
-        result.fail(GenerateErrorCode::ModelParked, "inkling2 target is parked");
+    if (parked_ || released_) {
+        result.fail(GenerateErrorCode::ModelParked,
+                    released_ ? "inkling2 GPUs are released" : "inkling2 target is parked");
         return result;
     }
     if (req.prompt.empty()) {

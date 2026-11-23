@@ -73,6 +73,8 @@ public:
     bool is_target_parked() const override { return parked_; }
 
     Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -95,6 +97,7 @@ public:
 private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored);
     bool load_all();
+    void release_device_state();
     void release_all();
     std::string resolve_dspark_path() const;
 
@@ -105,7 +108,9 @@ private:
     Inkling2Weights       weights_;
     Inkling2Cache         cache_;
     int                   chunk_          = 512;
+    int                   fitted_max_ctx_ = 0;
     bool                  parked_         = false;
+    bool                  released_       = false;
     std::vector<float>    last_logits_;
     std::array<Inkling2Snapshot, kMaxSlots> snapshots_;
     AdaptiveSpecWidth     spec_width_{kInkling2MaxVerify};

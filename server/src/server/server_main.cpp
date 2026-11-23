@@ -2252,20 +2252,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                              "pass one\n");
         return 1;
     }
-    // For Inkling 2 / Inkling 2 Loop, auto-load the embedded Jinja tokenizer.chat_template from the GGUF.
-    if (sconfig.chat_codec.empty() && sconfig.chat_template_src.empty() &&
-        (general_arch == "inkling2_loop" || general_arch == "inkling2")) {
-        struct gguf_init_params gp = { /*.no_alloc=*/true, /*.ctx=*/nullptr };
-        if (gguf_context * g = gguf_init_from_file(backend_model.path.c_str(), gp)) {
-            const int64_t k = gguf_find_key(g, "tokenizer.chat_template");
-            if (k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_STRING) {
-                sconfig.chat_template_src = gguf_get_val_str(g, k);
-                std::fprintf(stderr, "[server] loaded embedded Jinja chat_template from GGUF (%zu bytes)\n",
-                             sconfig.chat_template_src.size());
-            }
-            gguf_free(g);
-        }
-    }
     if (!sconfig.chat_codec.empty()) {
         std::fprintf(stderr, "[server] chat codec %s renders the prompt\n",
                      make_chat_codec(sconfig.chat_codec)->id().c_str());
@@ -2651,7 +2637,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (sconfig.hard_limit_reply_budget > 0) {
         std::string marker = card.thinking_marker;
         if (marker.empty()) {
-            marker = (arch == "gemma4") ? "<channel|>" : "</think>";
+            marker = (arch == "gemma4") ? "<channel|>"
+                   : luce::common::arch_is_inkling2_family(arch) ? "<|end_message|>"
+                   : "</think>";
         }
         const std::string close_text = card.thinking_terminator_hint.empty()
                                            ? marker

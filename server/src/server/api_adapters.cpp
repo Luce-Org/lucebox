@@ -348,6 +348,12 @@ TokenDelivery classify_generated_token(
         return TokenDelivery::kSkip;
     }
 
+    // Inkling 2 sub-message protocol (<|message_model|> [name] <|content_*|> ... <|end_message|>).
+    const int ink = emitter.consume_inkling_protocol_token(raw, tokenizer.token_text(token), text);
+    if (ink == 1) return TokenDelivery::kSkip;
+    if (ink == 2) return TokenDelivery::kText;
+    if (ink == 3) return TokenDelivery::kThinkTag;
+
     // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
     // thinking markers share one mapped dialect. The Qwen markers
     // <think> (id 248068) and </think> (id 248069) are SINGLE special

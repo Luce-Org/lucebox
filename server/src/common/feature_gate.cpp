@@ -34,6 +34,10 @@ std::string check_feature_compatibility(
                "' (supported: " + supported + ")";
     }
 
+    if (arch_is_inkling2_family(arch) && target_backend != PlacementBackend::Hip) {
+        return arch + " is only supported on AMD ROCm (HIP) backends";
+    }
+
     if ((arch == "qwen4exp" || arch_is_inkling2_family(arch)) &&
         (args.verify_width < 0 || args.verify_width > 8)) {
         return arch + " --verify-width expects 0 (auto), 1 (off), or 2..8 (fixed k=1..7)";

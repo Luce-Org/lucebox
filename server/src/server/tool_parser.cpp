@@ -76,6 +76,7 @@ static const char FUNCNAME_OPEN[] = "<funcname>";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
 static const char ATTRIBUTE_PARAMETER_OPEN[] = "<parameter name=";
 static const char ARG_KEY_OPEN[] = "<arg_key>";
+static const char INKLING_TOOL_OPEN[] = "<|content_invoke_tool_json|>";
 
 // Parameter names may start with '-': Claude Code's Grep takes -i, -n, -A, -B
 // and -C, and a call whose names no pattern matches is dropped whole.
@@ -119,7 +120,7 @@ static std::string declared_tool_name(const json & tool) {
 static const char * const TOOL_OPENERS[] = {
     TOOL_OPEN, TOOL_CALLS_OPEN, DSML_PREFIX, INVOKE_OPEN, FUNCTION_CALL_OPEN,
     FUNCTION_CALLS_OPEN, FUNCTION_OPEN, BARE_FUNCTION_OPEN, FUNCTION_SPACE_OPEN,
-    FUNCNAME_OPEN, TOOL_CODE_OPEN, ATTRIBUTE_PARAMETER_OPEN,
+    FUNCNAME_OPEN, TOOL_CODE_OPEN, ATTRIBUTE_PARAMETER_OPEN, INKLING_TOOL_OPEN,
 };
 
 static bool declared_tool_open_at(const std::string & text, size_t pos,
