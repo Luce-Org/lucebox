@@ -354,6 +354,17 @@ KvFlashFusedWs * kvflash_fused_ws_new() { return new KvFlashFusedWs(); }
 void kvflash_fused_ws_free(KvFlashFusedWs * w) { delete w; }
 size_t kvflash_fused_ws_bytes(const KvFlashFusedWs * w) { return w ? w->q8_b + w->qd_b + w->src_b + w->part_b + w->mz_b + w->out_b : 0; }
 
+bool kvflash_fused_device_shares_host_memory() {
+#if defined(__HIP_PLATFORM_AMD__)
+    return false;
+#else
+    int dev = 0, integrated = 0;
+    const bool ok = cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+    return ok && integrated != 0;
+#endif
+}
+
 bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const float * qd,
                        size_t max_partial_bytes, float * out_mean, float * out_top, float * out_max, KvFlashFusedTiming * tm,
                        std::string * err) {
