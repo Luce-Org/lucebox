@@ -80,13 +80,13 @@
 #include <array>
 #include <mutex>
 #include <thread>
-#include <poll.h>
 #include <chrono>
 #include <tuple>
 #include <vector>
 #include <limits>
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -428,6 +428,7 @@ struct SchedulerTestHarness {
 
 struct HttpServerTestAccess {
     using PreparedPrompt = HttpServer::PreparedPrompt;
+#if !defined(_WIN32)
     static void add_sse_subscriber(HttpServer & server, int fd) {
         std::lock_guard<std::mutex> lk(server.sse_mu_);
         server.sse_fds_.push_back(fd);
@@ -436,7 +437,13 @@ struct HttpServerTestAccess {
         std::lock_guard<std::mutex> lk(server.sse_mu_);
         return server.sse_fds_.size();
     }
+    static size_t sse_pending(HttpServer & server) {
+        std::lock_guard<std::mutex> lk(server.sse_mu_);
+        return server.sse_pending_;
+    }
+    static void handle_client(HttpServer & server, int fd) { server.handle_client(fd); }
     static void broadcast_token(HttpServer & server, const std::string & text) { server.broadcast_token(text); }
+#endif
     static std::string apply_pflash_compression(
             HttpServer & server, const ParsedRequest & req) {
         HttpServer::PreparedPrompt prepared;
@@ -21600,6 +21607,7 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
 }
 
+#if !defined(_WIN32)  // socketpair(), poll(), MSG_DONTWAIT
 // ─── HTTP edge bounds: status-event fan-out ─────────────────────────────
 
 namespace {
@@ -21646,3 +21654,39 @@ TEST_CASE(ServerUnitFixture, test_a_stuck_status_subscriber_does_not_block_a_bro
     close(stuck[1]);
     close(live[1]);
 }
+
+TEST_CASE(ServerUnitFixture, test_status_subscriber_handshake_during_shutdown_closes_fd_without_registering) {
+    SseRig rig;
+    int sp[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+    // Fill the server-to-client send buffer so send_all() blocks between the
+    // sse_pending_ reservation and the registration step.
+    const std::string fill(4096, 'x');
+    while (send(sp[0], fill.data(), fill.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    const char req[] = "GET /status/events HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    TEST_ASSERT(send(sp[1], req, sizeof(req) - 1, MSG_NOSIGNAL) == (ssize_t)(sizeof(req) - 1));
+
+    std::thread handler([&] { HttpServerTestAccess::handle_client(*rig.server, sp[0]); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (HttpServerTestAccess::sse_pending(*rig.server) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    TEST_ASSERT(HttpServerTestAccess::sse_pending(*rig.server) == 1);
+
+    // shutdown() runs while the handshake is in flight.
+    rig.server->shutdown();
+
+    // Drain the client side so send_all() completes and the handler reaches registration.
+    char buf[4096];
+    ssize_t n = 1;
+    while (n > 0) {
+        n = recv(sp[1], buf, sizeof(buf), 0);
+    }
+    handler.join();
+    TEST_ASSERT(n == 0);  // server closed sp[0] instead of leaking it
+    TEST_ASSERT(HttpServerTestAccess::sse_pending(*rig.server) == 0);
+    TEST_ASSERT(HttpServerTestAccess::sse_subscribers(*rig.server) == 0);
+    close(sp[1]);
+}
+#endif

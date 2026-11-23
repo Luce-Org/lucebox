@@ -2748,6 +2748,10 @@ void HttpServer::handle_client(SocketHandle fd) {
         sse_drop_closed_at_cap();
         {
             std::lock_guard<std::mutex> lk(sse_mu_);
+            if (stopping_.load()) {
+                socket_close(fd);
+                return;
+            }
             // A slot is reserved here, counting live and pending subscribers, so
             // two handlers cannot both pass for the last slot. The socket writes
             // below stay outside the mutex.
@@ -2780,6 +2784,10 @@ void HttpServer::handle_client(SocketHandle fd) {
         {
             std::lock_guard<std::mutex> lk(sse_mu_);
             --sse_pending_;   // the reservation becomes the registration
+            if (stopping_.load()) {
+                socket_close(fd);
+                return;
+            }
             sse_fds_.push_back(fd);
         }
         return;  // Do NOT close fd — it's now owned by the SSE broadcast loop.
