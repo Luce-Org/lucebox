@@ -790,7 +790,7 @@ static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggm
     if (!is_tree && is_r3 && k->type == GGML_TYPE_Q8_0 && n_rows <= 16) {
         return false;
     }
-    if (!is_tree && is_r4 && n_rows > 16) {
+    if (!is_tree && is_r4 && n_rows > 16 && n_rows < 128) {
         return false;
     }
 
