@@ -1663,7 +1663,7 @@ bool inkling2_dspark_draft(
         std::vector<int32_t> & out_draft_tokens,
         int max_draft) {
     out_draft_tokens.clear();
-    if (!w.dspark.loaded || n_draft <= 0) return false;
+    if (!w.dspark.loaded || n_draft <= 0 || w.dspark.block_size != 8) return false;
     const auto & ds = w.dspark;
     const int B = ds.block_size; // 8 (1 anchor + 7 masks)
     const int n_spec = std::min(n_draft, B - 1);

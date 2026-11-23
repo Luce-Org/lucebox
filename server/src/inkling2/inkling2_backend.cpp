@@ -290,7 +290,7 @@ size_t Inkling2Backend::snapshot_bytes_estimate(int tokens) const {
     size_t total = 0;
     for (int il = 0; il < weights_.n_layer_eff; ++il) {
         const bool is_swa = weights_.layers[weights_.phys_layer_for_slot(il)].is_swa;
-        const int rows = is_swa ? std::min(n_tok, cache_.swa_cap) : n_tok;
+        const int rows = is_swa ? cache_.swa_cap : n_tok;
         total += (size_t) rows * 2 * weights_.n_head_kv * kv_row_b;
         total += ggml_nbytes(cache_.conv_state[il]);
     }

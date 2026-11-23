@@ -549,7 +549,7 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
 
     uint64_t hdr_len = 0;
     std::memcpy(&hdr_len, mm_bytes, sizeof(hdr_len));
-    if (8 + hdr_len > mm.size()) {
+    if (hdr_len > mm.size() - 8) {
         error = "inkling2_dspark: corrupt safetensors header in " + path;
         return false;
     }
@@ -601,7 +601,7 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
         return false;
     }
 
-    auto get_f32 = [&](const std::string & name, std::vector<float> & out_vec) -> bool {
+    auto get_f32 = [&](const std::string & name, std::vector<float> & out_vec, size_t expected_elems) -> bool {
         auto it = entries.find(name);
         if (it == entries.end()) {
             error = "inkling2_dspark: missing tensor " + name;
@@ -622,6 +622,11 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
                 return false;
             }
             n *= (size_t) d;
+        }
+        if (n != expected_elems) {
+            error = "inkling2_dspark: shape mismatch for " + name +
+                    " (got " + std::to_string(n) + " elements, expected " + std::to_string(expected_elems) + ")";
+            return false;
         }
         const size_t need_bytes = n * elem_bytes;
         if (need_bytes > e.len || e.off > data_bytes || need_bytes > data_bytes - e.off) {
@@ -731,9 +736,17 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
         return false;
     }
 
+    auto cleanup_fail = [&]() -> bool {
+        if (ds.buf) { ggml_backend_buffer_free(ds.buf); ds.buf = nullptr; }
+        if (ds.ctx) { ggml_free(ds.ctx); ds.ctx = nullptr; }
+        ds.layers.clear();
+        ds.loaded = false;
+        return false;
+    };
+
     std::vector<float> tmp, tmp2, tmp3;
     // 1. fuse_weight [4, 4] -> softmax per row -> fuse_alpha[0..3]
-    if (!get_f32("fuse_weight", tmp) || tmp.size() != 16) return false;
+    if (!get_f32("fuse_weight", tmp, 16)) return cleanup_fail();
     for (int r = 0; r < 4; ++r) {
         float mx = tmp[r * 4];
         for (int c = 1; c < 4; ++c) mx = std::max(mx, tmp[r * 4 + c]);
@@ -744,69 +757,69 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
         ggml_backend_tensor_set(ds.fuse_alpha[r], row, 0, sizeof(row));
     }
 
-    if (!get_f32("mask_embed", tmp)) return false;
+    if (!get_f32("mask_embed", tmp, (size_t) H)) return cleanup_fail();
     ggml_backend_tensor_set(ds.mask_embed, tmp.data(), 0, tmp.size() * sizeof(float));
-    if (!get_f32("norm.weight", tmp)) return false;
+    if (!get_f32("norm.weight", tmp, (size_t) H)) return cleanup_fail();
     ggml_backend_tensor_set(ds.norm, tmp.data(), 0, tmp.size() * sizeof(float));
 
     for (int i = 0; i < ds.n_layer; ++i) {
         auto & L = ds.layers[i];
         const std::string p = "layers." + std::to_string(i) + ".";
         auto load_f32 = [&](const std::string & k, ggml_tensor * dst) {
-            if (!get_f32(p + k, tmp)) return false;
+            if (!get_f32(p + k, tmp, (size_t) ggml_nelements(dst))) return false;
             ggml_backend_tensor_set(dst, tmp.data(), 0, tmp.size() * sizeof(float));
             return true;
         };
-        if (!load_f32("dflare_norm.weight", L.dflare_norm)) return false;
-        if (!load_f32("input_layernorm.weight", L.inp_norm)) return false;
-        if (!load_f32("post_attention_layernorm.weight", L.post_norm)) return false;
-        if (!load_f32("self_attn.q_norm.weight", L.q_norm)) return false;
-        if (!load_f32("self_attn.k_norm.weight", L.k_norm)) return false;
-        if (!load_f32("self_attn.k_norm_ctx.weight", L.k_norm_ctx)) return false;
+        if (!load_f32("dflare_norm.weight", L.dflare_norm)) return cleanup_fail();
+        if (!load_f32("input_layernorm.weight", L.inp_norm)) return cleanup_fail();
+        if (!load_f32("post_attention_layernorm.weight", L.post_norm)) return cleanup_fail();
+        if (!load_f32("self_attn.q_norm.weight", L.q_norm)) return cleanup_fail();
+        if (!load_f32("self_attn.k_norm.weight", L.k_norm)) return cleanup_fail();
+        if (!load_f32("self_attn.k_norm_ctx.weight", L.k_norm_ctx)) return cleanup_fail();
 
         // Stack q_proj | k_proj | v_proj -> wqkv
-        if (!get_f32(p + "self_attn.q_proj.weight", tmp) ||
-            !get_f32(p + "self_attn.k_proj.weight", tmp2) ||
-            !get_f32(p + "self_attn.v_proj.weight", tmp3)) return false;
+        if (!get_f32(p + "self_attn.q_proj.weight", tmp, (size_t) q_sz * H) ||
+            !get_f32(p + "self_attn.k_proj.weight", tmp2, (size_t) kv_sz * H) ||
+            !get_f32(p + "self_attn.v_proj.weight", tmp3, (size_t) kv_sz * H)) return cleanup_fail();
         const size_t rs_h = ggml_row_size(ds_lin_type, H);
         upload_lin(L.wqkv, tmp,  H, q_sz,  0);
         upload_lin(L.wqkv, tmp2, H, kv_sz, (size_t) q_sz * rs_h);
         upload_lin(L.wqkv, tmp3, H, kv_sz, (size_t) (q_sz + kv_sz) * rs_h);
 
         // Stack k_proj_ctx | v_proj_ctx -> wkv_ctx
-        if (!get_f32(p + "self_attn.k_proj_ctx.weight", tmp) ||
-            !get_f32(p + "self_attn.v_proj_ctx.weight", tmp2)) return false;
+        if (!get_f32(p + "self_attn.k_proj_ctx.weight", tmp, (size_t) kv_sz * H) ||
+            !get_f32(p + "self_attn.v_proj_ctx.weight", tmp2, (size_t) kv_sz * H)) return cleanup_fail();
         upload_lin(L.wkv_ctx, tmp,  H, kv_sz, 0);
         upload_lin(L.wkv_ctx, tmp2, H, kv_sz, (size_t) kv_sz * rs_h);
 
-        if (!get_f32(p + "self_attn.o_proj.weight", tmp)) return false;
+        if (!get_f32(p + "self_attn.o_proj.weight", tmp, (size_t) H * q_sz)) return cleanup_fail();
         upload_lin(L.wo, tmp, q_sz, H, 0);
 
         // Stack gate_proj | up_proj -> w_gate_up
-        if (!get_f32(p + "mlp.gate_proj.weight", tmp) ||
-            !get_f32(p + "mlp.up_proj.weight", tmp2)) return false;
+        if (!get_f32(p + "mlp.gate_proj.weight", tmp, (size_t) ds.n_ff * H) ||
+            !get_f32(p + "mlp.up_proj.weight", tmp2, (size_t) ds.n_ff * H)) return cleanup_fail();
         upload_lin(L.w_gate_up, tmp,  H, ds.n_ff, 0);
         upload_lin(L.w_gate_up, tmp2, H, ds.n_ff, (size_t) ds.n_ff * rs_h);
 
-        if (!get_f32(p + "mlp.down_proj.weight", tmp)) return false;
+        if (!get_f32(p + "mlp.down_proj.weight", tmp, (size_t) H * ds.n_ff)) return cleanup_fail();
         upload_lin(L.w_down, tmp, ds.n_ff, H, 0);
     }
 
     // Markov head weights
-    if (!get_f32("markov_head.dflare_norm.weight", tmp)) return false;
+    if (!get_f32("markov_head.dflare_norm.weight", tmp, (size_t) H)) return cleanup_fail();
     ggml_backend_tensor_set(ds.markov_dflare_norm, tmp.data(), 0, tmp.size() * sizeof(float));
 
-    if (!get_f32("markov_head.markov_w1.weight", tmp)) return false;
+    if (!get_f32("markov_head.markov_w1.weight", tmp, (size_t) V * R)) return cleanup_fail();
     {
         auto w1_16 = f32_to_f16_vec(tmp);
         ggml_backend_tensor_set(ds.markov_w1, w1_16.data(), 0, w1_16.size() * sizeof(ggml_fp16_t));
     }
 
-    if (!get_f32("markov_head.rnn_proj.bias", tmp)) return false;
+    if (!get_f32("markov_head.rnn_proj.bias", tmp, (size_t) 3 * R)) return cleanup_fail();
     ggml_backend_tensor_set(ds.rnn_bias, tmp.data(), 0, tmp.size() * sizeof(float));
 
     // Split rnn_proj.weight [3*R, 2*R + 2*H] into step [: 2*R] and ctx [2*R :]
-    if (!get_f32("markov_head.rnn_proj.weight", tmp)) return false;
+    if (!get_f32("markov_head.rnn_proj.weight", tmp, (size_t) 3 * R * (2 * R + 2 * H))) return cleanup_fail();
     {
         const int in_total = 2 * R + 2 * H;
         std::vector<float> step_w((size_t) 3 * R * (2 * R));
@@ -823,8 +836,8 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
 
     // Pre-fold lm_head @ hidden_out.weight and lm_head @ hidden_out.bias on GPU (<5 ms!)
     std::vector<float> ho_w, ho_b;
-    if (!get_f32("markov_head.hidden_out.weight", ho_w) ||
-        !get_f32("markov_head.hidden_out.bias",   ho_b)) return false;
+    if (!get_f32("markov_head.hidden_out.weight", ho_w, (size_t) H * R) ||
+        !get_f32("markov_head.hidden_out.bias",   ho_b, (size_t) H)) return cleanup_fail();
     {
         // PyTorch hidden_out.weight is [H, R] row-major; transpose to [R, H] so each column is length H
         std::vector<float> ho_wt((size_t) R * H);

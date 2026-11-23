@@ -194,7 +194,8 @@ int SseEmitter::consume_inkling_protocol_token(
             out_text = "<think>";
             return 3;
         }
-        if (raw_token == "<|content_text|>") {
+        if (raw_token == "<|content_text|>" ||
+            raw_token == "<|content_invoke_tool_text|>") {
             inkling_header_ = false;
             inkling_header_name_.clear();
             if (mode_ == StreamMode::REASONING) {
@@ -203,8 +204,7 @@ int SseEmitter::consume_inkling_protocol_token(
             }
             return 1;
         }
-        if (raw_token == "<|content_invoke_tool_json|>" ||
-            raw_token == "<|content_invoke_tool_text|>") {
+        if (raw_token == "<|content_invoke_tool_json|>") {
             inkling_header_ = false;
             inkling_header_name_.clear();
             if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
@@ -243,15 +243,15 @@ int SseEmitter::consume_inkling_protocol_token(
         out_text = "<think>";
         return 3;
     }
-    if (raw_token == "<|content_text|>") {
+    if (raw_token == "<|content_text|>" ||
+        raw_token == "<|content_invoke_tool_text|>") {
         if (mode_ == StreamMode::REASONING) {
             out_text = "</think>\n";
             return 3;
         }
         return 1;
     }
-    if (raw_token == "<|content_invoke_tool_json|>" ||
-        raw_token == "<|content_invoke_tool_text|>") {
+    if (raw_token == "<|content_invoke_tool_json|>") {
         if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
             suppress_inkling_tool_ = true;
             return 1;

@@ -1407,7 +1407,7 @@ inkling2_attn_rel_prefill_wmma_kernel(
         int Hq, int Hk, int T, int kv_cap,
         int swa_window, int rel_extent,
         int partial_out, int include_sink) {
-#if defined(RDNA4) || defined(RDNA3)
+#if defined(RDNA4) || defined(RDNA3) || defined(RDNA3_5)
     constexpr int D = 128;
     constexpr int BN = 32;
     constexpr int BM = 128;
@@ -1994,18 +1994,22 @@ static __global__ void inkling2_dynamic_split_lut_kernel(
         for (int b = 1; b < 32; ++b) n_unique += s_hist[b];
         int n_hot = (n_unique * target_pct + 99) / 100;
         if (n_hot > n_unique) n_hot = n_unique;
-        int acc = 0;
         int cut_f = 32;
         int cut_rem = 0;
-        for (int b = 31; b >= 1; --b) {
-            if (acc + s_hist[b] <= n_hot) {
-                acc += s_hist[b];
-                cut_f = b;
-                cut_rem = 0;
-            } else {
-                cut_f = b;
-                cut_rem = n_hot - acc;
-                break;
+        if (n_hot > 0) {
+            int acc = 0;
+            for (int b = 31; b >= 1; --b) {
+                if (s_hist[b] == 0) continue;
+                if (acc + s_hist[b] <= n_hot) {
+                    acc += s_hist[b];
+                    cut_f = b;
+                    cut_rem = 0;
+                    if (acc == n_hot) break;
+                } else {
+                    cut_f = b;
+                    cut_rem = n_hot - acc;
+                    break;
+                }
             }
         }
         s_cut_f = cut_f;
@@ -2793,16 +2797,21 @@ static __global__ void inkling2_sigmoid_topk_split_kernel(
         for (int b = 1; b < 32; ++b) n_unique += s_hist[b];
         int n_hot = (n_unique * target_pct + 99) / 100;
         if (n_hot > n_unique) n_hot = n_unique;
-        int acc = 0, cut_f = 32, cut_rem = 0;
-        for (int b = 31; b >= 1; --b) {
-            if (acc + s_hist[b] <= n_hot) {
-                acc += s_hist[b];
-                cut_f = b;
-                cut_rem = 0;
-            } else {
-                cut_f = b;
-                cut_rem = n_hot - acc;
-                break;
+        int cut_f = 32, cut_rem = 0;
+        if (n_hot > 0) {
+            int acc = 0;
+            for (int b = 31; b >= 1; --b) {
+                if (s_hist[b] == 0) continue;
+                if (acc + s_hist[b] <= n_hot) {
+                    acc += s_hist[b];
+                    cut_f = b;
+                    cut_rem = 0;
+                    if (acc == n_hot) break;
+                } else {
+                    cut_f = b;
+                    cut_rem = n_hot - acc;
+                    break;
+                }
             }
         }
         s_cut_f = cut_f;
@@ -2970,16 +2979,21 @@ static __global__ void inkling2_dynamic_split_routes_kernel(
         for (int b = 1; b < 32; ++b) n_unique += s_hist[b];
         int n_hot = (n_unique * target_pct + 99) / 100;
         if (n_hot > n_unique) n_hot = n_unique;
-        int acc = 0, cut_f = 32, cut_rem = 0;
-        for (int b = 31; b >= 1; --b) {
-            if (acc + s_hist[b] <= n_hot) {
-                acc += s_hist[b];
-                cut_f = b;
-                cut_rem = 0;
-            } else {
-                cut_f = b;
-                cut_rem = n_hot - acc;
-                break;
+        int cut_f = 32, cut_rem = 0;
+        if (n_hot > 0) {
+            int acc = 0;
+            for (int b = 31; b >= 1; --b) {
+                if (s_hist[b] == 0) continue;
+                if (acc + s_hist[b] <= n_hot) {
+                    acc += s_hist[b];
+                    cut_f = b;
+                    cut_rem = 0;
+                    if (acc == n_hot) break;
+                } else {
+                    cut_f = b;
+                    cut_rem = n_hot - acc;
+                    break;
+                }
             }
         }
         s_cut_f = cut_f;
@@ -3252,7 +3266,7 @@ static __global__ void inkling2_dspark_build_masks_kernel(
     if (k >= kv_span) return;
     const int anchor_pos  = draft_pos[0];
     const int kv_total    = anchor_pos + B;
-    const int local_start = max(0, anchor_pos - swa_window);
+    const int local_start = max(0, anchor_pos - swa_window + 1);
     const half h_zero = __float2half(0.0f);
     const half h_ninf = __float2half(-INFINITY);
     const half vg = (k < kv_total) ? h_zero : h_ninf;
