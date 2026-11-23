@@ -1575,6 +1575,11 @@ if(LUCE_TESTS)
             list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
         endif()
 
+        # qwen4exp MoE MUL_MAT_ID across the MMVQ/MMQ/MMB batch cutovers vs an exact CPU reference (gfx1151).
+        luce_add_ggml_gpu_executable(test_mmb_mmid test/unit/test_mmb_mmid.cpp)
+        target_compile_definitions(test_mmb_mmid PRIVATE GGML_USE_HIP)
+        list(APPEND _raw_unit_test_targets test_mmb_mmid)
+
         # Vectorized bf16<->f32 cast vs the scalar fallback, bit-exact.
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_convert_vec.cpp")
             add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
@@ -2295,6 +2300,11 @@ if(LUCE_TESTS)
     target_include_directories(test_qwen4exp_prefix_cache PRIVATE ${LUCE_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     target_link_libraries(test_qwen4exp_prefix_cache PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        # KvFlashPager's layout keys on LUCE_BACKEND_CUDA, which luce_common sets PRIVATE (HIP builds match through
+        # ggml's GGML_USE_HIP). Without it this test's pager has no DMA members and luce_common reads past them.
+        target_compile_definitions(test_qwen4exp_prefix_cache PRIVATE LUCE_BACKEND_CUDA=1)
+    endif()
     # Not `cpu`: on a CUDA build its KVFlash pager records CUDA events, which the
     # hosted runner's driver stub refuses.
     add_test(NAME qwen4exp_prefix_cache COMMAND test_qwen4exp_prefix_cache)
@@ -2381,6 +2391,7 @@ if(LUCE_TESTS)
         target_link_libraries(test_kvflash PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
         if(LUCE_GPU_BACKEND STREQUAL "cuda")
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
+            target_compile_definitions(test_kvflash PRIVATE LUCE_BACKEND_CUDA=1)   # luce_common's KvFlashPager layout
         endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_paged_kv_pool.cpp")
@@ -2807,6 +2818,7 @@ if(LUCE_TESTS)
             test/unit/test_adaptive_keep_ratio.cpp
             test/unit/test_skip_park_guard.cpp
             test/unit/test_admission.cpp
+            test/unit/test_engine_load.cpp
             test/unit/test_restore_delta.cpp
             test/unit/test_restore_bounds.cpp
             test/unit/test_chain_rollback_policy.cpp

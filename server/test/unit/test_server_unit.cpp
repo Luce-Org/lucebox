@@ -17370,12 +17370,15 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
 
 TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_backends_reselect_mode) {
     using luce::server::kvflash_recall_mode;
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk") == "prefill-reselect=4");  // the default profile
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru").empty());   // --kvflash-policy lru turns recall off
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk").empty());    // retired mode
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk").empty());    // the user turned recall off
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk").empty());
-    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk").empty());    // no recall on other architectures
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 1) == "prefill-reselect=4");  // the default profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", 1).empty());   // --kvflash-policy lru turns recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", 1).empty());    // retired mode
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", 1).empty());    // the user turned recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", 1).empty());
+    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", 1).empty());    // no recall on other architectures
+    // Tensor parallelism: the backend turns recall off at load (kvflash_recall_features), so /props says off.
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 2).empty());
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 4).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_kvflash_disabled_without_the_flag) {
@@ -17397,7 +17400,7 @@ TEST_CASE(ServerUnitFixture, test_props_kvflash_reports_pool_and_recall) {
     cfg.arch                = "qwen35";
     cfg.kvflash_enabled     = true;
     cfg.kvflash_pool_tokens = 16384;
-    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk");
+    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk", 1);
     Tokenizer   tok;
     PrefixCache pc(0, tok);
     ToolMemory  tm;
@@ -18890,6 +18893,33 @@ TEST_CASE(ServerUnitFixture, test_eos_at_cap_finishes_as_stop) {
                 TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (eos ? "stop" : "length"), body.dump());
             } else {
                 TEST_ASSERT_MSG(body["stop_reason"] == (eos ? "end_turn" : "max_tokens"), body.dump());
+            }
+        }
+    }
+}
+
+// With ignore_eos an end token does not stop the generation, so one on the cap token was cut off.
+TEST_CASE(ServerUnitFixture, test_ignore_eos_at_cap_finishes_as_length) {
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(write_deepseek_marker_tokenizer_fixture().c_str()));  // eos id 2
+    GenerateResult result;
+    result.succeed();
+    result.tokens = {0, 0, tok.eos_id()};
+    const GenTimings timings{};
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::ANTHROPIC, ApiFormat::RESPONSES}) {
+        for (const bool ignore_eos : {false, true}) {
+            ParsedRequest req;
+            req.format = format;
+            req.raw_body = {{"ignore_eos", ignore_eos}};
+            auto em = make_emitter(format);
+            em.emit_start();
+            const json body = build_non_streaming_response(req, result, /*generation_cap=*/3, timings, tok, em);
+            if (format == ApiFormat::OPENAI_CHAT) {
+                TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (ignore_eos ? "length" : "stop"), body.dump());
+            } else if (format == ApiFormat::ANTHROPIC) {
+                TEST_ASSERT_MSG(body["stop_reason"] == (ignore_eos ? "max_tokens" : "end_turn"), body.dump());
+            } else {
+                TEST_ASSERT_MSG(body["status"] == (ignore_eos ? "incomplete" : "completed"), body.dump());
             }
         }
     }

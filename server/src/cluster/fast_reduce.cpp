@@ -10,6 +10,7 @@
 #include <poll.h>
 
 #include "cluster/cluster_control.h"
+#include "common/platform_env.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -181,8 +182,7 @@ bool exchange(const FastReduce::Config & cfg, const Endpoint & mine,
 
 // A switch is on when set to anything but empty or "0".
 static bool fr_env_on(const char * name) {
-    const char * v = std::getenv(name);
-    return v && *v && std::strcmp(v, "0") != 0;
+    return luce::common::env_flag_enabled(name);
 }
 
 struct FastReduceImpl {

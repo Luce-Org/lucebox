@@ -25,7 +25,7 @@ if _backend == "nvfp4":
 import time, torch
 import _phase2_variant  # noqa: F401 — prints "[megakernel] DN phase2 variant = scalar|wmma"
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
-from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, MAX_SEQ_LEN, _half_dtype
+from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_HEADS, _half_dtype
 import qwen35_megakernel_bf16_C
 from transformers import AutoTokenizer
 

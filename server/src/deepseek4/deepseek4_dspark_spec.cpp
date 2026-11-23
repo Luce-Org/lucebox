@@ -32,6 +32,7 @@
 #include "internal.h"
 #include "common/adaptive_spec_width.h"
 #include "common/dspark_head.h"
+#include "common/platform_env.h"
 #include "common/cuda_graph_overrides.h"
 
 #include "ggml.h"
@@ -160,8 +161,8 @@ public:
         return true;
     }
 
-    bool snapshot_kv() override { return deepseek4_snapshot_save(cache_, snap_backend_, snap_); }
-    bool restore_kv() override { return deepseek4_snapshot_restore(snap_, cache_); }
+    bool snapshot_kv() override { return deepseek4_snapshot_save(cache_, snap_backend_, snap_, nullptr, backend_); }
+    bool restore_kv() override { return deepseek4_snapshot_restore(snap_, cache_, nullptr, backend_); }
 
     bool is_eos(int token) const override { return deepseek4_is_eos_tok(token, w_); }
 
@@ -316,8 +317,7 @@ DraftWeights make_dspark_shim(const DSparkDrafter & d) {
 }
 
 bool spec_env_flag(const char * name) {
-    const char * v = std::getenv(name);
-    return v && *v && *v != '0';
+    return env_flag_enabled(name);
 }
 
 // True unless the variable is set to an explicit "0": for switches whose

@@ -128,8 +128,17 @@ private:
         // the ondisk prefix cache serializes. Owned by the slot.
         ggml_context *        ctx = nullptr;
         ggml_backend_buffer_t buf = nullptr;
+        // Live-KV prefix delta restore tracking
+        std::vector<int32_t>  tokens;
+        bool                  has_tokens = false;
+        uint64_t              gen = 0;
     };
     std::vector<Snapshot> snapshots_;
+    std::vector<int32_t>  live_tokens_;
+    bool                  live_tokens_valid_ = false;
+    uint64_t              next_snap_gen_ = 1;
+    uint64_t              live_source_gen_ = 0;
+    int                   live_source_pos_ = 0;
 
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

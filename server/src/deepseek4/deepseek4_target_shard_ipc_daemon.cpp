@@ -308,7 +308,7 @@ int run_deepseek4_target_shard_ipc_daemon(
         if (snap.shards.size() != shards.size()) snap.shards.resize(shards.size());
         for (size_t i = 0; i < shards.size(); ++i) {
             if (!deepseek4_snapshot_save(shards[i].cache, snapshot_backends[i],
-                                         snap.shards[i])) {
+                                         snap.shards[i], nullptr, shards[i].backend)) {
                 free_slot(slot);
                 return false;
             }
@@ -331,7 +331,7 @@ int run_deepseek4_target_shard_ipc_daemon(
         }
         for (size_t i = 0; i < shards.size(); ++i) {
             if (snap.shards[i].cur_pos != snap.cur_pos ||
-                !deepseek4_snapshot_restore(snap.shards[i], shards[i].cache)) {
+                !deepseek4_snapshot_restore(snap.shards[i], shards[i].cache, nullptr, shards[i].backend)) {
                 return false;
             }
         }
