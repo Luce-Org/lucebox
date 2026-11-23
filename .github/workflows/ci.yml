@@ -3,24 +3,73 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # Merge queue runs the full suite (--full) before anything lands on main.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
     paths:
       - 'server/**'
       - 'harness/**'
+      - 'optimizations/**'
+      - 'share/model_cards/**'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/ci.yml'
+      - '.github/ci/**'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Plan CI jobs from changed files
+    # Narrow PR feedback to what the diff can affect (.github/ci/ci_plan.py).
+    # Pushes to main, merge_group checks, manual dispatches, unknown paths,
+    # and any planning failure fall back to running everything (`!= 'false'`).
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      python: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.python || '' }}
+      cpp: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.cpp || '' }}
+      megakernel: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.megakernel || '' }}
+      windows: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.windows || '' }}
+      dgx: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.dgx || '' }}
+      gpu: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.gpu || '' }}
+      qwen38: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.qwen38 || '' }}
+      ds41: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.ds41 || '' }}
+    steps:
+      # A pull request checks out its merge commit: parent 1 is main, so the diff
+      # from it is what the pull request changes.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+          filter: blob:none
+          persist-credentials: false
+          sparse-checkout: .github/ci
+
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            python3 .github/ci/ci_plan.py --base HEAD^1 --head HEAD >> "$GITHUB_OUTPUT"
+          else
+            python3 .github/ci/ci_plan.py --full >> "$GITHUB_OUTPUT"
+          fi
+
   uv-workspace:
     name: uv workspace (lock + sync + import smoke)
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.python != 'false' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # setup-uv reads uv's version list from raw.githubusercontent.com once, with a
@@ -31,36 +80,47 @@ jobs:
         continue-on-error: true
         with:
           version: "0.11.x"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
       - if: steps.setup-uv.outcome == 'failure'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
       - name: Verify uv lockfile and workspace sync
-        # Skips the torch wheel in this fast job; the CUDA build below runs a
-        # full sync and builds megakernel against torch.
+        # Installs dev tooling in the same sync pass (skipping the torch wheel;
+        # build-megakernel below runs the cu128 torch sync).
+        env:
+          UV_WORKSPACE_SYNC_ARGS: "--extra dev --no-install-package torch"
         run: bash scripts/check_uv_workspace.sh
 
-      - name: Lint Python surfaces touched by lucebox tooling
-        run: uv run --frozen --extra dev ruff check .
+      - name: Lint Python surfaces and CI helper scripts
+        run: |
+          uv run --frozen --no-sync ruff check .
+          find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --no-sync ruff check
 
       - name: Python unit tests (no GPU/server/model required)
         # Includes .github/ci. server/model/slow-marked tests need a running
         # luce_server or local model files; no CI job runs them yet, so run
         # them by hand with --base-url/--launch.
-        run: uv run --frozen --extra dev pytest -q -m "not server and not model and not slow"
-
-      - name: Lint CI helper scripts
-        run: find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --extra dev ruff check
+        run: uv run --frozen --no-sync pytest -q -m "not server and not model and not slow"
 
   build:
-    name: Build (cmake + uv sync --extra megakernel)
+    name: Build (cmake + C++ CPU unit tests)
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.cpp != 'false' }}
     # ubuntu-latest is Ubuntu 26.04, whose NVIDIA apt repository has no CUDA 12.8 packages.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Add a last-resort Ubuntu mirror outside Canonical's DNS
         # The CUDA install below runs apt. The runner reads its Ubuntu mirrors from
@@ -72,8 +132,62 @@ jobs:
 
       - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
-          # Keep the existing upstream CUDA toolkit version; the uv workspace
-          # only replaces Python environment setup.
+          cuda: '12.8.0'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Provide CUDA driver stub for hosted tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -sf "$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so" \
+            "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          {
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
+          } >> "$GITHUB_ENV"
+
+      - name: Build luce (smoke + server)
+        run: |
+          cd server
+          gen=()
+          command -v ninja >/dev/null && gen=(-G Ninja)
+          cmake -B build "${gen[@]}" \
+            -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_BUILD_TYPE=Release
+          # Compile-only coverage for GPU/model tests the hosted runner can't run.
+          cmake --build build --target \
+            test_dflash test_generate test_model_smoke \
+            test_concat_transpose test_kernel_qualification_gdn \
+            test_kernel_qualification_moe_ds4 -j$(nproc)
+
+      - name: Build and run C++ CPU unit tests
+        # check-cpu builds every test labeled `cpu` in CMakeLists.txt and runs
+        # `ctest -L cpu`, so a new CPU-safe test needs no edit here.
+        run: cmake --build server/build --target check-cpu -j$(nproc)
+
+  build-megakernel:
+    name: Build megakernel (uv sync --extra megakernel)
+    # Split out of `build` so megakernel's cu128 torch sync + CUDAExtension
+    # builds run in parallel with C++ cmake and can be skipped when PRs don't
+    # touch megakernel or Python workspace files.
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.megakernel != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Add a last-resort Ubuntu mirror outside Canonical's DNS
+        run: printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' | sudo tee -a /etc/apt/apt-mirrors.txt
+
+      - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        with:
           # Building megakernel's CUDAExtension links against torch's libs,
           # so CI uses the matching cu128 PyTorch wheel below.
           cuda: '12.8.0'
@@ -91,8 +205,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # Twice, as in uv-workspace: one slow read of uv's version list fails setup-uv.
-      # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
-      # interpreter; no separate setup-python step needed.
+      # Omit uv cache here so the ~2.5 GB cu128 torch wheel doesn't compete with
+      # sccache for the 10 GB GHA cache quota (this job only runs when megakernel
+      # or workspace deps change, and downloading torch takes ~25s).
       - id: setup-uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         continue-on-error: true
@@ -102,25 +217,6 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
-
-      - name: Build luce (smoke + server)
-        run: |
-          cd server
-          cmake -B build \
-            -DCMAKE_CUDA_ARCHITECTURES="86" \
-            -DLUCE_ENABLE_BSA=OFF \
-            -DLUCE_FA_ALL_QUANTS=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          # Compile-only coverage for GPU/model tests the hosted runner can't run.
-          cmake --build build --target \
-            test_dflash test_generate test_model_smoke \
-            test_concat_transpose test_kernel_qualification_gdn \
-            test_kernel_qualification_moe_ds4 -j$(nproc)
-
-      - name: Build and run C++ CPU unit tests
-        # check-cpu builds every test labeled `cpu` in CMakeLists.txt and runs
-        # `ctest -L cpu`, so a new CPU-safe test needs no edit here.
-        run: cmake --build server/build --target check-cpu -j$(nproc)
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. luce declares
@@ -178,9 +274,10 @@ jobs:
     # action_required until a maintainer reviews the diff and approves it.
     # That human checkpoint is the line of defense for the self-hosted box;
     # do not weaken the approval policy while this job runs fork code.
-    # Gate only on the fast workspace check, not the hosted CPU build. Each GPU
-    # compiles and executes the focused suite independently on real hardware.
-    needs: [uv-workspace]
+    # Gate only on the fast plan step, not uv-workspace or the hosted CPU build,
+    # so NVIDIA verification starts immediately in parallel.
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.dgx != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -198,20 +295,20 @@ jobs:
             arch: "121"
             compute_cap: "12.1"
     runs-on: [self-hosted, "${{ matrix.runner }}"]
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       CUDA_HOME: /usr/local/cuda
       CUDACXX: /usr/local/cuda/bin/nvcc
       CUDA_ARCH: ${{ matrix.arch }}
       EXPECTED_COMPUTE_CAP: ${{ matrix.compute_cap }}
+      CCACHE_MAXSIZE: 20G
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime
     # No job concurrency group: each GPU box has one runner, which already runs its
     # jobs one at a time, in order. A group keeps only one job waiting and cancels the
     # older one when a third run arrives, so a busy box lost queued jobs.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: GPU and CUDA smoke (${{ matrix.job_name }})
         run: |
@@ -221,8 +318,11 @@ jobs:
 
       - name: Build focused NVIDIA verifier tests (sm_${{ matrix.arch }})
         run: |
+          export CCACHE_BASEDIR="$GITHUB_WORKSPACE"
           cd server
-          cmake -B build \
+          gen=()
+          command -v ninja >/dev/null && gen=(-G Ninja)
+          cmake -B build "${gen[@]}" \
             -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
             -DLUCE_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
@@ -255,6 +355,7 @@ jobs:
             test_qn_split_fusions
           )
           cmake --build build --target "${targets[@]}" -j"$(nproc)"
+          command -v ccache >/dev/null && ccache -s || true
 
       - name: Run focused NVIDIA verifier tests
         run: |
@@ -310,43 +411,6 @@ jobs:
       #       -H 'Content-Type: application/json' \
       #       -d '{"prompt":"The capital of France is","max_tokens":8}' | grep -q '"text"'
 
-  plan-lucebox3:
-    name: Plan the lucebox3 jobs from the changed files
-    # lucebox3 runs one job at a time, about 30 minutes a pull request, so a pull
-    # request runs only what its files can affect (.github/ci/ci_plan.py): Qwen 3.8
-    # code serves only Qwen 3.8, DeepSeek V4.1 code only V4.1, tests skip both serve
-    # checks, docs and Python tooling skip lucebox3. Shared code, other models and
-    # any path the rules don't name run everything, as do pushes to main and manual
-    # runs. The jobs read each output as "run unless 'false'", so a plan that fails
-    # or prints nothing runs everything.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Only a plan step that succeeded counts: one that printed its outputs, then
-    # failed (writing the step summary), leaves them empty, and everything runs.
-    outputs:
-      gpu: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.gpu || '' }}
-      qwen38: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.qwen38 || '' }}
-      ds41: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.ds41 || '' }}
-    steps:
-      # A pull request checks out its merge commit: parent 1 is main, so the diff
-      # from it is what the pull request changes.
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-          sparse-checkout: .github/ci
-
-      - name: Plan
-        id: plan
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT" = pull_request ]; then
-            python3 .github/ci/ci_plan.py --base HEAD^1 --head HEAD >> "$GITHUB_OUTPUT"
-          else
-            python3 .github/ci/ci_plan.py --full >> "$GITHUB_OUTPUT"
-          fi
-
   gpu-tests-amd:
     name: GPU tests (${{ matrix.device_name }}, ${{ matrix.arch }} / ROCm)
     # Companion to the NVIDIA jobs: lucebox3 carries both an R9700 and the Strix
@@ -356,11 +420,12 @@ jobs:
     #
     # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
     # approves the workflow run (approval_policy=all_external_contributors).
-    # Gate only on the fast workspace check, not the hosted CPU build. The two AMD
-    # matrix jobs share one physical runner and therefore execute one at a time.
+    # Gate only on the fast plan step so ROCm jobs start in parallel with
+    # uv-workspace. The two AMD matrix jobs share one physical runner and
+    # therefore execute one at a time.
     # !cancelled() keeps a failed plan from skipping the job: it then runs.
-    needs: [uv-workspace, plan-lucebox3]
-    if: ${{ !cancelled() && needs.uv-workspace.result == 'success' && needs.plan-lucebox3.outputs.gpu != 'false' }}
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.gpu != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -373,19 +438,21 @@ jobs:
             device_index: "1"
     runs-on: [self-hosted, lucebox3]
     # Up to 120 minutes waiting for development work on the box, and room to
-    # rerun steps stopped for it (.github/ci/box_step.sh).
+    # rerun steps stopped for it (.github/ci/box_step.sh). Lightweight setup and
+    # health checks run immediately outside box_step.sh; heavy ROCm builds and
+    # GPU tests stay inside box_step.sh because Strix Halo shares system RAM
+    # with the iGPU (yielding avoids OOM-killing dev workloads, keeps OOM retry,
+    # and ccache preserves already-compiled objects across yields).
     timeout-minutes: 180
-    defaults:
-      run:
-        # Every run step waits while someone else uses the box's GPUs, and
-        # steps aside and reruns when someone starts to.
-        shell: bash ${{ github.workspace }}/.github/ci/box_step.sh {0}
     env:
       BOX_WAIT_MINUTES: 120
-      # Each run of a step; the whole job had 20 minutes before it could wait.
+      # Each run of a GPU test step.
       BOX_STEP_MINUTES: 20
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
+      CCACHE_MAXSIZE: 30G
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime
       # The models this box serves: Qwen 3.8 27B (qwen35 architecture, as the target
       # loader expects) and DeepSeek V4.1 Flash's DSpark drafter (the 383 GB model
       # itself runs only across both GPUs; serve-smoke-amd below serves it).
@@ -395,14 +462,30 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Ensure local ccache is available
+        run: |
+          cache_dir="$HOME/.cache/lucebox-ci-ccache"
+          mkdir -p "$HOME/.local/bin" "$cache_dir"
+          echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          if ! command -v ccache >/dev/null && [ ! -x "$HOME/.local/bin/ccache" ]; then
+            url="https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-linux-x86_64-musl-static.tar.xz"
+            sha="d553fac006ed93a37342cee9228cf4e13dd66690fa1a8075c54c7bace9b72ae6"
+            tmp="$RUNNER_TEMP/ccache.tar.xz"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            tar -xJf "$tmp" -C "$RUNNER_TEMP"
+            mv "$RUNNER_TEMP/ccache-4.14.3-linux-x86_64-musl-static/ccache" "$HOME/.local/bin/ccache"
+            chmod +x "$HOME/.local/bin/ccache"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/ccache" --version 2>/dev/null || ccache --version
+
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
         # the whole job timeout. Probe with a hard timeout first,
         # and when it hangs, dump the evidence (D-state holders, dmesg) so
         # the job fails in seconds with a diagnosis instead of silently.
-        # The probe only reads, for 15 seconds at most, so it runs at once
-        # rather than in box_step.sh: a wedged process would make it wait.
-        shell: bash -e {0}
         run: |
           # A wedged KFD puts rocminfo in UNINTERRUPTIBLE sleep: timeout(1)
           # cannot kill it and a foreground wait blocks until the job
@@ -433,23 +516,41 @@ jobs:
       - name: ROCm inventory includes ${{ matrix.arch }}
         run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -F "${{ matrix.arch }}"
 
-      - name: Build + run HIP vector-add on ${{ matrix.device_name }}
-        # Self-contained HIP kernel correctness test (no model weights). This is
-        # the execution the GitHub-hosted jobs cannot do. The binary also checks
-        # that HIP_VISIBLE_DEVICES selected the matrix's expected architecture.
+      - name: Build HIP vector-add on ${{ matrix.device_name }}
         run: |
           /opt/rocm/bin/hipcc --offload-arch="$EXPECTED_HIP_ARCH" -O2 \
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
+
+      - name: Run HIP vector-add on ${{ matrix.device_name }}
+        # Self-contained HIP kernel correctness test (no model weights). This is
+        # the execution the GitHub-hosted jobs cannot do. The binary also checks
+        # that HIP_VISIBLE_DEVICES selected the matrix's expected architecture.
+        shell: bash .github/ci/box_step.sh {0}
+        run: |
           "$RUNNER_TEMP/hip_smoke" "$EXPECTED_HIP_ARCH"
 
-      - name: Build + test ROCm formats and inference core
+      - name: Build ROCm formats and inference core
+        shell: bash .github/ci/box_step.sh {0}
+        env:
+          BOX_STEP_MINUTES: 30
         run: |
-          cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
+          gen=()
+          command -v ninja >/dev/null && gen=(-G Ninja)
+          avail_gib=$(awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+          jobs=$(nproc)
+          mem_jobs=$(( avail_gib / 3 ))
+          if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
+          if (( jobs < 2 )); then jobs=2; fi
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-build" "${gen[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
             -DLUCE_SERVER=OFF \
             -DLUCE_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
@@ -468,17 +569,24 @@ jobs:
               test_qwen4exp_qsa_ids test_qwen4exp_indexer_score test_rope_tail \
               test_mmb_cublas_diff test_convert_vec test_getrows_scalar \
               test_rms_norm_scale test_mul_mat_host_input test_mmid_regression test_qn_split_fusions \
-            --parallel 8
+            --parallel "$jobs"
+          ccache -s
+
+      - name: Test ROCm formats and inference core
+        shell: bash .github/ci/box_step.sh {0}
+        run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
             -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_fused_ops_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|KvflashFusedMassFixture|KvflashGpuMassFixture|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_vdot2_route$|test_cuda_copy_batch\.|test_cuda_copy_batch_disabled$|test_ds41_mmid_width_invariance$|test_qwen4exp_qsa_ids$|test_qwen4exp_indexer_score$|test_rope_tail\.|test_mmb_cublas_diff$|test_convert_vec$|test_getrows_scalar$|test_rms_norm_scale$|test_mul_mat_host_input$|test_mmid_regression$|test_qn_split_fusions\.'
 
       - name: Run GPU draft top-K tests
+        shell: bash .github/ci/box_step.sh {0}
         run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
             -R '^draft_topk_cuda$' --no-tests=error
 
       - name: Run capture-safe copy test
+        shell: bash .github/ci/box_step.sh {0}
         run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
             -R '^test_capture_safe_copies\.' --no-tests=error
@@ -493,6 +601,7 @@ jobs:
 
       - name: Run model-backed ROCm tests
         if: matrix.arch == 'gfx1151'
+        shell: bash .github/ci/box_step.sh {0}
         run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
@@ -501,27 +610,45 @@ jobs:
 
       - name: Load DeepSeek V4.1's DSpark drafter and run its forward
         # The drafter's bindings and a forward that must come out finite, on each GPU.
+        shell: bash .github/ci/box_step.sh {0}
         run: |
           "$RUNNER_TEMP/rocmfp-build/test_ds4_dspark_load" "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"
 
-      - name: Build + test affine ROCmFP2 GPU paths
+      - name: Build affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout
         # separately so both configurations remain covered. The focused tests
         # assert real MMVQ/MMQ dispatch rather than accepting a BLAS fallback.
+        shell: bash .github/ci/box_step.sh {0}
         run: |
-          cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" \
+          gen=()
+          command -v ninja >/dev/null && gen=(-G Ninja)
+          avail_gib=$(awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+          jobs=$(nproc)
+          mem_jobs=$(( avail_gib / 3 ))
+          if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
+          if (( jobs < 2 )); then jobs=2; fi
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" "${gen[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
             -DLUCE_SERVER=OFF \
             -DLUCE_TESTS=ON \
             -DLUCE_ROCMFP2_AFFINE=ON \
             -DGGML_HIP_GRAPHS=ON \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-affine-build" \
             --target test_rocmfpx test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda \
-            --parallel 8
+            --parallel "$jobs"
+          ccache -s
+
+      - name: Test affine ROCmFP2 GPU paths
+        shell: bash .github/ci/box_step.sh {0}
+        run: |
           ctest --test-dir "$RUNNER_TEMP/rocmfp-affine-build" \
             --output-on-failure \
             -R 'rocmfpx_reference|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'
@@ -535,25 +662,23 @@ jobs:
     # ds41-halo profile), with the DSpark drafter; it replaces the V4 the per-device
     # job loaded for ds4_load_transactional, a qtype-105 load V4.1 files (qtype 107)
     # cannot run. After gpu-tests-amd on the same runner, so a kernel failure stops it
-    # before the model loads. Each model's step runs when plan-lucebox3 says the
+    # before the model loads. Each model's step runs when plan says the
     # change can affect it.
-    needs: [gpu-tests-amd, plan-lucebox3]
+    needs: [gpu-tests-amd, plan]
     if: >-
       ${{ !cancelled() && needs.gpu-tests-amd.result == 'success' &&
-      (needs.plan-lucebox3.outputs.qwen38 != 'false' || needs.plan-lucebox3.outputs.ds41 != 'false') }}
+      (needs.plan.outputs.qwen38 != 'false' || needs.plan.outputs.ds41 != 'false') }}
     runs-on: [self-hosted, lucebox3]
     # Up to 120 minutes waiting for development work on the box, and room to
-    # rerun steps stopped for it (.github/ci/box_step.sh).
+    # rerun GPU serve steps stopped for it (.github/ci/box_step.sh).
     timeout-minutes: 210
-    defaults:
-      run:
-        # Every run step waits while someone else uses the box's GPUs, and
-        # steps aside and reruns when someone starts to.
-        shell: bash ${{ github.workspace }}/.github/ci/box_step.sh {0}
     env:
       BOX_WAIT_MINUTES: 120
-      # Each run of a step; the whole job had 45 minutes before it could wait.
+      # Each run of a serve step.
       BOX_STEP_MINUTES: 45
+      CCACHE_MAXSIZE: 30G
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime
       LUCE_TEST_MODEL_QWEN38: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
       LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
       LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
@@ -562,20 +687,52 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Ensure local ccache is available
+        run: |
+          cache_dir="$HOME/.cache/lucebox-ci-ccache"
+          mkdir -p "$HOME/.local/bin" "$cache_dir"
+          echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          if ! command -v ccache >/dev/null && [ ! -x "$HOME/.local/bin/ccache" ]; then
+            url="https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-linux-x86_64-musl-static.tar.xz"
+            sha="d553fac006ed93a37342cee9228cf4e13dd66690fa1a8075c54c7bace9b72ae6"
+            tmp="$RUNNER_TEMP/ccache.tar.xz"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            tar -xJf "$tmp" -C "$RUNNER_TEMP"
+            mv "$RUNNER_TEMP/ccache-4.14.3-linux-x86_64-musl-static/ccache" "$HOME/.local/bin/ccache"
+            chmod +x "$HOME/.local/bin/ccache"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Build luce_server for the R9700 and the Strix Halo
         # The build server/docs/DS41.md gives for this recipe.
+        shell: bash .github/ci/box_step.sh {0}
         run: |
-          cmake -S server -B "$RUNNER_TEMP/serve-build" \
+          gen=()
+          command -v ninja >/dev/null && gen=(-G Ninja)
+          avail_gib=$(awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+          jobs=$(nproc)
+          mem_jobs=$(( avail_gib / 3 ))
+          if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
+          if (( jobs < 2 )); then jobs=2; fi
+          cmake -S server -B "$RUNNER_TEMP/serve-build" "${gen[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DCMAKE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build "$RUNNER_TEMP/serve-build" --target luce_server --parallel 8
+          cmake --build "$RUNNER_TEMP/serve-build" --target luce_server --parallel "$jobs"
+          ccache -s
 
       - name: Serve Qwen 3.8 27B with DFlash2, eight at once
         # The model card's default profile on the R9700 (qwen38-r9700, a
         # 204,800-token context) with Lucebox Manage's batching on top.
-        if: needs.plan-lucebox3.outputs.qwen38 != 'false'
+        if: needs.plan.outputs.qwen38 != 'false'
+        shell: bash .github/ci/box_step.sh {0}
         env:
           SERVE_SMOKE_PROFILE: qwen38-r9700
         run: |
@@ -585,7 +742,8 @@ jobs:
 
       - name: Serve DeepSeek V4.1 Flash with DSpark
         # The model card's default profile on the Lucebox (ds41-halo).
-        if: needs.plan-lucebox3.outputs.ds41 != 'false'
+        if: needs.plan.outputs.ds41 != 'false'
+        shell: bash .github/ci/box_step.sh {0}
         env:
           SERVE_SMOKE_PROFILE: ds41-halo
         run: |
@@ -594,13 +752,17 @@ jobs:
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.windows != 'false' }}
     runs-on: windows-2022
     timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Set up MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
@@ -625,6 +787,10 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75" ^
             -DLUCE_ENABLE_BSA=OFF ^
             -DLUCE_FA_ALL_QUANTS=OFF ^
+            -DGGML_CCACHE=OFF ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
 
       - name: Build Windows targets
@@ -663,18 +829,20 @@ jobs:
     # differently than on Linux (#944: std::memcpy inside a __global__ function).
     # Compile and link only: GitHub-hosted runners have no AMD GPU.
     name: Build Windows (ROCm HIP, server targets)
+    needs: [plan]
+    if: ${{ !cancelled() && needs.plan.outputs.windows != 'false' }}
     runs-on: windows-2022
     timeout-minutes: 45
-    permissions:
-      contents: read
     env:
       ROCM_VERSION: 10.0.0
       HIP_ARCH: gfx1201
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_MULTIARCH: "1"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
-          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Set up MSVC Developer Command Prompt
         # clang targets the MSVC ABI and needs its headers, libraries and linker.
@@ -738,6 +906,10 @@ jobs:
             -DLUCE_HIP_ARCHITECTURES="$env:HIP_ARCH" `
             -DGPU_TARGETS="$env:HIP_ARCH" `
             -DLUCE_FA_ALL_QUANTS=OFF `
+            -DGGML_CCACHE=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_HIP_COMPILER_LAUNCHER=sccache `
             -DCMAKE_C_COMPILER="$clang" `
             -DCMAKE_CXX_COMPILER="$clangxx" `
             -DCMAKE_HIP_COMPILER="$clangxx" `

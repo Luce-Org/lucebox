@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Pick what the lucebox3 jobs run for a pull request, from the files it changes.
+"""Pick which CI jobs run for a pull request, from the files it changes.
 
-Prints `gpu=`, `qwen38=` and `ds41=` lines for $GITHUB_OUTPUT, each `true` or
-`false`: the per-device GPU tests, and the serve checks of Qwen 3.8 27B and of
-DeepSeek V4.1 Flash. Each changed path takes the first rule in RULES that matches
-it, and the pull request runs every job any of its paths needs. A path no rule
-names runs everything; so does --full (pushes to main, manual runs), and so does
-a failure to list the changed files.
+Prints `<job>=true|false` lines for $GITHUB_OUTPUT covering Python checks,
+hosted C++/megakernel/Windows builds, DGX GB10, and the lucebox3 ROCm jobs.
+Each changed path takes the first rule in RULES that matches it, and the pull
+request runs every job any of its paths needs. A path no rule names runs
+everything; so does --full (pushes to main, merge_group, manual runs), and so
+does a failure to list the changed files.
 
 Usage: ci_plan.py --base HEAD^1 --head HEAD   (a pull request's merge commit)
        ci_plan.py --full
@@ -20,20 +20,43 @@ import subprocess
 import sys
 
 JOBS = {
+    "python": "uv workspace (lock + lint + Python unit tests)",
+    "cpp": "Build Linux (cmake + C++ CPU unit tests)",
+    "megakernel": "Build megakernel (CUDAExtension sm_75 + sm_86)",
+    "windows": "Build Windows (MSVC+CUDA and ROCm HIP)",
+    "dgx": "GPU tests (DGX GB10, sm_121)",
     "gpu": "GPU tests (R9700 and Strix Halo)",
     "qwen38": "Serve Qwen 3.8 27B",
     "ds41": "Serve DeepSeek V4.1 Flash",
 }
 ALL = frozenset(JOBS)
-GPU = frozenset({"gpu"})
-QWEN38 = frozenset({"gpu", "qwen38"})
-DS41 = frozenset({"gpu", "ds41"})
 NONE: frozenset[str] = frozenset()
+PY = frozenset({"python"})
+CPP = frozenset({"cpp"})
+PY_CPP = frozenset({"python", "cpp"})
+PY_MK = frozenset({"python", "megakernel"})
+CPP_ALL = frozenset({"cpp", "windows", "dgx", "gpu", "qwen38", "ds41"})
+CPP_GPU = frozenset({"cpp", "windows", "dgx", "gpu"})
+CPP_QWEN38 = frozenset({"cpp", "windows", "dgx", "gpu", "qwen38"})
+CPP_DS41 = frozenset({"cpp", "windows", "dgx", "gpu", "ds41"})
+DS41_PROFILE = frozenset({"cpp", "gpu", "ds41"})
+CARD_QWEN38 = frozenset({"python", "cpp", "gpu", "qwen38"})
+CARD_DS41 = frozenset({"python", "cpp", "gpu", "ds41"})
+CARD_OTHER = frozenset({"python", "cpp"})
 
 # (pattern, jobs, what the paths are). A pattern ending in "/" matches everything
 # under that directory, "*.md" matches by suffix, and anything else is one file.
+# Order matters: more specific paths must precede parent directories.
 RULES = [
-    (".github/", ALL, "the workflow and its scripts"),
+    (".github/workflows/ci.yml", ALL, "the CI workflow"),
+    (".github/ci/", ALL, "the CI helper scripts"),
+    (".github/workflows/docker.yml", NONE, "unrelated workflow (Docker prebuilds)"),
+    (".github/workflows/code-review.yml", NONE, "unrelated workflow (code review bot)"),
+    (".github/workflows/compact-commits.yml", NONE, "unrelated workflow (commit compaction bot)"),
+    (".github/workflows/ci-fix.yml", NONE, "unrelated workflow (CI fix bot)"),
+    (".github/workflows/commit-style.yml", NONE, "unrelated workflow (commit style)"),
+    (".github/workflows/speed-profile.yml", NONE, "unrelated workflow (speed profile)"),
+    (".github/", ALL, "other GitHub configuration"),
     # Each model's own code. qwen35 and deepseek4 include none of each other's
     # headers, and at link level (nm over a luce_server build, 2026-10-29) DeepSeek
     # links only gguf_target_loader.cpp from qwen35 (CpuEmbedder, which its prefill
@@ -41,17 +64,19 @@ RULES = [
     # and the MoE IPC path, which dense Qwen 3.8 doesn't run. Other model
     # directories run everything: qwen35's graph includes qwen35moe and
     # bailingmoe3 headers, luce_common includes laguna's.
-    ("server/src/qwen35/gguf_target_loader.cpp", ALL, "code both models link"),
-    ("server/src/qwen35/", QWEN38, "Qwen 3.8 27B's code"),
-    ("server/src/deepseek4/", DS41, "DeepSeek V4.1's code"),
-    ("server/share/deepseek41/", DS41, "the ds41-halo profile's files"),
+    ("server/src/qwen35/gguf_target_loader.cpp", CPP_ALL, "code both models link"),
+    ("server/src/qwen35/", CPP_QWEN38, "Qwen 3.8 27B's code"),
+    ("server/src/deepseek4/", CPP_DS41, "DeepSeek V4.1's code"),
+    ("server/share/deepseek41/", DS41_PROFILE, "the ds41-halo profile's files"),
     # The model cards: sampler defaults and launch profiles. Only the served
     # models' cards change what the serve checks run.
-    ("share/model_cards/qwen3.8-27b.json", QWEN38, "Qwen 3.8 27B's model card"),
-    ("share/model_cards/deepseek-v4.1-flash.json", DS41, "DeepSeek V4.1 Flash's model card"),
-    ("share/model_cards/", NONE, "cards of models the jobs don't serve"),
-    ("server/test/", GPU, "tests (luce_server links none of them)"),
-    # Nothing the lucebox3 jobs build or read.
+    ("share/model_cards/README.md", NONE, "documentation"),
+    ("share/model_cards/qwen3.8-27b.json", CARD_QWEN38, "Qwen 3.8 27B's model card"),
+    ("share/model_cards/deepseek-v4.1-flash.json", CARD_DS41, "DeepSeek V4.1 Flash's model card"),
+    ("share/model_cards/", CARD_OTHER, "cards of models the serve jobs don't run"),
+    ("server/test/python/", PY, "Python server tests"),
+    ("server/test/", CPP_GPU, "C++ tests (luce_server links none of them)"),
+    # Documentation and static media affect no build or test target.
     ("*.md", NONE, "documentation"),
     ("docs/", NONE, "documentation"),
     ("server/docs/", NONE, "documentation"),
@@ -59,25 +84,35 @@ RULES = [
     ("server/hero.png", NONE, "images"),
     ("server/hero.raw.png", NONE, "images"),
     ("server/demo.gif", NONE, "images"),
-    ("harness/", NONE, "Python tooling outside the engine"),
-    ("optimizations/", NONE, "Python tooling outside the engine"),
-    ("scripts/", NONE, "Python tooling outside the engine"),
-    ("conftest.py", NONE, "Python tooling outside the engine"),
-    ("pyproject.toml", NONE, "Python tooling outside the engine"),
-    ("uv.lock", NONE, "Python tooling outside the engine"),
-    (".python-version", NONE, "Python tooling outside the engine"),
-    ("server/pyproject.toml", NONE, "Python tooling outside the engine"),
-    ("server/scripts/", NONE, "engine scripts and tools the jobs don't build"),
-    ("server/tools/", NONE, "engine scripts and tools the jobs don't build"),
-    ("server/eval/", NONE, "engine scripts and tools the jobs don't build"),
-    ("server/examples/", NONE, "engine scripts and tools the jobs don't build"),
-    ("Dockerfile", NONE, "container and repository files"),
-    ("Dockerfile.rocm", NONE, "container and repository files"),
-    ("docker-bake.hcl", NONE, "container and repository files"),
-    (".dockerignore", NONE, "container and repository files"),
-    (".gitignore", NONE, "container and repository files"),
-    ("LICENSE", NONE, "container and repository files"),
-    ("Makefile", NONE, "container and repository files"),
+    # Python workspace and optimizations.
+    ("optimizations/megakernel/", PY_MK, "megakernel CUDA extension"),
+    ("optimizations/", PY, "Python optimizations outside the C++ engine"),
+    # Client launcher scripts and their shell test drivers are registered under
+    # ctest `-L cpu` in server/CMakeLists.txt (not pytest).
+    ("harness/clients/", PY_CPP, "client launcher scripts (covered by check-cpu shell tests)"),
+    ("harness/tests/", PY_CPP, "harness tests (including check-cpu shell drivers)"),
+    ("harness/", PY, "Python harness tooling"),
+    ("scripts/", PY, "repository scripts"),
+    ("conftest.py", PY, "pytest configuration"),
+    ("pyproject.toml", PY_MK, "Python workspace configuration"),
+    ("uv.lock", PY_MK, "Python lockfile"),
+    (".python-version", PY_MK, "Python version pin"),
+    ("server/pyproject.toml", PY_MK, "server Python package metadata"),
+    ("server/scripts/entrypoint.sh", PY_CPP, "container entrypoint (covered by server_unit_entrypoint)"),
+    ("server/scripts/", PY, "engine Python scripts"),
+    ("server/tools/export_ds4v_mmproj.py", PY, "DS4V mmproj exporter (covered by test_export_ds4v_mmproj.py)"),
+    ("server/tools/ds4_mix_converter/", CPP, "DS4 mix converter (compiled into test_ds4_mix_fitter)"),
+    ("server/tools/", NONE, "standalone engine tools CI does not build"),
+    ("server/eval/", NONE, "evaluation scripts CI does not run"),
+    ("server/examples/chat.py", PY, "chat CLI example (covered by test_chat_stream.py)"),
+    ("server/examples/", NONE, "example programs CI does not build"),
+    ("Dockerfile", NONE, "container files (covered by docker.yml)"),
+    ("Dockerfile.rocm", NONE, "container files (covered by docker.yml)"),
+    ("docker-bake.hcl", NONE, "container files (covered by docker.yml)"),
+    (".dockerignore", NONE, "container files (covered by docker.yml)"),
+    (".gitignore", NONE, "repository metadata"),
+    ("LICENSE", NONE, "repository metadata"),
+    ("Makefile", PY, "Makefile"),
 ]
 UNKNOWN = "code no rule narrows (shared code, other models, build files)"
 
@@ -122,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.full:
-        jobs, reasons = ALL, {"a full run (a push to main or a manual run)": []}
+        jobs, reasons = ALL, {"a full run (main, merge_group, or manual dispatch)": []}
     else:
         if not (args.base and args.head):
             parser.error("give --base and --head, or --full")
@@ -141,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     for job in JOBS:
         print(f"{job}={'true' if job in jobs else 'false'}")
 
-    lines = ["## lucebox3 plan", "", "| Job | Runs |", "|---|---|"]
+    lines = ["## CI plan", "", "| Job | Runs |", "|---|---|"]
     lines += [f"| {name} | {'yes' if job in jobs else 'no'} |" for job, name in JOBS.items()]
     lines += ["", "Changed files, by what decided them:", ""]
     for why, group in reasons.items():
