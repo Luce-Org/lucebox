@@ -176,6 +176,103 @@ bool SseEmitter::suppress_undeclared_tool_protocol_token(
            raw_token == "<arg_value>" || raw_token == "</arg_value>";
 }
 
+int SseEmitter::consume_inkling_protocol_token(
+        const std::string & raw_token,
+        const std::string & piece_text,
+        std::string & out_text) {
+    // 0 = not Inkling protocol, 1 = skip, 2 = text, 3 = think tag
+    if (raw_token == "<|message_model|>") {
+        suppress_inkling_tool_ = false;
+        inkling_header_ = true;
+        inkling_header_name_.clear();
+        return 1;
+    }
+    if (inkling_header_) {
+        if (raw_token == "<|content_thinking|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            out_text = "<think>";
+            return 3;
+        }
+        if (raw_token == "<|content_text|>" ||
+            raw_token == "<|content_invoke_tool_text|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            if (mode_ == StreamMode::REASONING) {
+                out_text = "</think>\n";
+                return 3;
+            }
+            return 1;
+        }
+        if (raw_token == "<|content_invoke_tool_json|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
+                suppress_inkling_tool_ = true;
+                return 1;
+            }
+            out_text = "<|content_invoke_tool_json|>";
+            return 2;
+        }
+        if (raw_token == "<|end_message|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            return 1;
+        }
+        // Absorb optional header name (e.g. tool name between <|message_model|>
+        // and <|content_invoke_tool_json|>) so it never leaks into content.
+        if (!(raw_token.size() >= 2 && raw_token[0] == '<' && raw_token[1] == '|')) {
+            inkling_header_name_ += piece_text;
+            if (inkling_header_name_.size() > 128) {
+                // Safety fallback if the model went off-format without a content marker.
+                out_text = std::move(inkling_header_name_);
+                inkling_header_name_.clear();
+                inkling_header_ = false;
+                return 2;
+            }
+        }
+        return 1;
+    }
+    if (suppress_inkling_tool_) {
+        if (raw_token == "<|end_message|>") {
+            suppress_inkling_tool_ = false;
+        }
+        return 1;
+    }
+    if (raw_token == "<|content_thinking|>") {
+        out_text = "<think>";
+        return 3;
+    }
+    if (raw_token == "<|content_text|>" ||
+        raw_token == "<|content_invoke_tool_text|>") {
+        if (mode_ == StreamMode::REASONING) {
+            out_text = "</think>\n";
+            return 3;
+        }
+        return 1;
+    }
+    if (raw_token == "<|content_invoke_tool_json|>") {
+        if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
+            suppress_inkling_tool_ = true;
+            return 1;
+        }
+        out_text = "<|content_invoke_tool_json|>";
+        return 2;
+    }
+    if (raw_token == "<|end_message|>") {
+        if (mode_ == StreamMode::REASONING) {
+            out_text = "</think>\n";
+            return 3;
+        }
+        if (mode_ == StreamMode::TOOL_BUFFER) {
+            out_text = "<|end_message|>";
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 // ─── SSE formatting helpers ─────────────────────────────────────────────
 
 std::string SseEmitter::sse_data(const std::string & json_str) {

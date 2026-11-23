@@ -187,6 +187,16 @@ public:
     bool suppress_undeclared_tool_protocol_token(
         const std::string & raw_token);
 
+    // Inkling 2 sub-message protocol state (<|message_model|> [name]
+    // <|content_thinking| | <|content_text|> | <|content_invoke_tool_json|>>
+    // ... <|end_message|>). Returns 0 if the token is not Inkling protocol,
+    // 1 to skip, 2 to emit `out_text` as text, 3 to emit `out_text` as a
+    // thinking-boundary tag.
+    int consume_inkling_protocol_token(
+        const std::string & raw_token,
+        const std::string & piece_text,
+        std::string & out_text);
+
     // Read tool calls with the chat codec's parser (the reverse of its
     // template) before the heuristic one. Null: the heuristic parser only.
     void set_chat_codec(const ChatCodec * codec) { chat_codec_ = codec; }
@@ -195,6 +205,9 @@ public:
     // again from the start (the non-streaming replay).
     void restart_tool_protocol_suppression() {
         suppress_undeclared_tool_protocol_ = false;
+        suppress_inkling_tool_ = false;
+        inkling_header_ = false;
+        inkling_header_name_.clear();
     }
 
 private:
@@ -240,6 +253,9 @@ private:
     bool         think_tags_are_tokens_ = false;
     bool         tool_from_reasoning_ = false;
     bool         suppress_undeclared_tool_protocol_ = false;
+    bool         suppress_inkling_tool_ = false;
+    bool         inkling_header_ = false;
+    std::string  inkling_header_name_;
     std::string  window_;           // holdback buffer
     // Incomplete trailing UTF-8 bytes from the previous token piece.
     // BPE tokens can split a multi-byte codepoint (emoji arrive as two
