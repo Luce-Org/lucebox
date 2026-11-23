@@ -41,12 +41,18 @@ __device__ __forceinline__ uint32_t pa_pack_f16x2(const float a, const float b) 
 
 __device__ __forceinline__ uint4 pa_dequant_q8_0_quad(const block_q8_0 * bp, const int sub) {
     const float d = __half2float(bp->d);
-    const uint16_t * qp = reinterpret_cast<const uint16_t *>(bp->qs + sub * 8);
-    const uint32_t p0 = qp[0], p1 = qp[1], p2 = qp[2], p3 = qp[3];
-    const float f0 = (float)(int8_t)(p0 & 0xFFu), f1 = (float)(int8_t)(p0 >> 8);
-    const float f2 = (float)(int8_t)(p1 & 0xFFu), f3 = (float)(int8_t)(p1 >> 8);
-    const float f4 = (float)(int8_t)(p2 & 0xFFu), f5 = (float)(int8_t)(p2 >> 8);
-    const float f6 = (float)(int8_t)(p3 & 0xFFu), f7 = (float)(int8_t)(p3 >> 8);
+    uint64_t q64;
+#ifdef __HIP_DEVICE_COMPILE__
+    __builtin_memcpy(&q64, bp->qs + sub * 8, sizeof(q64));
+#else
+    std::memcpy(&q64, bp->qs + sub * 8, sizeof(q64));
+#endif
+    const uint32_t lo = (uint32_t) q64;
+    const uint32_t hi = (uint32_t) (q64 >> 32);
+    const float f0 = (float)(int8_t)(lo & 0xFFu),         f1 = (float)(int8_t)((lo >>  8) & 0xFFu);
+    const float f2 = (float)(int8_t)((lo >> 16) & 0xFFu), f3 = (float)(int8_t)(lo >> 24);
+    const float f4 = (float)(int8_t)(hi & 0xFFu),         f5 = (float)(int8_t)((hi >>  8) & 0xFFu);
+    const float f6 = (float)(int8_t)((hi >> 16) & 0xFFu), f7 = (float)(int8_t)(hi >> 24);
     return make_uint4(
         pa_pack_f16x2(d * f0, d * f1),
         pa_pack_f16x2(d * f2, d * f3),

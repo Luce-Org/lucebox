@@ -1797,7 +1797,8 @@ static void interleave_layers(int n_layer, std::vector<Unit> & units, R && stage
     stage_c(units.back(), n_layer - 1);
 }
 
-// A split prompt chunk as n streams of about 4096 rows (2..4, multiples of 256; the last takes the rest). Per layer
+// A split prompt chunk as 2 streams (multiples of 256; the second takes the rest) to halve expert-weight
+// re-reads on the expert device while keeping both GPUs overlapped. Per layer
 // the graph is emitted as
 //   R(0) C(n-1,l-1) S(0)  R(1) C(0) S(1)  ...  R(n-1) C(n-2) S(n-1),
 // R = target work (attention, HC, router, shared expert), S = the routed experts on the expert device, C = the
@@ -1813,7 +1814,7 @@ static int build_pipelined_layers(Qwen4ExpLayerBuilder & lb, int64_t pos0, int64
     ggml_cgraph * gf = lb.gf;
     int pipeline_blocks = lb.cache.indexer_blocks;
     const int64_t r = std::max<int64_t>(1, qsa_ratio(w));
-    const int n_streams = (int) std::clamp<int64_t>(T / kQwen4ExpPipelineStreamRows, 2, 4);
+    const int n_streams = 2;
     streams.resize(n_streams);
     for (int i = 0; i + 1 < n_streams; ++i) {
         streams[i].T = std::max<int64_t>(256, (T / n_streams) / 256 * 256);
