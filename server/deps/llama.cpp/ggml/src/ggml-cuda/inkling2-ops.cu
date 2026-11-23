@@ -25,6 +25,23 @@ static __device__ __forceinline__ float round_bf16_f32(float x) {
     return __uint_as_float(bits);
 }
 
+template <typename T>
+static __device__ __forceinline__ T i2_shfl_xor(T v, int lane_mask, int width = WARP_SIZE) {
+#if defined(GGML_USE_HIP)
+    return __shfl_xor(v, lane_mask, width);
+#else
+    return __shfl_xor_sync(0xFFFFFFFFu, v, lane_mask, width);
+#endif
+}
+
+static __device__ __forceinline__ unsigned long long i2_ballot(int pred) {
+#if defined(GGML_USE_HIP)
+    return (unsigned long long) __ballot(pred);
+#else
+    return (unsigned long long) __ballot_sync(0xFFFFFFFFu, pred);
+#endif
+}
+
 // ─── 1. Fused Block Attention Residuals (+ optional RMSNorm) ──────────────
 // Mixes states[0..n_blocks-1] and cur (each RMS-normalized), weighted by
 // softmax(query @ norm(state) / sqrt(n_embd)). Optionally applies final RMSNorm.
@@ -1779,8 +1796,8 @@ static __global__ void inkling2_sigmoid_topk_ids_kernel(
         // Warp-wide max-index reduction (exact tie-break by smaller expert id)
         #pragma unroll
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(best_v, off, WARP_SIZE);
-            const int   oi = __shfl_xor(best_i, off, WARP_SIZE);
+            const float ov = i2_shfl_xor(best_v, off, WARP_SIZE);
+            const int   oi = i2_shfl_xor(best_i, off, WARP_SIZE);
             if (ov > best_v || (ov == best_v && oi < best_i)) {
                 best_v = ov;
                 best_i = oi;
@@ -1946,7 +1963,6 @@ static __global__ void inkling2_dynamic_split_lut_kernel(
     const int tid  = threadIdx.x;
     const int lane = tid & (WARP_SIZE - 1);
     const int warp = tid / WARP_SIZE;
-    const int nwarps = blockDim.x / WARP_SIZE;
 
     if (tid < n_expert) {
         s_freq[tid] = 0;
@@ -2000,7 +2016,7 @@ static __global__ void inkling2_dynamic_split_lut_kernel(
     const int cut_f   = s_cut_f;
     const int cut_rem = s_cut_rem;
     const bool is_tie = (tid < n_expert && f > 0 && f == cut_f && cut_rem > 0);
-    const unsigned long long mask = __ballot(is_tie);
+    const unsigned long long mask = i2_ballot(is_tie);
     if (lane == 0) s_warp_cnt[warp] = __popcll(mask);
     __syncthreads();
 
@@ -2636,9 +2652,9 @@ static __device__ __forceinline__ void inkling2_warp_top8_128(
 
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(bv, off, WARP_SIZE);
-            const float op = __shfl_xor(bp, off, WARP_SIZE);
-            const int   oi = __shfl_xor(bi, off, WARP_SIZE);
+            const float ov = i2_shfl_xor(bv, off, WARP_SIZE);
+            const float op = i2_shfl_xor(bp, off, WARP_SIZE);
+            const int   oi = i2_shfl_xor(bi, off, WARP_SIZE);
             if (ov > bv || (ov == bv && oi < bi)) {
                 bv = ov; bp = op; bi = oi;
             }
@@ -2703,9 +2719,9 @@ static __global__ void inkling2_sigmoid_topk_packed_kernel(
         }
         #pragma unroll
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            const float ov   = __shfl_xor(best_v, off, WARP_SIZE);
-            const float op_v = __shfl_xor(best_p, off, WARP_SIZE);
-            const int   oi   = __shfl_xor(best_i, off, WARP_SIZE);
+            const float ov   = i2_shfl_xor(best_v, off, WARP_SIZE);
+            const float op_v = i2_shfl_xor(best_p, off, WARP_SIZE);
+            const int   oi   = i2_shfl_xor(best_i, off, WARP_SIZE);
             if (ov > best_v || (ov == best_v && oi < best_i)) {
                 best_v = ov;
                 best_p = op_v;
@@ -2797,7 +2813,7 @@ static __global__ void inkling2_sigmoid_topk_split_kernel(
     const int cut_f   = s_cut_f;
     const int cut_rem = s_cut_rem;
     const bool is_tie = (tid < 128 && f > 0 && f == cut_f && cut_rem > 0);
-    const unsigned long long mask = __ballot(is_tie);
+    const unsigned long long mask = i2_ballot(is_tie);
     if (lane == 0 && warp < 4) s_warp_cnt[warp] = __popcll(mask);
     __syncthreads();
 
@@ -2974,7 +2990,7 @@ static __global__ void inkling2_dynamic_split_routes_kernel(
     const int cut_f   = s_cut_f;
     const int cut_rem = s_cut_rem;
     const bool is_tie = (tid < n_expert && f > 0 && f == cut_f && cut_rem > 0);
-    const unsigned long long mask = __ballot(is_tie);
+    const unsigned long long mask = i2_ballot(is_tie);
     if (lane == 0) s_warp_cnt[warp] = __popcll(mask);
     __syncthreads();
 
