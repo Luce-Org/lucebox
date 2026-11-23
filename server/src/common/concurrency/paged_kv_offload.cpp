@@ -162,7 +162,7 @@ bool PagedKvOffload::suspend(int slot, size_t available_bytes,
         size_t offset = 0;
         for (const auto & plane : tensors_) {
             for (uint32_t block : sequence.block_table) {
-                ggml_backend_tensor_get(plane.tensor, saved.data() + offset,
+                ggml_backend_tensor_get_async(backend_, plane.tensor, saved.data() + offset,
                     plane.offset + static_cast<size_t>(block) * plane.block_bytes,
                     plane.block_bytes);
                 offset += plane.block_bytes;
@@ -172,6 +172,7 @@ bool PagedKvOffload::suspend(int slot, size_t available_bytes,
             error = "could not release preserved KV blocks";
             return false;
         }
+        ggml_backend_synchronize(backend_);
         saved_[(size_t)slot] = std::move(saved);
         return true;
     } catch (const std::bad_alloc &) {
@@ -211,7 +212,7 @@ bool PagedKvOffload::restore(int slot, std::vector<int32_t> & blocks,
         size_t offset = 0;
         for (const auto & plane : tensors_) {
             for (uint32_t block : sequence.block_table) {
-                ggml_backend_tensor_set(plane.tensor, saved_[(size_t)slot].data() + offset,
+                ggml_backend_tensor_set_async(backend_, plane.tensor, saved_[(size_t)slot].data() + offset,
                     plane.offset + static_cast<size_t>(block) * plane.block_bytes,
                     plane.block_bytes);
                 offset += plane.block_bytes;

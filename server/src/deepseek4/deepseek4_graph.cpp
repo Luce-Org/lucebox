@@ -11,6 +11,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_cluster.h"
 #include "cluster/cluster_config.h"
+#include "common/platform_env.h"
 #include "deepseek4_norm.h"
 #include "deepseek4_image_policy.h"
 #include "deepseek4_vision.h"
@@ -107,8 +108,7 @@ static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
 }
 
 static bool ds4_env_flag(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
+    return env_flag_enabled(name);
 }
 
 // LUCE_DS4_ENGRAM_DEVICE=1: layer-major prefill applies Engram on the device
@@ -1938,9 +1938,7 @@ static int ds4_padded_comp_rows(int n_comp, int cap) {
 
 static int ds4_padded_gathered_raw_rows(int n_raw) {
     if (n_raw <= 0) return 0;
-    constexpr int stride = 16;
-    const int padded = ((n_raw + stride - 1) / stride) * stride;
-    return std::min(padded, (int) DS4_PAGE_TOKENS - 1);
+    return n_raw <= 64 ? 64 : ((int) DS4_PAGE_TOKENS - 1);
 }
 
 ggml_tensor * deepseek4_indexer_visibility_suffix(
@@ -2671,14 +2669,28 @@ static ggml_tensor * build_mla_attention_lane_core(
         // Persist only its final SWA tail so every physical ring row is written
         // once, even when the ubatch is much larger than the 128-row ring.
         const int first_write = std::max(0, n_tokens - w.n_swa);
-        for (int ti = first_write; ti < n_tokens; ti++) {
-            const int pos_ti = kv_start + ti;
-            ggml_tensor * kv_row = ggml_view_2d(
-                ctx, kv, head_dim, 1, kv->nb[1], (size_t)ti * kv->nb[1]);
-            ggml_tensor * kv_slot = ggml_view_2d(
-                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
-                (size_t)(pos_ti % w.n_swa) * lane.raw_kv->nb[1]);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
+        const int n_write = n_tokens - first_write;
+        if (n_write > 0) {
+            const int ring_start = (kv_start + first_write) % w.n_swa;
+            const int part1 = std::min(n_write, w.n_swa - ring_start);
+            const int part2 = n_write - part1;
+            ggml_tensor * kv_tail = ggml_view_2d(
+                ctx, kv, head_dim, n_write, kv->nb[1], (size_t) first_write * kv->nb[1]);
+            ggml_tensor * kv_tail_f16 = ggml_cast(ctx, kv_tail, GGML_TYPE_F16);
+            ggml_tensor * src1 = ggml_view_2d(
+                ctx, kv_tail_f16, head_dim, part1, kv_tail_f16->nb[1], 0);
+            ggml_tensor * dst1 = ggml_view_2d(
+                ctx, lane.raw_kv, head_dim, part1, lane.raw_kv->nb[1],
+                (size_t) ring_start * lane.raw_kv->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src1, dst1));
+            if (part2 > 0) {
+                ggml_tensor * src2 = ggml_view_2d(
+                    ctx, kv_tail_f16, head_dim, part2, kv_tail_f16->nb[1],
+                    (size_t) part1 * kv_tail_f16->nb[1]);
+                ggml_tensor * dst2 = ggml_view_2d(
+                    ctx, lane.raw_kv, head_dim, part2, lane.raw_kv->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src2, dst2));
+            }
         }
     }
     const int token_pos = kv_start + n_tokens - 1;
@@ -10320,7 +10332,7 @@ bool deepseek4_paged_gathered_step(
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
                 token_ids != nullptr, {}, hybrid, /*vocab_split=*/false, std::move(key),
-                &cache, &prepared, bucket_history)) {
+                &cache, &prepared, bucket_history, /*engram_upload=*/nullptr, &vc.stage)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
                 "(lanes=%u)\n", lanes);
@@ -10332,8 +10344,29 @@ bool deepseek4_paged_gathered_step(
     if (telemetry) telemetry->full_graph_build_us += ds4_elapsed_us(build_t0, Ds4TimingClock::now());
     const auto set_t0 = Ds4TimingClock::now();
     fg->last_use = vc.counter;
-    ds4_fv_set(fg->inp_embed, embeddings,
-               sizeof(float) * (size_t) w.n_embd * lanes);
+    size_t paged_stage_bytes = 0;
+    auto add_stage = [&](const ggml_tensor * t) {
+        if (t && t->buffer) paged_stage_bytes += ggml_nbytes(t) + 64;
+    };
+    add_stage(fg->inp_embed);
+    add_stage(ex->engram_keys);
+    add_stage(ex->pos_q);
+    add_stage(ex->neg_q);
+    add_stage(ex->paged_i32);
+    add_stage(ex->paged_i64);
+    add_stage(ex->paged_gather);
+    if (bucket_history) add_stage(fg->mask_bundle);
+    if (token_ids) {
+        for (const ggml_tensor * ids : fg->hash_ids) add_stage(ids);
+    }
+    const bool pinned_paged_io = vc.stage.reserve(backend, paged_stage_bytes);
+    if (pinned_paged_io) vc.stage.reset();
+    const auto set_paged_input = [&](ggml_tensor * t, const void * data, size_t bytes) {
+        if (pinned_paged_io && t && t->buffer) vc.stage.set(backend, t, data, 0, bytes);
+        else ds4_fv_set(t, data, bytes);
+    };
+    set_paged_input(fg->inp_embed, embeddings,
+                    sizeof(float) * (size_t) w.n_embd * lanes);
     // Engram keys, lane by lane from each sequence's n-gram context. Rows of
     // one slot come in position order, so each sees the tokens before it.
     if (ex->engram_keys) {
@@ -10353,7 +10386,7 @@ bool deepseek4_paged_gathered_step(
                             lane_keys.data() + (size_t) e * width, width * sizeof(float));
             }
         }
-        ds4_fv_set(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
+        set_paged_input(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
     }
     // The shared Q/KV prologue rotates all gathered lanes at once. Padding
     // lanes use position zero, matching their passive prepared row record.
@@ -10365,8 +10398,8 @@ bool deepseek4_paged_gathered_step(
             pos_batch[lane] = (int32_t) positions[lane];
             neg_batch[lane] = -(int32_t) positions[lane];
         }
-        ds4_fv_set(ex->pos_q, pos_batch.data(), sizeof(int32_t) * lanes);
-        ds4_fv_set(ex->neg_q, neg_batch.data(), sizeof(int32_t) * lanes);
+        set_paged_input(ex->pos_q, pos_batch.data(), sizeof(int32_t) * lanes);
+        set_paged_input(ex->neg_q, neg_batch.data(), sizeof(int32_t) * lanes);
     }
 
     auto & bundle_i32 = ex->bundle_i32;
@@ -10445,15 +10478,15 @@ bool deepseek4_paged_gathered_step(
             }
         }
     }
-    ds4_fv_set(ex->paged_i32, bundle_i32.data(),
-               bundle_i32.size() * sizeof(int32_t));
-    ds4_fv_set(ex->paged_i64, bundle_i64.data(),
-               bundle_i64.size() * sizeof(int64_t));
-    ds4_fv_set(ex->paged_gather, bundle_gather.data(),
-               bundle_gather.size() * sizeof(int32_t));
+    set_paged_input(ex->paged_i32, bundle_i32.data(),
+                    bundle_i32.size() * sizeof(int32_t));
+    set_paged_input(ex->paged_i64, bundle_i64.data(),
+                    bundle_i64.size() * sizeof(int64_t));
+    set_paged_input(ex->paged_gather, bundle_gather.data(),
+                    bundle_gather.size() * sizeof(int32_t));
     if (bucket_history) {
-        ds4_fv_set(fg->mask_bundle, mask_values.data(),
-                   mask_values.size() * sizeof(float));
+        set_paged_input(fg->mask_bundle, mask_values.data(),
+                        mask_values.size() * sizeof(float));
     }
     if (token_ids) {
         for (int il = 0; il < w.n_layer; ++il) {
@@ -10467,7 +10500,7 @@ bool deepseek4_paged_gathered_step(
                 std::memcpy(values.data() + lane * ids->ne[0], src,
                             (size_t) ids->ne[0] * sizeof(int32_t));
             }
-            ds4_fv_set(ids, values.data(), values.size() * sizeof(int32_t));
+            set_paged_input(ids, values.data(), values.size() * sizeof(int32_t));
         }
     }
     // Monolithic exact serving reuses a gathered graph for only a few rounds

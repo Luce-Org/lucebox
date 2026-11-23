@@ -36,6 +36,8 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmb.cuh"
+#include "ggml-cuda/small-m-gemm.cuh"
+#include "ggml-cuda/small-m-qgemm.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/hc-cn.cuh"
 #include "ggml-cuda/gated-norm.cuh"
@@ -1286,6 +1288,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (side_copy_stream != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaStreamSynchronize(side_copy_stream));
+        if (side_f16_buf != nullptr) {
+            CUDA_CHECK(cudaFree(side_f16_buf));
+            side_f16_buf = nullptr;
+            side_f16_cap = 0;
+        }
         CUDA_CHECK(cudaStreamDestroy(side_copy_stream));
         CUDA_CHECK(cudaEventDestroy(side_copy_ready));
         CUDA_CHECK(cudaEventDestroy(side_copy_done));
@@ -3364,6 +3371,34 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
 
+    // F16 routed activations (half-width PCIe handoff): dispatch directly to
+    // mix-wmma-moe pair (+ fused SwiGLU-DS4 epilogue) with 0 ULP change.
+    if (src1->type == GGML_TYPE_F16 && ids &&
+        up->src[0]->type == gate->src[0]->type &&
+        ggml_are_same_shape(up->src[0], gate->src[0])) {
+        const int cc_f16 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int64_t ncols_f16 = src1->ne[2];
+        if (ggml_cuda_mix_wmma_moe_enabled(up->src[0], src1, ids, ncols_f16, cc_f16)) {
+            static const bool wmma_glu = [] {
+                const char * v = std::getenv("LUCE_MIX_WMMA_GLU");
+                return !(v && v[0] == '0');
+            }();
+            if (wmma_glu && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_DS4 &&
+                glu->src[0] && glu->src[1] && glu->src[0]->data == gate->data && glu->src[1]->data == up->data &&
+                ggml_is_contiguous(glu->src[0]) && ggml_is_contiguous(glu->src[1]) &&
+                ggml_nelements(glu->src[0]) == ggml_nelements(gate) && ggml_is_contiguous(glu) &&
+                ggml_are_same_shape(glu, gate) && ggml_are_same_stride(glu, gate)) {
+                ggml_cuda_mix_wmma_moe_pair_glu(ctx, up->src[0], gate->src[0], src1, ids, gate, glu,
+                                                ggml_get_op_params_f32(glu, 2));
+                return true;
+            }
+            ggml_cuda_mix_wmma_moe_pair(ctx, up->src[0], gate->src[0], src1, ids, up, gate);
+            ggml_cuda_op_swiglu_ds4(ctx, glu);
+            return true;
+        }
+        return false;
+    }
+
     // The fused kernels read F32 activations; q8_1 rows (an MoE owner's input
     // quantized on another device) take the unfused MMVQ dispatch.
     if (src1->type != GGML_TYPE_F32) {
@@ -3889,6 +3924,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #if defined(GGML_USE_HIP)
     } else if (!split && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
+    } else if (!split && ggml_cuda_small_m_gemm_supported(ctx.device, src0, src1, dst)) {
+        ggml_cuda_small_m_gemm(ctx, src0, src1, dst);
+    } else if (!split && ggml_cuda_small_m_qgemm_supported(cc, src0, src1, dst)) {
+        ggml_cuda_small_m_qgemm(ctx, src0, src1, dst);
 #endif // defined(GGML_USE_HIP)
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
@@ -3981,6 +4020,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+    if (src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
+        ggml_cuda_mix_wmma_moe_enabled(src0, src1, ids, ne12, cc)) {
+        log_dispatch("mix_wmma_f16");
+        ggml_cuda_mix_wmma_moe(ctx, src0, src1, ids, dst);
+        return;
+    }
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_MOE_BATCH_SIZE) {
@@ -5101,6 +5146,107 @@ static bool ggml_cuda_peer_copy_qualifies(ggml_backend_t backend_src, ggml_backe
     const ggml_backend_cuda_buffer_context * bctx_dst = (const ggml_backend_cuda_buffer_context *) buf_dst->context;
     return ctx_src->device != ctx_dst->device && bctx_src->device == ctx_src->device &&
            bctx_dst->device == ctx_dst->device;
+#endif
+}
+
+static __global__ void ggml_cuda_cast_f32_to_f16_side_kernel(
+        const float * __restrict__ src, half * __restrict__ dst, int64_t n) {
+    const int64_t idx = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (idx + 3 < n) {
+        const float4 v = *reinterpret_cast<const float4 *>(src + idx);
+        half2 * out = reinterpret_cast<half2 *>(dst + idx);
+        out[0] = __floats2half2_rn(v.x, v.y);
+        out[1] = __floats2half2_rn(v.z, v.w);
+    } else {
+        for (int64_t i = idx; i < n && i < idx + 4; ++i) {
+            dst[i] = __float2half_rn(src[i]);
+        }
+    }
+}
+
+bool ggml_backend_cuda_mix_wmma_f16_src1_supported(
+        ggml_backend_t backend, const struct ggml_tensor * src0, int64_t n_tokens, int64_t n_expert_used) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !src0) return false;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    return ggml_cuda_mix_wmma_moe_supports_f16_src1(src0, n_tokens, n_expert_used, cc);
+}
+
+bool ggml_backend_cuda_copy_f32_to_f16_async_side(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED_VARS(backend_src, backend_dst, src, dst);
+    return false;
+#else
+    if (!backend_src || !backend_dst || !src || !dst ||
+        !ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst) ||
+        src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F16 ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(src);
+    if (n <= 0 || n != ggml_nelements(dst)) {
+        return false;
+    }
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!buf_src || !buf_dst || !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx_src = (ggml_backend_cuda_context *) backend_src->context;
+    ggml_backend_cuda_context * ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    const ggml_backend_cuda_buffer_context * bctx_src = (const ggml_backend_cuda_buffer_context *) buf_src->context;
+    const ggml_backend_cuda_buffer_context * bctx_dst = (const ggml_backend_cuda_buffer_context *) buf_dst->context;
+    if (ctx_src->device == ctx_dst->device ||
+        bctx_src->device != ctx_src->device ||
+        bctx_dst->device != ctx_dst->device) {
+        return false;
+    }
+
+    const size_t bytes_f16 = (size_t) n * sizeof(half);
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copy_batch("side-copy-f16");
+#endif
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+    ggml_cuda_tail_realize(ctx_src, nullptr, 0);
+    ggml_cuda_tail_realize(ctx_dst, nullptr, 0);
+    ctx_src->tail_clean_key = nullptr;
+    ctx_dst->tail_clean_key = nullptr;
+#endif
+    ggml_cuda_release_hold(ctx_src);
+    ggml_cuda_release_hold(ctx_dst);
+    ggml_cuda_set_device(ctx_src->device);
+    ggml_cuda_side_stream_init(ctx_src);
+
+    if (ctx_src->side_f16_cap < bytes_f16) {
+        if (ctx_src->side_f16_buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx_src->side_copy_stream));
+            CUDA_CHECK(cudaFree(ctx_src->side_f16_buf));
+            ctx_src->side_f16_buf = nullptr;
+            ctx_src->side_f16_cap = 0;
+        }
+        if (cudaMalloc(&ctx_src->side_f16_buf, bytes_f16) != cudaSuccess) {
+            ctx_src->side_f16_buf = nullptr;
+            ctx_src->side_f16_cap = 0;
+            return false;
+        }
+        ctx_src->side_f16_cap = bytes_f16;
+    }
+
+    cudaStream_t side = ctx_src->side_copy_stream;
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_ready, ctx_src->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, ctx_src->side_copy_ready, 0));
+    const int64_t n4 = (n + 3) / 4;
+    const int64_t blocks64 = (n4 + 255) / 256;
+    GGML_ASSERT(blocks64 <= INT32_MAX);
+    ggml_cuda_cast_f32_to_f16_side_kernel<<<(int) blocks64, 256, 0, side>>>(
+        (const float *) src->data, ctx_src->side_f16_buf, n);
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, ctx_dst->device, ctx_src->side_f16_buf, ctx_src->device, bytes_f16, side));
+    CUDA_CHECK(cudaEventRecord(ctx_src->side_copy_done, side));
+    ggml_cuda_set_device(ctx_dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), ctx_src->side_copy_done, 0));
+    return true;
 #endif
 }
 

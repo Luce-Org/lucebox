@@ -315,7 +315,7 @@ bool qwen4exp_snapshot_rows_in_pager(const Qwen4ExpCache & c);
 // Copy `c`, which lives on `backend`, into a snapshot allocated on `store`. Past a KVFlash pool the snapshot is
 // the point state alone (rows_in_pager).
 bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
-                            Qwen4ExpSnapshot & s);
+                            Qwen4ExpSnapshot & s, const Qwen4ExpSnapshot * ancestor = nullptr);
 // Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
 // concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
 // when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
@@ -326,7 +326,8 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
 // than `s`, false with `c` untouched. A donor without the MTP draft layer leaves no draft state, as above.
 // `rows_from` is ignored for a whole snapshot.
 bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c,
-                               const Qwen4ExpSnapshot * rows_from = nullptr);
+                               const Qwen4ExpSnapshot * rows_from = nullptr,
+                               bool skip_live_kv = false);
 // Free the per-position rows of a whole snapshot and keep its point state and host fields (state_only). Rows below
 // the position (MTP K/V: below the carry row) and pooled blocks below indexer_blocks are final once written: no
 // forward, verify rollback or MTP catch-up writes below them, so a deeper snapshot that continued from this state

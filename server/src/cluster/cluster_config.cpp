@@ -40,9 +40,7 @@ bool ends_with(const std::string & s, const char * suffix) {
 
 // True when the variable is set to a non-empty value other than "0".
 bool env_flag_set(const char * name) {
-    const char * v = std::getenv(name);
-    if (!v || v[0] == '\0') return false;
-    return std::strcmp(v, "0") != 0;
+    return luce::common::env_flag_enabled(name);
 }
 
 // setenv only when absent; returns 1 when a variable was written.

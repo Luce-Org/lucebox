@@ -291,9 +291,15 @@ TEST_CASE(KvflashFusedMassFixture, dp4a_impl_matches_and_wmma_impl_is_refused_of
 
 // A failed run (here a 256 GiB cudaMalloc) must not leave the runtime's sticky error set: the next launch check, the fused kernel's
 // own or ggml-cuda's in the logits-graph fallback, would read it and fail or abort.
+// Skipped where the device shares the host's RAM: there the driver does not refuse the 256 GiB, it takes host pages
+// until the OOM killer runs (it took down the GB10 CI runner).
 TEST_CASE(KvflashFusedMassFixture, device_failed_run_leaves_no_cuda_error_behind) {
     ggml_backend_t be = ggml_backend_cuda_init(0);
     if (!be) SKIP("no CUDA/HIP device");
+    if (kvflash_fused_device_shares_host_memory()) {
+        ggml_backend_free(be);
+        SKIP("device shares host memory: an oversized cudaMalloc is not refused");
+    }
     KvFlashFusedGeom g; g.L = 1; g.HK = 1; g.Hq = 1; g.D = 256; g.ct = 64; g.C = 1; g.nq = 1 << 30;
     KvFlashFusedK k; k.pool = {nullptr}; k.src = {0};
     KvFlashFusedWs * ws = kvflash_fused_ws_new();
