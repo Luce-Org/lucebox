@@ -377,34 +377,39 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         return result;
     }
 
+    const int max_vw = weights_.dspark.loaded
+        ? std::min(kInkling2MaxVerify, weights_.dspark.block_size)
+        : 1;
     int vw = cfg_.verify_width;
     if (const char * evw = std::getenv("LUCE_INKLING2_VERIFY_WIDTH")) {
         const int v = std::atoi(evw);
-        if (v >= 1 && v <= kInkling2MaxVerify) vw = v;
+        if (v >= 1 && v <= max_vw) vw = v;
     }
     const bool use_dspark = weights_.dspark.loaded && !req.force_ar_decode && vw != 1 && req.n_gen > 2;
     const bool is_dual = (weights_.expert_backend && weights_.split_exp > 0);
-    // Online Adaptive Speculation Width (on by default when no fixed vw is requested):
-    // Maximizes general throughput across ALL workloads (creative prose -> vw=3, math/reasoning -> vw=5,
-    // code/structured/long-ctx -> vw=7) by tracking per-position acceptance EWMA & measured step latency!
-    const bool fixed_vw = (vw >= 2 && vw <= kInkling2MaxVerify);
+    // Shared cost-aware AdaptiveSpecWidth controller over all widths 2..max_vw
+    // (seed-inclusive). Uses a hardware-agnostic linear shape seed scaled to
+    // live measured step times per context range and execution mode (single vs
+    // dual GPU), with reached-depth acceptance tracking across every depth.
+    const bool fixed_vw = (vw >= 2 && vw <= max_vw);
     const bool adaptive_vw = use_dspark && !fixed_vw &&
         (std::getenv("LUCE_INKLING2_ADAPTIVE_VW") == nullptr ||
          std::atoi(std::getenv("LUCE_INKLING2_ADAPTIVE_VW")) != 0);
-    const int default_vw = is_dual ? 7 : 6;
-    const int n_spec_max = fixed_vw
-        ? (vw - 1)
-        : std::min(weights_.dspark.block_size - 1, is_dual ? 6 : 6); // up to vw=7 (6 drafts)
-    // Candidate verify widths (at most 3 cached verify HIP graphs across entire server lifetime!):
-    //   vw=3 (2 drafts): ~21.0 ms -> optimal for hard/creative prose (never loses to AR!)
-    //   vw=6 (5 drafts): ~24.0 ms -> sweet spot for general math/reasoning/code (zero ramp-up!)
-    //   vw=7 (6 drafts): ~25.5 ms -> expands automatically on high-acceptance code/JSON/long-context!
-    const int kCandVws[3] = {3, 6, 7};
-    double p_ema[kInkling2MaxVerify] = {0.72, 0.50, 0.34, 0.22, 0.14, 0.09, 0.05};
-    double ms_ema[kInkling2MaxVerify + 1] = {
-        0.0, 12.5, 19.6, 20.8, 22.0, 23.1, 24.0, 25.5, 27.8
-    };
-    int cur_vw = fixed_vw ? vw : (adaptive_vw ? (is_dual ? 7 : 6) : default_vw);
+    if (adaptive_vw) {
+        if (!spec_width_init_ || spec_width_.max_width() != max_vw) {
+            spec_width_ = AdaptiveSpecWidth(max_vw, /*min_width=*/2, /*enabled=*/true);
+            std::vector<float> shape((size_t) max_vw + 1, 0.0f);
+            for (int w = 2; w <= max_vw; ++w) {
+                shape[(size_t) w] = 1.0f + 0.08f * (float) (w - 1);
+            }
+            spec_width_.set_relative_costs(shape, AdaptiveSpecWidth::CostSeed::kShape);
+            spec_width_.set_acceptance_model(AdaptiveSpecWidth::AcceptanceModel::kReachedDepths);
+            spec_width_init_ = true;
+        } else {
+            spec_width_.carry_acceptance(32.0f);
+        }
+        (is_dual ? spec_costs_dual_ : spec_costs_single_).load(spec_width_, (int64_t) req.prompt.size());
+    }
 
     const bool is_greedy = sample_logits_is_argmax(req.sampler);
     // Exact GPU top-candidate fast path for standard stochastic sampling (temp > 0, no penalties/grammar):
@@ -578,21 +583,27 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     long long spec_steps = 0;
     long long pos_hits[kInkling2MaxVerify] = {};
     long long pos_tries[kInkling2MaxVerify] = {};
+    int vw_hist[kInkling2MaxVerify + 1] = {};
     double draft_s_total = 0.0;
 
     // Automatic Dual-GPU Thermal / Contention Guard:
-    // Because target GPU (R9700) holds all 128 experts, if Dual-GPU step latency exceeds 30 ms
-    // for 2 consecutive steps (e.g. Strix Halo thermal throttle or GPU1 contention), seamlessly
-    // drop to R9700-only verify (24 ms/step, 130+ tok/s) instead of stalling at 50-60 ms/step!
+    // Because target GPU holds all 128 experts, if Dual-GPU step latency degrades
+    // sharply above its steady baseline for 2 consecutive steps (e.g. APU thermal
+    // throttle or contention), seamlessly drop to target-only verify.
     bool allow_dual_split = is_dual;
     int dual_slow_streak = 0;
+    double dual_fast_ms = 0.0;
 
     // ─── Decode Loop: DSpark Block-8 Speculative or Fast AR ─────────────
     while (more) {
         const int rem_gen = req.n_gen - (int) result.tokens.size();
         const int rem_ctx = cache_.max_ctx - pos - 1;
-        const int desired_k = adaptive_vw ? std::min(cur_vw - 1, n_spec_max) : (fixed_vw ? (vw - 1) : std::min(weights_.dspark.block_size - 1, default_vw - 1));
-        const int k_draft = use_dspark ? std::min({desired_k, rem_gen, rem_ctx}) : 0;
+        const int step_max_vw = std::min({max_vw, rem_gen, rem_ctx + 1});
+        const int cur_vw = !use_dspark ? 1
+            : fixed_vw ? std::min(vw, step_max_vw)
+            : adaptive_vw ? spec_width_.next_width_cost_aware({}, step_max_vw)
+            : step_max_vw;
+        const int k_draft = (use_dspark && cur_vw >= 2) ? (cur_vw - 1) : 0;
 
         if (k_draft >= 1) {
             // 1. Draft k_draft speculative tokens with DSpark in ONE HIP graph!
@@ -600,7 +611,8 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             const auto td0 = tstep0;
             std::vector<int32_t> drafts;
             const bool draft_ok = inkling2_dspark_draft(
-                backend_, weights_, cache_, next_tok, pos, k_draft, drafts);
+                backend_, weights_, cache_, next_tok, pos, k_draft, drafts,
+                adaptive_vw ? (max_vw - 1) : 0);
             const auto td1 = std::chrono::steady_clock::now();
             draft_s_total += std::chrono::duration<double>(td1 - td0).count();
 
@@ -669,54 +681,27 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
                     if (i < n_accepted) pos_hits[i]++;
                 }
 
-                // Online Adaptive Verify-Width + Dual-GPU Thermal Guard update:
+                // Shared AdaptiveSpecWidth + Dual-GPU Thermal Guard update:
                 const double step_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - tstep0).count();
+                if (adaptive_vw) {
+                    spec_width_.observe(retained, 1 + n_d, (float) step_ms);
+                }
                 if (allow_dual_split && weights_.target_has_all_experts && spec_steps >= 2 && step_ms < 120.0) {
-                    if (step_ms > 30.0) {
+                    if (dual_fast_ms <= 0.0 || step_ms < dual_fast_ms) {
+                        dual_fast_ms = step_ms;
+                    }
+                    const double trip_ms = std::max(30.0, dual_fast_ms * 1.45);
+                    if (step_ms > trip_ms) {
                         if (++dual_slow_streak >= 2) {
+                            if (adaptive_vw) {
+                                spec_costs_dual_.store(spec_width_, (int64_t) pos);
+                                spec_costs_single_.load(spec_width_, (int64_t) pos);
+                            }
                             allow_dual_split = false;
-                            if (adaptive_vw && cur_vw == 7) cur_vw = 6;
                         }
                     } else {
                         dual_slow_streak = 0;
-                    }
-                }
-                if (adaptive_vw && n_d == cur_vw - 1) {
-                    // Ignore first-build outlier (>80 ms graph capture)
-                    if (step_ms < 80.0) {
-                        ms_ema[cur_vw] = 0.70 * ms_ema[cur_vw] + 0.30 * step_ms;
-                    }
-                    // Update per-position unconditional acceptance probability EWMA
-                    constexpr double alpha_p = 0.22;
-                    for (int i = 0; i < n_d; ++i) {
-                        const double hit = (i < n_accepted) ? 1.0 : 0.0;
-                        p_ema[i] = (1.0 - alpha_p) * p_ema[i] + alpha_p * hit;
-                    }
-                    // Extrapolate unseen positions geometrically from last observed position
-                    const double decay = (n_d >= 2 && p_ema[n_d - 2] > 0.05)
-                        ? std::clamp(p_ema[n_d - 1] / p_ema[n_d - 2], 0.35, 0.85)
-                        : 0.65;
-                    for (int i = n_d; i < kInkling2MaxVerify; ++i) {
-                        p_ema[i] = p_ema[i - 1] * decay;
-                    }
-                    // Pick candidate vw maximizing expected tok/ms (or step up on full sweep!)
-                    if (n_accepted == n_d && cur_vw < kCandVws[2]) {
-                        cur_vw = (cur_vw < kCandVws[1]) ? kCandVws[1] : kCandVws[2];
-                    } else {
-                        int best_vw = cur_vw;
-                        double best_tps = -1.0;
-                        for (int cand : kCandVws) {
-                            if (cand - 1 > n_spec_max) continue;
-                            double exp_toks = 1.0;
-                            for (int i = 0; i < cand - 1; ++i) exp_toks += p_ema[i];
-                            const double tps = exp_toks / std::max(5.0, ms_ema[cand]);
-                            if (tps > best_tps) {
-                                best_tps = tps;
-                                best_vw = cand;
-                            }
-                        }
-                        cur_vw = best_vw;
                     }
                 }
 
@@ -725,6 +710,7 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
                 total_drafts += n_d;
                 total_accepted += n_accepted;
                 ++spec_steps;
+                if (1 + n_d <= kInkling2MaxVerify) ++vw_hist[1 + n_d];
                 if (io.observer) io.observer("accept", {n_accepted, n_d});
                 continue;
             }
@@ -744,6 +730,11 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         more = commit(next_tok);
     }
 
+    if (adaptive_vw && spec_steps > 0) {
+        (allow_dual_split ? spec_costs_dual_ : spec_costs_single_).store(
+            spec_width_, (int64_t) req.prompt.size());
+    }
+
     if (cancelled) {
         result.fail(GenerateErrorCode::Cancelled, "cancelled during decode");
         return result;
@@ -754,12 +745,13 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     result.accept_rate = total_drafts > 0 ? (double) total_accepted / (double) total_drafts : 0.0;
     if (spec_steps > 0) {
         std::fprintf(stderr,
-            "[inkling2] decode: %zu tok in %.3f s (%.1f tok/s), dspark steps=%lld accepted=%lld/%lld (%.2f/step, %.1f%%), draft=%.3f s | pos_acc=[%.0f%% %.0f%% %.0f%% %.0f%% %.0f%% %.0f%% %.0f%%]\n",
+            "[inkling2] decode: %zu tok in %.3f s (%.1f tok/s), dspark steps=%lld accepted=%lld/%lld (%.2f/step, %.1f%%), draft=%.3f s | vw=[2:%d 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d] | pos_acc=[%.0f%% %.0f%% %.0f%% %.0f%% %.0f%% %.0f%% %.0f%%]\n",
             result.tokens.size(), result.decode_s,
             result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0,
             spec_steps, total_accepted, total_drafts,
             (double) (total_accepted + spec_steps) / (double) spec_steps,
             100.0 * result.accept_rate, draft_s_total,
+            vw_hist[2], vw_hist[3], vw_hist[4], vw_hist[5], vw_hist[6], vw_hist[7], vw_hist[8],
             pos_tries[0] ? 100.0 * pos_hits[0] / pos_tries[0] : 0.0,
             pos_tries[1] ? 100.0 * pos_hits[1] / pos_tries[1] : 0.0,
             pos_tries[2] ? 100.0 * pos_hits[2] / pos_tries[2] : 0.0,

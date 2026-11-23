@@ -85,6 +85,7 @@ bool inkling2_dspark_draft(
     int32_t anchor_token,
     int anchor_pos,
     int n_draft, // 1..7 (default 7)
-    std::vector<int32_t> & out_draft_tokens);
+    std::vector<int32_t> & out_draft_tokens,
+    int max_draft = 0);
 
 } // namespace luce::common

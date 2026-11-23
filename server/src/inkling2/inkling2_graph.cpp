@@ -1654,12 +1654,14 @@ bool inkling2_dspark_draft(
         int32_t anchor_token,
         int anchor_pos,
         int n_draft,
-        std::vector<int32_t> & out_draft_tokens) {
+        std::vector<int32_t> & out_draft_tokens,
+        int max_draft) {
     out_draft_tokens.clear();
     if (!w.dspark.loaded || n_draft <= 0) return false;
     const auto & ds = w.dspark;
     const int B = ds.block_size; // 8 (1 anchor + 7 masks)
     const int n_spec = std::min(n_draft, B - 1);
+    const int build_n_spec = (max_draft > n_spec) ? std::min(max_draft, B - 1) : n_spec;
     if (anchor_pos + B > cache.max_ctx + B) return false;
 
     // Bucket draft KV span to multiples of 256 so the draft HIP graph replays without rebuilds!
@@ -1667,7 +1669,7 @@ bool inkling2_dspark_draft(
     const int64_t kv_span = std::min<int64_t>(cache.dspark_k[0]->ne[1], ((kv_total + 255) / 256) * 256);
 
     auto & ws = cache.dspark_ws;
-    if (!ws.draft_built || ws.draft_kv_span != kv_span || ws.draft_n_spec < n_spec) {
+    if (!ws.draft_built || ws.draft_kv_span != kv_span || ws.draft_n_spec < build_n_spec) {
         if (ws.alloc_draft) { ggml_gallocr_free(ws.alloc_draft); ws.alloc_draft = nullptr; }
         if (ws.ctx_draft)   { ggml_free(ws.ctx_draft); ws.ctx_draft = nullptr; }
         ws.draft_built = false;
@@ -1735,36 +1737,35 @@ bool inkling2_dspark_draft(
             x = ggml_add(c, x, ffn);
         }
 
-        // Final norm -> take ONLY the requested n_spec mask positions 1..n_spec ([n_embd, n_spec])!
-        // Saves ~28% of LM-head + Markov argmax work when vw=6 (n_spec=5) and ~14% when vw=7 (n_spec=6)!
+        // Final norm -> take mask positions 1..build_n_spec ([n_embd, build_n_spec])
         ggml_tensor * h_all = rms_norm_w(c, x, ds.norm, ds.rms_eps);
-        ggml_tensor * h_spec = ggml_cont(c, ggml_view_2d(c, h_all, ds.n_embd, n_spec, h_all->nb[1], h_all->nb[1]));
+        ggml_tensor * h_spec = ggml_cont(c, ggml_view_2d(c, h_all, ds.n_embd, build_n_spec, h_all->nb[1], h_all->nb[1]));
 
-        // Base logits for exact n_spec positions in ONE lm_head matmul (using fast Q4_0 draft head when loaded)!
+        // Base logits for build_n_spec positions in ONE lm_head matmul (using fast Q4_0 draft head when loaded)!
         ggml_tensor * draft_lm = ds.lm_head_q4 ? ds.lm_head_q4 : w.output;
-        ggml_tensor * base_logits = ggml_mul_mat(c, draft_lm, h_spec); // [V, n_spec]
+        ggml_tensor * base_logits = ggml_mul_mat(c, draft_lm, h_spec); // [V, build_n_spec]
 
-        // Recurrent Markov head context for exact n_spec steps in ONE matmul!
+        // Recurrent Markov head context for build_n_spec steps in ONE matmul!
         ggml_tensor * f_rnn = ggml_inkling2_dspark_mix_norm(
             c, cache.last_taps_dev, ds.fuse_alpha[3], ds.markov_dflare_norm, ds.rms_eps); // [n_embd, 1]
-        ggml_tensor * f_rep = (n_spec > 1)
-            ? ggml_repeat_4d(c, f_rnn, ds.n_embd, n_spec, 1, 1)
+        ggml_tensor * f_rep = (build_n_spec > 1)
+            ? ggml_repeat_4d(c, f_rnn, ds.n_embd, build_n_spec, 1, 1)
             : f_rnn;
-        ggml_tensor * ctx_in = ggml_concat(c, h_spec, f_rep, 0); // [2*n_embd, n_spec]
-        ggml_tensor * rnn_ctx = ggml_add(c, ggml_mul_mat(c, ds.rnn_proj_ctx, ctx_in), ds.rnn_bias); // [3*R, n_spec]
+        ggml_tensor * ctx_in = ggml_concat(c, h_spec, f_rep, 0); // [2*n_embd, build_n_spec]
+        ggml_tensor * rnn_ctx = ggml_add(c, ggml_mul_mat(c, ds.rnn_proj_ctx, ctx_in), ds.rnn_bias); // [3*R, build_n_spec]
 
         // Full 201k-vocab exact Markov argmax (100% full acceptance + Q8_0 MALL-resident <0.06 ms/step!).
         const bool use_topk_markov = (std::getenv("LUCE_INKLING2_DSPARK_TOPK") != nullptr &&
                                       std::atoi(std::getenv("LUCE_INKLING2_DSPARK_TOPK")) != 0);
         ggml_tensor * topk_cands = (use_topk_markov && ds.fold_weight->type == GGML_TYPE_F16)
-            ? ggml_inkling2_dspark_topk_cands(c, base_logits, w.n_vocab_unpadded) // I32 [1024, n_spec]
+            ? ggml_inkling2_dspark_topk_cands(c, base_logits, w.n_vocab_unpadded) // I32 [1024, build_n_spec]
             : nullptr;
 
-        // Unrolled n_spec-step fused RNN Markov chain IN ONE GRAPH (zero host round-trips!)
+        // Unrolled build_n_spec-step fused RNN Markov chain IN ONE GRAPH (zero host round-trips!)
         ggml_tensor * state = ws.draft_zero_state;
         ggml_tensor * prev  = ws.draft_anchor; // I32 [1]
 
-        for (int step = 0; step < n_spec; ++step) {
+        for (int step = 0; step < build_n_spec; ++step) {
             ggml_tensor * ctx_s = ggml_view_2d(c, rnn_ctx, 3 * ds.markov_rank, 1,
                                                rnn_ctx->nb[1], (size_t) step * rnn_ctx->nb[1]);
             ggml_tensor * st_lat = inkling2_dspark_markov_rnn_step(
@@ -1782,9 +1783,9 @@ bool inkling2_dspark_draft(
             }
             ws.draft_out_ids[step] = prev;
         }
-        // Pack all n_spec drafted token IDs into ONE contiguous [n_spec] tensor -> 1 single D2H readback!
+        // Pack all build_n_spec drafted token IDs into ONE contiguous [build_n_spec] tensor -> 1 single D2H readback!
         ggml_tensor * packed_ids = ws.draft_out_ids[0];
-        for (int step = 1; step < n_spec; ++step) {
+        for (int step = 1; step < build_n_spec; ++step) {
             packed_ids = ggml_concat(c, packed_ids, ws.draft_out_ids[step], 0);
         }
         ws.draft_out_all = packed_ids;
@@ -1798,7 +1799,7 @@ bool inkling2_dspark_draft(
         }
         ggml_backend_tensor_memset(ws.draft_zero_state, 0, 0, ggml_nbytes(ws.draft_zero_state));
         ws.draft_kv_span = kv_span;
-        ws.draft_n_spec  = n_spec;
+        ws.draft_n_spec  = build_n_spec;
         ws.draft_built   = true;
     }
 

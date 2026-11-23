@@ -6,11 +6,12 @@
 //   - Native bundled DSpark speculator (`mtp.safetensors`, auto-discovered beside GGUF)
 //   - Dual-GPU R9700 + Strix Halo 74/26 parallel MoE experts + 79/21 LM-head split +
 //     automatic thermal/contention guard + Split-KV Global Attention offload
-//   - Online Adaptive Speculation Width ({3, 6, 7}) + exact GPU top-candidate sampler
-//     Infinity Cache prefetch + Split-KV Global Attention offload
+//   - Shared cost-aware AdaptiveSpecWidth controller across all block widths (2..block_size)
+//     with per-context SpecWidthCostMemory + exact GPU top-candidate sampler
 
 #pragma once
 
+#include "common/adaptive_spec_width.h"
 #include "common/model_backend.h"
 #include "placement/placement_config.h"
 
@@ -107,6 +108,10 @@ private:
     bool                  parked_         = false;
     std::vector<float>    last_logits_;
     std::array<Inkling2Snapshot, kMaxSlots> snapshots_;
+    AdaptiveSpecWidth     spec_width_{kInkling2MaxVerify};
+    bool                  spec_width_init_ = false;
+    SpecWidthCostMemory   spec_costs_single_;
+    SpecWidthCostMemory   spec_costs_dual_;
 };
 
 } // namespace luce::common
