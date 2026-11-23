@@ -51,6 +51,11 @@ KvFlashFusedWs * kvflash_fused_ws_new();
 void kvflash_fused_ws_free(KvFlashFusedWs *);
 size_t kvflash_fused_ws_bytes(const KvFlashFusedWs *);   // device bytes the workspace holds between calls
 
+// Whether the current device takes its memory from the host's RAM (CUDA's integrated attribute: DGX Spark GB10, Jetson).
+// There an allocation larger than the memory is not refused: the driver takes host pages until the kernel's OOM killer
+// runs. Always false on HIP, where an oversized hipMalloc fails cleanly.
+bool kvflash_fused_device_shares_host_memory();
+
 // q8 (host): [nq][L*Hq][D] int8 and qd: [nq][L*Hq][D/32] float scales. Outputs (host) [nq][C] each.
 bool kvflash_fused_run(KvFlashFusedWs * ws, const KvFlashFusedGeom & g, const KvFlashFusedK & k, const int8_t * q8, const float * qd,
                        size_t max_partial_bytes, float * out_mean, float * out_top, float * out_max, KvFlashFusedTiming * tm,

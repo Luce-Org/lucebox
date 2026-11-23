@@ -635,6 +635,8 @@ extern "C" {
 
         GGML_OP_QSA_DECODE_IDS, // Sort selected blocks and expand visible QSA cells
 
+        GGML_OP_INKLING2_OP, // Fused Inkling2-Loop & DSpark ops (subop in op_params[0])
+
         GGML_OP_COUNT,
     };
 
@@ -3159,6 +3161,18 @@ extern "C" {
             struct ggml_tensor  * positions,
             int                   ratio);
 
+    // ggml_qsa_decode_ids for K/V rows kept in a paged pool: each emitted id p >= 0 becomes
+    // chunk_rows[p / chunk_tokens] + p % chunk_tokens, or -1 when that entry is negative (not resident) or past
+    // the table. chunk_rows: contiguous I32 [n_chunks]; chunk_tokens a positive multiple of ratio. The ids keep
+    // the position order of ggml_qsa_decode_ids.
+    GGML_API struct ggml_tensor * ggml_qsa_decode_ids_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * positions,
+            int                   ratio,
+            struct ggml_tensor  * chunk_rows,
+            int                   chunk_tokens);
+
     // Preserve the raw rows of base_mask and retain only selected compressed
     // rows. selected is I32 [top_k,n_tokens], indexing the compressed span;
     // base_mask is F32 [raw_rows+n_comp,n_tokens].
@@ -3215,6 +3229,283 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * z);
+
+    // ─── Inkling2-Loop & DSpark fused ops (GGML_OP_INKLING2_OP) ───────────
+    enum ggml_inkling2_subop {
+        GGML_INKLING2_ATTN_RES_MIX       = 0,
+        GGML_INKLING2_LOOP_CTRL_PRE      = 1,
+        GGML_INKLING2_LOOP_CTRL_POST     = 2,
+        GGML_INKLING2_SCONV              = 3,
+        GGML_INKLING2_CLIP_NORM          = 4,
+        GGML_INKLING2_KV_WRITE           = 5,
+        GGML_INKLING2_REL_TABLE          = 6,
+        GGML_INKLING2_ATTN_REL           = 7,
+        GGML_INKLING2_ATTN_SPLIT_COMBINE = 8,
+        GGML_INKLING2_SITU               = 9,
+        GGML_INKLING2_SIGMOID_TOPK_IDS   = 10,
+        GGML_INKLING2_SIGMOID_TOPK_WTS   = 11,
+        GGML_INKLING2_SOFTCAP_SLICE      = 12,
+        GGML_INKLING2_DSPARK_MIX_NORM    = 13,
+        GGML_INKLING2_DSPARK_MARKOV_GATE = 14,
+        GGML_INKLING2_DSPARK_ADD_SOFTCAP = 15,
+        GGML_INKLING2_STATE_RESTORE      = 16,
+        GGML_INKLING2_DYNAMIC_SPLIT_LUT  = 17,
+        GGML_INKLING2_DSPARK_TOPK_CANDS  = 18,
+        GGML_INKLING2_DSPARK_TOPK_SCORE  = 19,
+        GGML_INKLING2_MOE_MASKED_SUM     = 20,
+        GGML_INKLING2_DSPARK_MARKOV_ARGMAX = 21,
+        GGML_INKLING2_SCONV_KV_WRITE     = 22,
+        GGML_INKLING2_CLIP_R_REL_TABLE   = 23,
+    };
+
+    GGML_API struct ggml_tensor * ggml_inkling2_attn_res_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * norm_w,
+            struct ggml_tensor * const * blocks,
+            int                   n_blocks,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling2_loop_ctrl_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_inkling2_loop_ctrl_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * gf_out,
+            struct ggml_tensor  * norm_w,
+            float                 eps);
+
+    // Causal 4-tap short conv (+ optional dynamic taps) + state update + residual + 1/sqrt scale.
+    // write_mode: 0 = no write, 1 = update state_out in-place [3, S], 2 = write per-token verify ring [3, S, max_verify]
+    GGML_API struct ggml_tensor * ggml_inkling2_sconv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_static,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * state_out,
+            struct ggml_tensor  * dyn_taps,
+            int                   state_chan_offset,
+            int                   head_dim_for_dyn,
+            int                   write_mode);
+
+    // Same as ggml_inkling2_sconv, fusing `+ addend` into the output register write (zero extra kernel!).
+    GGML_API struct ggml_tensor * ggml_inkling2_sconv_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_static,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * state_out,
+            struct ggml_tensor  * dyn_taps,
+            struct ggml_tensor  * addend,
+            int                   state_chan_offset,
+            int                   head_dim_for_dyn,
+            int                   write_mode);
+
+    // mode 0: L2 clip (+ optional scale_w, optional pos_buf for log-tau); mode 1: per-head rms_norm (no gamma)
+    GGML_API struct ggml_tensor * ggml_inkling2_clip_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale_w,
+            struct ggml_tensor  * pos_buf,
+            int                   head_dim,
+            int                   n_head,
+            int                   mode,
+            float                 threshold,
+            float                 eps,
+            int                   log_floor,
+            float                 log_alpha);
+
+    // Fused K-clip (is_v=0) or V-rmsnorm (is_v=1) + write into kv_cache (F16 or Q8_0) at pos_buf[t] (with SWA wrap).
+    // Returns a dummy 1-element F32 dependency token pinned to kv_cache's device.
+    GGML_API struct ggml_tensor * ggml_inkling2_kv_write(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * pos_buf,
+            int                   head_dim,
+            int                   n_head_kv,
+            int                   is_v,
+            int                   swa_window,
+            float                 threshold,
+            float                 eps);
+
+    // Compute rel_table [rel_extent+1, n_head, T] = (rel_bias @ Rcur) - sink.
+    GGML_API struct ggml_tensor * ggml_inkling2_rel_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rel_bias,
+            struct ggml_tensor  * r_cur,
+            struct ggml_tensor  * sink);
+
+    // Inline relative-bias + zero-sink attention over K/V cache (F16 or Q8_0).
+    // kv_meta: I32 [4] on device = { pos0, kv_len, kv_start, kv_end } (kv_end <= 0 means full [0, kv_len)).
+    // k_dep/v_dep: optional dependency tokens from kv_write to order cache writes before reads.
+    // gate_proj: optional [D*Hq, T] F32; when non-null and partial==0, applies out *= sigmoid(gate_proj).
+    // partial == 0: returns [D*Hq, T] F32.
+    // partial == 1: returns [(D+2)*Hq, T] F32 packed (O[D] | m | l per head) for dual-GPU Split-KV combine.
+    GGML_API struct ggml_tensor * ggml_inkling2_attn_rel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_cache,
+            struct ggml_tensor  * v_cache,
+            struct ggml_tensor  * rel_table,
+            struct ggml_tensor  * kv_meta,
+            struct ggml_tensor  * k_dep,
+            struct ggml_tensor  * v_dep,
+            struct ggml_tensor  * gate_proj,
+            int                   swa_window,
+            int                   rel_extent,
+            int                   partial,
+            int                   include_sink);
+
+    // Combine two Split-KV partial outputs [(D+2)*Hq, T] -> [D*Hq, T] (+ optional sigmoid(gate_proj)).
+    GGML_API struct ggml_tensor * ggml_inkling2_attn_split_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * part_a,
+            struct ggml_tensor  * part_b,
+            struct ggml_tensor  * gate_proj,
+            int                   head_dim,
+            int                   n_head);
+
+    // Fused SITU MoE activation: [2*n_ff, k, T] -> [n_ff, k, T].
+    GGML_API struct ggml_tensor * ggml_inkling2_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate_up,
+            float                 beta,
+            float                 linear_beta);
+
+    // Fused sigmoid MoE router: top-k IDs I32 [k, T] and normalized scaled weights F32 [k, T].
+    GGML_API struct ggml_tensor * ggml_inkling2_sigmoid_topk_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * bias,
+            int                   top_k);
+
+    GGML_API struct ggml_tensor * ggml_inkling2_sigmoid_topk_wts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * ids,
+            float                 route_scale,
+            float                 eps);
+
+    // Fused final logit softcap (cap*tanh(x/cap)) + unpadded vocab slice [n_vocab_unpadded, T].
+    GGML_API struct ggml_tensor * ggml_inkling2_softcap_slice(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            int                   n_vocab_unpadded,
+            float                 softcap);
+
+    // DSpark: weighted tap mix + RMSNorm: taps [n_embd, n_taps, T], alpha [n_taps], weight [n_embd] -> [n_embd, T].
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_mix_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * taps,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * weight,
+            float                 eps);
+
+    // DSpark: RNN Markov gate: raw [3*R, B], state [R, B] -> [2*R, B] (new_state | latent).
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_markov_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * raw,
+            struct ggml_tensor  * state);
+
+    // DSpark: bf16-rounded add + softcap + unpadded slice [n_vocab_unpadded, B].
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_add_softcap(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base_logits,
+            struct ggml_tensor  * bias,
+            int                   n_vocab_unpadded,
+            float                 softcap);
+
+    // Restore live conv state [3, S] from verify ring [3, S, max_verify] at runtime slot index (I32 [1]).
+    GGML_API struct ggml_tensor * ggml_inkling2_state_restore(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state_ring,
+            struct ggml_tensor  * state_live,
+            struct ggml_tensor  * slot_idx);
+
+    // Dynamic exact-unique-expert work-stealing LUT [n_expert] I32 for dual-GPU MoE verify:
+    // assigns ceil(n_unique * target_pct / 100) highest-frequency unique experts to target (e -> e), rest -> -1.
+    GGML_API struct ggml_tensor * ggml_inkling2_dynamic_split_lut(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            int                   n_expert,
+            int                   target_pct);
+
+    // DSpark fast Markov step 1: select 1024 candidate token IDs per row from base_logits [V, B] -> I32 [1024, B].
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_topk_cands(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base_logits,
+            int                   n_vocab_unpadded);
+
+    // DSpark fast Markov step 2: score only the 1024 candidate rows with fold_weight @ latent + fold_bias + base_row
+    // (bf16 softcap) and return the winning token ID (I32 [1]).
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_topk_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cand_ids,
+            struct ggml_tensor  * base_row,
+            struct ggml_tensor  * latent,
+            struct ggml_tensor  * fold_weight,
+            struct ggml_tensor  * fold_bias,
+            float                 softcap);
+
+    // Dual-GPU masked MoE weighted sum: sums wsel[k,t]*down[:,k,t] over k where mask_sel[k,t]>=0,
+    // optionally adding peer_sum (F16 or F32 [H,T]). out_f16!=0 outputs F16 [H,T] (36 KB for T=8!).
+    GGML_API struct ggml_tensor * ggml_inkling2_moe_masked_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * wsel,
+            struct ggml_tensor  * mask_sel,
+            struct ggml_tensor  * peer_sum,
+            int                   out_f16);
+
+    // DSpark fused full-vocab Markov argmax: argmax_{v<n_vocab} (base_row[v] + fold_w[v]@latent + fold_b[v]) -> I32 [1].
+    GGML_API struct ggml_tensor * ggml_inkling2_dspark_markov_argmax(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base_row,
+            struct ggml_tensor  * latent,
+            struct ggml_tensor  * fold_weight,
+            struct ggml_tensor  * fold_bias,
+            int                   n_vocab_unpadded);
+
+    // Fused causal short conv (+ optional dynamic taps) + K-clip/V-RMSNorm + direct KV cache write (F16/Q8_0).
+    GGML_API struct ggml_tensor * ggml_inkling2_sconv_kv_write(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_static,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * state_out,
+            struct ggml_tensor  * dyn_taps,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * pos_buf,
+            int                   state_chan_offset,
+            int                   head_dim,
+            int                   n_head_kv,
+            int                   is_v,
+            int                   swa_window,
+            float                 threshold,
+            float                 eps,
+            int                   write_mode);
+
+    // Fused R L2-clip (+ scale + optional log-tau) + relative-position table [rel_extent+1, Hq, T].
+    GGML_API struct ggml_tensor * ggml_inkling2_clip_r_rel_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r_raw,
+            struct ggml_tensor  * r_clip_w,
+            struct ggml_tensor  * pos_buf,
+            struct ggml_tensor  * rel_bias,
+            struct ggml_tensor  * sink,
+            int                   d_rel,
+            int                   n_head,
+            float                 threshold,
+            float                 eps,
+            int                   log_floor,
+            float                 log_alpha);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

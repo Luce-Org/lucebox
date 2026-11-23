@@ -78,6 +78,32 @@ int qwen4exp_reserved_rows(int max_ctx, size_t available, size_t fixed, Measure 
                     qwen4exp_fit_chunk(std::min(max_ctx, preferred_rows), available, fixed + keep, measure));
 }
 
+// Where prefix snapshots live. gfx1151's memory is the system's, so they stay on it. Beside a GPU with its own
+// memory they live in system memory unless LUCE_Q4_SNAPSHOT_DEVICE=1 (`requested`) asks for the GPU: a save and
+// restore cross the host link (2.3 GB/s on a PCIe 3.0 x4 R9700: ~2 s of a 3.6 s turn at 66K). The GPU then takes
+// them with an automatic prompt chunk only (the allowance is sized beside it), and only when the planner's whole
+// `allowance` fits in what the planned context leaves (`required` of `available`): they never cost context.
+struct Qwen4ExpSnapshotPlacement {
+    bool on_device;
+    const char * reason;
+};
+inline Qwen4ExpSnapshotPlacement qwen4exp_place_snapshots(bool gfx1151, bool requested, bool explicit_chunk,
+                                                          size_t required, size_t available, size_t allowance) {
+    if (gfx1151) return {true, "gfx1151 memory is the system's"};
+    if (!requested) return {false, "the default (LUCE_Q4_SNAPSHOT_DEVICE=1 asks for the GPU)"};
+    if (explicit_chunk) return {false, "--chunk is set"};
+    if (!allowance) return {false, "no snapshot to place"};
+    if (required == SIZE_MAX || required > available) return {false, "the context leaves no room"};
+    if (allowance > available - required) return {false, "the allowance does not fit beside the context"};
+    return {true, "the allowance fits beside the context"};
+}
+
+// LUCE_Q4_SNAPSHOT_DEVICE: 1 asks for the target GPU; unset, empty and 0 are off; -1 for anything else.
+inline int qwen4exp_snapshot_device_from_env(const char * v) {
+    if (!v || !*v || (v[0] == '0' && !v[1])) return 0;
+    return v[0] == '1' && !v[1] ? 1 : -1;
+}
+
 // --max-ctx auto: the next context to try after a plan at `ctx` lacks `missing` bytes, when one context position
 // takes `position_bytes` across every slot. At least one step lower, in multiples of `step`; 0 when none is left.
 inline int qwen4exp_shrink_context(int ctx, size_t missing, size_t position_bytes, int step = 4096) {

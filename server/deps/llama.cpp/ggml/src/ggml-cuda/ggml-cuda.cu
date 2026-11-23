@@ -89,6 +89,7 @@
 #include "ggml-cuda/ds4-indexer.cuh"
 #include "ggml-cuda/qsa-ids.cuh"
 #include "ggml-cuda/qsa.cuh"
+#include "ggml-cuda/inkling2-ops.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4483,6 +4484,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DS4_MOE_COMBINE:
             ggml_cuda_op_ds4_moe_combine(ctx, dst);
             break;
+        case GGML_OP_INKLING2_OP:
+            ggml_cuda_op_inkling2(ctx, dst);
+            break;
 #if defined(GGML_USE_HIP)
         case GGML_OP_GATED_RMS_NORM_F16:
             ggml_cuda_op_gated_rms_norm_f16(ctx, dst);
@@ -4910,11 +4914,16 @@ static void ggml_cuda_backend_entry_keep_tail(ggml_backend_cuda_context * ctx) {
     ggml_cuda_backend_entry(ctx);
 }
 
+static std::atomic<bool> ggml_cuda_copy_tail_any{false};
+
 void ggml_backend_cuda_set_copy_tail(ggml_backend_t backend, bool on) {
     if (!ggml_backend_is_cuda(backend)) {
         return;
     }
     ((ggml_backend_cuda_context *) backend->context)->copy_tail = on;
+    if (on) {
+        ggml_cuda_copy_tail_any.store(true, std::memory_order_relaxed);
+    }
 }
 
 #if defined(GGML_USE_HIP)
@@ -5032,7 +5041,7 @@ static int ggml_cuda_peer_copy_setting(const char * value) {
 
 static bool ggml_cuda_peer_copy_kernel_enabled() {
     static const int setting = ggml_cuda_peer_copy_setting(getenv("GGML_CUDA_PEER_COPY_KERNEL"));
-    return setting < 0 ? ggml_cuda_qwen4exp_graph() : setting != 0;
+    return setting < 0 ? (ggml_cuda_qwen4exp_graph() || ggml_cuda_copy_tail_any.load(std::memory_order_relaxed)) : setting != 0;
 }
 
 static thread_local ggml_cuda_pending_peer_copy_batch
@@ -5048,7 +5057,7 @@ static bool ggml_cuda_batch_peer_copies_enabled() {
         }
         return ggml_cuda_peer_copy_setting(value);
     }();
-    return setting < 0 ? ggml_cuda_qwen4exp_graph() : setting != 0;
+    return setting < 0 ? (ggml_cuda_qwen4exp_graph() || ggml_cuda_copy_tail_any.load(std::memory_order_relaxed)) : setting != 0;
 }
 
 // A pending batch (thread-local, published lazily) that names a context about to be freed is published first.
@@ -9791,12 +9800,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_I32 &&
                    op->src[0]->ne[0] >= 1 && op->src[0]->ne[0] <= 1024 &&
                    ggml_is_matrix(op->src[0]) && op->src[0]->nb[0] == sizeof(int32_t) &&
-                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]);
+                   op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[2])));
         case GGML_OP_DS4_INDEXER_MASK:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]);
+        case GGML_OP_INKLING2_OP:
+            return op->src[0] != nullptr;
         case GGML_OP_DS4_MOE_COMBINE:
             // CUDA/HIP allocations are aligned, but views can start between
             // float4 boundaries. GGML folds nested views into view_offs, which

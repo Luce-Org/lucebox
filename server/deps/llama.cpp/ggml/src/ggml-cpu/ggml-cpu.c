@@ -229,6 +229,9 @@ static void ggml_compute_forward_qsa_decode_ids(
     const int32_t * positions = (const int32_t *) dst->src[1]->data;
     const int64_t budget = blocks->ne[0];
     const int64_t ratio = ggml_get_op_params_i32(dst, 0);
+    const int32_t * map = dst->src[2] ? (const int32_t *) dst->src[2]->data : NULL;
+    const int64_t n_chunks = dst->src[2] ? dst->src[2]->ne[0] : 0;
+    const int64_t chunk = ggml_get_op_params_i32(dst, 1);
     for (int64_t t = params->ith; t < blocks->ne[1]; t += params->nth) {
         const int32_t * src = (const int32_t *) ((const char *) blocks->data + t * blocks->nb[1]);
         int32_t * out = (int32_t *) ((char *) dst->data + t * dst->nb[1]);
@@ -245,6 +248,14 @@ static void ggml_compute_forward_qsa_decode_ids(
         const int64_t br = ((pos + 1) / ratio) * ratio;
         for (int64_t i = 0; i < ratio - 1; ++i) {
             out[budget * ratio + i] = br + i <= pos ? (int32_t) (br + i) : -1;
+        }
+        if (map) {   // paged pool: position -> arena row, -1 when the chunk is not resident
+            for (int64_t j = 0; j < budget * ratio + ratio - 1; ++j) {
+                if (out[j] < 0) continue;
+                const int64_t ci = out[j] / chunk;
+                const int32_t base = ci < n_chunks ? map[ci] : -1;
+                out[j] = base < 0 ? -1 : base + (int32_t) (out[j] % chunk);
+            }
         }
     }
 }
@@ -2138,6 +2149,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             GGML_ABORT("GGML_OP_HC_COMBINE_NORM is only supported on the CUDA/HIP backend");
         case GGML_OP_GATED_RMS_NORM_F16:
             GGML_ABORT("GGML_OP_GATED_RMS_NORM_F16 is only supported on the CUDA/HIP backend");
+        case GGML_OP_INKLING2_OP:
+            GGML_ABORT("GGML_OP_INKLING2_OP is only supported on the CUDA/HIP backend");
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2715,6 +2728,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_VISION_F32:
         case GGML_OP_MUL_MAT_VISION_AV_F32:
             GGML_ABORT("explicit vision attention cannot be planned on CPU");
+        case GGML_OP_INKLING2_OP:
+            GGML_ABORT("GGML_OP_INKLING2_OP cannot be planned on CPU");
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
