@@ -319,6 +319,8 @@ jobs:
       - name: Build focused NVIDIA verifier tests (sm_${{ matrix.arch }})
         run: |
           export CCACHE_BASEDIR="$GITHUB_WORKSPACE"
+          deps_cache="$HOME/.cache/lucebox-ci-deps"
+          mkdir -p "$deps_cache"
           cd server
           gen=()
           command -v ninja >/dev/null && gen=(-G Ninja)
@@ -328,6 +330,8 @@ jobs:
             -DLUCE_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
             -DLUCE_ENABLE_BSA=OFF \
             -DLUCE_FA_ALL_QUANTS=OFF \
+            -DFETCHCONTENT_BASE_DIR="$deps_cache" \
+            -DLUCE_IMAGE_CODECS_CACHE_DIR="$deps_cache" \
             -DCMAKE_BUILD_TYPE=Release
           if [[ "$CUDA_ARCH" == "121" ]]; then
             grep -q '^LUCE_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
@@ -462,12 +466,14 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Ensure local ccache is available
+      - name: Ensure local build tools are available
         run: |
           cache_dir="$HOME/.cache/lucebox-ci-ccache"
-          mkdir -p "$HOME/.local/bin" "$cache_dir"
+          deps_cache="$HOME/.cache/lucebox-ci-deps"
+          mkdir -p "$HOME/.local/bin" "$cache_dir" "$deps_cache"
           echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "LUCE_CI_DEPS_CACHE=$deps_cache" >> "$GITHUB_ENV"
           if ! command -v ccache >/dev/null && [ ! -x "$HOME/.local/bin/ccache" ]; then
             url="https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-linux-x86_64-musl-static.tar.xz"
             sha="d553fac006ed93a37342cee9228cf4e13dd66690fa1a8075c54c7bace9b72ae6"
@@ -478,8 +484,23 @@ jobs:
             mv "$RUNNER_TEMP/ccache-4.14.3-linux-x86_64-musl-static/ccache" "$HOME/.local/bin/ccache"
             chmod +x "$HOME/.local/bin/ccache"
           fi
+          if ! command -v ninja >/dev/null && [ ! -x "$HOME/.local/bin/ninja" ]; then
+            url="https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-linux.zip"
+            sha="6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255"
+            tmp="$RUNNER_TEMP/ninja.zip"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            python3 -m zipfile -e "$tmp" "$RUNNER_TEMP/ninja-extract"
+            mv "$RUNNER_TEMP/ninja-extract/ninja" "$HOME/.local/bin/ninja"
+            chmod +x "$HOME/.local/bin/ninja"
+          fi
+          if ! command -v ld.lld >/dev/null && [ ! -x "$HOME/.local/bin/ld.lld" ] && [ -x /opt/rocm/lib/llvm/bin/ld.lld ]; then
+            ln -sf /opt/rocm/lib/llvm/bin/ld.lld "$HOME/.local/bin/ld.lld"
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/ccache" --version 2>/dev/null || ccache --version
+          "$HOME/.local/bin/ninja" --version 2>/dev/null || ninja --version || true
+          "$HOME/.local/bin/ld.lld" --version 2>/dev/null || ld.lld --version || true
 
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
@@ -548,11 +569,12 @@ jobs:
             -DLUCE_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DGGML_CCACHE=OFF \
+            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
+            -DLUCE_IMAGE_CODECS_CACHE_DIR="$LUCE_CI_DEPS_CACHE" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
+            -DCMAKE_BUILD_TYPE=Release
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
@@ -618,6 +640,8 @@ jobs:
         # Keep the default wire-format build above and compile the affine layout
         # separately so both configurations remain covered. The focused tests
         # assert real MMVQ/MMQ dispatch rather than accepting a BLAS fallback.
+        # These 3 matmul/MMID tests never call FlashAttention or image codecs,
+        # so disable both to avoid compiling 97 unused fattn*.cu units.
         shell: bash .github/ci/box_step.sh {0}
         run: |
           gen=()
@@ -635,11 +659,13 @@ jobs:
             -DLUCE_ROCMFP2_AFFINE=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DGGML_CCACHE=OFF \
+            -DGGML_CUDA_FA=OFF \
+            -DLUCE_IMAGE_CODECS=OFF \
+            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
+            -DCMAKE_BUILD_TYPE=Release
           cmake --build "$RUNNER_TEMP/rocmfp-affine-build" \
             --target test_rocmfpx test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda \
@@ -687,12 +713,14 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Ensure local ccache is available
+      - name: Ensure local build tools are available
         run: |
           cache_dir="$HOME/.cache/lucebox-ci-ccache"
-          mkdir -p "$HOME/.local/bin" "$cache_dir"
+          deps_cache="$HOME/.cache/lucebox-ci-deps"
+          mkdir -p "$HOME/.local/bin" "$cache_dir" "$deps_cache"
           echo "CCACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "LUCE_CI_DEPS_CACHE=$deps_cache" >> "$GITHUB_ENV"
           if ! command -v ccache >/dev/null && [ ! -x "$HOME/.local/bin/ccache" ]; then
             url="https://github.com/ccache/ccache/releases/download/v4.14.3/ccache-4.14.3-linux-x86_64-musl-static.tar.xz"
             sha="d553fac006ed93a37342cee9228cf4e13dd66690fa1a8075c54c7bace9b72ae6"
@@ -702,6 +730,19 @@ jobs:
             tar -xJf "$tmp" -C "$RUNNER_TEMP"
             mv "$RUNNER_TEMP/ccache-4.14.3-linux-x86_64-musl-static/ccache" "$HOME/.local/bin/ccache"
             chmod +x "$HOME/.local/bin/ccache"
+          fi
+          if ! command -v ninja >/dev/null && [ ! -x "$HOME/.local/bin/ninja" ]; then
+            url="https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-linux.zip"
+            sha="6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255"
+            tmp="$RUNNER_TEMP/ninja.zip"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            python3 -m zipfile -e "$tmp" "$RUNNER_TEMP/ninja-extract"
+            mv "$RUNNER_TEMP/ninja-extract/ninja" "$HOME/.local/bin/ninja"
+            chmod +x "$HOME/.local/bin/ninja"
+          fi
+          if ! command -v ld.lld >/dev/null && [ ! -x "$HOME/.local/bin/ld.lld" ] && [ -x /opt/rocm/lib/llvm/bin/ld.lld ]; then
+            ln -sf /opt/rocm/lib/llvm/bin/ld.lld "$HOME/.local/bin/ld.lld"
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -721,6 +762,8 @@ jobs:
             -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DCMAKE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DGGML_CCACHE=OFF \
+            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
+            -DLUCE_IMAGE_CODECS_CACHE_DIR="$LUCE_CI_DEPS_CACHE" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
