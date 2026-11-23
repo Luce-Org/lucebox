@@ -678,6 +678,10 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         auto eot = token_to_id_.find("</assistant>");
         if (eot != token_to_id_.end()) eos_chat_id_ = eot->second;
     }
+    if (eos_chat_id_ < 0 && arch && (std::strcmp(arch, "inkling2_loop") == 0 || std::strcmp(arch, "inkling2") == 0)) {
+        auto eot = token_to_id_.find("<|content_model_end_sampling|>");
+        if (eot != token_to_id_.end()) eos_chat_id_ = eot->second;
+    }
     if (eos_chat_id_ < 0) {
         // Qwen3 uses <|im_end|> as EOT.
         auto eot = token_to_id_.find("<|im_end|>");

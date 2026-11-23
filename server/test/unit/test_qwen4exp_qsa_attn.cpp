@@ -31,10 +31,17 @@ static ggml_tensor * pack_values(ggml_context * c, ggml_tensor * values) {
     return ggml_cont(c, ggml_permute(c, blocks, 1, 0, 2, 3));
 }
 
-static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
+// chunk_map (unmasked): K/V live in a KVFlash pool, 64-token chunk c at rows chunk_map[c] (-1 = not resident),
+// read through ggml_qsa_decode_ids_paged; the reference then attends over the resident selected keys.
+static constexpr int CHUNK = 64;
+
+static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng,
+                const std::vector<int32_t> * chunk_map = nullptr, uint64_t * hash_out = nullptr) {
     const int T = cs.T, kv_len = cs.pos0 + T;
     const bool packed = T >= 128;
-    const int nk = packed ? (kv_len + 3) / 4 * 4 : kv_len;   // the graph pads K/V to whole 4-key blocks
+    if (chunk_map && cs.mask) return false;
+    const int rows = chunk_map ? (int) chunk_map->size() * CHUNK : cs.ctx;   // K/V rows of the cache tensor
+    const int nk = chunk_map ? rows : packed ? (kv_len + 3) / 4 * 4 : kv_len;   // the graph pads K/V to whole 4-key blocks
     const int n_after = kv_len / R;
     const bool dense = n_after <= cs.budget;                 // all complete blocks fit: enumerate them
     const int budget = dense ? std::max(1, n_after) : cs.budget;
@@ -46,6 +53,18 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
     std::vector<ggml_fp16_t> k((size_t) D * cs.ctx * HK), v(k.size());
     for (ggml_fp16_t & x : k) x = ggml_fp32_to_fp16(u(rng));
     for (ggml_fp16_t & x : v) x = ggml_fp32_to_fp16(u(rng));
+    if (chunk_map) {   // scatter whole chunks into the pool; rows no chunk maps keep noise
+        std::vector<ggml_fp16_t> kp((size_t) D * rows * HK, ggml_fp32_to_fp16(9.0f)), vp(kp);
+        for (int h = 0; h < HK; ++h) for (int ci = 0; ci < (int) chunk_map->size(); ++ci) {
+            const int base = (*chunk_map)[(size_t) ci];
+            if (base < 0) continue;
+            for (int i = 0; i < CHUNK && ci * CHUNK + i < cs.ctx; ++i) {
+                std::copy_n(k.begin() + ((size_t) h * cs.ctx + ci * CHUNK + i) * D, D, kp.begin() + ((size_t) h * rows + base + i) * D);
+                std::copy_n(v.begin() + ((size_t) h * cs.ctx + ci * CHUNK + i) * D, D, vp.begin() + ((size_t) h * rows + base + i) * D);
+            }
+        }
+        k.swap(kp); v.swap(vp);
+    }
     // Selected rows come from top-k in arbitrary order and may name blocks the query cannot see yet.
     std::vector<int32_t> blocks((size_t) budget * T), all(std::max(1, n_after));
     std::iota(all.begin(), all.end(), 0);
@@ -60,8 +79,9 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
 
     ggml_context * c = ggml_init({4 * 1024 * 1024, nullptr, true});
     ggml_tensor * tq = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, T, HQ);
-    ggml_tensor * kc = ggml_new_tensor_3d(c, GGML_TYPE_F16, D, cs.ctx, HK);
-    ggml_tensor * vc = ggml_new_tensor_3d(c, GGML_TYPE_F16, D, cs.ctx, HK);
+    ggml_tensor * kc = ggml_new_tensor_3d(c, GGML_TYPE_F16, D, rows, HK);
+    ggml_tensor * vc = ggml_new_tensor_3d(c, GGML_TYPE_F16, D, rows, HK);
+    ggml_tensor * tmap = chunk_map ? ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) chunk_map->size()) : nullptr;
     ggml_tensor * tb = ggml_new_tensor_2d(c, GGML_TYPE_I32, budget, T);
     ggml_tensor * tp = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
     ggml_tensor * tm = cs.mask ? ggml_new_tensor_2d(c, GGML_TYPE_F16, nk, T) : nullptr;
@@ -69,7 +89,7 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
     ggml_tensor * kf = ggml_view_3d(c, kc, D, nk, HK, kc->nb[1], kc->nb[2], 0);
     ggml_tensor * vf = ggml_view_3d(c, vc, D, nk, HK, vc->nb[1], vc->nb[2], 0);
     if (packed) { kf = ggml_cont(c, kf); vf = ggml_cont(c, vf); }
-    ggml_tensor * ids = ggml_qsa_decode_ids(c, tb, tp, R);
+    ggml_tensor * ids = tmap ? ggml_qsa_decode_ids_paged(c, tb, tp, R, tmap, CHUNK) : ggml_qsa_decode_ids(c, tb, tp, R);
     ggml_tensor * attn = ggml_flash_attn_ext(c, tq, kf, vf, tm, scale, 0.0f, 0.0f);
     attn->src[5] = ids;
     if (packed) {
@@ -86,6 +106,7 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
     ggml_backend_tensor_set(tb, blocks.data(), 0, ggml_nbytes(tb));
     ggml_backend_tensor_set(tp, pos.data(), 0, ggml_nbytes(tp));
     if (tm) ggml_backend_tensor_set(tm, mask.data(), 0, ggml_nbytes(tm));
+    if (tmap) ggml_backend_tensor_set(tmap, chunk_map->data(), 0, ggml_nbytes(tmap));
     const bool computed = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
     const int n_ids = (int) ids->ne[0];
     std::vector<float> got((size_t) D * HQ * T);
@@ -111,7 +132,7 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
                 if (key < 0 || key >= nk || bias == -INFINITY) continue;
                 double dot = 0.0;
                 for (int d = 0; d < D; ++d) {
-                    dot += (double) q[((size_t) h * T + t) * D + d] * ggml_fp16_to_fp32(k[((size_t) kvh * cs.ctx + key) * D + d]);
+                    dot += (double) q[((size_t) h * T + t) * D + d] * ggml_fp16_to_fp32(k[((size_t) kvh * rows + key) * D + d]);
                 }
                 s[j] = scale * dot + bias;
                 m = std::max(m, s[j]);
@@ -123,7 +144,7 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
                 const double p = std::exp(s[j] - m);
                 const int key = cells[(size_t) t * n_ids + j];
                 l += p;
-                for (int d = 0; d < D; ++d) o[d] += p * ggml_fp16_to_fp32(v[((size_t) kvh * cs.ctx + key) * D + d]);
+                for (int d = 0; d < D; ++d) o[d] += p * ggml_fp16_to_fp32(v[((size_t) kvh * rows + key) * D + d]);
             }
             for (int d = 0; d < D; ++d) {
                 const double want = l > 0.0 ? o[d] / l : 0.0;
@@ -137,9 +158,10 @@ static bool run(ggml_backend_t be, const Case & cs, std::mt19937 & rng) {
         std::memcpy(&bits, &x, 4);
         for (int b = 0; b < 4; ++b) hash = (hash ^ ((bits >> (8 * b)) & 0xFFu)) * 1099511628211ull;
     }
+    if (hash_out) *hash_out = hash;
     const bool pass = std::isfinite(max_err) && max_err < 1e-2;
-    std::printf("qsa-attn %-7s T=%-3d pos=%-4d budget=%-3d mask=%d max_abs_err=%.2e hash=%016llx %s\n",
-                packed ? "prefill" : "decode", T, cs.pos0, budget, cs.mask ? 1 : 0, max_err,
+    std::printf("qsa-attn %-7s%s T=%-3d pos=%-4d budget=%-3d mask=%d max_abs_err=%.2e hash=%016llx %s\n",
+                packed ? "prefill" : "decode", chunk_map ? " paged" : "", T, cs.pos0, budget, cs.mask ? 1 : 0, max_err,
                 (unsigned long long) hash, pass ? "OK" : "FAIL");
     return pass;
 }
@@ -164,6 +186,36 @@ int main() {
             {127, 2100, 512, 4096, false}, {8, 6000, 512, 8192, true}}) {
         ok &= run(gpu, cs, rng);
         ++cases;
+    }
+    // Paged pool: every chunk resident in reverse order reads the same keys in the same order, so the output is
+    // bit-identical to the position-order cache; with every third chunk out, it matches the reference over the rest.
+    for (const Case & cs : std::vector<Case>{{1, 3000, 512, 4096, false}, {5, 6001, 512, 8192, false}}) {
+        const int n_chunks = cs.ctx / CHUNK;
+        std::vector<int32_t> all_in((size_t) n_chunks), some_out((size_t) n_chunks);
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            all_in[(size_t) ci] = (n_chunks - 1 - ci) * CHUNK;
+            some_out[(size_t) ci] = ci % 3 == 1 && ci < (cs.pos0 / CHUNK) ? -1 : all_in[(size_t) ci];
+        }
+        uint64_t h_pos = 0, h_pool = 1;
+        std::mt19937 a(7), b(7), d(7);
+        const bool same = run(gpu, cs, a, nullptr, &h_pos) && run(gpu, cs, b, &all_in, &h_pool) && h_pos == h_pool;
+        std::printf("qsa-attn paged all resident T=%d pos=%d %s\n", cs.T, cs.pos0, same ? "bit-identical OK" : "FAIL");
+        ok &= same && run(gpu, cs, d, &some_out);
+        cases += 2;
+    }
+    // A prompt chunk over the pool (packed prefill kernel): the arena rows come out of position order, so the
+    // accumulation order changes; both maps must match the reference over the resident selected keys.
+    for (const Case & cs : std::vector<Case>{{130, 1001, 512, 4096, false}, {257, 3000, 512, 4096, false},
+                                             {300, 6001, 512, 8192, false}}) {
+        const int n_chunks = cs.ctx / CHUNK;
+        std::vector<int32_t> all_in((size_t) n_chunks), some_out((size_t) n_chunks);
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            all_in[(size_t) ci] = (n_chunks - 1 - ci) * CHUNK;
+            some_out[(size_t) ci] = ci % 3 == 1 && ci < (cs.pos0 / CHUNK) ? -1 : all_in[(size_t) ci];
+        }
+        ok &= run(gpu, cs, rng, &all_in);
+        ok &= run(gpu, cs, rng, &some_out);
+        cases += 2;
     }
     ggml_backend_free(gpu);
     std::printf("qsa-attn: %d cases, %s\n", cases, ok ? "PASS" : "FAIL");

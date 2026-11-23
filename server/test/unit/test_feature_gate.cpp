@@ -947,6 +947,30 @@ void test_feature_gate_kvflash_requires_reading_arch() {
           std::string::npos);
 }
 
+void test_inkling2_hip_only_and_verify_width() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/Inkling-2-Mini-IQ4_NL.gguf";
+    args.device.backend = PlacementBackend::Hip;
+    args.device.gpu = 0;
+
+    for (const char * arch : {"inkling2_loop", "inkling2"}) {
+        CHECK(gate_result(args, arch, PlacementBackend::Hip).empty());
+        CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+
+        BackendArgs vw_ok = args;
+        vw_ok.verify_width = 8;
+        CHECK(gate_result(vw_ok, arch, PlacementBackend::Hip).empty());
+
+        BackendArgs vw_bad = args;
+        vw_bad.verify_width = 9;
+        CHECK(!gate_result(vw_bad, arch, PlacementBackend::Hip).empty());
+
+        BackendAdmissionContext kvflash;
+        kvflash.kvflash = KvFlashRequest::Fixed;
+        CHECK(!gate_result(args, arch, PlacementBackend::Hip, kvflash).empty());
+    }
+}
+
 };
 }  // namespace
 
@@ -980,4 +1004,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_vision_projector_by_architecture();
     test_deepseek41_paged_unqualified_switches();
     test_feature_gate_kvflash_requires_reading_arch();
+    test_inkling2_hip_only_and_verify_width();
 }

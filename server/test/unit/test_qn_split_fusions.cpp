@@ -126,6 +126,19 @@ struct Pattern {
     std::vector<ggml_tensor *> inputs, filled;
 };
 
+// Pre-quantize a read-only weight tensor once so parameter-sweep tests don't
+// re-run identical CPU quantization on every (T, masked, fused, rows) step.
+std::vector<uint8_t> make_quant_bytes(ggml_type type, int64_t n0, int64_t n1, int64_t n2,
+                                      std::mt19937 & rng, float scale = 0.05f) {
+    std::normal_distribution<float> nd(0.0f, scale);
+    const int64_t nrows = n1 * n2;
+    std::vector<float> v((size_t) (n0 * nrows));
+    for (float & x : v) x = nd(rng);
+    std::vector<uint8_t> q(ggml_row_size(type, n0) * (size_t) nrows);
+    ggml_quantize_chunk(type, v.data(), q.data(), 0, nrows, n0, nullptr);
+    return q;
+}
+
 std::vector<uint8_t> read(const ggml_tensor * t) {
     std::vector<uint8_t> v(ggml_nbytes(t));
     ggml_backend_tensor_get(t, v.data(), 0, v.size());
@@ -983,7 +996,10 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
     // top picks of a router copy over the cold experts, mapped to expert ids. It must leave the experts' outputs and
     // the stacks it reads as they are, at any width and cap (below the picks, above them, above the kernel's 64), and
     // with picks the read skips: repeats, -1, out of range, unmapped (-1) and out-of-range map entries.
-    void moe_prefetch_rows(ggml_backend_t be, int T, int max_experts, bool odd) {
+    void moe_prefetch_rows(ggml_backend_t be, int T, int max_experts, bool odd,
+                           const std::vector<uint8_t> & gate_q, const std::vector<uint8_t> & up_q,
+                           const std::vector<uint8_t> & down_q, const std::vector<uint8_t> & router_q,
+                           const std::mt19937 & post_rng) {
         const std::string name = "moe_prefetch_rows T=" + std::to_string(T) + " max=" + std::to_string(max_experts) +
                                  (odd ? " odd picks" : "");
         const int n_embd = 512, n_ff = 256, n_exp = 24, n_used = 4, n_cold = 16, k = 4;
@@ -1018,9 +1034,14 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
             ggml_tensor * yd = ggml_mul_mat_id(p.ctx, down, yg, sel);  // [n_embd, n_used, T]
             for (ggml_tensor * t : {yg, yu, yd}) p.output(t);
             if (!p.alloc(be)) { fail(name + ": alloc"); return; }
+            p.set(gate, gate_q.data());
+            p.set(up, up_q.data());
+            p.set(down, down_q.data());
+            p.set(router, router_q.data());
             p.set(sel, ids.data());
             p.set(cold, map.data());
             p.set(picks, raw.data());
+            p.rng = post_rng;
             p.fill_rest();
             for (ggml_tensor * pf : pfs) {
                 if (!ggml_backend_supports_op(be, pf)) { fail(name + ": not supported"); return; }
@@ -1043,7 +1064,9 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
     // The Strix runs the cold gate/up experts through mul_mat_vec_q_moe_q4k_prefetch, two weight rows per wave. One,
     // two and four rows must give the same bytes, fused with the SwiGLU or not, with and without masked (-1) picks.
     // Elsewhere the override is ignored and the case compares the generic loop with itself.
-    void q4k_rows(ggml_backend_t be, int T, int masked, bool fused) {
+    void q4k_rows(ggml_backend_t be, int T, int masked, bool fused,
+                  const std::vector<uint8_t> & gate_q, const std::vector<uint8_t> & up_q,
+                  const std::mt19937 & post_rng) {
         const std::string name = "q4k_rows T=" + std::to_string(T) + " masked=" + std::to_string(masked) +
                                  (fused ? " fused" : " unfused");
         const int n_embd = 2560, n_ff = 640, n_exp = 16, n_used = 10;
@@ -1064,7 +1087,10 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
             if (!fused) { p.output(yg); p.output(yu); }
             p.output(gu);
             if (!p.alloc(be)) { fail(name + ": alloc"); return; }
+            p.set(gate, gate_q.data());
+            p.set(up, up_q.data());
             p.set(sel, ids.data());
+            p.rng = post_rng;
             p.fill_rest();
             const Profile prof(true);
             const bool fusion_was_off = ggml_backend_cuda_set_fusion_disabled_override(!fused);
@@ -1399,20 +1425,44 @@ TEST_CASE(QnSplitFusionsFixture, moe_prefetch) {
 }
 
 TEST_CASE(QnSplitFusionsFixture, moe_prefetch_rows) {
+    bool ready = false;
+    std::vector<uint8_t> gate_q, up_q, down_q, router_q;
+    std::mt19937 post_rng;
     each_gpu([&](ggml_backend_t be) {
+        if (!ready) {
+            std::mt19937 rng{1234};
+            gate_q = make_quant_bytes(GGML_TYPE_Q4_K, 512, 256, 24, rng);
+            up_q = make_quant_bytes(GGML_TYPE_Q4_K, 512, 256, 24, rng);
+            down_q = make_quant_bytes(GGML_TYPE_Q8_0, 256, 512, 24, rng);
+            router_q = make_quant_bytes(GGML_TYPE_Q8_0, 512, 16, 1, rng);
+            post_rng = rng;
+            ready = true;
+        }
         for (int T : {1, 3, 4}) {
             for (int max_experts : {2, 12, 100}) {
-                for (bool odd : {false, true}) moe_prefetch_rows(be, T, max_experts, odd);
+                for (bool odd : {false, true}) {
+                    moe_prefetch_rows(be, T, max_experts, odd, gate_q, up_q, down_q, router_q, post_rng);
+                }
             }
         }
     });
 }
 
 TEST_CASE(QnSplitFusionsFixture, q4k_rows) {
+    bool ready = false;
+    std::vector<uint8_t> gate_q, up_q;
+    std::mt19937 post_rng;
     each_gpu([&](ggml_backend_t be) {
+        if (!ready) {
+            std::mt19937 rng{1234};
+            gate_q = make_quant_bytes(GGML_TYPE_Q4_K, 2560, 640, 16, rng);
+            up_q = make_quant_bytes(GGML_TYPE_Q4_K, 2560, 640, 16, rng);
+            post_rng = rng;
+            ready = true;
+        }
         for (int T : {1, 2, 3, 4}) {
             for (int masked : {0, 6}) {
-                for (bool fused : {true, false}) q4k_rows(be, T, masked, fused);
+                for (bool fused : {true, false}) q4k_rows(be, T, masked, fused, gate_q, up_q, post_rng);
             }
         }
     });

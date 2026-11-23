@@ -26,10 +26,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 # of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
 # unit.
 ARG LUCE_CUDA_ARCHES="75;80;86;89;90;120"
+# Parallel nvcc threads per .cu compile. Ninja jobs are automatically scaled to
+# floor(nproc / LUCE_NVCC_THREADS) so total concurrent compiler threads stay
+# <= nproc and peak memory stays safe on 16 GB hosted runners.
+ARG LUCE_NVCC_THREADS=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        ccache \
         cmake \
         curl \
         git \
@@ -94,13 +99,31 @@ RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
 # binary at link time, instead of the default absolute build-tree paths.
 # Without this the binary loses its ggml shared libs after COPY to the
 # runtime stage (`libggml.so.0: cannot open shared object file`).
-RUN cmake -S /src/server -B /src/server/build \
+RUN --mount=type=cache,id=lucebox-ccache-cuda12,target=/root/.ccache \
+    export CCACHE_DIR=/root/.ccache \
+           CCACHE_MAXSIZE=2G \
+           CCACHE_COMPRESS=1 \
+           CCACHE_NOHASHDIR=true \
+           CCACHE_SLOPPINESS=time_macros,include_file_mtime \
+    && nvcc_threads="${LUCE_NVCC_THREADS}" \
+    && jobs=1 \
+    && if [ "$nvcc_threads" -gt 0 ] 2>/dev/null; then \
+           jobs=$(( $(nproc) / nvcc_threads )); \
+           if [ "$jobs" -lt 1 ]; then jobs=1; fi; \
+       fi \
+    && cmake -S /src/server -B /src/server/build \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DGGML_CCACHE=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_FLAGS="--threads=${nvcc_threads}" \
         -DLUCE_USER_CUDA_ARCHITECTURES="${LUCE_CUDA_ARCHES}" \
         -DCMAKE_CUDA_ARCHITECTURES="${LUCE_CUDA_ARCHES}" \
-    && cmake --build /src/server/build --target test_dflash luce_server test_server_unit --parallel
+    && cmake --build /src/server/build --target test_dflash luce_server test_server_unit -j "$jobs" \
+    && ccache -s
 
 # Prune the build tree to only what the runtime stage needs: the native server,
 # test_dflash, test_server_unit, and the ggml shared libs their embedded rpath

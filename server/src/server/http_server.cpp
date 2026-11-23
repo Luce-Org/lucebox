@@ -6819,7 +6819,8 @@ json HttpServer::memory_json() const {
 }
 
 bool HttpServer::think_tags_are_tokens() const {
-    return chat_codec_ && think_close_token(tokenizer_) >= 0;
+    return chat_codec_ &&
+        (think_close_token(tokenizer_) >= 0 || chat_codec_->id().rfind("inkling2/", 0) == 0);
 }
 
 bool HttpServer::save_generated_turn(

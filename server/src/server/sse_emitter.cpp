@@ -177,6 +177,103 @@ bool SseEmitter::suppress_undeclared_tool_protocol_token(
            raw_token == "<arg_value>" || raw_token == "</arg_value>";
 }
 
+int SseEmitter::consume_inkling_protocol_token(
+        const std::string & raw_token,
+        const std::string & piece_text,
+        std::string & out_text) {
+    // 0 = not Inkling protocol, 1 = skip, 2 = text, 3 = think tag
+    if (raw_token == "<|message_model|>") {
+        suppress_inkling_tool_ = false;
+        inkling_header_ = true;
+        inkling_header_name_.clear();
+        return 1;
+    }
+    if (inkling_header_) {
+        if (raw_token == "<|content_thinking|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            out_text = "<think>";
+            return 3;
+        }
+        if (raw_token == "<|content_text|>" ||
+            raw_token == "<|content_invoke_tool_text|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            if (mode_ == StreamMode::REASONING) {
+                out_text = "</think>\n";
+                return 3;
+            }
+            return 1;
+        }
+        if (raw_token == "<|content_invoke_tool_json|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
+                suppress_inkling_tool_ = true;
+                return 1;
+            }
+            out_text = "<|content_invoke_tool_json|>";
+            return 2;
+        }
+        if (raw_token == "<|end_message|>") {
+            inkling_header_ = false;
+            inkling_header_name_.clear();
+            return 1;
+        }
+        // Absorb optional header name (e.g. tool name between <|message_model|>
+        // and <|content_invoke_tool_json|>) so it never leaks into content.
+        if (!(raw_token.size() >= 2 && raw_token[0] == '<' && raw_token[1] == '|')) {
+            inkling_header_name_ += piece_text;
+            if (inkling_header_name_.size() > 128) {
+                // Safety fallback if the model went off-format without a content marker.
+                out_text = std::move(inkling_header_name_);
+                inkling_header_name_.clear();
+                inkling_header_ = false;
+                return 2;
+            }
+        }
+        return 1;
+    }
+    if (suppress_inkling_tool_) {
+        if (raw_token == "<|end_message|>") {
+            suppress_inkling_tool_ = false;
+        }
+        return 1;
+    }
+    if (raw_token == "<|content_thinking|>") {
+        out_text = "<think>";
+        return 3;
+    }
+    if (raw_token == "<|content_text|>" ||
+        raw_token == "<|content_invoke_tool_text|>") {
+        if (mode_ == StreamMode::REASONING) {
+            out_text = "</think>\n";
+            return 3;
+        }
+        return 1;
+    }
+    if (raw_token == "<|content_invoke_tool_json|>") {
+        if (!tool_calls_allowed_ || !has_request_tools(tools_)) {
+            suppress_inkling_tool_ = true;
+            return 1;
+        }
+        out_text = "<|content_invoke_tool_json|>";
+        return 2;
+    }
+    if (raw_token == "<|end_message|>") {
+        if (mode_ == StreamMode::REASONING) {
+            out_text = "</think>\n";
+            return 3;
+        }
+        if (mode_ == StreamMode::TOOL_BUFFER) {
+            out_text = "<|end_message|>";
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 // ─── SSE formatting helpers ─────────────────────────────────────────────
 
 std::string SseEmitter::sse_data(const std::string & json_str) {
@@ -673,25 +770,29 @@ void SseEmitter::emit_tool_buffer_text(std::vector<std::string> & out,
     if (text.empty()) return;
     size_t think_close = text.find(THINK_CLOSE);
     if (think_close != std::string::npos) {
-        std::string reasoning = text.substr(0, think_close);
-        std::string content = text.substr(think_close + THINK_CLOSE_LEN);
-        if (first_content_token_index_ == -1) {
-            first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
-        }
-        if (!reasoning.empty()) {
-            reasoning_text_ += reasoning;
-            emit_reasoning_delta(out, reasoning);
-        }
-        if (!content.empty()) {
-            accumulated_content_ += content;
-            emit_content_delta(out, content);
-        }
+        emit_thinking_then_content(out, text.substr(0, think_close), text.substr(think_close + THINK_CLOSE_LEN));
     } else if (tool_from_reasoning_) {
         reasoning_text_ += text;
         emit_reasoning_delta(out, text);
     } else {
         accumulated_content_ += text;
         emit_content_delta(out, text);
+    }
+}
+
+// The thinking up to its close, then the reply text after it.
+void SseEmitter::emit_thinking_then_content(std::vector<std::string> & out, const std::string & reasoning,
+                                            const std::string & content) {
+    if (first_content_token_index_ == -1) {
+        first_content_token_index_ = content.empty() ? emit_token_count_ : std::max(0, emit_token_count_ - 1);
+    }
+    if (!reasoning.empty()) {
+        reasoning_text_ += reasoning;
+        emit_reasoning_delta(out, reasoning);
+    }
+    if (!content.empty()) {
+        accumulated_content_ += content;
+        emit_content_delta(out, content);
     }
 }
 
@@ -726,6 +827,31 @@ void SseEmitter::emit_reasoning_delta(std::vector<std::string> & out,
     default:
         break;
     }
+}
+
+// ─── think_close_outside_calls ──────────────────────────────────────────
+//
+// The first </think> outside any tool-call block: in each format's call
+// wrapper, a function, or an argument value, more openers than closers
+// before it. A thinking that quotes whole calls closes after them; one that
+// quotes an opener alone never closes here (npos), as a call it then makes
+// would not either.
+static size_t think_close_outside_calls(const std::string & buf) {
+    static const std::pair<const char *, const char *> kBlocks[] = {
+        {"<tool_call>", "</tool_call>"},
+        {"<function=", "</function>"},
+        {"<arg_value>", "</arg_value>"},
+        {"<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"},
+        {"<｜DSML｜ calls>", "</｜DSML｜ calls>"},
+    };
+    std::vector<QuotedCall> blocks;
+    for (const auto & [open, close] : kBlocks) blocks.emplace_back(buf, 0, open, close);
+    for (size_t at = buf.find(THINK_CLOSE); at != std::string::npos; at = buf.find(THINK_CLOSE, at + 1)) {
+        bool inside = false;
+        for (QuotedCall & block : blocks) inside = block.open_before(at) || inside;
+        if (!inside) return at;
+    }
+    return std::string::npos;
 }
 
 // ─── find_top_level_think_close ─────────────────────────────────────────
@@ -901,6 +1027,30 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
     // Parse tool calls from buffer
     std::string fr = "stop";
+    // A codec's template puts the calls after the thinking, so tool syntax the
+    // thinking quotes is text when the thinking closes after it and the reply
+    // goes on (a model that reasons about a tool-call format quotes its tags).
+    // The thinking and the text before the calls go out now, without the blank
+    // lines around that text; the calls are read from the rest. A thinking
+    // followed by nothing keeps the calls it made.
+    if (mode_ == StreamMode::TOOL_BUFFER && chat_codec_ && tool_from_reasoning_) {
+        // Not a </think> inside a call (a command that greps for it).
+        const size_t think_close = think_close_outside_calls(tool_buffer_);
+        const auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        const size_t after = think_close == std::string::npos ? std::string::npos : think_close + THINK_CLOSE_LEN;
+        if (after != std::string::npos && tool_buffer_.find_first_not_of(" \t\r\n", after) != std::string::npos) {
+            size_t start = std::string::npos;
+            const size_t cut = find_tool_syntax_start(tool_buffer_.substr(after), tools_, start)
+                ? after + start : tool_buffer_.size();
+            size_t text_begin = after, text_end = cut;
+            while (text_begin < text_end && is_ws(tool_buffer_[text_begin])) ++text_begin;
+            while (text_end > text_begin && is_ws(tool_buffer_[text_end - 1])) --text_end;
+            emit_thinking_then_content(out, tool_buffer_.substr(0, think_close),
+                                       tool_buffer_.substr(text_begin, text_end - text_begin));
+            tool_buffer_.erase(0, cut);
+            tool_from_reasoning_ = false;
+        }
+    }
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
         ToolParseResult parsed;
         if (!chat_codec_ || !chat_codec_->parse_tool_calls(tool_buffer_, tools_, parsed)) {
