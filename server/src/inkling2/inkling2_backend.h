@@ -109,6 +109,7 @@ private:
     Inkling2Cache         cache_;
     int                   chunk_          = 512;
     int                   fitted_max_ctx_ = 0;
+    int                   fitted_remote_split_pos_ = -1;
     bool                  parked_         = false;
     bool                  released_       = false;
     std::vector<float>    last_logits_;

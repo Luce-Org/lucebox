@@ -145,9 +145,13 @@ bool Inkling2Backend::load_all() {
         fitted_max_ctx_ = max_ctx;
     }
 
-    if (!create_inkling2_cache(backend_, expert_backend_, weights_, max_ctx, chunk_, kv_type, cache_, err)) {
+    if (!create_inkling2_cache(backend_, expert_backend_, weights_, max_ctx, chunk_, kv_type, cache_, err,
+                               fitted_remote_split_pos_)) {
         std::fprintf(stderr, "[inkling2] %s\n", err.c_str());
         return false;
+    }
+    if (fitted_remote_split_pos_ < 0) {
+        fitted_remote_split_pos_ = cache_.remote_split_pos;
     }
 
     return true;
@@ -379,7 +383,7 @@ int Inkling2Backend::snapshot_cur_pos(int slot) const {
 GenerateResult Inkling2Backend::restore_and_generate_impl(int slot,
                                                           const GenerateRequest & req,
                                                           const DaemonIO & io) {
-    if (!snapshot_used(slot) || parked_ || released_) {
+    if (!snapshot_used(slot) || parked_ || released_ || cache_.remote_backend) {
         return generate_impl(req, io);
     }
     const Inkling2Snapshot & s = snapshots_[slot];

@@ -45,7 +45,8 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
                            int max_chunk,
                            ggml_type kv_type,
                            Inkling2Cache & out,
-                           std::string & error) {
+                           std::string & error,
+                           int fixed_remote_split_pos) {
     free_inkling2_cache(out);
     out.max_ctx = std::max(2048, max_ctx);
     out.kv_type = (kv_type == GGML_TYPE_F16 || kv_type == GGML_TYPE_Q8_0) ? kv_type : GGML_TYPE_Q8_0;
@@ -55,6 +56,7 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
     out.dspark_ctx_pos = 0;
 
     // Check whether global KV fits on target_backend or should split with expert_backend (Strix Halo).
+    // When fixed_remote_split_pos >= 0 (reinstate), replay the exact split boundary frozen at first load.
     const int n_global = (int) w.global_slots.size();
     const size_t kv_row_bytes = ggml_row_size(out.kv_type, w.head_dim);
     const size_t global_bytes_per_tok = (size_t) n_global * 2 * w.n_head_kv * kv_row_bytes;
@@ -66,25 +68,34 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
     out.global_local_cap = out.max_ctx;
 
     if (expert_backend && n_global > 0) {
-        const int tgpu = ggml_backend_cuda_get_device_id(target_backend);
-        size_t tfree = 0, ttotal = 0;
-        ggml_backend_cuda_get_device_memory(tgpu, &tfree, &ttotal);
-        const size_t need_global = (size_t) out.max_ctx * global_bytes_per_tok;
-        // Leave >= 4 GiB headroom on target for graph scratch, DSpark, activations, SWA & conv states
-        const size_t reserve = (size_t) 4 << 30;
-        if (tfree <= reserve || need_global > tfree - reserve) {
-            const size_t local_budget = tfree > reserve ? (tfree - reserve) / 2 : ((size_t) 512 << 20);
-            int local_toks = (int) std::min<size_t>(out.max_ctx, std::max<size_t>(4096, local_budget / std::max<size_t>(1, global_bytes_per_tok)));
-            local_toks = (local_toks / 256) * 256;
-            if (local_toks < out.max_ctx) {
+        if (fixed_remote_split_pos >= 0) {
+            if (fixed_remote_split_pos > 0 && fixed_remote_split_pos < out.max_ctx) {
                 out.remote_backend = expert_backend;
-                out.remote_split_pos = out.max_ctx - local_toks;
-                out.remote_cap = out.remote_split_pos;
-                out.global_local_cap = local_toks;
-                std::fprintf(stderr,
-                    "[inkling2] Split-KV Global Attention enabled: Strix=[0, %d) (%.2f GiB), Target=[%d, %d) (%.2f GiB)\n",
-                    out.remote_split_pos, (double) out.remote_cap * global_bytes_per_tok / 1073741824.0,
-                    out.remote_split_pos, out.max_ctx, (double) out.global_local_cap * global_bytes_per_tok / 1073741824.0);
+                out.remote_split_pos = fixed_remote_split_pos;
+                out.remote_cap = fixed_remote_split_pos;
+                out.global_local_cap = out.max_ctx - fixed_remote_split_pos;
+            }
+        } else {
+            const int tgpu = ggml_backend_cuda_get_device_id(target_backend);
+            size_t tfree = 0, ttotal = 0;
+            ggml_backend_cuda_get_device_memory(tgpu, &tfree, &ttotal);
+            const size_t need_global = (size_t) out.max_ctx * global_bytes_per_tok;
+            // Leave >= 4 GiB headroom on target for graph scratch, DSpark, activations, SWA & conv states
+            const size_t reserve = (size_t) 4 << 30;
+            if (tfree <= reserve || need_global > tfree - reserve) {
+                const size_t local_budget = tfree > reserve ? (tfree - reserve) / 2 : ((size_t) 512 << 20);
+                int local_toks = (int) std::min<size_t>(out.max_ctx, std::max<size_t>(4096, local_budget / std::max<size_t>(1, global_bytes_per_tok)));
+                local_toks = (local_toks / 256) * 256;
+                if (local_toks < out.max_ctx) {
+                    out.remote_backend = expert_backend;
+                    out.remote_split_pos = out.max_ctx - local_toks;
+                    out.remote_cap = out.remote_split_pos;
+                    out.global_local_cap = local_toks;
+                    std::fprintf(stderr,
+                        "[inkling2] Split-KV Global Attention enabled: Strix=[0, %d) (%.2f GiB), Target=[%d, %d) (%.2f GiB)\n",
+                        out.remote_split_pos, (double) out.remote_cap * global_bytes_per_tok / 1073741824.0,
+                        out.remote_split_pos, out.max_ctx, (double) out.global_local_cap * global_bytes_per_tok / 1073741824.0);
+                }
             }
         }
     }

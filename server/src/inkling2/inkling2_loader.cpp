@@ -564,6 +564,11 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
     }
 
     const uint8_t * base = mm_bytes + 8 + hdr_len;
+    const size_t data_bytes = mm.size() - (size_t) (8 + hdr_len);
+    if (!hdr.is_object()) {
+        error = "inkling2_dspark: safetensors header is not a JSON object in " + path;
+        return false;
+    }
     struct STEntry {
         std::string dtype;
         std::vector<int64_t> shape;
@@ -571,15 +576,29 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
         size_t len = 0;
     };
     std::unordered_map<std::string, STEntry> entries;
-    for (auto & it : hdr.items()) {
-        if (it.key() == "__metadata__") continue;
-        STEntry e;
-        e.dtype = it.value().at("dtype").get<std::string>();
-        e.shape = it.value().at("shape").get<std::vector<int64_t>>();
-        auto offs = it.value().at("data_offsets").get<std::vector<size_t>>();
-        e.off = offs[0];
-        e.len = offs[1] - offs[0];
-        entries[it.key()] = std::move(e);
+    try {
+        for (auto & it : hdr.items()) {
+            if (it.key() == "__metadata__") continue;
+            const auto & val = it.value();
+            if (!val.is_object() || !val.contains("dtype") || !val.contains("shape") || !val.contains("data_offsets")) {
+                error = "inkling2_dspark: malformed tensor entry " + it.key();
+                return false;
+            }
+            STEntry e;
+            e.dtype = val.at("dtype").get<std::string>();
+            e.shape = val.at("shape").get<std::vector<int64_t>>();
+            auto offs = val.at("data_offsets").get<std::vector<size_t>>();
+            if (offs.size() != 2 || offs[1] < offs[0] || offs[1] > data_bytes) {
+                error = "inkling2_dspark: out-of-bounds data_offsets for " + it.key();
+                return false;
+            }
+            e.off = offs[0];
+            e.len = offs[1] - offs[0];
+            entries[it.key()] = std::move(e);
+        }
+    } catch (const std::exception & ex) {
+        error = std::string("inkling2_dspark: header entry parse failed: ") + ex.what();
+        return false;
     }
 
     auto get_f32 = [&](const std::string & name, std::vector<float> & out_vec) -> bool {
@@ -589,20 +608,35 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
             return false;
         }
         const auto & e = it->second;
+        size_t elem_bytes = 0;
+        if (e.dtype == "BF16" || e.dtype == "F16") elem_bytes = 2;
+        else if (e.dtype == "F32") elem_bytes = 4;
+        else {
+            error = "inkling2_dspark: unsupported dtype " + e.dtype + " for " + name;
+            return false;
+        }
         size_t n = 1;
-        for (int64_t d : e.shape) n *= (size_t) d;
+        for (int64_t d : e.shape) {
+            if (d < 0 || (d > 0 && n > (SIZE_MAX / elem_bytes) / (size_t) d)) {
+                error = "inkling2_dspark: invalid shape for " + name;
+                return false;
+            }
+            n *= (size_t) d;
+        }
+        const size_t need_bytes = n * elem_bytes;
+        if (need_bytes > e.len || e.off > data_bytes || need_bytes > data_bytes - e.off) {
+            error = "inkling2_dspark: truncated tensor data for " + name;
+            return false;
+        }
         out_vec.resize(n);
         if (e.dtype == "BF16") {
             const auto * src = reinterpret_cast<const uint16_t *>(base + e.off);
             for (size_t i = 0; i < n; ++i) out_vec[i] = bf16_to_f32(src[i]);
         } else if (e.dtype == "F32") {
-            std::memcpy(out_vec.data(), base + e.off, n * sizeof(float));
-        } else if (e.dtype == "F16") {
+            std::memcpy(out_vec.data(), base + e.off, need_bytes);
+        } else {
             const auto * src = reinterpret_cast<const ggml_fp16_t *>(base + e.off);
             for (size_t i = 0; i < n; ++i) out_vec[i] = ggml_fp16_to_fp32(src[i]);
-        } else {
-            error = "inkling2_dspark: unsupported dtype " + e.dtype + " for " + name;
-            return false;
         }
         return true;
     };

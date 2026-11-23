@@ -1524,7 +1524,13 @@ bool inkling2_verify_rollback(
             ggml_build_forward_expand(dw.gf_rb, r);
         }
         dw.alloc_rb = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
-        if (!dw.alloc_rb || !ggml_gallocr_alloc_graph(dw.alloc_rb, dw.gf_rb)) return false;
+        if (!dw.alloc_rb || !ggml_gallocr_alloc_graph(dw.alloc_rb, dw.gf_rb)) {
+            if (dw.alloc_rb) { ggml_gallocr_free(dw.alloc_rb); dw.alloc_rb = nullptr; }
+            if (dw.ctx_rb)   { ggml_free(dw.ctx_rb); dw.ctx_rb = nullptr; }
+            dw.gf_rb = nullptr;
+            dw.rb_slot = nullptr;
+            return false;
+        }
         dw.rb_built = true;
     }
     const int32_t slot = retained - 1;
@@ -1795,6 +1801,9 @@ bool inkling2_dspark_draft(
         ws.alloc_draft = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
         if (!ws.alloc_draft || !ggml_gallocr_alloc_graph(ws.alloc_draft, ws.gf_draft)) {
             std::fprintf(stderr, "[inkling2] DSpark draft graph alloc failed\n");
+            if (ws.alloc_draft) { ggml_gallocr_free(ws.alloc_draft); ws.alloc_draft = nullptr; }
+            if (ws.ctx_draft)   { ggml_free(ws.ctx_draft); ws.ctx_draft = nullptr; }
+            ws.gf_draft = nullptr;
             return false;
         }
         ggml_backend_tensor_memset(ws.draft_zero_state, 0, 0, ggml_nbytes(ws.draft_zero_state));
