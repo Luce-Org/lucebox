@@ -22,6 +22,26 @@
 
 namespace {
 
+static int32_t paged_attn_partials_cap(int64_t output_rows, int32_t head_dim) {
+    constexpr int64_t budget = 256ll << 20;
+    const int64_t per_partition =
+        output_rows * ((int64_t) head_dim * (int64_t) sizeof(half) + (int64_t) sizeof(float2));
+    const int64_t cap = per_partition > 0 ? budget / per_partition : PAGED_ATTN_MAX_PARTITIONS;
+    return (int32_t) std::max<int64_t>(1, std::min<int64_t>(cap, PAGED_ATTN_MAX_PARTITIONS));
+}
+
+static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
+        int32_t n_blocks, int32_t min_partitions, int32_t cap) {
+    const int32_t context_partitions =
+        paged_attn_ceil_div(n_blocks, PAGED_ATTN_BLOCKS_PER_PARTITION);
+    const int32_t requested =
+        context_partitions > min_partitions
+            ? context_partitions
+            : min_partitions;
+    const int32_t available = n_blocks < cap ? n_blocks : cap;
+    return requested < available ? requested : available;
+}
+
 using pa_f16x8_t  = __attribute__((ext_vector_type(8)))  _Float16;
 using pa_f16x16_t = __attribute__((ext_vector_type(16))) _Float16;
 using pa_f32x8_t  = __attribute__((ext_vector_type(8)))  float;
@@ -370,14 +390,17 @@ __global__ void paged_attn_rdna_wmma_kernel(
                 }
             }
             phys_lds[tid] = phys;
-            const int inv = __any(phys < 0);
+            const int inv = (__any(phys < 0) ? 1 : 0) | (__all(phys < 0) ? 2 : 0);
             if (tid == 0) tile_inv_lds = inv;
         }
         __syncthreads();
 
         for (int32_t kv0 = token_begin; kv0 < token_end; kv0 += BN) {
-            const bool tile_has_inv = (tile_inv_lds != 0);
+            const int inv_flags     = tile_inv_lds;
+            const bool tile_has_inv = (inv_flags & 1) != 0;
+            const bool tile_all_inv = (inv_flags & 2) != 0;
 
+            if (!tile_all_inv) {
             // 1. Load K[kv0..kv0+31, 0..255] into XOR-swizzled KV_lds[32][256]
             {
                 constexpr int chunks_per_row = D / 8;
@@ -655,6 +678,11 @@ __global__ void paged_attn_rdna_wmma_kernel(
 #endif
             }
 
+            } else {
+                // Ensure every warp has read tile_inv_lds before next-tile pre-resolve overwrites it.
+                __syncthreads();
+            }
+
             // Pre-resolve next tile phys indices before end-of-tile barrier
             const int32_t next_kv0 = kv0 + BN;
             if (next_kv0 < token_end && tid < 32) {
@@ -674,7 +702,7 @@ __global__ void paged_attn_rdna_wmma_kernel(
                     }
                 }
                 phys_lds[tid] = phys;
-                const int inv = __any(phys < 0);
+                const int inv = (__any(phys < 0) ? 1 : 0) | (__all(phys < 0) ? 2 : 0);
                 if (tid == 0) tile_inv_lds = inv;
             }
             __syncthreads();
@@ -737,7 +765,7 @@ static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggm
         const char * e = getenv("LUCE_PAGED_WMMA");
         return !(e && atoi(e) == 0);
     }();
-    if (!enabled) {
+    if (!enabled || ggml_cuda_mmvq_batch_invariant()) {
         return false;
     }
 

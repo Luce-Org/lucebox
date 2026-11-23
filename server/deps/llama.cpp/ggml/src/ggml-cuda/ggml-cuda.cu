@@ -3930,11 +3930,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
 #if defined(GGML_USE_HIP)
-    } else if (!split && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
-    } else if (!split && ggml_cuda_small_m_gemm_supported(ctx.device, src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_small_m_gemm_supported(ctx.device, src0, src1, dst)) {
         ggml_cuda_small_m_gemm(ctx, src0, src1, dst);
-    } else if (!split && ggml_cuda_small_m_qgemm_supported(cc, src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_small_m_qgemm_supported(cc, src0, src1, dst)) {
         ggml_cuda_small_m_qgemm(ctx, src0, src1, dst);
 #endif // defined(GGML_USE_HIP)
     } else if (!split && use_mul_mat_q) {

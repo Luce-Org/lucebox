@@ -7,6 +7,7 @@
 #include "fattn-chunked.cuh"
 #include "fattn-rdna-wmma.cuh"
 #include "fattn.cuh"
+#include "mmvq.cuh"
 #include "ds4-env.cuh"
 #include "ds4-causal.h"
 #include "qsa.cuh"
@@ -4838,7 +4839,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT((dst->src[3] || !dst->src[5]) &&
         "sparse flash attention without a mask needs the qsa kernel");
 #if defined(GGML_USE_HIP)
-    if (ggml_cuda_fattn_rdna_wmma_supported(ggml_cuda_get_device(), dst)) {
+    if (!ggml_cuda_mmvq_batch_invariant() && ggml_cuda_fattn_rdna_wmma_supported(ggml_cuda_get_device(), dst)) {
         ggml_cuda_flash_attn_ext_rdna_wmma(ctx, dst);
         return;
     }
