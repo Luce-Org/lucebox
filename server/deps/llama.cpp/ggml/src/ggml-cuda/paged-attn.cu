@@ -1934,18 +1934,20 @@ static __global__ void paged_attn_wmma(
                     : row;
                 row_seq[j] = slot;
                 if (slot >= 0 && slot < n_table_seq) {
+                    const int32_t table_cap = max_blocks * block_size;
                     int32_t kv_len = *(const int32_t *) (kv_seq_lens + (int64_t) slot * ksl_nb0);
                     if (tree_sizes != nullptr && row >= tree_row_offset) {
-                        // Chain row: committed prefix plus its own node and the
-                        // nodes before it. A padding node (at or past the tree
-                        // size) is a dead row.
+                        // Chain row: committed prefix (capped to the table width)
+                        // plus its own node and the nodes before it in scratch. A
+                        // padding node (at or past the tree size) is a dead row.
                         const int32_t tree_local = row - tree_row_offset;
                         const int32_t tree_seq = tree_local / tree_width;
                         const int32_t node = tree_local - tree_seq * tree_width;
                         const int32_t tree_size = *(const int32_t *) (tree_sizes + (int64_t) tree_seq * tsz_nb0);
+                        const int32_t committed = kv_len < table_cap ? kv_len : table_cap;
                         row_chain[j] = true;
                         kv_len = tree_size >= 0 && tree_size <= tree_width && node < tree_size
-                            ? kv_len + node + 1 : 0;
+                            ? committed + node + 1 : 0;
                     } else if (has_pos) {
                         const int32_t pos = *(const int32_t *) (query_positions + (int64_t) row * qpos_nb0);
                         if (pos < 0) {
@@ -1957,7 +1959,7 @@ static __global__ void paged_attn_wmma(
                             kv_len = pos + 1;
                         }
                     }
-                    const int32_t cap = max_blocks * block_size;
+                    const int32_t cap = table_cap + (row_chain[j] ? tree_width : 0);
                     extent = kv_len > 0 ? (kv_len < cap ? kv_len : cap) : 0;
                 }
             } else {
@@ -2176,7 +2178,9 @@ static __global__ void paged_attn_wmma(
         }
         paged_attn_wmma_chain chain{INT32_MAX, 0, 0};
         if (seq_chain) {
-            chain.committed_len = *(const int32_t *) (kv_seq_lens + (int64_t) seq_s * ksl_nb0);
+            const int32_t committed_raw = *(const int32_t *) (kv_seq_lens + (int64_t) seq_s * ksl_nb0);
+            const int32_t table_cap = max_blocks * block_size;
+            chain.committed_len = committed_raw < table_cap ? committed_raw : table_cap;
             chain.scratch_row0  = tree_scratch_base + seq_s * tree_scratch_stride;
             chain.scratch_len   = tree_width;
         }
@@ -2547,13 +2551,25 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     // launch covers (the batch's longest context, as rounded by the caller).
     // The grid may shrink with the batch; the cut positions do not, and the
     // combine reads the dead partitions as exact zeros in fixed slots.
-    const int32_t n_logical_blocks =
-        std::min<int32_t>(paged_attn_ceil_div(max_kv_seq_len + tree_width, block_size), table_blocks);
+    // A chain launched at the very end of a full table carries its candidate
+    // rows in the scratch slab past table_blocks; cover those logical blocks
+    // and coarsen S if needed (mirroring the V_DOT2 route).
+    const int32_t committed_cap = table_blocks * block_size;
+    const int32_t extent_blocks =
+        table_blocks + (chain_mode ? paged_attn_ceil_div(tree_width, block_size) : 0);
+    const int32_t n_logical_blocks = std::min<int32_t>(
+        paged_attn_ceil_div(std::min<int32_t>(max_kv_seq_len, committed_cap) + tree_width, block_size),
+        extent_blocks);
     blocks_per_partition = paged_attn_occupancy_blocks_per_partition(
         blocks_per_partition, n_logical_blocks,
         (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 4,
         (int64_t) n_rows * n_head_kv, n_rows);
-    const int32_t max_partitions = paged_attn_ceil_div(table_blocks, blocks_per_partition);
+    while (paged_attn_ceil_div(n_logical_blocks, blocks_per_partition) >
+           PAGED_ATTN_WMMA_MAX_PARTITIONS) {
+        ++blocks_per_partition;
+    }
+    const int32_t max_partitions = paged_attn_ceil_div(
+        std::max<int32_t>(table_blocks, n_logical_blocks), blocks_per_partition);
     const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
         max_partitions, paged_attn_ceil_div(n_logical_blocks, blocks_per_partition)));
     // The direct path (f32 output) and the partials path (half partials, then
