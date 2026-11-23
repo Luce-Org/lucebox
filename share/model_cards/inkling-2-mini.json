@@ -1,7 +1,7 @@
 {
   "name": "Inkling 2 Mini",
   "source": "https://huggingface.co/thinkingmachines/Inkling-2-Mini",
-  "verified_at": "2026-11-21",
+  "verified_at": "2026-11-23",
   "chat_codec": "inkling2",
   "thinking_marker": "<|end_message|>",
   "thinking_terminator_hint": "<|end_message|><|message_model|><|content_text|>",
@@ -16,31 +16,60 @@
     "presence_penalty": 0.0,
     "repetition_penalty": 1.0
   },
+  "default_profile": [
+    "inkling2-r9700-strix",
+    "inkling2-r9700",
+    "inkling2-strix"
+  ],
   "profiles": {
     "inkling2-r9700-strix": {
-      "summary": "Inkling 2 Mini with full model + DSpark speculator on R9700 (gfx1201), adaptive speculation width, 3-pass wavefront prefill, and dynamic 74/26 MoE expert verify + 79/21 LM-head split + Split-KV Global Attention on Strix Halo (gfx1151)",
+      "summary": "Inkling 2 Mini on a Lucebox (R9700 gfx1201 + Strix Halo gfx1151): dense layers, KV cache, 3-pass wavefront prefill, and DSpark drafter on R9700 with parallel 74/26 MoE expert verify, 79/21 LM-head split, and Split-KV Global Attention on Strix Halo",
       "gpus": ["gfx1201", "gfx1151"],
+      "min_gpu_memory_gib": [30, 32],
       "flags": {
         "--target-device": "hip:0",
         "--expert-device": "hip:1",
-        "--max-ctx": "auto"
-      }
+        "--max-ctx": "auto",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Peak single-stream decode on Lucebox (up to 155.4 tok/s code, 136.5 tok/s HTTP greedy) with automatic thermal fallback to R9700-only if the shared APU slows down."
     },
     "inkling2-r9700": {
-      "summary": "Inkling 2 Mini monolithic on R9700 (gfx1201) with auto-discovered DSpark speculator and Q8_0 KV cache",
+      "summary": "Inkling 2 Mini monolithic on one R9700 (gfx1201) with auto-discovered DSpark speculator, 3-pass wavefront prefill, and Q8_0 KV cache (auto-fits up to 262K context in 32 GB)",
       "gpus": ["gfx1201"],
+      "min_gpu_memory_gib": [30],
       "flags": {
         "--target-device": "hip:0",
-        "--max-ctx": "65536"
-      }
+        "--max-ctx": "auto",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Default on R9700-only hosts, or selectable on a Lucebox with --profile inkling2-r9700 to leave Strix Halo free. Holds up to 262K Q8_0 KV (4,556 MiB) + 3,072 MiB DSpark in 32 GB VRAM."
     },
     "inkling2-strix": {
-      "summary": "Inkling 2 Mini monolithic on Strix Halo (gfx1151) with auto-discovered DSpark speculator and long context",
+      "summary": "Inkling 2 Mini monolithic on a Strix Halo-only host (gfx1151, hip:0) with auto-discovered DSpark speculator and 262K Q8_0 KV cache",
       "gpus": ["gfx1151"],
+      "min_gpu_memory_gib": [24],
+      "flags": {
+        "--target-device": "hip:0",
+        "--max-ctx": "262144",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Default on Strix Halo-only systems where gfx1151 is hip:0."
+    },
+    "inkling2-halo": {
+      "summary": "Inkling 2 Mini on a Lucebox's Strix Halo (gfx1151, hip:1) with auto-discovered DSpark speculator and 262K Q8_0 KV cache, leaving the R9700 (hip:0) free",
+      "gpus": ["gfx1201", "gfx1151"],
+      "min_gpu_memory_gib": [0, 24],
       "flags": {
         "--target-device": "hip:1",
-        "--max-ctx": "262144"
-      }
+        "--max-ctx": "262144",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Mirrors qwen38-halo: keeps hip:0 (R9700) free for image generation or another LLM while serving Inkling 2 Mini on hip:1."
     }
   },
   "notes": "Thinking Machines Lab Inkling 2 Mini (inkling2_loop, 24 physical layers -> 48 effective visits, 128 MoE top-8 with SITU, 40 SWA-1024 + 8 Global layers, bundled DSpark block-8 speculator in mtp.safetensors)."
