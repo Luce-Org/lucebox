@@ -192,10 +192,6 @@ static bool env_flag_disabled(const char * name) {
     return value && std::strcmp(value, "0") == 0;
 }
 
-static bool env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
-}
 
 // The expert usage profile that ranks placement: LUCE_DS4_HOTNESS_CSV, or
 // else the route counts earlier runs learned into LUCE_DS4_ROUTING_STATS_OUT.
@@ -1564,6 +1560,116 @@ bool DeepSeek4Backend::run_staged_chunk(StagedPrefill & item, int max_rows,
         error = "image encoding failed";
         return false;
     }
+    // Layer-major staged text prefill (+ decoder SWA bounded replay when
+    // LUCE_DS41_DECODER_BOUNDED_REPLAY=1): reads each expert weight matrix ONCE
+    // per layer per pass and skips layers > replay_cut for tokens before the
+    // final n_swa window (since import_deepseek4_paged_slot only imports the
+    // 128-row raw ring for layers past the deepest KV compressor source).
+    const int remaining = item.stop() - item.done;
+    if (!images && moe_hybrid_ && remaining >= 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+        constexpr int band_cfg = 1024;
+        const int cut = bounded_replay_cut();
+        const bool use_replay = (cut >= 0 && cut + 1 < w_.n_layer &&
+                                 item.cuts.empty() &&
+                                 item.prefix > w_.n_swa + 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+                                 w_.n_swa >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+                                 item.done < item.prefix - w_.n_swa);
+        const int replay_from = use_replay ? (item.prefix - w_.n_swa) : item.stop();
+        const int target_end  = use_replay ? replay_from : item.stop();
+        const int rem_target  = target_end - item.done;
+
+        const int dev_rows = deepseek4_layer_major_device_rows(cfg_.device.gpu, w_);
+        const int pass_cap = std::min({
+            rem_target,
+            std::max(max_rows, 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS),
+            DS4_LAYER_MAJOR_PROMPT_SPAN,
+            dev_rows >= 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ? dev_rows : DS4_LAYER_MAJOR_PROMPT_SPAN,
+        });
+        const int band_cap = std::min(band_cfg, std::max(DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS, hybrid_prefill_chunk_cap_));
+        std::vector<int> bands;
+        int span = 0;
+        while (span < pass_cap) {
+            const int left_pass = pass_cap - span;
+            const int left_total = rem_target - span;
+            int b = deepseek4_hybrid_prefill_step_tokens(band_cap, item.done + span, left_pass);
+            b = std::min(b, left_pass);
+            if (b < left_total && left_total - b < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+                if (left_total <= pass_cap && left_total <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) {
+                    b = left_total;
+                } else if (b > DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+                    b = left_total - DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+                }
+            }
+            if (b < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) break;
+            bands.push_back(b);
+            span += b;
+        }
+        const bool with_tail = use_replay && !bands.empty() && (item.done + span == replay_from);
+        const int tail_rows  = with_tail ? w_.n_swa : 0;
+        if ((bands.size() >= 2 || with_tail) && span > 0) {
+            const bool tail_merged = with_tail &&
+                bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+            if (tail_merged) bands.back() += tail_rows;
+            else if (with_tail) bands.push_back(tail_rows);
+
+            const int pass_rows = span + tail_rows;
+            std::vector<float> embed(size_t(pass_rows) * size_t(w_.n_embd));
+            if (!w_.embedder.embed(item.prompt.data() + item.done, pass_rows, embed.data())) {
+                error = "staged prefill embedding failed";
+                return false;
+            }
+            DeepSeek4LayerMajorTail replay_tail;
+            replay_tail.rows = tail_rows;
+            if (!deepseek4_prefill_layer_major(
+                    backend_, cfg_.device.gpu, w_, *item.staging, embed.data(),
+                    item.prompt.data() + item.done, item.done, bands, nullptr,
+                    moe_hybrid_.get(), expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                    routing_stats_.get(), use_replay ? (cut + 1) : -1,
+                    with_tail ? &replay_tail : nullptr)) {
+                error = "staged text layer-major prefill failed";
+                return false;
+            }
+            if (with_tail) {
+                item.staging->cur_pos = replay_from;
+                for (int il = cut + 1; il < w_.n_layer; ++il) {
+                    item.staging->layers[(size_t) il].swa_floor = replay_from;
+                }
+                DeepSeek4LayerMajorBand tail_band;
+                tail_band.staggered_pre = &replay_tail.pre;
+                tail_band.selection_first = replay_tail.selection_first;
+                tail_band.selection_columns = replay_tail.selection_columns;
+                item.staging->layer_major_band = &tail_band;
+                std::vector<float> hc_state;
+                const bool tail_ok = deepseek4_step_layer_range(
+                    backend_, cfg_.device.gpu, w_, *item.staging, hc_state,
+                    replay_tail.residual.data(), tail_rows, replay_from,
+                    cut + 1, w_.n_layer, nullptr,
+                    item.prompt.data() + replay_from, nullptr,
+                    /*allow_decode_graph_reuse=*/false, nullptr,
+                    moe_hybrid_.get(),
+                    expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                    routing_stats_.get(), vision::ImageSpanView{});
+                item.staging->layer_major_band = nullptr;
+                for (int il = cut + 1; il < w_.n_layer; ++il) {
+                    item.staging->layers[(size_t) il].swa_floor = 0;
+                }
+                if (!tail_ok) {
+                    error = "staged text bounded replay tail failed";
+                    return false;
+                }
+                std::fprintf(stderr,
+                             "[deepseek4] staged layer-major replay: %d+%d tokens (cut=%d) in %zu bands at pos=%d\n",
+                             span, tail_rows, cut, bands.size(), item.done);
+                item.done = item.prefix;
+                return true;
+            }
+            std::fprintf(stderr, "[deepseek4] staged layer-major prefill: %d tokens (layers 0-%d) in %zu bands at pos=%d\n",
+                         span, use_replay ? cut : (w_.n_layer - 1), bands.size(), item.done);
+            item.done += span;
+            return true;
+        }
+    }
+
     const int n = staged_chunk_rows(item, max_rows);
     if (n <= 0) {
         error = "staged prefill could not be chunked";
@@ -3080,7 +3186,7 @@ bool DeepSeek4Backend::init() {
                 // Text staging is an optimization: keep serving without it.
                 for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
                 image_staging_caches_.clear();
-                free_deepseek4_cache(cache_);  // paged text serving does not use it
+                free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;  // paged text serving does not use it
                 std::fprintf(stderr, "[deepseek4] staging caches do not fit (%d x ctx=%d): text prompts "
                                      "prefill in the batch\n", cfg_.max_concurrency, max_ctx);
             }
@@ -4174,7 +4280,7 @@ void DeepSeek4Backend::release_target_state(bool keep_snapshots) {
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
-    free_deepseek4_cache(cache_);
+    free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
     expert_runtime_.reset();
     expert_cache_.destroy();
     stream_engine_.destroy();
@@ -4321,7 +4427,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             std::fprintf(stderr,
                          "[deepseek4] unpark: failed to recreate KV cache (ctx=%d)\n",
                          max_ctx);
-            free_deepseek4_cache(cache_);
+            free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
             release_vision();
             free_deepseek4_weights(w_);
             expert_cache_.destroy();
@@ -4338,7 +4444,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 
         if (env_flag_enabled("LUCE_DS4_MOE_TP") &&
             !init_moe_tensor_parallel()) {
-            free_deepseek4_cache(cache_);
+            free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
             release_vision();
             free_deepseek4_weights(w_);
             expert_runtime_.reset();
@@ -4581,6 +4687,15 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     if (kv_offset == 0) {
         cache_has_images_ = images != nullptr;
         reset_deepseek4_cache(cache_);
+        live_tokens_.clear();
+        live_tokens_valid_ = (images == nullptr);
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
+    } else if (images != nullptr || cache_has_images_) {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
     }
     last_logits_.clear();
     last_logits_pos_ = -1;
@@ -4782,6 +4897,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                         expert_runtime_.compute ? &expert_runtime_ : nullptr, routing_stats_.get(),
                         replay ? replay_cut + 1 : -1, with_tail ? &replay_tail : nullptr)) {
                     std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+                    live_tokens_.clear();
+                    live_tokens_valid_ = false;
+                    live_source_gen_ = 0;
+                    live_source_pos_ = 0;
                     return -1;
                 }
                 if (with_tail) {
@@ -4799,6 +4918,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                     add_step_tel(tel_acc, step_tel);
                     steps += (int) bands.size();
                 }
+                if (live_tokens_valid_ && !images && pos <= (int) live_tokens_.size()) {
+                    live_tokens_.resize((size_t) pos);
+                    live_tokens_.insert(live_tokens_.end(), tokens.data() + i, tokens.data() + i + span);
+                } else {
+                    live_tokens_.clear();
+                    live_tokens_valid_ = false;
+                }
+                if (pos < live_source_pos_) live_source_pos_ = pos;
                 pos += span;
                 i += span;
                 continue;
@@ -4971,6 +5098,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         if (!ok) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+            live_source_gen_ = 0;
+            live_source_pos_ = 0;
             return -1;
         }
         if (timing) {
@@ -4980,6 +5111,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (need_logits) {
             last_logits_ = std::move(logits);
         }
+        if (live_tokens_valid_ && !images && pos <= (int) live_tokens_.size()) {
+            live_tokens_.resize((size_t) pos);
+            live_tokens_.insert(live_tokens_.end(), tokens.data() + i, tokens.data() + i + n_tok);
+        } else {
+            live_tokens_.clear();
+            live_tokens_valid_ = false;
+        }
+        if (pos < live_source_pos_) live_source_pos_ = pos;
         pos += n_tok;
         last_logits_pos_ = cache_.cur_pos;
         i += n_tok;
@@ -5618,7 +5757,7 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
     aux_in.n_logits = last_logits_.size();
     aux_in.spec_feat = feat_tail.empty() ? nullptr : feat_tail.data();
     aux_in.n_spec_feat = feat_tail.size();
-    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot], &aux_in)) {
+    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot], &aux_in, backend_)) {
         return false;
     }
 
@@ -5626,6 +5765,16 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
         auto & aux = snapshot_aux_[slot];
         aux.last_logits = last_logits_;
         aux.spec_feat_window = std::move(feat_tail);
+        aux.gen = next_snap_gen_++;
+        if (live_tokens_valid_ && (int) live_tokens_.size() >= cache_.cur_pos) {
+            aux.tokens.assign(live_tokens_.begin(), live_tokens_.begin() + cache_.cur_pos);
+            aux.has_tokens = true;
+        } else {
+            aux.tokens.clear();
+            aux.has_tokens = false;
+        }
+        live_source_gen_ = aux.gen;
+        live_source_pos_ = cache_.cur_pos;
         aux.used = true;
     } catch (const std::bad_alloc &) {
         snapshot_free(slot);
@@ -5872,6 +6021,9 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
             ggml_backend_tensor_get(snap.spec_feat_snap, aux.spec_feat_window.data(),
                                     0, aux.spec_feat_window.size() * sizeof(float));
         }
+        aux.gen = next_snap_gen_++;
+        aux.tokens.clear();
+        aux.has_tokens = false;
         aux.used = true;
     } catch (const std::bad_alloc &) {
         return reject("out of memory");
@@ -5903,13 +6055,43 @@ bool DeepSeek4Backend::snapshot_restore(int slot, int rows_slot) {
         return false;
     }
 
-    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from)) {
+    int skip_tokens = 0;
+    const auto & aux = snapshot_aux_[slot];
+    if (!cache_has_images_) {
+        if (live_tokens_valid_ && aux.has_tokens) {
+            const int max_cmp = std::min({cache_.cur_pos, snapshots_[slot].cur_pos,
+                                          (int) live_tokens_.size(), (int) aux.tokens.size()});
+            int lcp = 0;
+            while (lcp < max_cmp && live_tokens_[(size_t) lcp] == aux.tokens[(size_t) lcp]) {
+                ++lcp;
+            }
+            skip_tokens = std::max(skip_tokens, lcp);
+        }
+        if (live_source_gen_ != 0 && live_source_gen_ == aux.gen) {
+            skip_tokens = std::max(skip_tokens, std::min({live_source_pos_, cache_.cur_pos, snapshots_[slot].cur_pos}));
+        }
+    }
+    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_, rows_from, backend_,
+                                    skip_tokens, &w_.compress_ratios)) {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+        live_source_gen_ = 0;
+        live_source_pos_ = 0;
         return false;
     }
     last_logits_ = std::move(restored_logits);
     spec_feat_window_ = std::move(restored_features);
     last_logits_pos_ = cache_.cur_pos;
     cache_has_images_ = false;
+    if (aux.has_tokens) {
+        live_tokens_ = aux.tokens;
+        live_tokens_valid_ = true;
+    } else {
+        live_tokens_.clear();
+        live_tokens_valid_ = false;
+    }
+    live_source_gen_ = aux.gen;
+    live_source_pos_ = cache_.cur_pos;
     return true;
 }
 
@@ -6032,7 +6214,7 @@ void DeepSeek4Backend::shutdown() {
     free_deepseek4_paged_cache(paged_cache_);
     for (auto & cache : image_staging_caches_) free_deepseek4_cache(*cache);
     image_staging_caches_.clear();
-    free_deepseek4_cache(cache_);
+    free_deepseek4_cache(cache_); live_tokens_.clear(); live_tokens_valid_ = false; live_source_gen_ = 0; live_source_pos_ = 0;
     expert_runtime_.reset();
     expert_cache_.destroy();
     stream_engine_.destroy();

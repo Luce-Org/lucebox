@@ -351,3 +351,66 @@ __device__ __forceinline__ void mmb_dq_q51_pair(uint4 a, uint4 b, uint4 c, uint3
         }
     }
 }
+
+
+// One IQ4_XS sub-block (32 elements = 16 packed bytes + 8-byte superblock header), using register LUT + v_perm_b32.
+__device__ __forceinline__ void mmb_dq_iq4xs_one(const uint4 q, const uint32_t hdr0, const uint32_t hdr1, const int ib, uint32_t * out) {
+    const float d_sb = mmb_h2f((uint16_t)(hdr0 & 0xffffu));
+    const uint32_t sh = hdr0 >> 16;
+    const uint32_t ls = ((hdr1 >> (4 * ib)) & 0xFu) | (((sh >> (2 * ib)) & 3u) << 4);
+    const float d = d_sb * (float)((int)ls - 32);
+    const float md = -128.0f * d;
+    // kv + 128 = {1,24,45,63,79,93,106,118,129,141,153,166,181,197,217,241}
+    const uint32_t L0 = 0x3f2d1801u, L1 = 0x766a5d4fu, L2 = 0xa6998d81u, L3 = 0xf1d9c5b5u;
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t v = words[w];
+        const uint32_t nib[2] = { v & 0x0F0F0F0Fu, (v >> 4) & 0x0F0F0F0Fu };
+        float x[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint32_t n = nib[h];
+            const uint32_t sel = n & 0x07070707u;
+            const uint32_t pA = __builtin_amdgcn_perm(L1, L0, sel);
+            const uint32_t pB = __builtin_amdgcn_perm(L3, L2, sel);
+            const uint32_t m  = ((n >> 3) & 0x01010101u) * 0xFFu;
+            const uint32_t u  = (pA & ~m) | (pB & m);
+            x[h][0] = fmaf((float)(u & 0xFFu), d, md);
+            x[h][1] = fmaf((float)((u >> 8) & 0xFFu), d, md);
+            x[h][2] = fmaf((float)((u >> 16) & 0xFFu), d, md);
+            x[h][3] = fmaf((float)(u >> 24), d, md);
+        }
+        out[2*w]         = q4x_pack2(x[0][0], x[0][1]);
+        out[2*w + 1]     = q4x_pack2(x[0][2], x[0][3]);
+        out[8 + 2*w]     = q4x_pack2(x[1][0], x[1][1]);
+        out[8 + 2*w + 1] = q4x_pack2(x[1][2], x[1][3]);
+    }
+}
+
+// Decode 16 packed bytes of Q5_K + 16 bytes of qh into both nibble planes (2 threads cover a 64-element slice).
+__device__ __forceinline__ void mmb_dq_q5k_stripe(const uint4 q, const uint4 qh, const uint4 meta, const int slice, uint32_t * out) {
+    const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
+    auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
+    const uint32_t qwords[4]  = {q.x,  q.y,  q.z,  q.w};
+    const uint32_t hwords[4]  = {qh.x, qh.y, qh.z, qh.w};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int i = 2 * slice + half;
+        const uint32_t sc = i < 4 ? byte(i) & 63 : (byte(i + 4) & 15) | ((byte(i - 4) >> 6) << 4);
+        const uint32_t mn = i < 4 ? byte(i + 4) & 63 : (byte(i + 4) >> 4) | ((byte(i) >> 6) << 4);
+        const float ds = d * sc, ms = dm * mn;
+        const int hb_shift = 2 * slice + half;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t v = qwords[j] >> (4 * half);
+            const uint32_t h = hwords[j] >> hb_shift;
+            const int q0 = (v & 15)         | (((h      ) & 1) << 4);
+            const int q1 = ((v >>  8) & 15) | (((h >>  8) & 1) << 4);
+            const int q2 = ((v >> 16) & 15) | (((h >> 16) & 1) << 4);
+            const int q3 = ((v >> 24) & 15) | (((h >> 24) & 1) << 4);
+            out[16*half + 2*j]     = q4x_pack2(fmaf((float)q0, ds, -ms), fmaf((float)q1, ds, -ms));
+            out[16*half + 2*j + 1] = q4x_pack2(fmaf((float)q2, ds, -ms), fmaf((float)q3, ds, -ms));
+        }
+    }
+}

@@ -241,6 +241,11 @@ static void print_usage(const char * prog) {
         "                       Qwen3.6 targets with 16-token blocks, or DeepSeek4\n"
         "                       targets with 128-token blocks. This mode is experimental.\n"
         "  --routing-queue-limit <N> Maximum waiting auto requests (default: 32)\n"
+        "  --queue-limit <N>   Requests that may wait while every slot is busy;\n"
+        "                       past them a request gets 503 with Retry-After\n"
+        "                       before it is tokenized (default: no limit;\n"
+        "                       0: refuse while every slot is taken or promised).\n"
+        "                       One model only.\n"
         "  --decode-kv-offload-mb <auto|N> RAM budget for active KV suspension (default: auto)\n"
         "                              N is MiB; 0 disables.\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
@@ -329,7 +334,7 @@ static void print_usage(const char * prog) {
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
-        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: qk on qwen35 with --kvflash, else drafter)\n"
         "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -821,6 +826,19 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             const auto parsed = std::from_chars(value, end, sconfig.routing_queue_limit);
             if (parsed.ec != std::errc{} || parsed.ptr != end || sconfig.routing_queue_limit < 0) {
                 std::fprintf(stderr, "[server] --routing-queue-limit must be a nonnegative integer\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--queue-limit") == 0 && i + 1 < argc) {
+            if (load_balancing) {
+                std::fprintf(stderr, "[server] --queue-limit is for a server with one model; "
+                             "with several, --routing-queue-limit bounds the waiting requests\n");
+                return 2;
+            }
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, sconfig.queue_limit);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || sconfig.queue_limit < 0) {
+                std::fprintf(stderr, "[server] --queue-limit must be a nonnegative integer\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--decode-kv-offload-mb") == 0 && i + 1 < argc) {
@@ -1611,12 +1629,31 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+    // The shipped KVFlash recall settings come first, so an explicit
+    // --kvflash-policy below still replaces the policy default.
+    if (!model.kvflash_pool.empty()) {
+        const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
+        std::fprintf(stderr, "[kvflash] %s\n", luce::server::kvflash_recall_banner(arch, [](const char * k) {
+            const char * v = std::getenv(k);
+            return std::string(v ? v : "");
+        }).c_str());
+        apply_env_defaults("KVFlash recall", luce::server::kvflash_recall_env(arch));
+    }
     if (!model.kvflash_pool.empty())
         set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())
         set_environment_variable("LUCE_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
     if (!model.kvflash_tau.empty())
         set_environment_variable("LUCE_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
+    // /props.kvflash reads the variables the backend reads, once the flags above have set them.
+    if (const char * pool = std::getenv("LUCE_KVFLASH"); pool && *pool) {
+        const auto env = [](const char * k) { const char * v = std::getenv(k); return std::string(v ? v : ""); };
+        model.sconfig.kvflash_enabled     = true;
+        model.sconfig.kvflash_pool_tokens = std::max(0, std::atoi(pool));  // 0: "auto", sized at load
+        model.sconfig.kvflash_recall_mode = luce::server::kvflash_recall_mode(
+            inspect_gguf_model_info(model.bargs.model_path.c_str()).arch, env("LUCE_KVFLASH_PREFILL_RESELECT"),
+            env("LUCE_KVFLASH_POLICY"), env("LUCE_KVFLASH_RESELECT_SCORER"));
+    }
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);

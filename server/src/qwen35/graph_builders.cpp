@@ -386,7 +386,8 @@ bool build_target_step(
     bool compact_slots,
     int top_n,
     bool keep_base_ssm_state,
-    ggml_tensor * single_replay_slot_ids) {
+    ggml_tensor * single_replay_slot_ids,
+    bool capture_q_all) {
     step_graph_free(sg);
 
     // KEEP_BASE: only the single-sequence chain capture verify may
@@ -678,6 +679,7 @@ bool build_target_step(
     gi.active_slot_ids            = sg.active_slot_ids;
     gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
+    gi.q_capture_all              = capture_qk && capture_q_all;
     gi.n_seqs                     = n_seqs;
     gi.seq_slot                   = seq_slot;
     gi.paged_max_kv_len           = paged_max_kv_len;
@@ -700,28 +702,30 @@ bool build_target_step(
     gi.single_replay_slot_ids     = single_replay_slot_ids;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
-    if (!go.logits) return false;
+    if (!go.logits && logits_tail_rows >= 0) return false;
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
-    ggml_set_output(sg.logits);
+    if (sg.logits) {
+        ggml_set_output(sg.logits);
 
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+        ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
+        ggml_set_output(sg.argmax_tokens);
+        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
 
-    // Each row's top candidates, for a sampled verify under a top_k: the host
-    // draws from these few logits instead of reading the whole row.
-    if (top_n > 0 && top_n < sg.logits->ne[0] && ggml_is_contiguous(sg.logits)) {
-        sg.top_ids = ggml_top_k(sg.ctx, sg.logits, top_n);
-        sg.top_vals = ggml_get_rows(sg.ctx,
-            ggml_reshape_3d(sg.ctx, sg.logits, 1, sg.logits->ne[0], sg.logits->ne[1]),
-            sg.top_ids);
-        ggml_set_output(sg.top_ids);
-        ggml_set_output(sg.top_vals);
-        ggml_build_forward_expand(sg.gf, sg.top_ids);
-        ggml_build_forward_expand(sg.gf, sg.top_vals);
+        // Each row's top candidates, for a sampled verify under a top_k: the host
+        // draws from these few logits instead of reading the whole row.
+        if (top_n > 0 && top_n < sg.logits->ne[0] && ggml_is_contiguous(sg.logits)) {
+            sg.top_ids = ggml_top_k(sg.ctx, sg.logits, top_n);
+            sg.top_vals = ggml_get_rows(sg.ctx,
+                ggml_reshape_3d(sg.ctx, sg.logits, 1, sg.logits->ne[0], sg.logits->ne[1]),
+                sg.top_ids);
+            ggml_set_output(sg.top_ids);
+            ggml_set_output(sg.top_vals);
+            ggml_build_forward_expand(sg.gf, sg.top_ids);
+            ggml_build_forward_expand(sg.gf, sg.top_vals);
+        }
     }
 
     if (!sg.alloc) {

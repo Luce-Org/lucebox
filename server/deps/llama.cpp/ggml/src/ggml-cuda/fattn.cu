@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn-chunked.cuh"
+#include "fattn-rdna-wmma.cuh"
 #include "fattn.cuh"
 #include "ds4-env.cuh"
 #include "ds4-causal.h"
@@ -4836,6 +4837,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // DeepSeek4 has its own maskless kernel and returns above.
     GGML_ASSERT((dst->src[3] || !dst->src[5]) &&
         "sparse flash attention without a mask needs the qsa kernel");
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_fattn_rdna_wmma_supported(ggml_cuda_get_device(), dst)) {
+        ggml_cuda_flash_attn_ext_rdna_wmma(ctx, dst);
+        return;
+    }
+#endif
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

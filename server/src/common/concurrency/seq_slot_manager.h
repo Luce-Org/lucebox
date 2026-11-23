@@ -187,6 +187,13 @@ public:
 
     int slot_count() const { return (int)slots_.size(); }
     int max_context() const { return max_ctx_; }
+    // Free counts the blocks neither appended nor reserved by any slot; a
+    // parked slot holds none until it resumes.
+    SeqEngine::KvPoolTokens kv_pool_tokens() const {
+        const int64_t block = (int64_t)kv_.block_size();
+        return {(int64_t)kv_.physical_block_count() * block,
+                (int64_t)kv_.free_block_count() * block};
+    }
     int decoding_count() const;
     bool is_active(int slot) const;
     bool is_prefilling(int slot) const;

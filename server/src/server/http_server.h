@@ -35,6 +35,7 @@
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
+#include "engine_load.h"
 #include "sse_emitter.h"
 #include "pflash_unified.h"
 #include "pflash/pflash_selection.h"
@@ -121,6 +122,10 @@ struct ServerConfig {
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
     int         routing_queue_limit = 32; // waiting auto requests across the listener
+    // --queue-limit: the requests that may wait for this model while every
+    // slot is taken; past it a request is refused with 503 before it is
+    // tokenized. Negative: no limit.
+    int         queue_limit = -1;
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "luce";
@@ -243,6 +248,10 @@ struct ServerConfig {
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
+    // /props.kvflash: set by server_main from --kvflash; recall is on when the mode is not empty.
+    bool        kvflash_enabled     = false;
+    int         kvflash_pool_tokens = 0;       // 0 = off or "auto" (sized by the backend)
+    std::string kvflash_recall_mode;           // launch_profiles.h kvflash_recall_mode
     std::string arch;                  // detected model arch (qwen35/36, laguna, gemma4, ...)
     std::string model_path;            // bargs.model_path
     std::string draft_path;            // bargs.draft_path (empty if no draft)
@@ -620,6 +629,9 @@ struct ParsedRequest {
     // (tool_checks::with_note). The client never sends that conversation
     // back, so the pass keeps no checkpoint and no generated turn of it.
     bool                      tool_checks_note = false;
+    // A tool-checks pass waits in its request's place among the waiting,
+    // held from the --queue-limit gate (EngineLoad). Null otherwise.
+    EngineLoad::Place *       tool_checks_place = nullptr;
     // Original messages (for response formatting)
     json                      messages;
     // Original request body (for upstream proxy forwarding)
@@ -841,8 +853,9 @@ private:
                               RoutingAdmission * admission = nullptr);
     // Tool-use checks: the request runs as inner chat completions through
     // handle_model_request, and the checked reply goes to the client.
+    // `waiting`: the request's place, which each pass waits in.
     bool serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
-                                RoutingAdmission * admission);
+                                RoutingAdmission * admission, EngineLoad::Place & waiting);
     // One inner non-streaming chat completion. False when the router's
     // admission turned it away (nothing was sent); otherwise `status` and
     // `body` hold the HTTP response. When `client_fd` disconnects, the inner
@@ -858,13 +871,17 @@ private:
                                bool * dropped_tool_call = nullptr,
                                bool note_pass = false,
                                const nlohmann::ordered_json * ordered_tools = nullptr,
-                               const std::string & client = {});
+                               const std::string & client = {},
+                               EngineLoad::Place * waiting = nullptr);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
     void worker_loop();
     void process_job(ServerJob * job);
+    // The worker's one slot is free: called before the reply's last bytes go
+    // out, so the client's next request finds it free.
+    void release_serial_slot(ServerJob * job);
 
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
@@ -1036,9 +1053,10 @@ private:
         const GenTimings & gen_timings,
         ClientSendBuffer * send_buffer = nullptr,
         const luce::common::SpecAcceptanceStats * acceptance = nullptr);
+    // extra_headers: complete header lines, each ending in CRLF.
     std::string format_http_response(
         int status, const std::string & content_type,
-        const std::string & body);
+        const std::string & body, const std::string & extra_headers = {});
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -1087,13 +1105,18 @@ private:
     // Every token's text, built on first use and shared by all requests.
     std::shared_ptr<const ConstraintVocab> output_constraint_vocab();
     void log_parsed_request(const ParsedRequest & req) const;
+    // `waiting`: the request's place among the waiting, given up when it
+    // takes a slot.
     RoutingAdmission enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
-                                  bool report_admission = false);
+                                  bool report_admission = false,
+                                  EngineLoad::Place * waiting = nullptr);
 
     // Send HTTP response helpers.
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
-                       const std::string & body);
+                       const std::string & body, const std::string & extra_headers = {});
     bool send_error(SocketHandle fd, int status, const std::string & message);
+    // --queue-limit reached: 503 with Retry-After, in the request's API shape.
+    void send_queue_full(SocketHandle fd, const ParsedRequest & req);
     bool send_sse_headers(ServerJob * job);
 
     // Send raw bytes with stall detection.
@@ -1157,6 +1180,8 @@ private:
 
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;
+    // Slots, waiting requests and KV now, and the --queue-limit gate (/props "load").
+    EngineLoad load_;
 
     // SSE client connections for /status/events push.
     std::mutex             sse_mu_;
@@ -1302,6 +1327,9 @@ struct ServerJob {
     std::chrono::steady_clock::time_point last_stream_write{};
     std::atomic<bool> client_disconnected{false};
     ServerJob *   next = nullptr;
+    // The request's place among the waiting (EngineLoad), owned by the
+    // client thread; the serving thread gives it up when the job takes a slot.
+    EngineLoad::Place * waiting = nullptr;
 
     // Concurrent-scheduler state that survives a pool-full admission retry.
     // The classic worker leaves these fields untouched.

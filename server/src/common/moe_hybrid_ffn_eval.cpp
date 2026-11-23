@@ -1504,7 +1504,7 @@ bool build_moe_hybrid_ffn_graph(
     const auto mask_in_combine = [&](const MoeOwnerGraphSpec & owner) {
         return allow_fused_combine &&
                !canonical_route_join && dynamic_main_slots_x4 == 0 &&
-               !moe_owner_branch_tokenwise(owner, branch_rows) &&
+               (shared_rows || !moe_owner_branch_tokenwise(owner, branch_rows)) &&
                !moe_owner_takes_coarse_op(owner, desc);
     };
     if (!prepare_moe_owner_branch(
@@ -3191,7 +3191,17 @@ static bool eval_moe_owner_expert_major_batched(
             return false;
         }
 
-        ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        const bool cur_already_f16 = cur_backend && cur_backend->type == GGML_TYPE_F16;
+        const bool use_f16_pcie_in =
+            cur_backend && cur_backend_owner && cur_backend_owner != backend &&
+            !has_shared && !gate_up_tensor && gate_tensor && up_tensor &&
+            gate_tensor->type == up_tensor->type &&
+            desc.ffn_gate_exps_s == 1.0f && desc.ffn_up_exps_s == 1.0f &&
+            cur_backend->type == GGML_TYPE_F32 && ggml_is_contiguous(cur_backend) &&
+            side_copy_enabled() &&
+            ggml_backend_cuda_mix_wmma_f16_src1_supported(backend, gate_tensor, n_tokens, n_used);
+        ggml_tensor * inp = ggml_new_tensor_2d(
+            ctx, (cur_already_f16 || use_f16_pcie_in) ? GGML_TYPE_F16 : GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp);
 
         ggml_tensor * local_ids_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
@@ -3306,8 +3316,14 @@ static bool eval_moe_owner_expert_major_batched(
             if (cur_backend_owner) {
                 // A side-stream copy reads the routed input after this call
                 // returns: callers join this owner before they route again.
-                const bool side_copied = cur_backend_owner != backend && side_copy_enabled() &&
-                    ggml_backend_cuda_copy_tensor_async_side(cur_backend_owner, backend, cur_backend, inp);
+                bool side_copied = false;
+                if (use_f16_pcie_in) {
+                    side_copied = ggml_backend_cuda_copy_f32_to_f16_async_side(
+                        cur_backend_owner, backend, cur_backend, inp);
+                } else if (cur_backend_owner != backend && side_copy_enabled()) {
+                    side_copied = ggml_backend_cuda_copy_tensor_async_side(
+                        cur_backend_owner, backend, cur_backend, inp);
+                }
                 if (!side_copied) {
                     ggml_backend_tensor_copy_async(
                         cur_backend_owner, backend, cur_backend, inp);
@@ -4024,13 +4040,44 @@ bool eval_moe_hybrid_ffn_batched(
             vp.mem_size = 2 * ggml_tensor_overhead();
             vp.no_alloc = true;
             deferred->view_ctx = ggml_init(vp);
-            ggml_tensor * view = deferred->view_ctx
-                ? ggml_view_2d(deferred->view_ctx, defer->input, cfg.n_embd, n_tokens,
-                               defer->input->nb[1], 0)
-                : nullptr;
-            if (view && ggml_backend_view_init(view) == GGML_STATUS_SUCCESS &&
-                ggml_backend_cuda_copy_tensor_async_side(gpu_backend, storage.cold_backend,
-                                                         cur_backend, view)) {
+            const bool use_f16_defer =
+                cur_backend && cur_backend->type == GGML_TYPE_F32 && ggml_is_contiguous(cur_backend) &&
+                !storage.gate_up_cold && storage.gate_cold && storage.up_cold &&
+                storage.gate_cold->type == storage.up_cold->type &&
+                desc.ffn_gate_exps_s == 1.0f && desc.ffn_up_exps_s == 1.0f &&
+                ggml_backend_cuda_mix_wmma_f16_src1_supported(
+                    storage.cold_backend, storage.gate_cold, n_tokens, cfg.n_expert_used);
+            ggml_tensor * view = nullptr;
+            bool copied = false;
+            if (use_f16_defer && deferred->view_ctx) {
+                view = ggml_view_tensor(deferred->view_ctx, defer->input);
+                if (view) {
+                    view->type = GGML_TYPE_F16;
+                    view->ne[0] = cfg.n_embd;
+                    view->ne[1] = n_tokens;
+                    view->ne[2] = 1;
+                    view->ne[3] = 1;
+                    view->nb[0] = sizeof(ggml_fp16_t);
+                    view->nb[1] = (size_t) cfg.n_embd * sizeof(ggml_fp16_t);
+                    view->nb[2] = view->nb[1] * (size_t) n_tokens;
+                    view->nb[3] = view->nb[2];
+                    if (ggml_backend_view_init(view) == GGML_STATUS_SUCCESS &&
+                        ggml_backend_cuda_copy_f32_to_f16_async_side(
+                            gpu_backend, storage.cold_backend, cur_backend, view)) {
+                        copied = true;
+                    }
+                }
+            }
+            if (!copied) {
+                view = deferred->view_ctx
+                    ? ggml_view_2d(deferred->view_ctx, defer->input, cfg.n_embd, n_tokens,
+                                   defer->input->nb[1], 0)
+                    : nullptr;
+                copied = view && ggml_backend_view_init(view) == GGML_STATUS_SUCCESS &&
+                    ggml_backend_cuda_copy_tensor_async_side(gpu_backend, storage.cold_backend,
+                                                             cur_backend, view);
+            }
+            if (copied) {
                 deferred->input = view;
             } else {
                 defer = nullptr;  // no staging copy: join in this call

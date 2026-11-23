@@ -109,6 +109,7 @@ profile and the requirements checked at startup.
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFIX_CACHE_MAX_MIB` | auto | Container-entrypoint equivalent of `--prefix-cache-max-mib`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
+| `LUCE_QUEUE_LIMIT` | unset (no limit) | Container-entrypoint equivalent of `--queue-limit`; not read directly by the native binary. |
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
 | `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
 | `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name (unset: for a single model, the first of its card's default profiles whose GPUs, in HIP order, start the visible ones with the memory it needs; `none`: no profile), and extra `luce_server` flags split on whitespace. |
@@ -128,6 +129,14 @@ profile and the requirements checked at startup.
 | `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
 | `LUCE_PC_DEEP_FIRST_MIN` | 4096 | KILL SWITCH (burn-in): tail length, in tokens past a short system/tools head, at which a tool request's first turn is snapshotted whole instead of at the head, so the first follow-up only prefills the new turn. =0 keeps the head pin. Not applied when a forced pin is still ahead of the restored prefix or the whole prompt cannot fit the resident budget. |
 | `LUCE_PC_DEEP_FIRST_MAX_HEAD` | 2048 | Longest system/tools head (tokens) that gives up its own pin for the whole-prompt snapshot above; longer heads keep the head pin. |
+| `LUCE_KVFLASH_PREFILL_RESELECT` | 4 with `--kvflash` on qwen35, else 0 | Recall mode of the serial KVFlash pool. 0 off (recency pool only), 4 reselects by the exact attention mass at the last user turn before writing it. Other values are off. Needs the qk policy. Off under tensor parallelism. |
+| `LUCE_KVFLASH_RESELECT_SCORER` | `exact` with `--kvflash` on qwen35 | The scorer mode 4 needs: `exact`. A mismatch turns recall off and logs why. |
+| `LUCE_KVFLASH_RECALL_BLOCKS` | 6 with `--kvflash` on qwen35, else 0 | A/B: recall budget in 10-chunk blocks (10 x N chunks) kept beside the newest chunks; `LUCE_KVFLASH_SELECT_UNIT` sets the size of each picked unit, so the defaults (6, unit 2) pick 30 units of 2 chunks. 0 keeps the pool on recency plus the exact scores of the newest chunks only; it is not a plain recency pool under mode 4. A pool too small for the preamble pins, the recall and the turn runs as a recency pool (logged). |
+| `LUCE_KVFLASH_SELECT_UNIT` | 2 with `--kvflash` on qwen35, else 10 | A/B: chunks per recall unit; the recall budget stays 10 x `LUCE_KVFLASH_RECALL_BLOCKS` chunks. |
+| `LUCE_KVFLASH_SCORE_POOL_RECENT` | 1 with `--kvflash` on qwen35, else 0 | A/B: =1 scores mode 4 on the recency pool, so the first pass of a request does not run under the previous request's pool. =0 turns that off. |
+| `LUCE_KVFLASH_PREAMBLE_ROWS` | 1152 with `--kvflash` on qwen35, else 0 | Pool rows (rounded up to a chunk) reserved inside `--kvflash N` for the pinned system+tools preamble, so the history budget is N minus the reserve and the pool, and the decode cost, stay N. A reserve that leaves no history row (>= N) turns the pin off with a log line. 0 turns the pin off. |
+| `LUCE_KVFLASH_UQ_QUERIES` | 64 with `--kvflash` on qwen35, else 0 | The last N (at most 64) queries of the latest human turn join the selector's queries. 0 off. Serial path only; off under tensor parallelism. |
+| `LUCE_KVFLASH_GPU_SCORE_FUSED` | 1 | KILL SWITCH: mode 4's exact GPU scorer runs the fused chunk-mass kernel and keeps the evicted K it reads on the device between calls (about 1.06 MiB of VRAM per evicted chunk at q8_0, taken only under the scorer's free-memory guard). Used when the KV cache K is q8_0 with a head dim that is a multiple of 32 and at most 256; any other K, a kernel failure, or =0 scores with the logits graph and uploads the evicted K on every call, as before. |
 
 ## Full inventory (generated)
 
@@ -136,6 +145,14 @@ profile and the requirements checked at startup.
 - `LUCE_CHUNKED` - qwen35_target_graph.cpp
 - `LUCE_DRAFT_FP16` - draft_safetensors_loader.cpp
 - `LUCE_DRAFT_SWA` - server_main.cpp
+- `LUCE_KVFLASH_PREAMBLE_ROWS` - kvflash_prefill_reselect.h
+- `LUCE_KVFLASH_PREFILL_RESELECT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_RECALL_BLOCKS` - qwen35_backend.cpp
+- `LUCE_KVFLASH_RESELECT_SCORER` - qwen35_backend.cpp
+- `LUCE_KVFLASH_SCORE_POOL_RECENT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_SELECT_UNIT` - qwen35_backend.cpp
+- `LUCE_KVFLASH_GPU_SCORE_FUSED` - qwen35_backend.cpp
+- `LUCE_KVFLASH_UQ_QUERIES` - kvflash_query_capture.h
 - `LUCE_KV_F16` - kv_quant.cpp
 - `LUCE_KV_K` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_KV_Q4` - kv_quant.cpp
@@ -382,6 +399,7 @@ profile and the requirements checked at startup.
 - `LUCE_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `LUCE_PREFIX_CACHE_MAX_MIB` - scripts/entrypoint.sh (maps to `--prefix-cache-max-mib`)
 - `LUCE_PROFILE` - scripts/entrypoint.sh (maps to `--profile`)
+- `LUCE_QUEUE_LIMIT` - scripts/entrypoint.sh (maps to `--queue-limit`)
 - `LUCE_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `LUCE_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp

@@ -22,6 +22,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/launch_profiles.h"
 #include "server/api_adapters.h"
 #include "server/image_input.h"
 #include "qwen35/qwen35_backend.h"
@@ -17379,6 +17380,46 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     TEST_ASSERT(body["budget_envelope"]["model_card_source"] == "share/model_cards/qwen3.6-27b.json");
 }
 
+TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_backends_reselect_mode) {
+    using luce::server::kvflash_recall_mode;
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "exact") == "prefill-reselect=4");  // the default profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", "exact").empty());   // --kvflash-policy lru turns recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "pflash2").empty());  // mode 4 needs the exact scorer
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", "exact").empty());    // retired mode
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", "exact").empty());    // the user turned recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", "exact").empty());
+    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", "exact").empty());    // no recall on other architectures
+}
+
+TEST_CASE(ServerUnitFixture, test_props_kvflash_disabled_without_the_flag) {
+    ServerConfig cfg;
+    cfg.arch = "qwen35";
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body.contains("kvflash"));
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>() == false);
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 0);
+    TEST_ASSERT(body["kvflash"]["mode"].is_string());
+    TEST_ASSERT(body["kvflash"]["mode"].get<std::string>().empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_props_kvflash_reports_pool_and_recall) {
+    ServerConfig cfg;
+    cfg.arch                = "qwen35";
+    cfg.kvflash_enabled     = true;
+    cfg.kvflash_pool_tokens = 16384;
+    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk", "exact");
+    Tokenizer   tok;
+    PrefixCache pc(0, tok);
+    ToolMemory  tm;
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["kvflash"]["enabled"].get<bool>());
+    TEST_ASSERT(body["kvflash"]["pool_tokens"].get<int>() == 16384);
+    TEST_ASSERT(body["kvflash"]["mode"].get<std::string>() == "prefill-reselect=4");
+}
+
 TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     // When family or hard fallback was used (no sidecar), /props.model_card
     // is JSON null. The budget_envelope still carries the resolved values.
@@ -18901,6 +18942,33 @@ TEST_CASE(ServerUnitFixture, test_eos_at_cap_finishes_as_stop) {
                 TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (eos ? "stop" : "length"), body.dump());
             } else {
                 TEST_ASSERT_MSG(body["stop_reason"] == (eos ? "end_turn" : "max_tokens"), body.dump());
+            }
+        }
+    }
+}
+
+// With ignore_eos an end token does not stop the generation, so one on the cap token was cut off.
+TEST_CASE(ServerUnitFixture, test_ignore_eos_at_cap_finishes_as_length) {
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(write_deepseek_marker_tokenizer_fixture().c_str()));  // eos id 2
+    GenerateResult result;
+    result.succeed();
+    result.tokens = {0, 0, tok.eos_id()};
+    const GenTimings timings{};
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::ANTHROPIC, ApiFormat::RESPONSES}) {
+        for (const bool ignore_eos : {false, true}) {
+            ParsedRequest req;
+            req.format = format;
+            req.raw_body = {{"ignore_eos", ignore_eos}};
+            auto em = make_emitter(format);
+            em.emit_start();
+            const json body = build_non_streaming_response(req, result, /*generation_cap=*/3, timings, tok, em);
+            if (format == ApiFormat::OPENAI_CHAT) {
+                TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (ignore_eos ? "length" : "stop"), body.dump());
+            } else if (format == ApiFormat::ANTHROPIC) {
+                TEST_ASSERT_MSG(body["stop_reason"] == (ignore_eos ? "max_tokens" : "end_turn"), body.dump());
+            } else {
+                TEST_ASSERT_MSG(body["status"] == (ignore_eos ? "incomplete" : "completed"), body.dump());
             }
         }
     }

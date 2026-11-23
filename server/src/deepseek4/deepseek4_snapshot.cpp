@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -71,42 +72,58 @@ size_t prefix_bytes(const ggml_tensor * t, int rows) {
     return (size_t) rows * t->nb[1];
 }
 
-bool copy_prefix_from_backend(const ggml_tensor * src, ggml_tensor * dst, int rows) {
+bool copy_prefix_from_backend(const ggml_tensor * src, ggml_tensor * dst, int rows, ggml_backend_t be = nullptr) {
     if (!src || !dst || rows < 0) return false;
     const size_t bytes = prefix_bytes(src, rows);
     if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_get(src, dst->data, 0, bytes);
+    if (bytes > 0) {
+        if (be) ggml_backend_tensor_get_async(be, src, dst->data, 0, bytes);
+        else    ggml_backend_tensor_get(src, dst->data, 0, bytes);
+    }
     return true;
 }
 
-bool copy_prefix_to_backend(const ggml_tensor * src, ggml_tensor * dst, int rows) {
-    if (!src || !dst || rows < 0) return false;
-    const size_t bytes = prefix_bytes(src, rows);
-    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_set(dst, src->data, 0, bytes);
+bool copy_range_to_backend(const ggml_tensor * src, ggml_tensor * dst, int start_row, int end_row, ggml_backend_t be = nullptr) {
+    if (!src || !dst || start_row < 0 || end_row < start_row) return false;
+    if (start_row == end_row) return true;
+    const size_t src_off = (size_t) start_row * src->nb[1];
+    const size_t dst_off = (size_t) start_row * dst->nb[1];
+    const size_t bytes   = (size_t) (end_row - start_row) * dst->nb[1];
+    if (src->nb[1] != dst->nb[1] || src_off + bytes > ggml_nbytes(src) || dst_off + bytes > ggml_nbytes(dst)) {
+        return false;
+    }
+    if (bytes > 0) {
+        const char * src_ptr = (const char *) src->data + src_off;
+        if (be) ggml_backend_tensor_set_async(be, dst, src_ptr, dst_off, bytes);
+        else    ggml_backend_tensor_set(dst, src_ptr, dst_off, bytes);
+    }
     return true;
 }
 
-bool copy_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
+bool copy_from_backend(const ggml_tensor * src, ggml_tensor * dst, ggml_backend_t be = nullptr) {
     if (!src || !dst || ggml_nbytes(src) != ggml_nbytes(dst)) return false;
-    ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
+    const size_t bytes = ggml_nbytes(src);
+    if (be) ggml_backend_tensor_get_async(be, src, dst->data, 0, bytes);
+    else    ggml_backend_tensor_get(src, dst->data, 0, bytes);
     return true;
 }
 
-bool copy_to_backend(const ggml_tensor * src, ggml_tensor * dst) {
+bool copy_to_backend(const ggml_tensor * src, ggml_tensor * dst, ggml_backend_t be = nullptr) {
     if (!src || !dst || ggml_nbytes(src) != ggml_nbytes(dst)) return false;
-    ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+    const size_t bytes = ggml_nbytes(src);
+    if (be) ggml_backend_tensor_set_async(be, dst, src->data, 0, bytes);
+    else    ggml_backend_tensor_set(dst, src->data, 0, bytes);
     return true;
 }
 
 // Optional pair copy: both null is fine, one null is not.
-bool copy_opt_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
+bool copy_opt_from_backend(const ggml_tensor * src, ggml_tensor * dst, ggml_backend_t be = nullptr) {
     if (!src && !dst) return true;
-    return copy_from_backend(src, dst);
+    return copy_from_backend(src, dst, be);
 }
-bool copy_opt_to_backend(const ggml_tensor * src, ggml_tensor * dst) {
+bool copy_opt_to_backend(const ggml_tensor * src, ggml_tensor * dst, ggml_backend_t be = nullptr) {
     if (!src && !dst) return true;
-    return copy_to_backend(src, dst);
+    return copy_to_backend(src, dst, be);
 }
 
 bool tensors_compatible(const ggml_tensor * a, const ggml_tensor * b) {
@@ -325,28 +342,32 @@ bool deepseek4_snapshot_declare_at(ggml_context * ctx,
 
 bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
                              const DeepSeek4SnapshotAux * aux,
-                             DeepSeek4Snapshot & out) {
+                             DeepSeek4Snapshot & out,
+                             ggml_backend_t cache_backend,
+                             bool sync_backend) {
     if (!cache.ctx || !cache.hc_state || out.layers.size() != cache.layers.size() ||
         !out.hc_state_snap || !out.hc_state_snap->data) {
         return false;
     }
-    if (!copy_from_backend(cache.hc_state, out.hc_state_snap)) return false;
+    if (!copy_from_backend(cache.hc_state, out.hc_state_snap, cache_backend)) return false;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const auto & src = cache.layers[il];
         auto & dst = out.layers[il];
         dst.n_comp = src.n_comp;
         dst.n_index_comp = src.n_index_comp;
-        if (!copy_from_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv && !copy_prefix_from_backend(src.comp_kv, dst.comp_kv, src.n_comp)) ||
+        if (!copy_from_backend(src.raw_kv, dst.raw_kv, cache_backend) ||
+            (src.comp_kv && !copy_prefix_from_backend(src.comp_kv, dst.comp_kv, src.n_comp, cache_backend)) ||
             (src.index_comp_kv &&
-             !copy_prefix_from_backend(src.index_comp_kv, dst.index_comp_kv, src.n_index_comp)) ||
-            !copy_opt_from_backend(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
-            !copy_opt_from_backend(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
-            !copy_opt_from_backend(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||
-            !copy_opt_from_backend(src.indexer_compressor.state_score, dst.indexer_compressor.state_score)) {
+             !copy_prefix_from_backend(src.index_comp_kv, dst.index_comp_kv, src.n_index_comp, cache_backend)) ||
+            !copy_opt_from_backend(src.attn_compressor.state_kv, dst.attn_compressor.state_kv, cache_backend) ||
+            !copy_opt_from_backend(src.attn_compressor.state_score, dst.attn_compressor.state_score, cache_backend) ||
+            !copy_opt_from_backend(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv, cache_backend) ||
+            !copy_opt_from_backend(src.indexer_compressor.state_score, dst.indexer_compressor.state_score, cache_backend)) {
+            if (cache_backend) ggml_backend_synchronize(cache_backend);
             return false;
         }
     }
+    if (sync_backend && cache_backend) ggml_backend_synchronize(cache_backend);
 
     if (out.meta_snap) {
         if (!out.last_logits_snap || !out.spec_feat_snap) return false;
@@ -393,7 +414,8 @@ bool deepseek4_snapshot_fill(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out,
-                             const DeepSeek4SnapshotAux * aux) {
+                             const DeepSeek4SnapshotAux * aux,
+                             ggml_backend_t cache_backend) {
     free_deepseek4_snapshot(out);
     if (!snapshot_backend) return false;
 
@@ -421,7 +443,7 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
     out.ctx = ctx;
     out.buf = buf;
     out.owns_storage = true;
-    if (!deepseek4_snapshot_fill(cache, aux, out)) {
+    if (!deepseek4_snapshot_fill(cache, aux, out, cache_backend)) {
         free_deepseek4_snapshot(out);
         return false;
     }
@@ -497,7 +519,11 @@ bool deepseek4_snapshot_drop_rows(DeepSeek4Snapshot & snap) {
 
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache,
-                                const DeepSeek4Snapshot * rows_from) {
+                                const DeepSeek4Snapshot * rows_from,
+                                ggml_backend_t cache_backend,
+                                int skip_prefix_tokens,
+                                const std::vector<uint32_t> * compress_ratios,
+                                bool sync_backend) {
     if (snap.state_only) {
         if (!rows_from || rows_from == &snap || !rows_from->ctx || rows_from->state_only ||
             rows_from->cur_pos < snap.cur_pos ||
@@ -564,28 +590,46 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
         }
     }
 
-    if (!copy_to_backend(snap.hc_state_snap, cache.hc_state)) {
+    if (!copy_to_backend(snap.hc_state_snap, cache.hc_state, cache_backend)) {
         std::fprintf(stderr, "[deepseek4] snapshot restore: HC copy failed\n");
         return false;
     }
+    const int eff_skip = (compress_ratios && skip_prefix_tokens > 0)
+        ? std::min(skip_prefix_tokens, snap.cur_pos) : 0;
+
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const auto & src = snap.layers[il];
         const auto & rows = rows_of(il);
         auto & dst = cache.layers[il];
-        if (!copy_to_backend(src.raw_kv, dst.raw_kv) ||
-            (rows.comp_kv && !copy_prefix_to_backend(rows.comp_kv, dst.comp_kv, src.n_comp)) ||
+        int skip_comp = 0;
+        int skip_idx  = 0;
+        if (eff_skip > 0 && il < compress_ratios->size()) {
+            const uint32_t ratio = (*compress_ratios)[il];
+            if (ratio > 0 && rows.comp_kv) {
+                skip_comp = std::min({src.n_comp, dst.n_comp, eff_skip / (int) ratio});
+                if (skip_comp < 0) skip_comp = 0;
+            }
+            if (ratio > 0 && rows.index_comp_kv) {
+                skip_idx = std::min({src.n_index_comp, dst.n_index_comp, eff_skip / (int) ratio});
+                if (skip_idx < 0) skip_idx = 0;
+            }
+        }
+        if (!copy_to_backend(src.raw_kv, dst.raw_kv, cache_backend) ||
+            (rows.comp_kv && !copy_range_to_backend(rows.comp_kv, dst.comp_kv, skip_comp, src.n_comp, cache_backend)) ||
             (rows.index_comp_kv &&
-             !copy_prefix_to_backend(rows.index_comp_kv, dst.index_comp_kv, src.n_index_comp)) ||
-            !copy_opt_to_backend(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
-            !copy_opt_to_backend(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
-            !copy_opt_to_backend(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||
-            !copy_opt_to_backend(src.indexer_compressor.state_score, dst.indexer_compressor.state_score)) {
+             !copy_range_to_backend(rows.index_comp_kv, dst.index_comp_kv, skip_idx, src.n_index_comp, cache_backend)) ||
+            !copy_opt_to_backend(src.attn_compressor.state_kv, dst.attn_compressor.state_kv, cache_backend) ||
+            !copy_opt_to_backend(src.attn_compressor.state_score, dst.attn_compressor.state_score, cache_backend) ||
+            !copy_opt_to_backend(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv, cache_backend) ||
+            !copy_opt_to_backend(src.indexer_compressor.state_score, dst.indexer_compressor.state_score, cache_backend)) {
+            if (cache_backend) ggml_backend_synchronize(cache_backend);
             std::fprintf(stderr, "[deepseek4] snapshot restore: layer %zu copy failed\n", il);
             return false;
         }
         dst.n_comp = src.n_comp;
         dst.n_index_comp = src.n_index_comp;
     }
+    if (sync_backend && cache_backend) ggml_backend_synchronize(cache_backend);
     cache.cur_pos = snap.cur_pos;
     cache.engram_tokens = snap.engram_tokens;
     return true;

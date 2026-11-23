@@ -21,7 +21,6 @@ import os
 import re
 import statistics
 import struct
-import time
 from pathlib import Path
 
 from tokenizers import Tokenizer
