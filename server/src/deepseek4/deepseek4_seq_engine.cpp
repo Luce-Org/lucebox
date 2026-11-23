@@ -383,8 +383,8 @@ bool DeepSeek4SeqEngine::staging_in_flight(int slot) const {
 }
 
 namespace {
-constexpr int kHybridStagedRowsWithDecode = 1024;
-constexpr int kHybridStagedRowsWithoutDecode = 2048;
+constexpr int kHybridStagedRowsWithDecode = 8192;
+constexpr int kHybridStagedRowsWithoutDecode = 16000;
 // A prompt or context this long gets the decode graphs and pools cleared
 // before its prefill and after it retires.
 constexpr int kLongStagedPromptTokens = 4096;

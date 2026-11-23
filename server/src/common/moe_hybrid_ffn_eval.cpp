@@ -1504,7 +1504,7 @@ bool build_moe_hybrid_ffn_graph(
     const auto mask_in_combine = [&](const MoeOwnerGraphSpec & owner) {
         return allow_fused_combine &&
                !canonical_route_join && dynamic_main_slots_x4 == 0 &&
-               !moe_owner_branch_tokenwise(owner, branch_rows) &&
+               (shared_rows || !moe_owner_branch_tokenwise(owner, branch_rows)) &&
                !moe_owner_takes_coarse_op(owner, desc);
     };
     if (!prepare_moe_owner_branch(
