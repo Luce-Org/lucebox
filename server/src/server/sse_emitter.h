@@ -50,10 +50,13 @@ struct GenTimings {
     // PFlash compression details (compress time, kept/served tokens, the
     // multi-turn view and drafter-session outcome); null when not compressed.
     nlohmann::json pflash;
+    // Last: the positional initializers end at pflash. The wait for admission (the slot scheduler's Deferred retries), not in prefill_s.
+    double queue_s              = 0.0;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
 //   prefill_ms              = prefill_s * 1000.0  (1 decimal)
+//   queue_ms                = queue_s   * 1000.0  (1 decimal), the wait for admission, not in prefill_ms
 //   decode_ms               = decode_s  * 1000.0  (1 decimal)
 //   decode_tokens_per_sec   = completion_tokens / decode_s (0.0 when
 //                              decode_s == 0 to avoid div-by-zero on

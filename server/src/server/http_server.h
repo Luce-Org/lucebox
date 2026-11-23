@@ -107,7 +107,17 @@ HeartbeatSendResult try_send_sse_heartbeat(SocketHandle fd, size_t & offset);
 }
 
 // ─── Server configuration ───────────────────────────────────────────────
+// Deadlines for reading one HTTP request (milliseconds). Fields exist so a
+// test can run them in under a second; the defaults are the production values.
+struct HttpReadLimits {
+    int first_byte_ms = 60000;     // connect -> first request byte (idle connections)
+    int header_ms     = 60000;     // first byte -> complete headers
+    int body_idle_ms  = 60000;     // no body bytes for this long
+    int body_total_ms = 600000;    // headers complete -> full body
+};
+
 struct ServerConfig {
+    HttpReadLimits http_read;
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
@@ -1055,7 +1065,8 @@ private:
         std::string body;
         std::string user_agent;
     };
-    bool read_http_request(SocketHandle fd, HttpRequest & out);
+    int read_http_request(SocketHandle fd, HttpRequest & out);
+    void send_busy_503(SocketHandle fd);
 
     // Route request to appropriate parser.
     bool route_request(SocketHandle fd, const HttpRequest & hr);
@@ -1175,6 +1186,9 @@ private:
     // SSE client connections for /status/events push.
     std::mutex             sse_mu_;
     std::vector<SocketHandle> sse_fds_;
+    size_t                 sse_pending_ = 0;   // reserved slots, under sse_mu_
+    std::mutex             sse_send_mu_;   // serializes fan-out/heartbeat/shutdown (see sse_fanout)
+    void sse_fanout(const std::string & event);
 
     // Broadcast current status to all SSE clients. Removes dead fds.
     void broadcast_status();
@@ -1184,6 +1198,7 @@ private:
 
     // Send SSE heartbeat comment to prune disconnected clients.
     void sse_heartbeat();
+    void sse_drop_closed_at_cap();
 
     // Resolve and cache path to share/status.html.
     std::string status_html_path_;
@@ -1324,9 +1339,8 @@ struct ServerJob {
     // The learned shared-prefix cut, found at the first admission attempt
     // (before the request's own region joins the ring); -1 until then.
     int           shared_prefix_cut = -1;
-    // First concurrent-scheduler attempt; retained across busy deferrals so
-    // server-side prefill/elapsed telemetry does not erase queueing delay.
-    std::chrono::steady_clock::time_point parallel_started_at{};
+    // When enqueue() took the request: its queue wait and its elapsed time count from here.
+    std::chrono::steady_clock::time_point arrived_at{};
     // Concurrent PFlash (scheduler.cpp): the job came back from the
     // compression thread. When it was compressed, req.prompt_tokens holds the
     // served prompt and req.client_prompt_tokens the client prompt's size.
