@@ -157,6 +157,8 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int de
 // Peer copy on the source device's side stream: the source's compute stream
 // keeps running while the copy is in flight; the destination waits for it.
 // Returns false when it does not apply (the caller copies the usual way).
+GGML_BACKEND_API bool ggml_backend_cuda_mix_wmma_f16_src1_supported(ggml_backend_t backend, const struct ggml_tensor * src0, int64_t n_tokens, int64_t n_expert_used);
+GGML_BACKEND_API bool ggml_backend_cuda_copy_f32_to_f16_async_side(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 GGML_BACKEND_API bool ggml_backend_cuda_copy_tensor_async_side(
         ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const struct ggml_tensor * src, struct ggml_tensor * dst);
