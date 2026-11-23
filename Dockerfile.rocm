@@ -55,6 +55,7 @@ ENV PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        ccache \
         cmake \
         curl \
         git \
@@ -100,15 +101,26 @@ RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
 # native HIP build). CMAKE_BUILD_WITH_INSTALL_RPATH bakes the $ORIGIN-relative
 # rpath (incl. ggml-hip + ROCm lib) so the binaries find their .so files after
 # the COPY into the runtime stage.
-RUN cmake -S /src/server -B /src/server/build \
+RUN --mount=type=cache,id=lucebox-ccache-rocm,target=/root/.ccache \
+    export CCACHE_DIR=/root/.ccache \
+           CCACHE_MAXSIZE=2G \
+           CCACHE_COMPRESS=1 \
+           CCACHE_NOHASHDIR=true \
+           CCACHE_SLOPPINESS=time_macros,include_file_mtime \
+    && cmake -S /src/server -B /src/server/build \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DGGML_CCACHE=OFF \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
         -DLUCE_GPU_BACKEND=hip \
         -DLUCE_HIP_ARCHITECTURES="${LUCE_HIP_ARCHES}" \
         -DLUCE_FA_ALL_QUANTS=OFF \
         -DLUCE_ENABLE_BSA=OFF \
-    && cmake --build /src/server/build --target test_dflash luce_server test_server_unit --parallel
+    && cmake --build /src/server/build --target test_dflash luce_server test_server_unit --parallel \
+    && ccache -s
 
 # Prune the build tree to only what the runtime stage needs: the native server,
 # test_dflash, test_server_unit, and the ggml shared libs their embedded rpath
