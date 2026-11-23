@@ -3622,13 +3622,36 @@ endif()
 
 if(LUCE_TESTS)
     # `make check-cpu` — build only the CPU-safe test binaries, then run
-    # `ctest -L cpu`. The hosted CI job runs exactly this target.
+    # `ctest -L cpu` across available cores. The hosted CI job runs this target.
     if(_luce_cpu_test_targets)
+        include(ProcessorCount)
+        ProcessorCount(_luce_cpu_test_jobs)
+        if(NOT _luce_cpu_test_jobs OR _luce_cpu_test_jobs LESS 1)
+            set(_luce_cpu_test_jobs 4)
+        endif()
+        set(_luce_check_cpu_script "${CMAKE_CURRENT_BINARY_DIR}/run_check_cpu.cmake")
+        file(WRITE "${_luce_check_cpu_script}"
+            "if(DEFINED ENV{CTEST_PARALLEL_LEVEL} AND NOT \"\$ENV{CTEST_PARALLEL_LEVEL}\" STREQUAL \"\")\n"
+            "    set(_parallel_args \"\")\n"
+            "else()\n"
+            "    set(_parallel_args --parallel \"${_luce_cpu_test_jobs}\")\n"
+            "endif()\n"
+            "execute_process(\n"
+            "    COMMAND \"${CMAKE_CTEST_COMMAND}\" --output-on-failure \${_parallel_args} -L cpu --no-tests=error\n"
+            "    WORKING_DIRECTORY \"${CMAKE_CURRENT_BINARY_DIR}\"\n"
+            "    RESULT_VARIABLE _rc\n"
+            ")\n"
+            "if(NOT _rc EQUAL 0)\n"
+            "    message(FATAL_ERROR \"ctest failed with exit code \${_rc}\")\n"
+            "endif()\n"
+        )
         add_custom_target(check-cpu
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -L cpu --no-tests=error
+            COMMAND ${CMAKE_COMMAND} -P "${_luce_check_cpu_script}"
             COMMENT "Building and running the CPU-only unit subset"
             USES_TERMINAL)
         add_dependencies(check-cpu ${_luce_cpu_test_targets})
+        unset(_luce_check_cpu_script)
+        unset(_luce_cpu_test_jobs)
     endif()
     unset(_luce_cpu_test_targets)
     unset(_luce_cpu_ctest_names)
