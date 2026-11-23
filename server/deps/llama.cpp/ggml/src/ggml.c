@@ -10426,7 +10426,7 @@ struct ggml_tensor * ggml_inkling2_attn_split_combine(
         int                   n_head) {
     GGML_ASSERT(part_a && part_b);
     const int64_t n_tokens = part_a->ne[1];
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_head, n_tokens);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) head_dim * n_head, n_tokens);
     result->op = GGML_OP_INKLING2_OP;
     result->src[0] = part_a;
     result->src[1] = part_b;

@@ -439,10 +439,10 @@ static bool build_inkling2_target_graph(
             if (!L.is_swa && L.wk_dyn && L.wv_dyn) {
                 ggml_tensor * kd = ggml_mul_mat(c, L.wk_dyn, inputs[1]);
                 K_raw = row_view_2d(c, kd, 0, kv_sz);
-                k_dyn = row_view_2d(c, kd, kv_sz, w.sconv_kernel * Hk);
+                k_dyn = row_view_2d(c, kd, kv_sz, (int64_t) w.sconv_kernel * Hk);
                 ggml_tensor * vd = ggml_mul_mat(c, L.wv_dyn, inputs[2]);
                 V_raw = row_view_2d(c, vd, 0, kv_sz);
-                v_dyn = row_view_2d(c, vd, kv_sz, w.sconv_kernel * Hk);
+                v_dyn = row_view_2d(c, vd, kv_sz, (int64_t) w.sconv_kernel * Hk);
             } else {
                 K_raw = ggml_mul_mat(c, L.wk, inputs[1]);
                 V_raw = ggml_mul_mat(c, L.wv, inputs[2]);
@@ -1010,9 +1010,9 @@ Inkling2ForwardOut inkling2_prefill_wavefront(
             Sink  = row_view_2d(c, proj, 2 * q_sz + r_sz, Hq);
             if (!L.is_swa && L.wk_dyn && L.wv_dyn) {
                 ggml_tensor * kd = ggml_mul_mat(c, L.wk_dyn, inputs[1]);
-                K_raw = row_view_2d(c, kd, 0, kv_sz); k_dyn = row_view_2d(c, kd, kv_sz, w.sconv_kernel * Hk);
+                K_raw = row_view_2d(c, kd, 0, kv_sz); k_dyn = row_view_2d(c, kd, kv_sz, (int64_t) w.sconv_kernel * Hk);
                 ggml_tensor * vd = ggml_mul_mat(c, L.wv_dyn, inputs[2]);
-                V_raw = row_view_2d(c, vd, 0, kv_sz); v_dyn = row_view_2d(c, vd, kv_sz, w.sconv_kernel * Hk);
+                V_raw = row_view_2d(c, vd, 0, kv_sz); v_dyn = row_view_2d(c, vd, kv_sz, (int64_t) w.sconv_kernel * Hk);
             } else {
                 K_raw = ggml_mul_mat(c, L.wk, inputs[1]);
                 V_raw = ggml_mul_mat(c, L.wv, inputs[2]);
@@ -1240,9 +1240,9 @@ Inkling2ForwardOut inkling2_prefill_wavefront(
                     ggml_tensor * pk = slice_s(k_all, si);
                     ggml_tensor * pv = slice_s(v_all, si);
                     ggml_tensor * K_raw = (!L.is_swa && L.wk_dyn) ? row_view_2d(c, pk, 0, kv_sz) : pk;
-                    ggml_tensor * k_dyn = (!L.is_swa && L.wk_dyn) ? row_view_2d(c, pk, kv_sz, w.sconv_kernel * Hk) : nullptr;
+                    ggml_tensor * k_dyn = (!L.is_swa && L.wk_dyn) ? row_view_2d(c, pk, kv_sz, (int64_t) w.sconv_kernel * Hk) : nullptr;
                     ggml_tensor * V_raw = (!L.is_swa && L.wv_dyn) ? row_view_2d(c, pv, 0, kv_sz) : pv;
-                    ggml_tensor * v_dyn = (!L.is_swa && L.wv_dyn) ? row_view_2d(c, pv, kv_sz, w.sconv_kernel * Hk) : nullptr;
+                    ggml_tensor * v_dyn = (!L.is_swa && L.wv_dyn) ? row_view_2d(c, pv, kv_sz, (int64_t) w.sconv_kernel * Hk) : nullptr;
 
                     ggml_tensor * Q = nullptr, * rt = nullptr;
                     inkling2_clip_qr_rel_table(
