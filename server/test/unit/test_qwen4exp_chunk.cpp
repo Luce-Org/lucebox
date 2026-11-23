@@ -5,6 +5,8 @@ using luce::common::qwen4exp_fit_chunk;
 using luce::common::qwen4exp_reserved_rows;
 using luce::common::Qwen4ExpContextFit;
 using luce::common::qwen4exp_shrink_context;
+using luce::common::qwen4exp_place_snapshots;
+using luce::common::qwen4exp_snapshot_device_from_env;
 int main() {
     // --max-ctx auto: step down by the shortfall over a position's bytes, in 4096 multiples, at least one step.
     assert(qwen4exp_shrink_context(262144, 10000000000ULL, 138400) == 188416);
@@ -101,4 +103,25 @@ int main() {
     snapshots = 100000;
     assert(qwen4exp_fit_chunk(2048, 100000, 20000, workspace, &snapshots, 4096, luce::common::kQwen4ExpMaxChunk, 49520) == 2048);
     assert(snapshots == 49520);
+    // Prefix snapshots: gfx1151 keeps them on the device whatever the numbers. Elsewhere they take the device only on
+    // request, with an automatic chunk, when the allowance fits in what the planned context leaves.
+    // available 1000, required 600 -> 400 spare.
+    auto place = [](bool gfx1151, bool asked, bool chunk_set, size_t required, size_t available, size_t allowance) {
+        return qwen4exp_place_snapshots(gfx1151, asked, chunk_set, required, available, allowance).on_device;
+    };
+    assert(place(true, false, true, SIZE_MAX, 1000, 5000));   // gfx1151: whatever the flags and numbers
+    assert(place(false, true, false, 600, 1000, 400));       // exact fit
+    assert(!place(false, false, false, 600, 1000, 400));     // not asked: the default stays in system memory
+    assert(!place(false, true, true, 600, 1000, 400));       // --chunk set
+    assert(!place(false, true, false, 600, 1000, 401));      // one byte costs context
+    assert(!place(false, true, false, 1000, 1000, 1));       // nothing spare
+    assert(!place(false, true, false, 1001, 1000, 1));       // the context itself misses (allowance non-zero)
+    assert(!place(false, true, false, SIZE_MAX, 1000, 1));   // the plan could not be measured
+    assert(!place(false, true, false, 600, 1000, 0));        // no snapshot to place
+    assert(qwen4exp_place_snapshots(false, true, false, 600, 1000, 401).reason[0] != 0);
+    // Strict env flag: unset, empty and 0 are off, 1 is on, anything else is refused.
+    assert(qwen4exp_snapshot_device_from_env(nullptr) == 0 && qwen4exp_snapshot_device_from_env("") == 0);
+    assert(qwen4exp_snapshot_device_from_env("0") == 0 && qwen4exp_snapshot_device_from_env("1") == 1);
+    assert(qwen4exp_snapshot_device_from_env("true") == -1 && qwen4exp_snapshot_device_from_env("01") == -1);
+    assert(qwen4exp_snapshot_device_from_env("2") == -1 && qwen4exp_snapshot_device_from_env(" 1") == -1);
 }

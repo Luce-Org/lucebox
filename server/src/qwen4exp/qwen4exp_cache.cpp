@@ -58,7 +58,7 @@ void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s) {
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp, int mtp_draft,
                            const Qwen4ExpSlotStates * slot_states, int state_slot, int remote_layers,
-                           int kvflash_pool, ggml_backend_buffer_t reuse_remote_buf) {
+                           int kvflash_pool, ggml_backend_buffer_t reuse_remote_buf, int recall_queries) {
     const Qwen4ExpCudaScope profile(w.gfx1151);
     // The QSA cell-id kernel is exact for positions below 2^24.
     if (max_ctx <= 0 || max_ctx >= (1 << 24)) {
@@ -152,13 +152,27 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         const int il = out.full_layer_ids[i];
         const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
         // QSA selects blocks of positions laid out in order, which pool slots are not: a pooled cache attends densely.
-        if (w.indexer_head_size > 0 && ratio > 0 && kvflash_pool == 0) {
+        // ponytail: recall keeps the indexer at full max_ctx (F32 raw keys, ~max_ctx * 512 B per full-attention layer).
+        if (w.indexer_head_size > 0 && ratio > 0 && (kvflash_pool == 0 || recall_queries > 0)) {
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_blocks + 1);
             out.indexer_raw[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_ctx);
         }
+    }
+    out.recall_q.assign(n_full, nullptr);
+    out.recall_queries = 0;
+    if (recall_queries > 0) {
+        size_t bytes = 0;
+        for (size_t i = 0; i < n_full; ++i) {
+            if (!out.indexer_raw[i] || out.remote((int) i)) continue;   // ponytail: remote layers are refused
+            out.recall_q[i] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.indexer_head_size, w.indexer_n_head, recall_queries);
+            bytes += ggml_nbytes(out.indexer_raw[i]) + ggml_nbytes(out.indexer_k[i]) + ggml_nbytes(out.recall_q[i]);
+        }
+        out.recall_queries = recall_queries;
+        std::fprintf(stderr, "[qwen4exp] indexer recall: %zu bytes of indexer_raw/indexer_k/query tensors (%d queries)\n",
+                     bytes, recall_queries);
     }
     if (slot_states && slot_states->ssm.size() != n_linear) return false;
     for (size_t i = 0; i < n_linear; ++i) {
@@ -370,6 +384,9 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     for (auto & tail : c.spec_ple_prev) tail.clear();
     c.indexer_k.clear();
     c.indexer_raw.clear();
+    c.recall_q.clear();
+    c.recall_queries = c.recall_q_n = c.recall_q_pos0 = 0;
+    c.recall_capture = false;
     c.ssm_state.clear();
     c.conv_state.clear();
     c.ple_conv_state.clear();
@@ -401,6 +418,8 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     c.mtp_prev_pos = -1;
     c.spec_tokens = 0;
     c.indexer_blocks = 0;
+    c.recall_q_n = 0;
+    c.recall_capture = false;
     c.kv_bucket_base = 0;
     c.ple_prev.clear();
 }

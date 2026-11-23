@@ -138,8 +138,23 @@ Qwen4ExpForwardResult qwen4exp_forward(ggml_backend_t backend,
                                        const Qwen4ExpInputs * inputs = nullptr,
                                        Qwen4ExpRowOutputs * out_rows = nullptr);
 
+// LUCE_Q4_INDEXER_RECALL: the QSA indexer's top-k block picks for the queries a prompt forward captured
+// (Qwen4ExpCache::recall_q), ids [layer][query][budget]; each query sits at position pos0 + its index. Pools the
+// context's blocks first (advancing cache.indexer_blocks). False: nothing captured, too few blocks to select among,
+// or remote layers (false, graph_failed unset), or the graph failed (false, graph_failed set).
+struct Qwen4ExpRecallPicks {
+    std::vector<int32_t> ids;
+    int layers = 0, queries = 0, budget = 0, blocks = 0, pos0 = 0, ratio = 0;   // blocks: complete, of `ratio` tokens
+    bool graph_failed = false;   // the preconditions held but the graph did not allocate or compute
+};
+bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                           Qwen4ExpRecallPicks & out);
+
 // The cache was created with `mtp` (and a loaded sidecar).
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache);
+// Qwen4ExpCache::pool_qsa can be set: a KVFlash pool with indexer rows at the full context, and a backend that runs the
+// stable QSA graph at max_ctx.
+bool qwen4exp_pool_qsa_supported(ggml_backend_t backend, const Qwen4ExpWeights & w, const Qwen4ExpCache & cache);
 
 // Retain the first `retained` verify inputs (accepted drafts + 1, or fewer at EOS).
 // Restores recurrent/conv/PLE state and truncates KV and QSA visibility by position.
