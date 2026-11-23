@@ -217,14 +217,11 @@ PFlash reads a long prompt with a small model first and gives the main model onl
 
 ```bash
 hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-BF16.gguf --local-dir models/pflash
-hf download Lucebox/pflash-scorer-head seg-scoring-head.gguf --local-dir models/pflash
-hf download Lucebox/pflash-segment-probe segment-probe.gguf --local-dir models/pflash
-hf download Lucebox/pflash-request-probe request-probe.gguf --local-dir models/pflash
+hf download Lucebox/pflash seg-scoring-head.gguf segment-probe.gguf request-probe.gguf seg-reranker.gguf \
+  --local-dir models/pflash
 
-# PFlash: add to any launch above
+# PFlash: add to any launch above (segment-probe, request-probe, seg-reranker auto-discover beside head)
 PFLASH_SCORING_HEAD_GGUF=models/pflash/seg-scoring-head.gguf \
-PFLASH_SEGMENT_PROBE_GGUF=models/pflash/segment-probe.gguf \
-PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
 ./server/build-hip/luce_server <model and flags as above> \
   --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf
 
@@ -233,7 +230,7 @@ PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
   --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf --kvflash auto
 ```
 
-With both chips, `--prefill-drafter-device hip:1` runs the small model on the iGPU. PFlash starts at 16K tokens and `--pflash off` turns it off. Every setting is in the [PFlash reference](server/docs/PFLASH_CONFIGURATION.md).
+With both chips, `--prefill-drafter-device hip:1` runs the small model on the iGPU. PFlash needs all four files; it starts at 8K tokens and `--pflash off` turns it off. Every setting is in the [PFlash reference](server/docs/PFLASH_CONFIGURATION.md).
 
 ## Coding agents
 

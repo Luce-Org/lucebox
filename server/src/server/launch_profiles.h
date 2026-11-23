@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -423,19 +424,17 @@ inline std::string kvflash_recall_mode(std::string_view arch, const std::string 
     return mode ? "prefill-reselect=" + std::to_string(mode) : "";
 }
 
-// PFlash with a trained scoring head (PFLASH_SCORING_HEAD_GGUF): the release
-// profile measured for the PFlash v2 post (Qwen3.8-27B target, Qwen3.5-0.8B
-// drafter, R9700). With prefill compression on, the server installs these
-// environment defaults and the threshold and curve below for flags the
-// command line did not give; a variable that is already set keeps its value.
-// Without a head the built-in defaults stay. The request-probe query needs
-// PFLASH_REQUEST_PROBE_GGUF, and its candidates and pin the segment probe
-// too; each yields to an experiment arm it cannot combine with.
-inline constexpr int kPFlashReleaseThreshold = 16384;
+// The PFlash release profile (Qwen3.8-27B target, Qwen3.5-0.8B drafter). With
+// prefill compression on and all four components resolved
+// (pflash_resolve_components below), the server installs these environment
+// defaults and the threshold and curve below for flags the command line did not
+// give; a variable that is already set keeps its value. The request-probe query
+// and its candidates yield to an experiment arm they cannot combine with.
+inline constexpr int kPFlashReleaseThreshold = 8192;
 
 inline const std::vector<std::pair<int, float>> & pflash_release_curve() {
     static const std::vector<std::pair<int, float>> curve = {
-        {16384, 0.315f}, {32768, 0.270f}, {65536, 0.270f}, {120000, 0.225f}};
+        {8192, 0.450f}, {16384, 0.350f}, {32768, 0.270f}, {65536, 0.260f}, {120000, 0.240f}};
     return curve;
 }
 
@@ -468,38 +467,97 @@ inline bool parse_pflash_curve_arg(const char * arg, std::vector<std::pair<int, 
     return true;
 }
 
-inline std::vector<LaunchProfileEnv> pflash_release_env() {
-    const auto set = [](const char * name) {
-        const char * raw = std::getenv(name);
-        return raw && *raw;
-    };
-    const auto is = [](const char * name, const char * value) {
-        const char * raw = std::getenv(name);
-        return raw && std::strcmp(raw, value) == 0;
-    };
-    if (!set("PFLASH_SCORING_HEAD_GGUF")) return {};
-    std::vector<LaunchProfileEnv> env = {
-        // Units are taken by relevance per token until the budget is full.
-        {"PFLASH_SELECT_MODE", "budget_only"},
-        {"PFLASH_SELECT_SCORE", "density"},
-        {"PFLASH_SELECT_CHUNK_SIZE", "256"},
-        {"PFLASH_SELECT_QUERY_TOKENS", "128"},
-        {"PFLASH_SELECT_QUERY_HEAD", "1"},
-    };
-    const bool segment_probe = set("PFLASH_SEGMENT_PROBE_GGUF");
-    if (segment_probe) env.push_back({"PFLASH_SELECT_SEGMENTS", "probe"});
-    // Another scorer or the identifier query replaces the request-probe query.
-    if (set("PFLASH_REQUEST_PROBE_GGUF") &&
-        (!set("PFLASH_SELECT_SCORER") || is("PFLASH_SELECT_SCORER", "head")) &&
-        !is("PFLASH_EVAL_REF_IDENT_QUERY", "heur")) {
-        env.push_back({"PFLASH_SELECT_QUERY_PROBE", "1"});
-        if (segment_probe && !is("PFLASH_SELECT_QUERY_PROBE", "0") &&
-            !set("PFLASH_REQUEST_STAGE2_GGUF")) {
-            env.push_back({"PFLASH_QUERY_CANDIDATES", "1"});
-            env.push_back({"PFLASH_QUERY_PIN", "512"});
-        }
+// All four PFlash model components must be present whenever PFlash is selected:
+//   1. PFLASH_SCORING_HEAD_GGUF   (seg-scoring-head.gguf)
+//   2. PFLASH_SEGMENT_PROBE_GGUF  (segment-probe.gguf; auto-discovered beside head)
+//   3. PFLASH_REQUEST_PROBE_GGUF  (request-probe.gguf; auto-discovered beside head)
+//   4. PFLASH_SEG_RERANKER_GGUF   (seg-reranker.gguf; auto-discovered beside head)
+// A set variable names its file, and an empty value or 0/off/none/false/no
+// turns the component off; an unset probe or reranker variable finds its file
+// beside the scoring head. A component is present only when its file opens.
+// If any component is missing (or disabled), PFlash cannot be selected:
+// --pflash auto leaves it off and --pflash on refuses to start.
+struct PFlashComponents {
+    std::string scoring_head;
+    std::string segment_probe;
+    std::string request_probe;
+    std::string seg_reranker;
+    std::vector<std::string> unreadable;   // paths that were given but do not open
+
+    bool complete() const {
+        return !scoring_head.empty() && !segment_probe.empty() &&
+               !request_probe.empty() && !seg_reranker.empty();
     }
-    return env;
+
+    std::vector<std::string> missing() const {
+        std::vector<std::string> out;
+        if (scoring_head.empty())  out.push_back("PFLASH_SCORING_HEAD_GGUF (seg-scoring-head.gguf)");
+        if (segment_probe.empty()) out.push_back("PFLASH_SEGMENT_PROBE_GGUF (segment-probe.gguf)");
+        if (request_probe.empty()) out.push_back("PFLASH_REQUEST_PROBE_GGUF (request-probe.gguf)");
+        if (seg_reranker.empty())  out.push_back("PFLASH_SEG_RERANKER_GGUF (seg-reranker.gguf)");
+        return out;
+    }
+
+    std::string missing_summary() const {
+        const auto m = missing();
+        std::string s;
+        for (size_t i = 0; i < m.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += m[i];
+        }
+        for (const auto & path : unreadable) s += "; does not open: " + path;
+        return s;
+    }
+};
+
+inline PFlashComponents pflash_resolve_components() {
+    PFlashComponents out;
+    const auto is_disabled = [](const std::string & val) -> bool {
+        std::string low;
+        low.reserve(val.size());
+        for (unsigned char c : val) low.push_back((char) std::tolower(c));
+        return low.empty() || low == "0" || low == "off" || low == "none" || low == "false" || low == "no";
+    };
+    const auto opens = [](const std::string & path) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec) || ec) return false;
+        FILE * f = std::fopen(path.c_str(), "rb");
+        if (f) std::fclose(f);
+        return f != nullptr;
+    };
+    const auto resolve = [&](const char * name, const char * sibling) -> std::string {
+        if (const char * raw = std::getenv(name)) {
+            if (is_disabled(raw)) return {};
+            if (opens(raw)) return raw;
+            out.unreadable.push_back(raw);
+            return {};
+        }
+        if (!sibling || out.scoring_head.empty()) return {};
+        const size_t slash = out.scoring_head.find_last_of("/\\");
+        const std::string candidate =
+            (slash == std::string::npos ? std::string() : out.scoring_head.substr(0, slash + 1)) + sibling;
+        return opens(candidate) ? candidate : std::string();
+    };
+    out.scoring_head = resolve("PFLASH_SCORING_HEAD_GGUF", nullptr);
+    out.segment_probe = resolve("PFLASH_SEGMENT_PROBE_GGUF", "segment-probe.gguf");
+    out.request_probe = resolve("PFLASH_REQUEST_PROBE_GGUF", "request-probe.gguf");
+    out.seg_reranker = resolve("PFLASH_SEG_RERANKER_GGUF", "seg-reranker.gguf");
+    return out;
+}
+
+inline std::vector<LaunchProfileEnv> pflash_release_env(const PFlashComponents & comps) {
+    if (!comps.complete()) return {};
+    // Populate sibling-discovered component paths when not explicitly set;
+    // the November Update selection and query defaults are baked in.
+    return {
+        {"PFLASH_SEGMENT_PROBE_GGUF", comps.segment_probe},
+        {"PFLASH_REQUEST_PROBE_GGUF", comps.request_probe},
+        {"PFLASH_SEG_RERANKER_GGUF", comps.seg_reranker},
+    };
+}
+
+inline std::vector<LaunchProfileEnv> pflash_release_env() {
+    return pflash_release_env(pflash_resolve_components());
 }
 
 // The flag `--no-<flag>` leaves out of a profile ("--no-peer-access" ->

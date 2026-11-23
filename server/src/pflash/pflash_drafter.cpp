@@ -102,6 +102,7 @@ void free_drafter_weights(DrafterContext & ctx) {
     }
     ctx.loaded = false;
     ctx.path.clear();
+    ctx.loaded_assets_identity.clear();
 }
 
 std::vector<int32_t> drafter_score_and_compress(
@@ -116,7 +117,6 @@ std::vector<int32_t> drafter_score_and_compress(
     bool query_suffix_candidates,
     const std::vector<PFlashTokenSpan> & history_queries,
     PFlashTokenSpan turn_query,
-    const std::vector<PFlashTokenSpan> & extra_queries,
     const PFlashRequestMessages * request_messages,
     const std::vector<PFlashTokenSpan> & keep_queries) {
     pflash_clear_kept_spans();
@@ -127,8 +127,8 @@ std::vector<int32_t> drafter_score_and_compress(
 
     luce::pflash::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!luce::pflash::resolve_pflash_selection(
-            (int) ids.size(), chunk_size, experiment, experiment_error)) {
+    if (!luce::pflash::resolve_pflash_drafter_selection(
+            (int) ids.size(), chunk_size, request_messages, experiment, experiment_error)) {
         set_last_error("invalid PFlash strict selection config: " + experiment_error);
         std::fprintf(stderr, "[pflash-select] ERROR config: %s\n",
                      experiment_error.c_str());
@@ -136,119 +136,82 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
     chunk_size = experiment.chunk_size;
-    experiment.query_suffix_candidates =
-        query_suffix_candidates && experiment.selection_active;
-    if (experiment.selection_active) {
-        for (const auto & window : history_queries) {
-            if (window.begin >= 0 && window.end > window.begin &&
-                window.end <= (int) ids.size()) {
-                experiment.history_queries.push_back(window);
-            }
-        }
-        for (const auto & window : keep_queries) {
-            if (window.begin >= 0 && window.end > window.begin &&
-                window.end <= (int) ids.size()) {
-                experiment.keep_queries.push_back(window);
-            }
-        }
-        if (turn_query.begin >= 0 && turn_query.end > turn_query.begin &&
-            turn_query.end <= (int) ids.size()) {
-            experiment.turn_query = turn_query;
-        }
-        for (const auto & window : extra_queries) {
-            if (window.begin >= 0 && window.end > window.begin &&
-                window.end <= (int) ids.size()) {
-                experiment.extra_queries.push_back(window);
-            }
-        }
-        if (experiment.query_probe) {
-            if (!request_messages) {
-                experiment.request_messages_error = "no human message spans from the caller";
-            } else {
-                for (const auto & span : request_messages->human) {
-                    if (span.begin < 0 || span.end < span.begin ||
-                        span.end > (int) ids.size()) {
-                        experiment.request_messages.clear();
-                        experiment.request_messages_error = "human message span outside the input";
-                        break;
-                    }
-                    experiment.request_messages.push_back(span);
-                }
-                experiment.request_human_index = request_messages->human_index;
-                for (const auto & span : request_messages->recent) {
-                    if (span.begin < 0 || span.end < span.begin ||
-                        span.end > (int) ids.size()) {
-                        experiment.request_messages.clear();
-                        experiment.request_recent.clear();
-                        experiment.request_messages_error = "recent message span outside the input";
-                        break;
-                    }
-                    experiment.request_recent.push_back(span);
-                }
-                experiment.request_recent_index = request_messages->recent_index;
-            }
-            // cand_v5 / stage 2 inputs: every message's role and content span (read only by a cand_v5 probe).
-            if (request_messages) {
-                experiment.request_messages_all_error = request_messages->all_error;
-                if (experiment.request_messages_all_error.empty() &&
-                    request_messages->all_roles.size() != request_messages->all_spans.size()) {
-                    experiment.request_messages_all_error = "message roles and spans differ in count";
-                }
-                for (size_t i = 0; experiment.request_messages_all_error.empty() &&
-                                   i < request_messages->all_spans.size(); ++i) {
-                    luce::pflash::PFlashRequestMessage m;
-                    m.span = request_messages->all_spans[i];
-                    if (!luce::pflash::pflash_request_role_from_name(request_messages->all_roles[i], m.role)) {
-                        experiment.request_messages_all_error = "unknown message role " + request_messages->all_roles[i];
-                    } else if (m.span.end > m.span.begin &&
-                               (m.span.begin < 0 || m.span.end > (int) ids.size())) {
-                        experiment.request_messages_all_error = "message span outside the input";
-                    } else {
-                        experiment.request_messages_all.push_back(m);
-                    }
-                }
-                if (!experiment.request_messages_all_error.empty()) experiment.request_messages_all.clear();
-            } else {
-                experiment.request_messages_all_error = "no message spans from the caller";
-            }
-        }
-        if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
-            if (!request_messages) {
-                experiment.ident_error = "no identifier tokens from the caller";
-            } else if (!request_messages->ident_error.empty()) {
-                experiment.ident_error = request_messages->ident_error;
-            } else {
-                experiment.ident_turns = request_messages->ident_turns;
-                for (const int t : request_messages->ident_tokens) {
-                    if (t < 0 || t >= (int) ids.size()) {
-                        experiment.ident_tokens.clear();
-                        experiment.ident_error = "identifier token outside the input";
-                        break;
-                    }
-                    experiment.ident_tokens.push_back(t);
-                }
-            }
+    experiment.query_suffix_candidates = query_suffix_candidates;
+    for (const auto & window : history_queries) {
+        if (window.begin >= 0 && window.end > window.begin &&
+            window.end <= (int) ids.size()) {
+            experiment.history_queries.push_back(window);
         }
     }
-    if (!experiment.selection_active && !required_instruction_spans.empty()) {
-        set_last_error(
-            "PFlash instruction spans require strict budget selection");
+    for (const auto & window : keep_queries) {
+        if (window.begin >= 0 && window.end > window.begin &&
+            window.end <= (int) ids.size()) {
+            experiment.keep_queries.push_back(window);
+        }
+    }
+    if (turn_query.begin >= 0 && turn_query.end > turn_query.begin &&
+        turn_query.end <= (int) ids.size()) {
+        experiment.turn_query = turn_query;
+    }
+    if (experiment.query_probe) {
+        if (!request_messages) {
+            experiment.request_messages_error = "no human message spans from the caller";
+        } else {
+            for (const auto & span : request_messages->human) {
+                if (span.begin < 0 || span.end < span.begin ||
+                    span.end > (int) ids.size()) {
+                    experiment.request_messages.clear();
+                    experiment.request_messages_error = "human message span outside the input";
+                    break;
+                }
+                experiment.request_messages.push_back(span);
+            }
+            experiment.request_human_index = request_messages->human_index;
+            for (const auto & span : request_messages->recent) {
+                if (span.begin < 0 || span.end < span.begin ||
+                    span.end > (int) ids.size()) {
+                    experiment.request_messages.clear();
+                    experiment.request_recent.clear();
+                    experiment.request_messages_error = "recent message span outside the input";
+                    break;
+                }
+                experiment.request_recent.push_back(span);
+            }
+            experiment.request_recent_index = request_messages->recent_index;
+        }
+        if (request_messages) {
+            experiment.request_messages_all_error = request_messages->all_error;
+            if (experiment.request_messages_all_error.empty() &&
+                request_messages->all_roles.size() != request_messages->all_spans.size()) {
+                experiment.request_messages_all_error = "message roles and spans differ in count";
+            }
+            for (size_t i = 0; experiment.request_messages_all_error.empty() &&
+                               i < request_messages->all_spans.size(); ++i) {
+                luce::pflash::PFlashRequestMessage m;
+                m.span = request_messages->all_spans[i];
+                if (!luce::pflash::pflash_request_role_from_name(request_messages->all_roles[i], m.role)) {
+                    experiment.request_messages_all_error = "unknown message role " + request_messages->all_roles[i];
+                } else if (m.span.end > m.span.begin &&
+                           (m.span.begin < 0 || m.span.end > (int) ids.size())) {
+                    experiment.request_messages_all_error = "message span outside the input";
+                } else {
+                    experiment.request_messages_all.push_back(m);
+                }
+            }
+            if (!experiment.request_messages_all_error.empty()) experiment.request_messages_all.clear();
+        } else {
+            experiment.request_messages_all_error = "no message spans from the caller";
+        }
+    }
+    std::string span_error;
+    if (!luce::pflash::validate_pflash_instruction_spans(
+            required_instruction_spans, (int) ids.size(), span_error)) {
+        set_last_error("invalid PFlash instruction spans: " + span_error);
         std::fprintf(stderr,
-            "[pflash-select] ERROR instruction spans require strict selection\n");
+            "[pflash-select] ERROR instruction spans: %s\n",
+            span_error.c_str());
         std::fflush(stderr);
         return {};
-    }
-    if (experiment.selection_active) {
-        std::string span_error;
-        if (!luce::pflash::validate_pflash_instruction_spans(
-                required_instruction_spans, (int) ids.size(), span_error)) {
-            set_last_error("invalid PFlash instruction spans: " + span_error);
-            std::fprintf(stderr,
-                "[pflash-select] ERROR instruction spans: %s\n",
-                span_error.c_str());
-            std::fflush(stderr);
-            return {};
-        }
     }
     if (experiment.configured) {
         std::fprintf(stderr,

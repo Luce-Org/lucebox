@@ -9,14 +9,12 @@ remain in `test/unit/test_server_unit.cpp`.
 parity cases. The fixture generator is documented in
 [PFlash development tools](../../scripts/pflash/README.md).
 
-The existing helper executables keep their target names:
+The helper executable keeps its target name:
 
 - `pflash_daemon`: drafter-only capture and compression protocol.
-- `pflash_fold_replay`: model-free request-rule replay and tokenizer-backed
-  query, text and fold replay.
 
 ```sh
-cmake --build server/build --target test_server_unit pflash_daemon pflash_fold_replay -j
+cmake --build server/build --target test_server_unit pflash_daemon -j
 server/build/test_server_unit pflash
 ```
 

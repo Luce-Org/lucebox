@@ -1,4 +1,4 @@
-// Request probe (PFLASH_SELECT_QUERY_PROBE=1): the scorer query comes from
+// Request probe: the scorer query comes from
 // the human user's own request text, found per token by a small probe of
 // its own on the segment probe's block-14 tap, computed in the same graph
 // pass: LayerNorm -> fc1 -> GELU (erf) -> fc2, one raw logit per token,
@@ -14,8 +14,7 @@
 // (string, must equal kRequestExtractionVersion), plus base_model,
 // runtime_gguf_sha256 and feature_tap as for the segment probe.
 //
-// The model-free part lives here so tests and offline tools
-// (pflash_fold_replay request) run the runtime's own code:
+// The model-free part lives here so tests run the runtime's own code:
 //   - pflash_request_runs        maximal runs of raw logit >= tau, >= 2 tokens,
 //                                inside one human user message
 //   - pflash_request_query_set   the role rule: the latest human message's
@@ -75,14 +74,11 @@ inline constexpr int kRequestMessages = 2;      // human messages the rule reads
 // reserve): R = min(kRequestPostReserve, |post-latest run tokens|); the seed is the latest user message's run tokens
 // capped at kRequestQueryCap - R by score; then the R best post-latest run tokens; then the run tokens of every other
 // non-system message by score until the cap; ascending union. A GGUF opts in with requestprobe.candidate_rule ==
-// kRequestCandidateRuleV5 (pflash_request_query_set_v5 = rule.probe_query_v5). Only this rule pairs with a
-// stage-2 GGUF (pflash_request_stage2.h); its requestprobe.checkpoint_sha256 is the pairing key.
+// kRequestCandidateRuleV5 (pflash_request_query_set_v5 = rule.probe_query_v5); its
+// requestprobe.checkpoint_sha256 identifies the checkpoint.
 inline constexpr const char * kRequestCandidateRuleV5 =
     "cand_v5_latest_user_seed_reserve256_postlatest_then_score_fill";
 inline constexpr const char * kRequestCheckpointShaKey = "requestprobe.checkpoint_sha256";
-// Contract section 5: at most this many promoted (look-back) tokens, by stage-2 score.
-inline constexpr int kStage2PromotedCap = 512;
-// Contract v3 section 1: query slots reserved for the post-latest cues, R = min(256, |post-latest run tokens|).
 inline constexpr int kRequestPostReserve = 256;
 
 // Maximal runs of tokens t in ``message`` with logits[t] >= tau (a NaN
@@ -186,43 +182,6 @@ PFlashRequestQuerySet pflash_request_query_set_v5(
     int cap = kRequestQueryCap,
     int reserve = kRequestPostReserve);
 
-// Contract section 5 step 5: B' = min(n_prompt, B + floor(B / 2)); raw_fits when B' >= n_prompt.
-int pflash_stage2_widened_budget(int budget, int n_prompt, bool & raw_fits);
-
-// Pass-1 query assembly (contract v3 section 5, rule.stage2_assemble). ``s1`` / ``s2``: raw logits over every token
-// (NaN where not computed; s2 is read on the earlier messages only). R = min(reserve, |post-latest runs|); the seed
-// is capped at cap - R; promoted (look-back on) at min(promoted_cap, cap - R - |seed|); post-latest takes the rest
-// (>= R). Without a user message stage 2 is inactive (reason "no_user_message") and the query is the cand_v5
-// rule's; no widening then.
-struct PFlashStage2Assembly {
-    bool active = false;
-    std::string reason;            // "" | "no_user_message" | "no_request_runs"
-    int latest = -1;
-    std::vector<int> seed;         // ascending
-    std::vector<int> promoted;     // ascending
-    std::vector<int> post;         // ascending
-    std::vector<int> query;        // ascending union, all pinned
-    int reserve = 0;               // R
-    bool seed_capped = false;
-    bool lookback = false;
-    bool promoted_capped = false;
-    int promoted_runs = 0;         // stage-2 runs of the earlier messages (before the caps)
-    bool widened = false;
-    int budget = 0;                // B, or B' when widened
-    bool raw_fits = false;
-};
-PFlashStage2Assembly pflash_stage2_assemble(
-    const std::vector<PFlashRequestMessage> & messages,
-    const std::vector<float> & s1,
-    const std::vector<float> & s2,
-    float lookback_logit,
-    float vague_logit,
-    float tau1, float tau2, float tau_lb, float tau_fb,
-    int budget, int n_prompt,
-    int cap = kRequestQueryCap,
-    int promoted_cap = kStage2PromotedCap,
-    int reserve = kRequestPostReserve);
-
 // A request-probe candidate message for the V2-A3 rule: its index in the
 // normalised message list, whether it is human (role "user"), whether it is
 // a non-system message (every one is a candidate under the rule), and its
@@ -269,9 +228,7 @@ PFlashRequestQuerySet pflash_request_query_set_v2(
 //  - Bounded recency PIN: the last recency_pin_tokens tokens of the latest human message are pinned (never scored),
 //    merged with the query pins (no double charge) and charged to the budget like them. Only when the request set is
 //    used (not on a fallback or abstention).
-// Sources: the request-probe GGUF metadata requestprobe.policy.<key> (set from the CALIBRATION pool), overridden
-// key by key by the JSON file PFLASH_REQUEST_PROBE_POLICY (same keys) and, for the pin, by
-// PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN.
+// Source: the request-probe GGUF metadata requestprobe.policy.<key> (set from the CALIBRATION pool).
 struct PFlashRequestPolicy {
     int min_prompt_tokens = 0;           // 0 = no lower bound
     int max_prompt_tokens = 0;           // 0 = no upper bound
@@ -292,9 +249,6 @@ struct PFlashRequestAbstainStats {
     int prompt_tokens = 0;
 };
 
-// Overrides ``policy`` with the keys of a JSON object (the PFLASH_REQUEST_PROBE_POLICY file; keys as the struct
-// fields). Unknown keys, wrong types or out-of-range values fail (false + error); nothing changes then.
-bool pflash_request_policy_apply_json(const std::string & text, PFlashRequestPolicy & policy, std::string & error);
 // Validates a policy (bounds ordered, shares in [0, 1], counts >= 0).
 bool pflash_request_policy_valid(const PFlashRequestPolicy & policy, std::string & error);
 
@@ -310,54 +264,14 @@ PFlashRequestAbstainStats pflash_request_abstain(
 // message is empty.
 PFlashTokenSpan pflash_request_recency_pin(PFlashTokenSpan latest, int k);
 
-// Stage 2 on one scoring call (trace object request_probe.stage2, contract section 5).
-struct PFlashStage2Trace {
-    bool evaluated = false;        // a cand_v5 probe ran (the object is written)
-    bool active = false;
-    // "" when active; else "stage2_not_loaded", "no_user_message", "rows_missing", "message_mapping".
-    std::string reason;
-    int post_reserve = 0;          // R (contract v3)
-    int seed_tokens = 0;
-    bool seed_capped = false;
-    int latest_tokens = 0;         // content tokens of the latest user message
-    float lookback_logit = 0.0f;
-    float vague_logit = 0.0f;
-    bool lookback = false;
-    int earlier_tokens = 0;        // N = |E|
-    int promoted_tokens = 0;
-    bool promoted_capped = false;
-    int promoted_runs = 0;
-    int post_tokens = 0;
-    bool widened = false;
-    int budget = 0;                // B
-    int budget_widened = 0;        // B' (== B when not widened)
-    bool raw_fits = false;
-    bool s2_computed = false;      // a_h / s2 ran (look-back on, or the feature dump)
-    int latest_message = -1;       // L: index of the latest user message in the normalised list
-    PFlashTokenSpan latest_span{-1, -1};
-    int resume = -1;               // scoring resume point (0: stage 2 forces fresh scoring)
-    int history_dropped = 0;       // PFLASH_CHAT_HISTORY_QUERIES windows dropped (stage 2 alone decides look-back)
-    // The final reason the request did not score the stage-2 query ("" = scored): the request probe's fallback
-    // ("message_mapping: ...", "logits_missing", "no_request_runs", "rows_missing", "pins_exceed_budget",
-    // "abstain:..."), and how many requests fell back for that reason since the drafter loaded (this one included).
-    std::string fallback;
-    long fallback_count = 0;
-    int attention_tiles = 0;
-    int64_t pass1_us = 0;
-    int64_t pass2_us = 0;
-};
-
 struct PFlashQueryTrace;  // pflash_query_candidates.h
 
 // What the request probe did on one scoring call, for the compression
 // trace ("request_probe" object) and the log line.
 struct PFlashRequestProbeTrace {
-    PFlashStage2Trace stage2;
-    // Query step 1 (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN), not owned; nullptr when both are off (the
-    // trace object request_probe.query is written only then).
+    // Relative query candidates + verbatim pin, not owned; nullptr when not run.
     const PFlashQueryTrace * query = nullptr;
     float tau = 0.0f;
-    bool stub = false;                  // zero row, tau = +inf (plumbing test)
     PFlashRequestQuerySet set;          // messages, runs, capped query tokens
     // "" when the gathered set was scored; else the fallback to today's
     // windows: the set's own reason, "message_mapping: <error>",
@@ -380,9 +294,6 @@ struct PFlashRequestProbeTrace {
     PFlashRequestAbstainStats abstain;
     PFlashTokenSpan recency_pin{-1, -1};
     int recency_pin_new_tokens = 0;     // pin tokens not already pinned (query pins or the caller's)
-    // Per-token request logits of the messages read, when
-    // PFLASH_TRACE_REQUEST_LOGITS=1 (trace only).
-    std::vector<std::vector<float>> message_logits;
 };
 
 // The rows a message's turn retains: its request tokens capped at

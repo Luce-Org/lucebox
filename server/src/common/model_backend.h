@@ -509,12 +509,13 @@ struct ModelBackend {
         // The latest user turn's tail, a second query window at full weight
         // (prompt-end chat queries; {-1, -1} otherwise).
         PFlashTokenSpan turn_query_span{-1, -1};
-        // PFLASH_SELECT_QUERY_HEAD=1: the user's prose blocks around pasted
-        // material, extra query windows at full weight (also kept verbatim).
-        std::vector<PFlashTokenSpan> extra_query_spans;
-        // PFLASH_SELECT_QUERY_PROBE=1: the human user messages' content
-        // spans (latest first) the request probe reads.
+        // Human user messages' content spans (latest first) and full message
+        // map for the request probe.
         PFlashRequestMessages request_messages;
+        // True for HTTP server PFlash requests: enforces the baked November
+        // Update profile and requires all four PFlash assets on the drafter.
+        // False for standalone callers (e.g. daemon stdin compress).
+        bool                 use_release_profile = false;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
@@ -529,25 +530,29 @@ struct ModelBackend {
         std::vector<PFlashTokenSpan> kept_spans;
         // Drafter session reuse: the token scoring resumed from and the
         // tokens it ran (-1 when unknown), and its forward time.
-        // Strict selection with the head: every candidate's attention lift
-        // (mass per token relative to uniform); empty when unknown.
+        // Strict selection with the head: every candidate's raw Stage-1 attention
+        // lift (mass per token relative to uniform, calibrated for recall gating)
+        // and final ranking score (reranker-adjusted when PFLASH_SEG_RERANKER_GGUF
+        // is loaded; otherwise equal to candidate_lifts).
         std::vector<std::pair<PFlashTokenSpan, double>> candidate_lifts;
+        std::vector<std::pair<PFlashTokenSpan, double>> candidate_rank_scores;
         // The request probe's own pins in that selection (pflash_last_probe_pins).
         std::vector<PFlashTokenSpan> probe_pins;
         int                  scorer_resume = -1;
         int                  scorer_new_tokens = -1;
         double               scorer_forward_s = 0.0;
-        // Request stage 2 (STAGE2-CONTRACT.md section 5 step 5): the keep budget was widened x1.5 (drafter
-        // tokens B -> B'), and when B' covers the prompt the caller serves it raw.
-        bool                 budget_widened = false;
-        bool                 raw_fits = false;
-        int                  stage2_budget = -1;
-        int                  stage2_budget_widened = -1;
-        // Relevance spread of the served selection (PFLASH_FALLBACK_SPREAD);
-        // spread_valid is false when the backend did not compute one.
-        bool                 spread_valid = false;
-        double               spread = 0.0;
-        int                  spread_k = 0;
+        // The segment reranker's adaptive keep-ratio signal (sink-free effective token fraction).
+        bool                 adaptive_valid = false;
+        float                adaptive_eff = 0.0f;
+        float                adaptive_keep_ratio = 0.0f;
+        bool                 adaptive_full_bypass = false;
+        // Non-empty when a loaded segment reranker failed to execute and the
+        // scorer fell back to Stage-1 scores (empty on success or when fewer
+        // than two optional segments were eligible).
+        std::string          reranker_error;
+        // Identity of the drafter and PFlash asset files actually loaded when
+        // this scoring pass ran (empty for mock / remote backends).
+        std::string          loaded_assets_identity;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {
