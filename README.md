@@ -52,7 +52,7 @@ and easy to use with:
 | [Qwen 3.8 Flash-Next](server/docs/QWEN4EXP.md) | R9700 + Ryzen AI MAX+, or the Ryzen AI MAX+ alone, up to 4 users | 82.7 tok/s | [target](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf), [MTP](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) |
 | [DeepSeek V4.1 Flash](server/docs/DS41.md) | R9700 + Ryzen AI MAX+ | 25.4 tok/s on 128 GB, 52.7 on 192 GB | [target](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf), drafter for [128 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf) or [192 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf) |
 | [DeepSeek V4 Flash](server/docs/DS4.md) | Ryzen AI MAX+ | 27.9 tok/s | [target](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf), [drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) |
-| [Inkling 2 Mini](share/model_cards/inkling-2-mini.json) | R9700 + Ryzen AI MAX+, R9700, or Ryzen AI MAX+ alone | 136.5 tok/s HTTP (up to 155.4), 3,628 tok/s prefill | [target](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/Inkling-2-Mini-IQ4_NL.gguf), [DSpark](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/main/mtp.safetensors) |
+| [Inkling 2 Mini](share/model_cards/inkling-2-mini.json) | R9700 + Ryzen AI MAX+, R9700, or Ryzen AI MAX+ alone | 136.5 tok/s HTTP (up to 155.4), 3,628 tok/s prefill, 2x faster answers with Fast GGUF | [Fast target](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/Inkling-2-Mini-Fast-IQ4_NL.gguf), [16 GB](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/Inkling-2-Mini-Fast-IQ4_NL-16GB.gguf), [DSpark](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/mtp.safetensors) |
 | [MOSS-Image 5B](optimizations/image_gen/README.md) | R9700 | 2.74 s per 1024x1024 image | [model](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_sft_bf16.safetensors) |
 
 Every model runs on both the 128 GB and the 192 GB Ryzen AI MAX+. The Qwen and DeepSeek models take PFlash, and the Qwen models KVFlash.
@@ -166,10 +166,10 @@ hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
 ```
 
 ```bash
-# Inkling 2 Mini: auto-picks R9700 + iGPU, R9700 alone, or iGPU alone; auto-discovers mtp.safetensors beside the GGUF
-hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models/inkling2
-hf download thinkingmachines/Inkling-2-Mini mtp.safetensors --local-dir models/inkling2
-./server/build-hip/luce_server models/inkling2/Inkling-2-Mini-IQ4_NL.gguf
+# Inkling 2 Mini Fast: auto-picks R9700 + iGPU, R9700 alone, or iGPU alone; auto-discovers mtp.safetensors beside the GGUF
+hf download Lucebox/Inkling-2-Mini-Fast-GGUF \
+  Inkling-2-Mini-Fast-IQ4_NL.gguf mtp.safetensors --local-dir models/inkling2
+./server/build-hip/luce_server models/inkling2/Inkling-2-Mini-Fast-IQ4_NL.gguf
 ```
 
 Try it:

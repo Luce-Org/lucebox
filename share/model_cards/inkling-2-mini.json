@@ -2,6 +2,11 @@
   "name": "Inkling 2 Mini",
   "source": "https://huggingface.co/thinkingmachines/Inkling-2-Mini",
   "verified_at": "2026-11-23",
+  "download_urls": {
+    "IQ4_NL-Fast-target": "https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/resolve/main/Inkling-2-Mini-Fast-IQ4_NL.gguf",
+    "IQ4_NL-Fast-16GB-target": "https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/resolve/main/Inkling-2-Mini-Fast-IQ4_NL-16GB.gguf",
+    "DSpark-draft": "https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/resolve/main/mtp.safetensors"
+  },
   "chat_codec": "inkling2",
   "thinking_marker": "<|end_message|>",
   "thinking_terminator_hint": "<|end_message|><|message_model|><|content_text|>",
