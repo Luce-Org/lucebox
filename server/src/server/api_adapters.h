@@ -58,10 +58,11 @@ TokenDelivery classify_generated_token(
         int32_t token, std::string & text);
 
 // Replays a finished generation through `emitter` (the non-streaming path)
-// and counts its reasoning and content tokens.
+// and counts its reasoning and content tokens. With `ignore_eos` a last end
+// token at the cap does not make the reply a normal stop.
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter, int generation_cap);
+        SseEmitter & emitter, int generation_cap, bool ignore_eos);
 
 // The non-streaming response body in the request's API format.
 json build_non_streaming_response(
