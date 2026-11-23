@@ -18898,6 +18898,33 @@ TEST_CASE(ServerUnitFixture, test_eos_at_cap_finishes_as_stop) {
     }
 }
 
+// With ignore_eos an end token does not stop the generation, so one on the cap token was cut off.
+TEST_CASE(ServerUnitFixture, test_ignore_eos_at_cap_finishes_as_length) {
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(write_deepseek_marker_tokenizer_fixture().c_str()));  // eos id 2
+    GenerateResult result;
+    result.succeed();
+    result.tokens = {0, 0, tok.eos_id()};
+    const GenTimings timings{};
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::ANTHROPIC, ApiFormat::RESPONSES}) {
+        for (const bool ignore_eos : {false, true}) {
+            ParsedRequest req;
+            req.format = format;
+            req.raw_body = {{"ignore_eos", ignore_eos}};
+            auto em = make_emitter(format);
+            em.emit_start();
+            const json body = build_non_streaming_response(req, result, /*generation_cap=*/3, timings, tok, em);
+            if (format == ApiFormat::OPENAI_CHAT) {
+                TEST_ASSERT_MSG(body["choices"][0]["finish_reason"] == (ignore_eos ? "length" : "stop"), body.dump());
+            } else if (format == ApiFormat::ANTHROPIC) {
+                TEST_ASSERT_MSG(body["stop_reason"] == (ignore_eos ? "max_tokens" : "end_turn"), body.dump());
+            } else {
+                TEST_ASSERT_MSG(body["status"] == (ignore_eos ? "incomplete" : "completed"), body.dump());
+            }
+        }
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_invoke_zero_args) {
     json tools = json::array({
         {

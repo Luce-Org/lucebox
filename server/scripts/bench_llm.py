@@ -22,7 +22,7 @@ from pathlib import Path
 
 # Shared math-scoring helpers (canonical copy in harness/).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "harness"))
-from math_scoring import _extract_boxed, _math_equiv, _normalize_math
+from math_scoring import _extract_boxed, _math_equiv
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""

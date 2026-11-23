@@ -81,3 +81,19 @@ TEST_CASE(PlatformCompatFixture, platform_environment_and_socket_compatibility) 
 #endif
 
 }
+
+TEST_CASE(PlatformCompatFixture, env_flag_reads_one_on_off_rule) {
+    constexpr const char * kEnvName = "LUCE_PLATFORM_COMPAT_FLAG";
+
+    unset_environment_variable(kEnvName);
+    CHECK_FALSE(env_flag_enabled(kEnvName));
+    for (const char * off : {"", "0", "false", "FALSE", "No", "off", "OFF"}) {
+        set_environment_variable(kEnvName, off, true);
+        CHECK_FALSE(env_flag_enabled(kEnvName));
+    }
+    for (const char * on : {"1", "true", "yes", "on", "01", "offline", "falsey"}) {
+        set_environment_variable(kEnvName, on, true);
+        CHECK_TRUE(env_flag_enabled(kEnvName));
+    }
+    unset_environment_variable(kEnvName);
+}

@@ -102,6 +102,18 @@ __global__ void mix_wmma_build_tiles(const int32_t * __restrict__ expert_bounds,
 }
 
 // X[r][k] = half(src1[ids_src1[r] * s11 + k]); 8 halves per thread.
+// X[r][k] = src1[ids_src1[r] * s11 + k] when activations already arrive as F16
+// (e.g. half-width PCIe transfer from primary GPU; 0 ULP vs F32->F16 gather).
+__global__ void mix_wmma_gather_f16(const half * __restrict__ src1, const int32_t * __restrict__ ids_src1,
+                                    half * __restrict__ x, int64_t n_routes, int k, int64_t s11) {
+    const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int64_t r = i / k;
+    const int c = (int) (i % k);
+    if (r >= n_routes) return;
+    const uint4 v = *reinterpret_cast<const uint4 *>(src1 + (int64_t) ids_src1[r] * s11 + c);
+    *reinterpret_cast<uint4 *>(x + r * k + c) = v;
+}
+
 __global__ void mix_wmma_gather(const float * __restrict__ src1, const int32_t * __restrict__ ids_src1,
                                 half * __restrict__ x, int64_t n_routes, int k, int64_t s11) {
     const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;
@@ -439,22 +451,19 @@ uint64_t ggml_cuda_mix_wmma_moe_launch_count() {
     return g_mix_wmma_launches.load(std::memory_order_relaxed);
 }
 
-bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
-                                    const ggml_tensor * ids, int64_t n_tokens, int cc) {
+bool ggml_cuda_mix_wmma_moe_supports_f16_src1(const ggml_tensor * src0, int64_t n_tokens,
+                                              int64_t n_expert_used, int cc) {
     const bool enabled = mix_wmma_prefill_enabled();
-    // A whole number >= 1; anything else keeps the default (0 would send
-    // decode batches here).
     static const int min_tokens = [] {
         const char * v = std::getenv("LUCE_MIX_WMMA_MIN_TOKENS");
         char * end = nullptr;
         const long n = v && *v ? std::strtol(v, &end, 10) : 0;
         return (end && *end == '\0' && n >= 1 && n <= 1 << 20) ? (int) n : 64;
     }();
-    if (!enabled || !(GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) return false;
-    // Plain ROCmFP2 (qtype 107) is opt-in: LUCE_ROCMFP2_WMMA_PREFILL=1.
+    if (!enabled || !src0 || !(GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) return false;
     static const bool plain_fp2 = [] {
 #ifdef ROCMFP2_AFFINE
-        return false;  // the affine wire format is not the two-scale layout decoded here
+        return false;
 #else
         const char * v = std::getenv("LUCE_ROCMFP2_WMMA_PREFILL");
         return v && v[0] && v[0] != '0';
@@ -465,12 +474,17 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
     if (!(n_tokens >= min_tokens && src0->ne[0] % kBK2 == 0 && src0->ne[1] % kBM == 0 && src0->ne[2] <= 1024)) {
         return false;
     }
-    // The gather reads each activation row as K contiguous floats.
-    if (!ids || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
-    // One grid row per route tile: at most n_routes / 32 + n_experts tiles
-    // (bn >= 32) must fit the 65535 grid-y limit; longer batches stay on MMQ.
-    const int64_t max_tiles = (ids->ne[0] * n_tokens + 31) / 32 + src0->ne[2];
+    const int64_t max_tiles = (n_expert_used * n_tokens + 31) / 32 + src0->ne[2];
     return max_tiles <= 65535;
+}
+
+bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor * src1,
+                                    const ggml_tensor * ids, int64_t n_tokens, int cc) {
+    // The gather reads each activation row as K contiguous floats or halves.
+    if (!src1 || !ids || (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    return ggml_cuda_mix_wmma_moe_supports_f16_src1(src0, n_tokens, ids->ne[0], cc);
 }
 
 // Routes, tiles and the gathered F16 activations are shared by every weight
@@ -525,10 +539,16 @@ static void mix_wmma_moe_run(ggml_backend_cuda_context & ctx, const ggml_tensor 
     mix_wmma_build_tiles<<<1, tile_threads, 0, stream>>>(expert_bounds.get(), (int) n_experts, tiles.get(), n_tiles.get(), bn);
 
     ggml_cuda_pool_alloc<half> x(ctx.pool(), n_routes * k);
-    const int64_t s11 = src1->nb[1] / sizeof(float);
     const int64_t gather_threads = n_routes * k / 8;
-    mix_wmma_gather<<<(gather_threads + 255) / 256, 256, 0, stream>>>(
-        (const float *) src1->data, ids_src1.get(), x.get(), n_routes, (int) k, s11);
+    if (src1->type == GGML_TYPE_F16) {
+        const int64_t s11 = src1->nb[1] / sizeof(half);
+        mix_wmma_gather_f16<<<(gather_threads + 255) / 256, 256, 0, stream>>>(
+            (const half *) src1->data, ids_src1.get(), x.get(), n_routes, (int) k, s11);
+    } else {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        mix_wmma_gather<<<(gather_threads + 255) / 256, 256, 0, stream>>>(
+            (const float *) src1->data, ids_src1.get(), x.get(), n_routes, (int) k, s11);
+    }
 
     // Side data must stay registered until the kernels are enqueued.
     struct RegistryLock {

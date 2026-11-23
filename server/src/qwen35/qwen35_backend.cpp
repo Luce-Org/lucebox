@@ -1388,9 +1388,28 @@ bool Qwen35Backend::snapshot_save(int slot) {
     const bool deferred_here = live_snapshot_deferred_ &&
         slot == live_snapshot_slot_ && cache_.cur_pos == live_snapshot_pos_;
     materialize_live_snapshot();
-    const bool ok = deferred_here && prefix_snapshots_[slot].ctx
-        ? true
-        : snapshot_target_cache(w_, cache_, snap_backend_, prefix_snapshots_[slot]);
+    auto find_anc = [&](int dst_slot) -> const PrefixSnapshot * {
+        if (!live_kv_valid_ || (int)live_kv_tokens_.size() != cache_.cur_pos) return nullptr;
+        const PrefixSnapshot * best = nullptr;
+        for (int a = 0; a < PREFIX_SLOTS; ++a) {
+            if (a == dst_slot) continue;
+            const auto & cand = prefix_snapshots_[a];
+            if (!cand.ctx || !cand.buf || cand.is_pooled || cand.state_only ||
+                cand.cur_pos <= 0 || cand.cur_pos > cache_.cur_pos) continue;
+            if ((int)cand.tokens.size() != cand.cur_pos) continue;
+            if (!std::equal(cand.tokens.begin(), cand.tokens.end(), live_kv_tokens_.begin())) continue;
+            if (!best || cand.cur_pos > best->cur_pos) best = &cand;
+        }
+        return best;
+    };
+    bool ok = deferred_here && prefix_snapshots_[slot].ctx;
+    if (!ok) {
+        ok = snapshot_target_cache(w_, cache_, snap_backend_, prefix_snapshots_[slot],
+                                   false, nullptr, false, target_backend_, find_anc(slot));
+        if (ok && live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+            prefix_snapshots_[slot].tokens = live_kv_tokens_;
+        }
+    }
     live_snapshot_slot_ = ok && !generating_ ? slot : -1;
     return ok;
 }
@@ -1416,11 +1435,26 @@ void Qwen35Backend::materialize_live_snapshot() {
     if (!live_snapshot_deferred_) return;
     live_snapshot_deferred_ = false;
     const int slot = live_snapshot_slot_;
+    const PrefixSnapshot * anc = nullptr;
+    if (live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+        for (int a = 0; a < PREFIX_SLOTS; ++a) {
+            if (a == slot) continue;
+            const auto & cand = prefix_snapshots_[a];
+            if (!cand.ctx || !cand.buf || cand.is_pooled || cand.state_only ||
+                cand.cur_pos <= 0 || cand.cur_pos > cache_.cur_pos) continue;
+            if ((int)cand.tokens.size() != cand.cur_pos) continue;
+            if (!std::equal(cand.tokens.begin(), cand.tokens.end(), live_kv_tokens_.begin())) continue;
+            if (!anc || cand.cur_pos > anc->cur_pos) anc = &cand;
+        }
+    }
     if (cache_.cur_pos != live_snapshot_pos_ ||
         !snapshot_target_cache(w_, cache_, snap_backend_,
-                               prefix_snapshots_[slot])) {
+                               prefix_snapshots_[slot], false, nullptr, false,
+                               target_backend_, anc)) {
         free_prefix_snapshot(prefix_snapshots_[slot]);
         live_snapshot_slot_ = -1;
+    } else if (live_kv_valid_ && (int)live_kv_tokens_.size() == cache_.cur_pos) {
+        prefix_snapshots_[slot].tokens = live_kv_tokens_;
     }
 }
 
@@ -1442,6 +1476,9 @@ bool Qwen35Backend::snapshot_used(int slot) const {
 bool Qwen35Backend::restore_target_cache_from_snapshot(int slot, int kv_slot) {
     materialize_live_snapshot();
     live_snapshot_slot_ = -1;
+    live_kv_valid_ = false;
+    live_target_feat_valid_ = false;
+    live_kv_tokens_.clear();
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
     return restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
                                 snapshot_kv_source(slot, kv_slot));
@@ -2141,13 +2178,29 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         result.restored_prefix_tokens = live_cut;
         result.restore_cut_reported = true;
     } else {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
                                /*kv_offset=*/0, has_images ? &image_rows : nullptr,
                                req.restore_points);
     }
     if (committed < 0) {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
+    }
+    if (!has_images && rope_delta_ == 0 && !kvflash_active() && !cfg_.paged_attention &&
+        committed > 0 && committed <= (int)req.prompt.size()) {
+        live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + committed);
+        live_kv_valid_ = true;
+        live_target_feat_valid_ = (cache_.target_feat != nullptr && !draft_parked_);
+    } else {
+        live_kv_valid_ = false;
+        live_target_feat_valid_ = false;
+        live_kv_tokens_.clear();
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
@@ -2339,30 +2392,63 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     const bool adopt = plan == KvflashRestorePlan::AdoptDense;
     const bool full_reprefill = plan == KvflashRestorePlan::FullReprefill;
 
+
+
     if (live_restore) {
-        // The live cache already is this snapshot (saved after the previous
-        // generation, nothing ran since). Only the rows past it differ from
-        // a restore: rejected drafts, which the padded decode span reads.
         clear_kv_rows_from(cache_, cache_.cur_pos);
+        if (live_kv_valid_ && (int)live_kv_tokens_.size() > cache_.cur_pos) {
+            live_kv_tokens_.resize(cache_.cur_pos);
+        }
     } else {
-        // Clear-then-restore: the step-invariant decode reads a 256-padded,
-        // mask-less FA span, so rows beyond the restored prefix must be ZERO,
-        // not leftovers from the previous request. cudaMemset is ~0.2ms.
-        if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-        if (full_reprefill) {
-            std::fprintf(stderr,
-                "[kvflash] snapshot (pos=%d) %s: full re-prefill "
-                "of %zu prompt tokens\n", snap_pos,
-                snap_pooled ? "not consumable" : "dense prefix cannot continue past the pool",
-                req.prompt.size());
-            reset_recurrent_state(cache_);
+        const bool live_kv_prefix =
+            !consume && !full_reprefill && !kvflash_active() &&
+            !cfg_.paged_attention && !req.images && !req.prompt.empty() &&
+            live_kv_valid_ &&
+            (int)live_kv_tokens_.size() >= snap_pos &&
+            (int)req.prompt.size() >= snap_pos &&
+            std::equal(req.prompt.begin(), req.prompt.begin() + snap_pos, live_kv_tokens_.begin());
+
+        if (live_kv_prefix) {
+            clear_kv_rows_from(cache_, snap_pos);
+            const bool skip_tf = live_target_feat_valid_ && cache_.target_feat != nullptr &&
+                cache_.target_feat_cap > 0 &&
+                cache_.cur_pos <= cache_.target_feat_cap &&
+                (int)live_kv_tokens_.size() <= cache_.target_feat_cap &&
+                snap_pos <= cache_.target_feat_cap;
+            const bool restored = restore_target_cache(
+                prefix_snapshots_[slot], cache_, /*skip_kv=*/true, /*kv_from=*/nullptr,
+                /*skip_target_feat=*/skip_tf);
+            if (!restored) {
+                live_kv_valid_ = false;
+                live_target_feat_valid_ = false;
+                live_kv_tokens_.clear();
+                std::fprintf(stderr, "[qwen35] live-kv delta restore slot=%d failed: %s\n",
+                             slot, luce_last_error());
+                cache_.cur_pos = 0;
+                result.fail(GenerateErrorCode::InvalidSnapshotSlot,
+                            std::string("snapshot restore failed: ") + luce_last_error());
+                out_io.emit(-1);
+                return result;
+            }
+            live_kv_tokens_.resize(snap_pos);
         } else {
-            // Decoding on a cache the restore did not fill yields garbage.
-            const bool restored = consume
-                ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
-                   kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
-                : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
-                                       snapshot_kv_source(slot, req.restore_kv_slot));
+            live_kv_valid_ = false;
+            live_target_feat_valid_ = false;
+            live_kv_tokens_.clear();
+            if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
+            if (full_reprefill) {
+                std::fprintf(stderr,
+                    "[kvflash] snapshot (pos=%d) %s: full re-prefill "
+                    "of %zu prompt tokens\n", snap_pos,
+                    snap_pooled ? "not consumable" : "dense prefix cannot continue past the pool",
+                    req.prompt.size());
+                reset_recurrent_state(cache_);
+            } else {
+                const bool restored = consume
+                    ? (restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/true) &&
+                       kvflash_restore_pooled(prefix_snapshots_[slot], req.prompt))
+                    : restore_target_cache(prefix_snapshots_[slot], cache_, /*skip_kv=*/false,
+                                           snapshot_kv_source(slot, req.restore_kv_slot));
             if (!restored) {
                 std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
                              slot, luce_last_error());
@@ -2387,8 +2473,16 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                     std::fflush(stdout);
                 }
             }
+            if (!consume && !kvflash_active() && !cfg_.paged_attention && !req.images &&
+                !req.prompt.empty() && (int)req.prompt.size() >= snap_pos) {
+                live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + snap_pos);
+                live_kv_valid_ = true;
+                live_target_feat_valid_ = (cache_.target_feat != nullptr && prefix_snapshots_[slot].target_feat_snap != nullptr);
+            }
         }
     }
+    }
+
 
     // Now generate from restored state
     sampler_ = req.sampler;
@@ -2470,6 +2564,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+        if (live_kv_valid_ && !req.images && rope_delta_ == 0 && !kvflash_active() &&
+            committed > 0 && committed <= prompt_len) {
+            live_kv_tokens_.assign(req.prompt.begin(), req.prompt.begin() + committed);
+            if (draft_parked_) live_target_feat_valid_ = false;
+        }
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
         // The slot's snapshot covers more KV than the new prompt. This is
         // routine with agent clients (Letta, Hermes, ...) that edit or
@@ -2922,7 +3021,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/
-                                   (start + n_tokens < prompt_len ? 1 : 0),
+                                   ((is_final_batch ||
+                                     (snap_slot >= 0 && snap_pos >= kv_pos + n_tokens && snap_pos < kv_pos + n_tokens + prefill_ubatch) ||
+                                     !ladder.empty() || rw.run) ? 1 : -1),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/kvf_paged,
@@ -3021,15 +3122,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         // The discarded first pass of mode 4 must not count in the MoE routing stats.
         if (!rw_pass1) after_target_compute(sg_, kv_pos, n_tokens);
-        int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
-        const size_t argmax_off =
-            is_final_chunk ? sizeof(int32_t) * (size_t)(n_tokens - 1) : 0;
-        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
-        cache_.last_tok = last_tok;
-        if (is_final_chunk) {
-            prefill_last_logits_offset_ = (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
-            prefill_last_logits_valid_ = true;
+        if (sg_.argmax_tokens) {
+            int32_t last_tok = -1;
+            const int64_t n_logit_rows = sg_.logits ? sg_.logits->ne[1] : 1;
+            const size_t argmax_off = sizeof(int32_t) * (size_t)(n_logit_rows - 1);
+            ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
+            cache_.last_tok = last_tok;
+            if (is_final_chunk) {
+                prefill_last_logits_offset_ = (size_t)(n_logit_rows - 1) * (size_t)vocab * sizeof(float);
+                prefill_last_logits_valid_ = true;
+            }
         }
 
         committed = kv_pos + n_tokens;

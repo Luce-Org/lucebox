@@ -1167,8 +1167,6 @@ int main(int argc, char ** argv) {
                 ? std::max<int>(LUCE_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
                 : LUCE_DRAFT_BLOCK_SIZE;
             lsargs.stream_fd   = stream_fd;
-            // TODO: migrate to run_qwen35_layer_split_daemon() once helpers
-            // are extracted to src/qwen35/. For now, call the local function.
             return run_target_layer_split_daemon(
                 lsargs.target_path, lsargs.draft_path,
                 lsargs.device.layer_split_gpus,

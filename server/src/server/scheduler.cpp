@@ -402,7 +402,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
         } else if (req.stream && !s.client_disconnected) {
-            const bool is_eos = !s.gen_tokens.empty() &&
+            const bool is_eos = !request_ignores_eos(req) && !s.gen_tokens.empty() &&
                 engine.token_is_eos(s.gen_tokens.back());
             auto final_chunks =
                 s.emitter->emit_finish(
@@ -441,6 +441,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         engine.retire(idx);
         // A retirement may have released the blocks the head job needs.
         deferred_retry_at = {};
+        // Before the reply goes out: the client's next request finds the
+        // slot free.
+        live_slots--;
+        load_.vacate(req.tool_checks_pass ? s.job->waiting : nullptr, live_slots,
+                     engine.kv_pool_tokens().free);
 
         // Hand any undrained bytes to the drain list; the job stays parked
         // until they are out (or the drain gives up).
@@ -473,7 +478,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             drains.push_back(std::move(d));
         }
         s = SchedSlot{};
-        live_slots--;
         publish_live_count();
     };
 
@@ -716,6 +720,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
+        load_.seat(job->waiting, live_slots, engine.kv_pool_tokens().free);
         publish_live_count();
         return AdmissionDisposition::Admitted;
     };
@@ -930,6 +935,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
     while (true) {
         kv_cache_.reap_reads();
+        // Decode grows the slots' KV every step; parking and resuming move it.
+        load_.publish(live_slots, engine.kv_pool_tokens().free);
         // A waiter whose client left is finished now, even while every slot
         // is busy and nothing is admitted: the scheduler took it off the
         // queue, so nothing else would notice.

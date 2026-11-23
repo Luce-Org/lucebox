@@ -94,6 +94,11 @@ has_pair "$out" --prefix-cache-slots 4 || fail "LUCE_PREFIX_CACHE_SLOTS not forw
 has_pair "$out" --prefix-cache-max-mib 8192 || fail "LUCE_PREFIX_CACHE_MAX_MIB not forwarded"
 has_pair "$out" --prefill-cache-slots 2 || fail "LUCE_PREFILL_CACHE_SLOTS not forwarded"
 
+# ── queue limit: none unless set, 0 included ───────────────────────────────
+has_flag "$(run_entrypoint --)" --queue-limit && fail "entrypoint sets a queue limit by default"
+out="$(run_entrypoint LUCE_QUEUE_LIMIT=0 --)"
+has_pair "$out" --queue-limit 0 || fail "explicit LUCE_QUEUE_LIMIT=0 dropped"
+
 # ── PFlash ratio and threshold defaults stay with luce_server ──────────────
 out="$(run_entrypoint LUCE_PFLASH=on LUCE_PREFILL_DRAFTER="$TARGET" --)"
 has_pair "$out" --pflash on || fail "LUCE_PFLASH not forwarded"

@@ -75,6 +75,7 @@ public:
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
+    KvPoolTokens kv_pool_tokens() const override { return slots_.kv_pool_tokens(); }
     bool supports_prefix_store() const override { return true; }
     bool prefix_store_in_backend_snapshots() const override { return true; }
     size_t estimate_prefix_store_bytes(int tokens) const override;
@@ -323,6 +324,8 @@ private:
     std::vector<int32_t>     active_slot_ids_;
     std::vector<int32_t>     state_slot_ids_;
     std::vector<int32_t>     seq_lens_;
+    std::vector<int> restored_kv_checkpoint_;
+    std::vector<int> restored_kv_tokens_;
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;

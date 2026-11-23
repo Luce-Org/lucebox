@@ -1029,7 +1029,9 @@ gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v,
                               const float * curr_state, float * dst, float * state,
                               int H, int n_tokens, int neqk1,
                               int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2,
-                              float scale) {
+                              float scale,
+                              const int * active_slot_ids = nullptr, int64_t n_state_slots = 0,
+                              const float * gate_bias = nullptr, const float * gate_A = nullptr) {
     constexpr int D   = 128;
     constexpr int VEC = 8;             // gdn_f4 per lane segment (32 keys)
     constexpr int NT  = WAVES * 32;
@@ -1045,6 +1047,8 @@ gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v,
 
     const int h    = blockIdx.y;
     const int tid  = threadIdx.x;
+    const float gb_h = gate_bias ? gate_bias[h] : 0.0f;
+    const float ga_h = gate_A    ? gate_A[h]    : 0.0f;
     const int lane = tid & 31;
     const int wave = tid >> 5;
     const int seg  = lane & 3;
@@ -1057,12 +1061,23 @@ gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v,
     __shared__ float  s_v[2][WIN][RPB];
     __shared__ float  s_m[2][WIN][2];
 
+    const int mapped_slot = active_slot_ids ? active_slot_ids[0] : 0;
+    const bool mapped_valid = !active_slot_ids || (mapped_slot >= 0 && mapped_slot < n_state_slots);
+    const int64_t slot_off = (active_slot_ids && mapped_valid) ? ((int64_t) mapped_slot * H * D * D) : 0;
+    const float * curr_state_slot = curr_state + slot_off;
+    float * state_slot = mapped_valid ? (state + slot_off) : (dst + (int64_t) D * H * n_tokens);
+
     gdn_f4 s[ROWS][VEC];
 #pragma unroll
     for (int rr = 0; rr < ROWS; ++rr) {
-        const gdn_f4 * st = (const gdn_f4 *) (curr_state + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
+        if (mapped_valid) {
+            const gdn_f4 * st = (const gdn_f4 *) (curr_state_slot + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
 #pragma unroll
-        for (int i = 0; i < VEC; ++i) s[rr][i] = st[i];
+            for (int i = 0; i < VEC; ++i) s[rr][i] = st[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < VEC; ++i) s[rr][i] = {0.0f, 0.0f, 0.0f, 0.0f};
+        }
     }
 
     // Window chunk ownership. q/k: chunk c -> (which, token, gdn_f4 index);
@@ -1113,7 +1128,18 @@ gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v,
         for (int j = 0; j < QK_PT; ++j) s_qk[lds][qk_which[j]][qk_tok[j]][qk_slot[j]] = r.qk[j];
 #pragma unroll
         for (int j = 0; j < V_PT; ++j) s_v[lds][v_tok[j]][v_row[j]] = r.vv[j];
-        if (tid < 2 * WIN) s_m[lds][m_tok][m_idx] = m_idx ? r.m : expf(r.m);
+        if (tid < 2 * WIN) {
+            float mv = r.m;
+            if (gate_bias != nullptr) {
+                if (m_idx) {
+                    mv = 1.0f / (1.0f + expf(-mv));
+                } else {
+                    const float a = mv + gb_h;
+                    mv = ((a > 20.0f) ? a : logf(1.0f + expf(a))) * ga_h;
+                }
+            }
+            s_m[lds][m_tok][m_idx] = m_idx ? mv : expf(mv);
+        }
     };
 
     const int n_windows = (n_tokens + WIN - 1) / WIN;
@@ -1241,7 +1267,7 @@ gated_delta_net_rowsplit_cuda(const float * q, const float * k, const float * v,
     }
 #pragma unroll
     for (int rr = 0; rr < ROWS; ++rr) {
-        gdn_f4 * st = (gdn_f4 *) (state + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
+        gdn_f4 * st = (gdn_f4 *) (state_slot + ((int64_t) h * D + row0 + row_local(rr)) * D) + seg * VEC;
 #pragma unroll
         for (int i = 0; i < VEC; ++i) st[i] = s[rr][i];
     }
@@ -1310,22 +1336,30 @@ static void launch_gated_delta_net(
     // intermediate capture, raw gates and multi-sequence batches, which the
     // scalar/grouped kernels still own; T=1 decode keeps the grouped kernel.
     // qwen4exp graphs only, as for the tiled kernel this replaces.
-    if (ggml_cuda_qwen4exp_enabled() && !KDA && !TREE_MODE && !WRITE_INTER &&
-        active_slot_ids_d == nullptr && persist_inter_d == nullptr &&
-        replay_log_d == nullptr && gate_bias == nullptr && gate_A == nullptr &&
-        state_out_d != nullptr && n_seqs == 1 && S_v == 128 && H == 48 &&
-        GGML_CUDA_CC_IS_RDNA3_5(cc) && n_tokens >= 2 && n_tokens <= 32768 &&
+    const bool qwen4exp_rowsplit = ggml_cuda_qwen4exp_enabled() && active_slot_ids_d == nullptr &&
+        H == 48 && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_tokens >= 2;
+    const bool rdna4_wide_rowsplit = GGML_CUDA_CC_IS_RDNA4(cc) && H > 0 && n_tokens >= 128;
+    if (!KDA && !TREE_MODE && !WRITE_INTER &&
+        persist_inter_d == nullptr &&
+        replay_log_d == nullptr && ((gate_bias == nullptr) == (gate_A == nullptr)) &&
+        state_out_d != nullptr && n_seqs == 1 && S_v == 128 && n_tokens <= 32768 &&
+        (qwen4exp_rowsplit || rdna4_wide_rowsplit) &&
         // A pinned route wins: the qualification test pins scalar or
         // grouped_cols, so the tiled path must not shadow them.
         g_gdn_route_override.load(std::memory_order_relaxed) < 0) {
         static const bool legacy = getenv("LUCE_GDN_LEGACY") != nullptr;
-        if (legacy) {
+        if (legacy && active_slot_ids_d == nullptr && gate_bias == nullptr) {
             ++g_gdn_tiled_launch_count;
+            ggml_cuda_gdn_prefill_kernel_launch(true, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d,
+                                                H, neqk1, n_tokens, sq1, sq2, sv1, sv2, sb1, sb2, scale, stream);
         } else {
             ++g_gdn_rowsplit_launch_count;
+            constexpr int rows_per_block = 8 * GDN_ROWSPLIT_ROWS * GDN_ROWSPLIT_WAVES;
+            gated_delta_net_rowsplit_cuda<GDN_ROWSPLIT_ROWS, GDN_ROWSPLIT_WAVES, GDN_ROWSPLIT_WIN>
+                <<<dim3(128 / rows_per_block, (unsigned) H), dim3(GDN_ROWSPLIT_WAVES * 32), 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, (int) H, (int) n_tokens, (int) neqk1,
+                    sq1, sq2, sv1, sv2, sb1, sb2, scale, active_slot_ids_d, n_state_slots, gate_bias, gate_A);
         }
-        ggml_cuda_gdn_prefill_kernel_launch(legacy, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d,
-                                            H, neqk1, n_tokens, sq1, sq2, sv1, sv2, sb1, sb2, scale, stream);
         return;
     }
 
