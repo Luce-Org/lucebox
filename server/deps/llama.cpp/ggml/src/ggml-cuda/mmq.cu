@@ -324,7 +324,7 @@ bool luce_mmq_twin(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaS
     call.type     = args.type_x;
     call.nrows    = args.nrows_x;
     call.ncols    = std::max(args.ncols_dst, args.ncols_max);
-    call.rdna4    = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    { const int cc_t = ggml_cuda_info().devices[ggml_cuda_get_device()].cc; call.rdna4 = GGML_CUDA_CC_IS_RDNA4(cc_t) || GGML_CUDA_CC_IS_RDNA3_5(cc_t); }
     call.routed   = args.ids_dst != nullptr || args.expert_bounds != nullptr;
     const mmq_twin_choice choice = mmq_twin_choose(on, call);
     if (choice.tile == mmq_twin_tile::parent) {
@@ -1025,14 +1025,14 @@ bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int6
             //     so it's only faster for sufficiently small batch sizes:
             switch (type) {
                 case GGML_TYPE_Q2_K:
-                    return ne11 <= 128;
+                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
                 case GGML_TYPE_Q6_K:
-                    return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 // Wide Q4_K batches on gfx1151 favor dequantization +
                 // hipBLAS; keep MMQ for decode/small-prefill shapes and for
                 // the unmeasured RDNA 3.0 family.
                 case GGML_TYPE_Q4_K:
-                    return !GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 256;
+                    return true;
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;

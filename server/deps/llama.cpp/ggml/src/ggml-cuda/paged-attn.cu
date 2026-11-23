@@ -2476,10 +2476,15 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     return true;
 }
 
+#include "paged-attn-rdna-wmma.cuh"
+
 void ggml_cuda_paged_attn(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_paged_attn_supported(dst));
+    if (try_launch_paged_attn_rdna_wmma(ctx, dst)) {
+        return;
+    }
     if (try_launch_paged_attn_wmma(ctx, dst)) {
         return;
     }

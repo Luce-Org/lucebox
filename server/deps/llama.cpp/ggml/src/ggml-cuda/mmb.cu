@@ -91,6 +91,75 @@ __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, con
     }
 }
 
+// 2-thread-per-row Q8_0 decoder: 1 block_q8_0 (32 elements -> 16 bf16x2).
+// s==0: ws[0..8] starts at block byte 0 (d in ws[0] lo16, qs straddles ws[w] hi16 | ws[w+1] lo16).
+// s==1: ws[0..8] starts at block byte -2 (d in ws[0] hi16, qs aligned in ws[1..8]).
+__device__ __forceinline__ void mmb_dq_q80_one(const uint4 a0, const uint4 a1, const uint32_t a2, const int s, uint32_t * out) {
+    const uint32_t ws[9] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w, a2};
+    const float d = mmb_h2f((uint16_t)(s ? (ws[0] >> 16) : (ws[0] & 0xffffu)));
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const uint32_t v = s ? ws[1 + w] : ((ws[w] >> 16) | (ws[w + 1] << 16));
+        const float e0 = d * (float)(int8_t)(v      ), e1 = d * (float)(int8_t)(v >>  8);
+        const float e2 = d * (float)(int8_t)(v >> 16), e3 = d * (float)(int8_t)(v >> 24);
+        out[2 * w + 0] = q4x_pack2(e0, e1);
+        out[2 * w + 1] = q4x_pack2(e2, e3);
+    }
+}
+
+// 2-thread-per-row IQ3_S decoder: 1 sub-block ib (32 elements -> 16 bf16x2).
+// a0 = {qs[0..3], qs[4..7], signs[0..3], (qh_byte << 16) | d_bits}, scale_nib = 4-bit scale.
+__device__ __forceinline__ void mmb_dq_iq3s_one(const uint4 a0, const uint32_t scale_nib, uint32_t * out) {
+    const float dl = mmb_h2f((uint16_t)(a0.w & 0xffffu)) * (float)(1 + 2 * (int)(scale_nib & 0xfu));
+    const uint32_t qh = (a0.w >> 16) & 0xffu;
+    const uint32_t qs_pair[2] = {a0.x, a0.y};
+    const uint32_t sgn_all = a0.z;
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const uint32_t qw = (qs_pair[il >> 1] >> ((il & 1) * 16)) & 0xffffu;
+        const uint32_t idx0 = (qw & 0xffu) | ((qh << (8 - 2 * il)) & 256u);
+        const uint32_t idx1 = (qw >> 8)    | ((qh << (7 - 2 * il)) & 256u);
+        const uint32_t g0 = iq3s_grid[idx0];
+        const uint32_t g1 = iq3s_grid[idx1];
+        const uint32_t sg = (sgn_all >> (8 * il)) & 0xffu;
+        auto dec4 = [&](const uint32_t g, const uint32_t sb, uint32_t * dst2) {
+            const float v0 = dl * (float)(g & 0xffu)         * ((sb & 1u) ? -1.0f : 1.0f);
+            const float v1 = dl * (float)((g >> 8) & 0xffu)  * ((sb & 2u) ? -1.0f : 1.0f);
+            const float v2 = dl * (float)((g >> 16) & 0xffu) * ((sb & 4u) ? -1.0f : 1.0f);
+            const float v3 = dl * (float)(g >> 24)           * ((sb & 8u) ? -1.0f : 1.0f);
+            dst2[0] = q4x_pack2(v0, v1);
+            dst2[1] = q4x_pack2(v2, v3);
+        };
+        dec4(g0, sg & 0xfu, out + 4 * il + 0);
+        dec4(g1, sg >> 4,   out + 4 * il + 2);
+    }
+}
+
+// 2-thread-per-row Q6_K decoder: 32 elements -> 16 bf16x2.
+// ql0/ql1 = 32 bytes of ql, qh0/qh1 = 32 bytes of qh, meta = (d_bits) | ((uint8_t)sc0 << 16) | ((uint8_t)sc1 << 24).
+__device__ __forceinline__ void mmb_dq_q6k_one(
+        const uint4 ql0, const uint4 ql1, const uint4 qh0, const uint4 qh1,
+        const uint32_t meta, const int hi_nib, const int s, uint32_t * out) {
+    const float d = mmb_h2f((uint16_t)(meta & 0xffffu));
+    const float d0 = d * (float)(int8_t)((meta >> 16) & 0xffu);
+    const float d1 = d * (float)(int8_t)(meta >> 24);
+    const int ql_sh = hi_nib * 4;
+    const int qh_sh = hi_nib * 4 + s * 2;
+    const uint32_t qlw[8] = {ql0.x, ql0.y, ql0.z, ql0.w, ql1.x, ql1.y, ql1.z, ql1.w};
+    const uint32_t qhw[8] = {qh0.x, qh0.y, qh0.z, qh0.w, qh1.x, qh1.y, qh1.z, qh1.w};
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const float ds = (w < 4) ? d0 : d1;
+        const uint32_t qlv = qlw[w], qhv = qhw[w];
+        const int q0 = (int)(((qlv >> (0  + ql_sh)) & 0xfu) | (((qhv >> (0  + qh_sh)) & 3u) << 4)) - 32;
+        const int q1 = (int)(((qlv >> (8  + ql_sh)) & 0xfu) | (((qhv >> (8  + qh_sh)) & 3u) << 4)) - 32;
+        const int q2 = (int)(((qlv >> (16 + ql_sh)) & 0xfu) | (((qhv >> (16 + qh_sh)) & 3u) << 4)) - 32;
+        const int q3 = (int)(((qlv >> (24 + ql_sh)) & 0xfu) | (((qhv >> (24 + qh_sh)) & 3u) << 4)) - 32;
+        out[2 * w + 0] = q4x_pack2(ds * (float)q0, ds * (float)q1);
+        out[2 * w + 1] = q4x_pack2(ds * (float)q2, ds * (float)q3);
+    }
+}
+
 template <bool DH_F16 = false, typename DRowFn>
 __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
         const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
@@ -140,8 +209,15 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
 
     int weight_ks = 0;
-    // Q5_1 with 2*BM == MMB_NT: two threads per row, one 32-element block each (was BM of 256 threads decoding both).
-    constexpr bool Q51_SPLIT = WTYPE == 32 + GGML_TYPE_Q5_1 && 2 * BM == MMB_NT;
+    // 2*BM == MMB_NT split loaders: two threads per row, zero wasted elements, all 256 threads active.
+    constexpr bool Q51_SPLIT   = WTYPE == 32 + GGML_TYPE_Q5_1   && 2 * BM == MMB_NT;
+    constexpr bool Q80_SPLIT   = WTYPE == 1                     && 2 * BM == MMB_NT;
+    constexpr bool IQ4XS_SPLIT = WTYPE == 32 + GGML_TYPE_IQ4_XS && 2 * BM == MMB_NT;
+    constexpr bool IQ3S_SPLIT  = WTYPE == 32 + GGML_TYPE_IQ3_S  && 2 * BM == MMB_NT;
+    constexpr bool Q4K_SPLIT   = WTYPE == 32 + GGML_TYPE_Q4_K   && 2 * BM == MMB_NT;
+    constexpr bool Q5K_SPLIT   = WTYPE == 32 + GGML_TYPE_Q5_K   && 2 * BM == MMB_NT;
+    constexpr bool Q6K_SPLIT   = WTYPE == 32 + GGML_TYPE_Q6_K   && 2 * BM == MMB_NT;
+    constexpr bool ANY_SPLIT   = Q51_SPLIT || Q80_SPLIT || IQ4XS_SPLIT || IQ3S_SPLIT || Q4K_SPLIT || Q5K_SPLIT || Q6K_SPLIT;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
         if constexpr (Q51_SPLIT) {
@@ -151,6 +227,83 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 const uint2 w0 = p[0], w1 = p[1], w2 = p[2];
                 a0[0] = make_uint4(w0.x, w0.y, w1.x, w1.y); a2[0] = w2.x; a3[0].x = w2.y;
             } else { a0[0] = make_uint4(0,0,0,0); a2[0] = 0; a3[0].x = 0; }
+        } else if constexpr (Q80_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                // 4-byte aligned base: s==0 reads bytes 0..35, s==1 reads bytes 32..67
+                const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 68 + (tid & 1) * 32;
+                a0[0] = *(const uint4 *)(p);
+                a1[0] = *(const uint4 *)(p + 16);
+                a2[0] = *(const uint32_t *)(p + 32);
+            } else { a0[0] = make_uint4(0,0,0,0); a1[0] = make_uint4(0,0,0,0); a2[0] = 0; }
+        } else if constexpr (IQ3S_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * blk = Wbase + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 110;
+                const int ib = (ks & 3) * 2 + (tid & 1);
+                const uint16_t d_bits = *(const uint16_t *)(blk);
+                const uint16_t * qp = (const uint16_t *)(blk + 2 + ib * 8);
+                const uint32_t qlo = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
+                const uint32_t qhi = (uint32_t)qp[2] | ((uint32_t)qp[3] << 16);
+                const uint16_t * sp = (const uint16_t *)(blk + 74 + ib * 4);
+                const uint32_t sg  = (uint32_t)sp[0] | ((uint32_t)sp[1] << 16);
+                const uint32_t qhb = (uint32_t)blk[66 + ib];
+                a0[0] = make_uint4(qlo, qhi, sg, (qhb << 16) | d_bits);
+                a2[0] = (blk[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xfu;
+            } else { a0[0] = make_uint4(0,0,0,0); a2[0] = 0; }
+        } else if constexpr (Q6K_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * blk = Wbase + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 210;
+                const int ip = (ks & 2) >> 1;
+                const int hi_nib = ks & 1;
+                const int s = tid & 1;
+                // block_q6_K is 210 bytes (2-byte aligned); load 16-bit pairs safely into uint4
+                auto ld16 = [](const uint8_t * ptr) -> uint4 {
+                    const uint16_t * h = (const uint16_t *)ptr;
+                    return make_uint4(
+                        (uint32_t)h[0] | ((uint32_t)h[1] << 16),
+                        (uint32_t)h[2] | ((uint32_t)h[3] << 16),
+                        (uint32_t)h[4] | ((uint32_t)h[5] << 16),
+                        (uint32_t)h[6] | ((uint32_t)h[7] << 16));
+                };
+                const uint8_t * qlp = blk + ip * 64 + s * 32;
+                const uint8_t * qhp = blk + 128 + ip * 32;
+                a0[0] = ld16(qlp);
+                a1[0] = ld16(qlp + 16);
+                a3[0] = ld16(qhp);
+                a4[0] = ld16(qhp + 16);
+                const uint16_t d_bits = *(const uint16_t *)(blk + 208);
+                const int sc_off = ip * 8 + hi_nib * 4 + s * 2;
+                const uint16_t sc_pair = *(const uint16_t *)(blk + 192 + sc_off);
+                a2[0] = (uint32_t)d_bits | ((uint32_t)sc_pair << 16);
+            } else { a0[0] = a1[0] = a3[0] = a4[0] = make_uint4(0,0,0,0); a2[0] = 0; }
+        } else if constexpr (IQ4XS_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const int ib = (ks & 3) * 2 + (tid & 1);
+                const uint8_t * blk = Wbase + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 136;
+                const uint2 hdr = *(const uint2 *) blk;
+                const uint2 * qp = (const uint2 *)(blk + 8 + ib * 16);
+                const uint2 qlo = qp[0], qhi = qp[1];
+                a0[0] = make_uint4(qlo.x, qlo.y, qhi.x, qhi.y);
+                a2[0] = hdr.x; a3[0].x = hdr.y;
+            } else { a0[0] = make_uint4(0,0,0,0); a2[0] = 0u; a3[0].x = 0u; }
+        } else if constexpr (Q4K_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * blk = Wbase + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 144;
+                a1[0] = *(const uint4 *) blk;
+                a0[0] = *(const uint4 *)(blk + 16 + (ks & 3) * 32 + (tid & 1) * 16);
+            } else { a0[0] = make_uint4(0,0,0,0); a1[0] = make_uint4(0,0,0,0); }
+        } else if constexpr (Q5K_SPLIT) {
+            const int row = tid >> 1;
+            if (row < a_rows) {
+                const uint8_t * blk = Wbase + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 176;
+                a1[0] = *(const uint4 *) blk;
+                a3[0] = *(const uint4 *)(blk + 16 + (tid & 1) * 16);
+                a0[0] = *(const uint4 *)(blk + 48 + (ks & 3) * 32 + (tid & 1) * 16);
+            } else { a0[0] = make_uint4(0,0,0,0); a1[0] = make_uint4(0,0,0,0); a3[0] = make_uint4(0,0,0,0); }
         } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
@@ -175,10 +328,22 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         }
     };
     auto store_lds = [&]() {
-        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1 && !ANY_SPLIT) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
         if constexpr (Q51_SPLIT) {
             const uint32_t w[6] = {a0[0].x, a0[0].y, a0[0].z, a0[0].w, a2[0], a3[0].x};
             mmb_dq_q51_one(w, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else if constexpr (Q80_SPLIT) {
+            mmb_dq_q80_one(a0[0], a1[0], a2[0], tid & 1, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else if constexpr (IQ3S_SPLIT) {
+            mmb_dq_iq3s_one(a0[0], a2[0], (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else if constexpr (Q6K_SPLIT) {
+            mmb_dq_q6k_one(a0[0], a1[0], a3[0], a4[0], a2[0], weight_ks & 1, tid & 1, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else if constexpr (IQ4XS_SPLIT) {
+            mmb_dq_iq4xs_one(a0[0], a2[0], a3[0].x, (weight_ks & 3) * 2 + (tid & 1), (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 16 * (tid & 1));
+        } else if constexpr (Q4K_SPLIT) {
+            mmb_dq_q4k_stripe(a0[0], a1[0], weight_ks & 3, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 8 * (tid & 1));
+        } else if constexpr (Q5K_SPLIT) {
+            mmb_dq_q5k_stripe(a0[0], a3[0], a1[0], weight_ks & 3, (uint32_t *)(As + (tid >> 1) * MMB_LDS_STRIDE) + 8 * (tid & 1));
         } else
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
@@ -205,19 +370,20 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     load_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
-#pragma unroll
+#pragma unroll 1
         for (int kk = 0; kk < MMB_BK; kk += 16) {
-            v16s a[TM], b[TN]; const int r = lane & 15;
-#pragma unroll
-            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+            v16s b[TN]; const int r = lane & 15;
 #pragma unroll
             for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                 const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
 #pragma unroll
-            for (int i = 0; i < TM; ++i)
+            for (int i = 0; i < TM; ++i) {
+                const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8);
+                const v16s ai = __builtin_bit_cast(v16s, (uint4[2]){v0, v1});
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ai, acc[i][j]); }
+            }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
@@ -238,7 +404,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 }
 
 template <int BM, int BN, int WTM, int WTN, int WTYPE>
-__global__ void __launch_bounds__(MMB_NT, 2)
+__global__ void __launch_bounds__(MMB_NT, (WTM * WTN >= 2048) ? 1 : 2)
 mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
     __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
@@ -824,8 +990,26 @@ bool ggml_cuda_mmb_q8f16_f16_input(const ggml_tensor * w, int64_t n_tokens) {
         n_tokens >= mmb_min_t() && n_tokens <= INT32_MAX / 4;
 }
 
+static bool mmb_general_fast_quant(const ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q5_1:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    if (!mmb_enabled()) return false;
+    const bool q4x = mmb_enabled();
+    const bool gen = !q4x && mmb_arch() && mmb_general_fast_quant(src0->type);
+    if (!q4x && !gen) return false;
     const bool quant = mmb_quant_type(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16;
     const bool f32w  = src0->type == GGML_TYPE_F32;
@@ -839,7 +1023,9 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     const int64_t K = src0->ne[0], M = src0->ne[1];
     if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+    const int64_t min_t = q4x ? mmb_min_t() : 128;
+    if (T < min_t || T > INT32_MAX / 4) return false;
+    if (gen && M < 128) return false;
     return ggml_nrows(dst) == T;
 }
 

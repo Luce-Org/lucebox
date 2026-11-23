@@ -1255,7 +1255,17 @@ bool Qwen4ExpBackend::snapshot_save_replacing(int slot, int source) {
     }
     if (!snapshot_fits(slot)) return false;
     auto & s = snapshots_[slot];
-    if (!save_qwen4exp_snapshot(backend_, snap_backend_, cache_, s)) return false;
+    const Qwen4ExpSnapshot * ancestor = nullptr;
+    for (int i = 0; i < kMaxSlots; ++i) {
+        if (i == slot) continue;
+        const auto & cand = snapshots_[i];
+        if (!cand.buf || cand.state_only || cand.rows_in_pager || cand.cur_pos <= 0 ||
+            cand.cur_pos > cache_.cur_pos || cand.indexer_blocks > cache_.indexer_blocks) continue;
+        if (cand.tokens.size() != (size_t) cand.cur_pos || cand.tokens.size() > tokens_.size()) continue;
+        if (!std::equal(cand.tokens.begin(), cand.tokens.end(), tokens_.begin())) continue;
+        if (!ancestor || cand.cur_pos > ancestor->cur_pos) ancestor = &cand;
+    }
+    if (!save_qwen4exp_snapshot(backend_, snap_backend_, cache_, s, ancestor)) return false;
     s.tokens = tokens_;
     s.logits = logits_;
     std::fprintf(stderr, "[qwen4exp-snap] slot=%d pos=%d bytes=%zu\n",
@@ -1417,7 +1427,14 @@ GenerateResult Qwen4ExpBackend::restore_and_generate_impl(
                                    !std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin()))) {
             return generate_impl(req, io);
         }
-        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows)) return generate_impl(req, io);
+        const bool live_kv_prefix =
+            !snap.rows_in_pager && !cache_.kvflash &&
+            cache_.cur_pos >= snap.cur_pos &&
+            tokens_.size() >= snap.tokens.size() &&
+            snap.tokens.size() == (size_t) snap.cur_pos &&
+            cache_.kv_bucket_base == snap.kv_bucket_base &&
+            std::equal(snap.tokens.begin(), snap.tokens.end(), tokens_.begin());
+        if (!restore_qwen4exp_snapshot(backend_, snapshots_[slot], cache_, rows, live_kv_prefix)) return generate_impl(req, io);
         tokens_ = snapshots_[slot].tokens;
         logits_ = snapshots_[slot].logits;
     }

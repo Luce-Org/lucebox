@@ -433,6 +433,9 @@ private:
     int  live_snapshot_pos_ = 0;
     bool live_snapshot_deferred_ = false;
     bool generating_ = false;
+    std::vector<int32_t> live_kv_tokens_;
+    bool live_kv_valid_ = false;
+    bool live_target_feat_valid_ = false;
     // Copies a deferred live snapshot into its slot before the live state
     // changes; a no-op otherwise.
     void materialize_live_snapshot();

@@ -21,6 +21,7 @@
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
+#include "common/platform_env.h"
 #include "luce.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/model_capabilities.h"
@@ -127,6 +128,10 @@ constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
 constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
 constexpr auto kReadClosedProbeInterval = std::chrono::seconds(1);
 constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
+// Retry-After on a --queue-limit refusal. The line moves as requests finish,
+// so a caller with somewhere else to go goes now, and one without asks again
+// soon instead of backing off for long.
+constexpr int kQueueFullRetryAfterSeconds = 1;
 }
 
 namespace http_detail {
@@ -1134,7 +1139,7 @@ static bool curl_forward(const std::string & url,
     }
 
     CURLcode res = curl_easy_perform(curl);
-    if (streaming) ctx.stop_stream();
+    ctx.stop_stream();  // before a buffered response goes out below
 
     bool response_sent = true;
     if (!streaming && res == CURLE_OK) {
@@ -1334,15 +1339,6 @@ json require_messages_array(const json & body) {
     return body["messages"];
 }
 
-static bool env_flag_enabled(const char * name) {
-    const char * raw = std::getenv(name);
-    if (!raw || !*raw) return false;
-    std::string value(raw);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return value != "0" && value != "false" && value != "no" &&
-           value != "off";
-}
 
 static const json * find_tool_function(const json & tools,
                                        const std::string & name) {
@@ -1952,6 +1948,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, checkpoints_)
     , kv_cache_(prefix_cache_, disk_cache_, checkpoints_,
                 config.disk_cache_cold_max_tokens, config.disk_cache_min_tokens)
+    , load_(config.queue_limit)
 {
     if (!config_.chat_codec.empty() && !chat_codec_) {
         throw std::invalid_argument("unknown chat codec: " + config_.chat_codec);
@@ -2376,6 +2373,15 @@ bool HttpServer::start_worker() {
     // replaces the one-request worker with the concurrent scheduler.
     // Upstream forwarding stays on the classic path even when the local
     // backend exposes an engine.
+    const bool allow_concurrent = config_.pflash_upstream_base.empty();
+    // The load's slots and KV pool, before the first request can read them
+    // and before the serving thread, the engine's one caller, starts. The
+    // one-request worker has one slot whose cache holds the whole context.
+    if (SeqEngine * engine = allow_concurrent ? backend_.seq_engine() : nullptr) {
+        load_.configure(engine->slot_count(), engine->kv_pool_tokens().total);
+    } else {
+        load_.configure(1, config_.max_ctx);
+    }
     luce::engine::LuceEngine::ServingLoops loops;
     loops.serial = [this]() { worker_loop(); };
     loops.concurrent =
@@ -2384,8 +2390,7 @@ bool HttpServer::start_worker() {
         request_stop();
         queue_cv_.notify_all();
     };
-    if (!engine_.start_serving(
-            std::move(loops), config_.pflash_upstream_base.empty())) {
+    if (!engine_.start_serving(std::move(loops), allow_concurrent)) {
         std::fprintf(stderr, "[server] failed to start LuceEngine\n");
         return false;
     }
@@ -2658,6 +2663,7 @@ void HttpServer::handle_client(SocketHandle fd) {
                 : status_.to_json();
             if (hr.path == "/props") {
                 body["memory"] = memory_json();
+                body["load"] = load_.to_json();
                 body["shared_prefixes"] = {
                     {"mode", shared_prefix_mode_name(config_.shared_prefix)},
                     {"pins", shared_prefix_pins_ ? shared_prefix_pins_->size() : 0}};
@@ -2685,6 +2691,7 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         body["memory"] = memory_json();
+        body["load"] = load_.to_json();
         body["shared_prefixes"] = {
             {"mode", shared_prefix_mode_name(config_.shared_prefix)},
             {"pins", shared_prefix_pins_ ? shared_prefix_pins_->size() : 0}};
@@ -2924,6 +2931,7 @@ json HttpServer::model_routing_status() {
         json props = build_props_body(
             server.config_, server.prefix_cache_, server.tool_memory_);
         props["memory"] = server.memory_json();
+        props["load"] = server.load_.to_json();
         models.push_back({{"id", server.config_.model_name},
             {"capacity", model.capacity}, {"in_flight", model.in_flight},
             {"execution_mode", server.backend_.seq_engine() ? "batched" : "single-request"},
@@ -3646,7 +3654,8 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
 }
 
 RoutingAdmission HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
-                                           bool report_admission) {
+                                           bool report_admission,
+                                           EngineLoad::Place * waiting) {
     // Set socket non-blocking for send() stall detection during streaming.
     sock_set_nonblock(fd);
 
@@ -3654,6 +3663,7 @@ RoutingAdmission HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedReq
     job.fd = fd;
     job.req = std::move(req);
     job.report_admission = report_admission;
+    job.waiting = waiting;
     enqueue(&job);
 
     // The worker can spend minutes in prefill before its first token. Keep the
@@ -3726,9 +3736,22 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
+    // The --queue-limit gate, before anything is tokenized. A routed request
+    // is counted but not refused: the router bounds its waiting
+    // (--routing-queue-limit) and takes a busy model's turn-away itself. A
+    // tool-check pass belongs to a request the gate already let in, and waits
+    // in its place: from the gate to the first pass's slot, then from each
+    // pass's end to the next pass's slot or the reply.
+    EngineLoad::Place own_place(load_);
+    EngineLoad::Place & waiting = req.tool_checks_place ? *req.tool_checks_place : own_place;
+    if (!count_tokens_only &&
+        !load_.enter(waiting, !admission && !req.tool_checks_pass)) {
+        send_queue_full(fd, req);
+        return true;
+    }
     if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
         tool_checks::requested(req.raw_body, config_.tool_checks)) {
-        return serve_with_tool_checks(fd, req, admission);
+        return serve_with_tool_checks(fd, req, admission, waiting);
     }
     try {
         const json & body = req.raw_body;
@@ -3837,7 +3860,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         return true;
     }
     log_parsed_request(req);
-    const auto outcome = enqueue_request_and_wait(fd, std::move(req), admission != nullptr);
+    const auto outcome = enqueue_request_and_wait(fd, std::move(req), admission != nullptr, &waiting);
     if (admission) *admission = outcome;
     return true;
 }
@@ -3953,7 +3976,8 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
                                        SocketHandle client_fd, bool * dropped_tool_call,
                                        bool note_pass,
                                        const nlohmann::ordered_json * ordered_tools,
-                                       const std::string & client) {
+                                       const std::string & client,
+                                       EngineLoad::Place * waiting) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -4000,6 +4024,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         }
         inner.tool_checks_pass = true;
         inner.tool_checks_note = note_pass;
+        inner.tool_checks_place = waiting;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
         if (dropped_tool_call) *dropped_tool_call = *dropped;
     } catch (const std::exception & e) {
@@ -4020,7 +4045,8 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
 }
 
 bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
-                                        RoutingAdmission * admission) {
+                                        RoutingAdmission * admission,
+                                        EngineLoad::Place & waiting) {
     namespace tc = tool_checks;
     const auto started = std::chrono::steady_clock::now();
     const bool stream = req.raw_body.value("stream", false);
@@ -4054,7 +4080,8 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         std::string raw;
         bool dropped_here = false;
         if (!inner_chat_completion(body, nullptr, status, raw, fd, &dropped_here,
-                                   note_pass, &req.ordered_tools, req.client) ||
+                                   note_pass, &req.ordered_tools, req.client,
+                                   &waiting) ||
             status != 200) {
             return false;
         }
@@ -4067,12 +4094,14 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     std::string raw;
     bool dropped_call = false;
     if (!inner_chat_completion(request, admission, status, raw, fd, &dropped_call,
-                               /*note_pass=*/false, &req.ordered_tools, req.client)) {
+                               /*note_pass=*/false, &req.ordered_tools, req.client,
+                               &waiting)) {
         return true;
     }
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
+        load_.leave(waiting);  // before the reply: the client's next request may follow it
         if (keepalive) {
             keepalive->stop();
             raw.erase(raw.find_last_not_of(" \r\n") + 1);
@@ -4184,6 +4213,7 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
 
+    load_.leave(waiting);
     if (keepalive) {
         keepalive->stop();
         const std::string events = tc::as_sse(response);
@@ -6352,7 +6382,7 @@ bool HttpServer::forward_upstream(
             [this, job](const void * data, size_t size) {
                 return send_job_bytes(job, data, size);
             },
-            [this, job]() { stop_job_stream(job); },
+            [this, job]() { stop_job_stream(job); release_serial_slot(job); },
             [job]() {
                 return job->client_disconnected.load(std::memory_order_acquire);
             });
@@ -6370,7 +6400,7 @@ bool HttpServer::forward_upstream(
             [this, job](const void * data, size_t size) {
                 return send_job_bytes(job, data, size);
             },
-            [this, job]() { stop_job_stream(job); },
+            [this, job]() { stop_job_stream(job); release_serial_slot(job); },
             [job]() {
                 return job->client_disconnected.load(std::memory_order_acquire);
             });
@@ -7219,7 +7249,7 @@ void HttpServer::send_nonstream_response(
         const luce::common::SpecAcceptanceStats * acceptance) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
-    const bool is_eos = !gen_tokens.empty() &&
+    const bool is_eos = !request_ignores_eos(req) && !gen_tokens.empty() &&
         (gen_tokens.back() == tokenizer_.eos_id() ||
          gen_tokens.back() == tokenizer_.eos_chat_id());
     emitter.emit_finish(counts.total, nullptr, n_gen_cap, is_eos);
@@ -7263,7 +7293,8 @@ void HttpServer::worker_loop() {
         ServerJob * job = dequeue();
         if (!job) break;  // stopping
 
-        process_job(job);
+        load_.seat(job->waiting, 1, 0);
+        process_job(job);   // frees the slot before the reply's last bytes
         publish_memory_report();
     }
 }
@@ -7308,6 +7339,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     auto finish_job = [&]() {
         stop_job_stream(job);
+        release_serial_slot(job);  // before the client wakes
         std::lock_guard<std::mutex> lk(job->mu);
         job->done = true;
         job->cv.notify_one();
@@ -7371,6 +7403,7 @@ void HttpServer::process_job(ServerJob * job) {
             error = ResponseError::internal("server_error", message);
         }
         stop_job_stream(job);
+        release_serial_slot(job);
         if (req.stream) {
             for (const std::string & chunk : emitter.emit_error(error)) {
                 send_job_bytes(job, chunk.data(), chunk.size());
@@ -7523,6 +7556,7 @@ void HttpServer::process_job(ServerJob * job) {
     // branch records or frames a successful generation.
     if (!result.ok()) {
         stop_job_stream(job);
+        release_serial_slot(job);
         if (job->client_disconnected.load(std::memory_order_acquire)) {
             client_disconnected = true;
         }
@@ -7592,10 +7626,12 @@ void HttpServer::process_job(ServerJob * job) {
     // Serialize final frames after disabling heartbeat comments so no comment
     // can appear after the protocol's [DONE] marker.
     stop_job_stream(job);
+    // A request let in now waits in the queue only for the bookkeeping below.
+    release_serial_slot(job);
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
-    const bool is_eos = !result.tokens.empty() &&
+    const bool is_eos = !request_ignores_eos(req) && !result.tokens.empty() &&
         (result.tokens.back() == tokenizer_.eos_id() ||
          result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
@@ -7648,6 +7684,10 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Signal client thread that we're done.
     finish_job();
+}
+
+void HttpServer::release_serial_slot(ServerJob * job) {
+    load_.vacate(job->req.tool_checks_pass ? job->waiting : nullptr, 0, config_.max_ctx);
 }
 
 // ─── Job queue ──────────────────────────────────────────────────────────
@@ -7991,7 +8031,7 @@ void HttpServer::maybe_send_job_heartbeat(
 
 std::string HttpServer::format_http_response(
         int status, const std::string & content_type,
-        const std::string & body) {
+        const std::string & body, const std::string & extra_headers) {
     const char * reason = "OK";
     switch (status) {
         case 200: reason = "OK"; break;
@@ -8012,6 +8052,7 @@ std::string HttpServer::format_http_response(
     if (!content_type.empty()) {
         header += "Content-Type: " + content_type + "\r\n";
     }
+    header += extra_headers;
     header += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     header += "Connection: close\r\n\r\n";
     header += body;
@@ -8020,9 +8061,9 @@ std::string HttpServer::format_http_response(
 
 bool HttpServer::send_response(
         SocketHandle fd, int status, const std::string & content_type,
-        const std::string & body) {
+        const std::string & body, const std::string & extra_headers) {
     const std::string payload =
-        format_http_response(status, content_type, body);
+        format_http_response(status, content_type, body, extra_headers);
     if (status == 503 && stopping_.load()) {
         // Reject unstarted requests without delaying shutdown for a stalled
         // reader. Active native requests keep the normal send/drain path;
@@ -8039,6 +8080,22 @@ bool HttpServer::send_error(
         SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
     return send_response(fd, status, "application/json", wire_json(err) + "\n");
+}
+
+void HttpServer::send_queue_full(SocketHandle fd, const ParsedRequest & req) {
+    // 503 as for the engine's other capacity refusals (a full routing queue,
+    // a full image gate): the server is at capacity whoever asks, where 429
+    // would tell one client it sent too much. A streaming request gets it
+    // too: no stream has started.
+    const ResponseError error = ResponseError::unavailable(
+        "queue_full",
+        "the server's slots and its queue of " + std::to_string(config_.queue_limit) +
+        " are full; retry later");
+    std::fprintf(stderr, "[server] refused %s: %s\n",
+                 req.response_id.c_str(), error.message.c_str());
+    send_response(fd, response_error_http_status(error), "application/json",
+                  wire_json(build_error_response(req.format, error, req.response_id)) + "\n",
+                  "Retry-After: " + std::to_string(kQueueFullRetryAfterSeconds) + "\r\n");
 }
 
 bool HttpServer::send_sse_headers(ServerJob * job) {

@@ -146,17 +146,17 @@ static __global__ void mm_ids_helper_fast(
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    __shared__ int smem_hist[256];
-    __shared__ int smem_curr[256];
+    __shared__ int smem_hist[1024];
+    __shared__ int smem_curr[1024];
 
     const int tid = threadIdx.x;
     const int warp_id = tid / warp_size;
     const int lane_id = tid % warp_size;
     const int nwarps = 256 / warp_size;
 
-    // 1. Initialize LDS
-    if (tid < n_experts) {
-        smem_hist[tid] = 0;
+    // 1. Initialize LDS (supports up to 1024 experts: DS4.1 357/384, Qwen3.8 512)
+    for (int e = tid; e < n_experts; e += 256) {
+        smem_hist[e] = 0;
     }
     __syncthreads();
 
@@ -172,7 +172,7 @@ static __global__ void mm_ids_helper_fast(
     }
     __syncthreads();
 
-    // 3. Exclusive prefix sum over at most 256 experts. A short serial scan
+    // 3. Exclusive prefix sum over at most 1024 experts. A short serial scan
     // avoids partial-warp shuffle masks and is negligible next to route
     // histogram/scatter and the following matrix multiplies.
     if (tid == 0) {
@@ -212,7 +212,7 @@ static void launch_mm_ids_helper(
     GGML_ASSERT((int64_t) n_tokens * n_expert_used_var <= 0x7FFFFFFFLL &&
                 "MUL_MAT_ID route count exceeds compact int32 indexing");
 
-    if (n_experts <= 256) {
+    if (n_experts <= 1024) {
         mm_ids_helper_fast<n_expert_used_template><<<1, 256, 0, stream>>>
             (ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
         return;

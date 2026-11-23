@@ -15,11 +15,9 @@ from transformers import AutoTokenizer
 
 from model_nvfp4 import (
     Decoder,
-    DN_CONV_CHANNELS,
     DN_NUM_HEADS,
     DN_V_SIZE,
     FA_KV_SIZE,
-    FA_QPROJ_SIZE,
     FA_Q_SIZE,
     HIDDEN_SIZE,
     INTERMEDIATE_SIZE,

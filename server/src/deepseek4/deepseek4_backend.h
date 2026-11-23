@@ -216,6 +216,9 @@ private:
     struct SnapshotAux {
         std::vector<float> last_logits;
         std::vector<float> spec_feat_window;
+        std::vector<int32_t> tokens;
+        bool has_tokens = false;
+        uint64_t gen = 0;
         bool used = false;
     };
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
@@ -224,6 +227,12 @@ private:
     // Absolute cache position represented by last_logits_. A snapshot is
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
+    // Live-KV prefix delta restore tracking
+    std::vector<int32_t>   live_tokens_;
+    bool                   live_tokens_valid_ = false;
+    uint64_t               next_snap_gen_ = 1;
+    uint64_t               live_source_gen_ = 0;
+    int                    live_source_pos_ = 0;
 
     // DSpark speculative decode (opt-in: --draft <gguf>, or
     // LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).

@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Allow importing bench_he for its PROMPTS list.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_llm import _extract_boxed, _normalize_math, _math_equiv
+from bench_llm import _extract_boxed, _math_equiv
 
 N_SAMPLE = 10
 N_GEN_DEFAULT = 256

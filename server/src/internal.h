@@ -678,6 +678,7 @@ struct PrefixSnapshot {
     // lives in kvflash_blob (valid iff is_pooled). Plain dense path only.
     bool                 is_pooled    = false;
     std::vector<uint8_t> kvflash_blob;
+    std::vector<int32_t> tokens; // exact prefix tokens saved in this snapshot (for delta save)
 
     // State only (drop_prefix_snapshot_kv): the recurrent and conv state, the
     // decode seed and the drafter features at cur_pos, with no attention KV.
@@ -705,7 +706,9 @@ bool snapshot_target_cache(const TargetWeights & w,
                            PrefixSnapshot & snap,
                            bool skip_kv = false,
                            const std::vector<uint8_t> * kvflash_blob = nullptr,
-                           bool skip_target_feat = false);  // no drafter: omit the feature ring
+                           bool skip_target_feat = false,
+                           ggml_backend_t src_backend = nullptr,
+                           const PrefixSnapshot * ancestor = nullptr);  // no drafter: omit the feature ring
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =
@@ -716,7 +719,8 @@ bool snapshot_target_cache(const TargetWeights & w,
 // state-only `snap`; it is required for one and ignored otherwise.
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
                           bool skip_kv = false,
-                          const PrefixSnapshot * kv_from = nullptr);
+                          const PrefixSnapshot * kv_from = nullptr,
+                          bool skip_target_feat = false);
 
 // Free the attention KV of a snapshot (dense, or a paged checkpoint) and keep
 // the rest: the result is state-only and restores with the rows of a deeper
@@ -772,7 +776,8 @@ bool snapshot_paged_target_cache(
     const std::vector<uint32_t> & block_table,
     int block_size,
     int token_count,
-    PrefixSnapshot & snap);
+    PrefixSnapshot & snap,
+    const PrefixSnapshot * base_kv = nullptr);
 
 // Atomically replace a paged snapshot. The incumbent remains valid when
 // allocation, layout validation, or any staged copy fails.
@@ -783,7 +788,8 @@ bool replace_paged_target_cache(
     int block_size,
     int token_count,
     PrefixSnapshot & destination,
-    PrefixSnapshot * displaced = nullptr);
+    PrefixSnapshot * displaced = nullptr,
+    const PrefixSnapshot * base_kv = nullptr);
 
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and

@@ -1492,6 +1492,8 @@ struct ggml_backend_cuda_context {
     cudaStream_t side_copy_stream = nullptr;
     cudaEvent_t side_copy_ready = nullptr;
     cudaEvent_t side_copy_done = nullptr;
+    half * side_f16_buf = nullptr;
+    size_t side_f16_cap = 0;
     // Side-stream copy batches (ggml_backend_cuda_copy_batch_side) the compute stream has not waited for yet, and
     // whether its work may run beside them (ggml_backend_cuda_set_side_overlap).
     bool side_batch_pending = false;
