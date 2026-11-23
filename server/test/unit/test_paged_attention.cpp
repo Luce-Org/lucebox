@@ -1305,3 +1305,41 @@ TEST_CASE(PagedAttention, ChainVerifyRowsEqualSequentialArBitsAcrossTableWidths)
     CHECK_EQUAL(0, bad);
     ggml_backend_free(backend);
 }
+
+// A chain verify launched at the very end of a completely full block table
+// (committed == max_blocks * BLOCK_SIZE) holds its candidate rows in scratch
+// past table_blocks. Both WMMA and V_DOT2 must cover those logical blocks and
+// reproduce the exact bits of the same chain on a wider table.
+TEST_CASE(PagedAttention, ChainVerifyAtFullTableCoversCandidateScratchRows) {
+    const InvariantScope invariant;
+    const GraphsOffScope graphs_off;
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        const bool expect_wmma = ggml_backend_cuda_paged_attn_wmma_route(
+            0, /*tree_mode=*/false, D, N_HEAD, N_HEAD_KV, kv_type, kv_type, BLOCK_SIZE);
+        for (int full_blocks : {16, 32}) {
+            const int committed = full_blocks * BLOCK_SIZE;
+            const int width = 8;
+            const ChainPool wide = make_chain_pool(kv_type, committed, width, full_blocks + 1);
+            ChainPool full = wide;
+            full.max_blocks = full_blocks;
+            full.table.resize((size_t) full_blocks);
+
+            std::vector<float> q_data((size_t) D * width * N_HEAD);
+            for (float & x : q_data) x = invariance_next() * 0.5f;
+
+            size_t wide_wmma = 0, full_wmma = 0;
+            const std::vector<float> wide_out = run_chain_or_ar(
+                backend, kv_type, wide, /*chain=*/true, committed, committed, q_data, width, &wide_wmma);
+            const std::vector<float> full_out = run_chain_or_ar(
+                backend, kv_type, full, /*chain=*/true, committed, committed, q_data, width, &full_wmma);
+            REQUIRE(!wide_out.empty());
+            REQUIRE_EQUAL(wide_out.size(), full_out.size());
+            CHECK_EQUAL(0, std::memcmp(wide_out.data(), full_out.data(), wide_out.size() * sizeof(float)));
+            CHECK_EQUAL(wide_wmma > 0, full_wmma > 0);
+            if (expect_wmma) CHECK(full_wmma > 0);
+        }
+    }
+    ggml_backend_free(backend);
+}
