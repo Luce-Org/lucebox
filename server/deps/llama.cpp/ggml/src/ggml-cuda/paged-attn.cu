@@ -2469,13 +2469,32 @@ static bool paged_attn_wmma_route(
         head_dim, n_head, n_head_kv, k_type, v_type, block_size);
 }
 
-// Whether paged attention on `device` runs the WMMA route for this shape
+// Whether paged attention on `device` runs a WMMA route for this shape
 // (false: V_DOT2). A saved KV is only valid under the route that computed it.
 extern "C" bool ggml_backend_cuda_paged_attn_wmma_route(
         int device, bool tree_mode, int head_dim, int n_head, int n_head_kv,
         ggml_type k_type, ggml_type v_type, int block_size) {
-    return paged_attn_wmma_route(
-        device, tree_mode, head_dim, n_head, n_head_kv, k_type, v_type, block_size);
+    if (paged_attn_wmma_route(
+            device, tree_mode, head_dim, n_head, n_head_kv, k_type, v_type, block_size)) {
+        return true;
+    }
+#if defined(GGML_USE_HIP)
+    // Wave32 RDNA3.5 WMMA paged attention (paged-attn-rdna-wmma.cuh) also runs on
+    // RDNA3 (e.g., gfx1151) for F16/Q8_0 KV unless LUCE_PAGED_WMMA=0 or batch-invariant mode.
+    static const bool rdna_enabled = []() {
+        const char * e = getenv("LUCE_PAGED_WMMA");
+        return !(e && atoi(e) == 0);
+    }();
+    if (rdna_enabled && !ggml_cuda_mmvq_batch_invariant() &&
+        device >= 0 && device < ggml_cuda_info().device_count &&
+        GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc) &&
+        head_dim == PAGED_ATTN_HEAD_DIM && block_size == 16 &&
+        k_type == v_type && (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+        n_head_kv > 0 && n_head % n_head_kv == 0 && n_head / n_head_kv <= 8) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 // Launcher for the stage-1 WMMA paged kernel. Falls back to the V_DOT2 kernel
