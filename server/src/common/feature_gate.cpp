@@ -34,8 +34,9 @@ std::string check_feature_compatibility(
                "' (supported: " + supported + ")";
     }
 
-    if (arch == "qwen4exp" && (args.verify_width < 0 || args.verify_width > 8)) {
-        return "qwen4exp --verify-width expects 0 (adaptive), 1 (off), or 2..8 (fixed k=1..7)";
+    if ((arch == "qwen4exp" || arch_is_inkling2_family(arch)) &&
+        (args.verify_width < 0 || args.verify_width > 8)) {
+        return arch + " --verify-width expects 0 (auto), 1 (off), or 2..8 (fixed k=1..7)";
     }
 
     // ── target placement × compiled backend

@@ -40,6 +40,17 @@ static __device__ __forceinline__ int get_int_b4_nt(const void * x, const int & 
 #endif
 }
 
+static __device__ __forceinline__ int get_int_b2_nt(const void * x, const int & i32) {
+    const uint16_t * x16 = (const uint16_t *) x;
+#if defined(GGML_USE_HIP)
+    const uint32_t lo = __builtin_nontemporal_load(&x16[2*i32 + 0]);
+    const uint32_t hi = __builtin_nontemporal_load(&x16[2*i32 + 1]);
+    return (int) (lo | (hi << 16));
+#else
+    return (int) ((uint32_t) x16[2*i32 + 0] | ((uint32_t) x16[2*i32 + 1] << 16));
+#endif
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -1755,14 +1766,20 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int aux_q4 = get_int_b2_nt(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
+#if defined(GGML_USE_HIP)
+    const uint16_t d_bits = __builtin_nontemporal_load((const uint16_t *) &bq4->d);
+    const half d_h = __builtin_bit_cast(half, d_bits);
+    const float d = __half2float(d_h) * __low2float(bq8_1->ds);
+#else
     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
+#endif
     return d * sumi;
 }
 

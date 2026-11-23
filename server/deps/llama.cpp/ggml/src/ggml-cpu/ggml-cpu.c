@@ -2138,6 +2138,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             GGML_ABORT("GGML_OP_HC_COMBINE_NORM is only supported on the CUDA/HIP backend");
         case GGML_OP_GATED_RMS_NORM_F16:
             GGML_ABORT("GGML_OP_GATED_RMS_NORM_F16 is only supported on the CUDA/HIP backend");
+        case GGML_OP_INKLING2_OP:
+            GGML_ABORT("GGML_OP_INKLING2_OP is only supported on the CUDA/HIP backend");
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2715,6 +2717,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_VISION_F32:
         case GGML_OP_MUL_MAT_VISION_AV_F32:
             GGML_ABORT("explicit vision attention cannot be planned on CPU");
+        case GGML_OP_INKLING2_OP:
+            GGML_ABORT("GGML_OP_INKLING2_OP cannot be planned on CPU");
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:

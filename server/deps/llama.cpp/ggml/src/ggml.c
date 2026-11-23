@@ -1225,9 +1225,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "HC_COMBINE_NORM",
     "GATED_RMS_NORM_F16",
     "QSA_DECODE_IDS",
+    "INKLING2_OP",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1361,9 +1362,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "hc_combine_norm(inj,res,blk,gamma)",
     "gated_rms_norm_f16(x,gamma,z)",
     "qsa_decode_ids(blocks,positions)",
+    "inkling2_op(x)",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10181,4 +10183,546 @@ struct ggml_tensor * ggml_gated_f16(
         struct ggml_tensor  * x,
         struct ggml_tensor  * z) {
     return ggml_gated_rms_norm_f16(ctx, x, NULL, z, 0.0f);
+}
+
+// ─── Inkling2-Loop & DSpark fused ops ────────────────────────────────────
+
+struct ggml_tensor * ggml_inkling2_attn_res_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * norm_w,
+        struct ggml_tensor * const * blocks,
+        int                   n_blocks,
+        float                 eps) {
+    GGML_ASSERT(cur && query);
+    GGML_ASSERT(n_blocks >= 0 && n_blocks <= GGML_MAX_SRC - 3);
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t n_q      = query->ne[1];
+    struct ggml_tensor * result = (n_q == 1)
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens)
+        : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = cur;
+    result->src[1] = query;
+    result->src[2] = norm_w;
+    for (int i = 0; i < n_blocks; ++i) {
+        result->src[3 + i] = blocks[i];
+    }
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_ATTN_RES_MIX);
+    ggml_set_op_params_i32(result, 1, n_blocks);
+    ggml_set_op_params_i32(result, 2, (int) n_q);
+    ggml_set_op_params_f32(result, 3, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_loop_ctrl_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        float                 eps) {
+    GGML_ASSERT(cur && msg);
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = msg->ne[1];
+    const int64_t n_groups = msg->ne[2];
+    struct ggml_tensor * result = (n_groups > 1)
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * n_embd, n_tokens, n_groups)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * n_embd, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_LOOP_CTRL_PRE);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_loop_ctrl_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * gf_out,
+        struct ggml_tensor  * norm_w,
+        float                 eps) {
+    GGML_ASSERT(cur && msg && gf_out);
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = msg->ne[1];
+    const int64_t n_groups = msg->ne[2];
+    struct ggml_tensor * result = (n_groups > 1)
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_groups)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    result->src[2] = gf_out;
+    result->src[3] = norm_w;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_LOOP_CTRL_POST);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sconv_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_static,
+        struct ggml_tensor  * state_in,
+        struct ggml_tensor  * state_out,
+        struct ggml_tensor  * dyn_taps,
+        struct ggml_tensor  * addend,
+        int                   state_chan_offset,
+        int                   head_dim_for_dyn,
+        int                   write_mode) {
+    GGML_ASSERT(x && w_static && state_in);
+    const int64_t n_ch     = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = x;
+    result->src[1] = w_static;
+    result->src[2] = state_in;
+    result->src[3] = state_out;
+    result->src[4] = dyn_taps;
+    result->src[5] = addend;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SCONV);
+    ggml_set_op_params_i32(result, 1, state_chan_offset);
+    ggml_set_op_params_i32(result, 2, head_dim_for_dyn);
+    ggml_set_op_params_i32(result, 3, write_mode);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sconv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_static,
+        struct ggml_tensor  * state_in,
+        struct ggml_tensor  * state_out,
+        struct ggml_tensor  * dyn_taps,
+        int                   state_chan_offset,
+        int                   head_dim_for_dyn,
+        int                   write_mode) {
+    return ggml_inkling2_sconv_add(ctx, x, w_static, state_in, state_out, dyn_taps, NULL,
+                                   state_chan_offset, head_dim_for_dyn, write_mode);
+}
+
+struct ggml_tensor * ggml_inkling2_clip_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale_w,
+        struct ggml_tensor  * pos_buf,
+        int                   head_dim,
+        int                   n_head,
+        int                   mode,
+        float                 threshold,
+        float                 eps,
+        int                   log_floor,
+        float                 log_alpha) {
+    GGML_ASSERT(x);
+    const int64_t n_tokens = x->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = x;
+    result->src[1] = scale_w;
+    result->src[2] = pos_buf;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_CLIP_NORM);
+    ggml_set_op_params_i32(result, 1, head_dim);
+    ggml_set_op_params_i32(result, 2, n_head);
+    ggml_set_op_params_i32(result, 3, mode);
+    ggml_set_op_params_f32(result, 4, threshold);
+    ggml_set_op_params_f32(result, 5, eps);
+    ggml_set_op_params_i32(result, 6, log_floor);
+    ggml_set_op_params_f32(result, 7, log_alpha);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_kv_write(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * pos_buf,
+        int                   head_dim,
+        int                   n_head_kv,
+        int                   is_v,
+        int                   swa_window,
+        float                 threshold,
+        float                 eps) {
+    GGML_ASSERT(x && kv_cache && pos_buf);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = x;
+    result->src[1] = kv_cache;
+    result->src[2] = pos_buf;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_KV_WRITE);
+    ggml_set_op_params_i32(result, 1, head_dim);
+    ggml_set_op_params_i32(result, 2, n_head_kv);
+    ggml_set_op_params_i32(result, 3, is_v);
+    ggml_set_op_params_i32(result, 4, swa_window);
+    ggml_set_op_params_f32(result, 5, threshold);
+    ggml_set_op_params_f32(result, 6, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_rel_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rel_bias,
+        struct ggml_tensor  * r_cur,
+        struct ggml_tensor  * sink) {
+    GGML_ASSERT(rel_bias && r_cur && sink);
+    const int64_t rel_extent = rel_bias->ne[1];
+    const int64_t n_head     = r_cur->ne[1];
+    const int64_t n_tokens   = r_cur->ne[2];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rel_extent + 1, n_head, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = rel_bias;
+    result->src[1] = r_cur;
+    result->src[2] = sink;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_REL_TABLE);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_attn_rel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_cache,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * rel_table,
+        struct ggml_tensor  * kv_meta,
+        struct ggml_tensor  * k_dep,
+        struct ggml_tensor  * v_dep,
+        struct ggml_tensor  * gate_proj,
+        int                   swa_window,
+        int                   rel_extent,
+        int                   partial,
+        int                   include_sink) {
+    GGML_ASSERT(q && k_cache && v_cache && rel_table && kv_meta);
+    const int64_t head_dim = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    struct ggml_tensor * result = partial
+        ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (head_dim + 2) * n_head, n_tokens)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_head, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = q;
+    result->src[1] = k_cache;
+    result->src[2] = v_cache;
+    result->src[3] = rel_table;
+    result->src[4] = kv_meta;
+    result->src[5] = k_dep;
+    result->src[6] = v_dep;
+    result->src[7] = gate_proj;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_ATTN_REL);
+    ggml_set_op_params_i32(result, 1, swa_window);
+    ggml_set_op_params_i32(result, 2, rel_extent);
+    ggml_set_op_params_i32(result, 3, partial);
+    ggml_set_op_params_i32(result, 4, include_sink);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_attn_split_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * part_a,
+        struct ggml_tensor  * part_b,
+        struct ggml_tensor  * gate_proj,
+        int                   head_dim,
+        int                   n_head) {
+    GGML_ASSERT(part_a && part_b);
+    const int64_t n_tokens = part_a->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_head, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = part_a;
+    result->src[1] = part_b;
+    result->src[2] = gate_proj;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_ATTN_SPLIT_COMBINE);
+    ggml_set_op_params_i32(result, 1, head_dim);
+    ggml_set_op_params_i32(result, 2, n_head);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate_up,
+        float                 beta,
+        float                 linear_beta) {
+    GGML_ASSERT(gate_up && (gate_up->ne[0] % 2 == 0));
+    struct ggml_tensor * result = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, gate_up->ne[0] / 2, gate_up->ne[1], gate_up->ne[2]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = gate_up;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SITU);
+    ggml_set_op_params_f32(result, 1, beta);
+    ggml_set_op_params_f32(result, 2, linear_beta);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sigmoid_topk_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * bias,
+        int                   top_k) {
+    GGML_ASSERT(logits && top_k > 0);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, logits->ne[1]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = logits;
+    result->src[1] = bias;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SIGMOID_TOPK_IDS);
+    ggml_set_op_params_i32(result, 1, top_k);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sigmoid_topk_wts(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * ids,
+        float                 route_scale,
+        float                 eps) {
+    GGML_ASSERT(logits && ids);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ids->ne[0], ids->ne[1]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = logits;
+    result->src[1] = ids;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SIGMOID_TOPK_WTS);
+    ggml_set_op_params_f32(result, 1, route_scale);
+    ggml_set_op_params_f32(result, 2, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_softcap_slice(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        int                   n_vocab_unpadded,
+        float                 softcap) {
+    GGML_ASSERT(logits && n_vocab_unpadded > 0 && n_vocab_unpadded <= logits->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab_unpadded, logits->ne[1]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = logits;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SOFTCAP_SLICE);
+    ggml_set_op_params_f32(result, 1, softcap);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_mix_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * taps,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * weight,
+        float                 eps) {
+    GGML_ASSERT(taps && alpha && weight);
+    const int64_t n_embd   = taps->ne[0];
+    const int64_t n_tokens = taps->ne[2];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = taps;
+    result->src[1] = alpha;
+    result->src[2] = weight;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_MIX_NORM);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_markov_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * raw,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(raw && state);
+    const int64_t rank = state->ne[0];
+    const int64_t B    = state->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * rank, B);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = raw;
+    result->src[1] = state;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_MARKOV_GATE);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_add_softcap(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * base_logits,
+        struct ggml_tensor  * bias,
+        int                   n_vocab_unpadded,
+        float                 softcap) {
+    GGML_ASSERT(base_logits && bias);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab_unpadded, base_logits->ne[1]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = base_logits;
+    result->src[1] = bias;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_ADD_SOFTCAP);
+    ggml_set_op_params_f32(result, 1, softcap);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_state_restore(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state_ring,
+        struct ggml_tensor  * state_live,
+        struct ggml_tensor  * slot_idx) {
+    GGML_ASSERT(state_ring && state_live && slot_idx);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = state_ring;
+    result->src[1] = state_live;
+    result->src[2] = slot_idx;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_STATE_RESTORE);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dynamic_split_lut(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        int                   n_expert,
+        int                   target_pct) {
+    GGML_ASSERT(sel && sel->type == GGML_TYPE_I32 && n_expert > 0 && n_expert <= 256);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_expert);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = sel;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DYNAMIC_SPLIT_LUT);
+    ggml_set_op_params_i32(result, 1, n_expert);
+    ggml_set_op_params_i32(result, 2, target_pct);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_topk_cands(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * base_logits,
+        int                   n_vocab_unpadded) {
+    GGML_ASSERT(base_logits && base_logits->type == GGML_TYPE_F32 && n_vocab_unpadded > 0);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1024, base_logits->ne[1]);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = base_logits;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_TOPK_CANDS);
+    ggml_set_op_params_i32(result, 1, n_vocab_unpadded);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_topk_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cand_ids,
+        struct ggml_tensor  * base_row,
+        struct ggml_tensor  * latent,
+        struct ggml_tensor  * fold_weight,
+        struct ggml_tensor  * fold_bias,
+        float                 softcap) {
+    GGML_ASSERT(cand_ids && base_row && latent && fold_weight && fold_bias);
+    GGML_ASSERT(cand_ids->type == GGML_TYPE_I32 && cand_ids->ne[0] == 1024);
+    GGML_ASSERT(fold_weight->type == GGML_TYPE_F16 && latent->type == GGML_TYPE_F32);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = cand_ids;
+    result->src[1] = base_row;
+    result->src[2] = latent;
+    result->src[3] = fold_weight;
+    result->src[4] = fold_bias;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_TOPK_SCORE);
+    ggml_set_op_params_f32(result, 1, softcap);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_moe_masked_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * wsel,
+        struct ggml_tensor  * mask_sel,
+        struct ggml_tensor  * peer_sum,
+        int                   out_f16) {
+    GGML_ASSERT(down && wsel && mask_sel);
+    const int64_t H = down->ne[0];
+    const int64_t T = down->ne[2];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, out_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, H, T);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = down;
+    result->src[1] = wsel;
+    result->src[2] = mask_sel;
+    result->src[3] = peer_sum;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_MOE_MASKED_SUM);
+    ggml_set_op_params_i32(result, 1, out_f16);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_dspark_markov_argmax(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * base_row,
+        struct ggml_tensor  * latent,
+        struct ggml_tensor  * fold_weight,
+        struct ggml_tensor  * fold_bias,
+        int                   n_vocab_unpadded) {
+    GGML_ASSERT(base_row && latent && fold_weight && fold_bias && n_vocab_unpadded > 0);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = base_row;
+    result->src[1] = latent;
+    result->src[2] = fold_weight;
+    result->src[3] = fold_bias;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_DSPARK_MARKOV_ARGMAX);
+    ggml_set_op_params_i32(result, 1, n_vocab_unpadded);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sconv_kv_write(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_static,
+        struct ggml_tensor  * state_in,
+        struct ggml_tensor  * state_out,
+        struct ggml_tensor  * dyn_taps,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * pos_buf,
+        int                   state_chan_offset,
+        int                   head_dim,
+        int                   n_head_kv,
+        int                   is_v,
+        int                   swa_window,
+        float                 threshold,
+        float                 eps,
+        int                   write_mode) {
+    GGML_ASSERT(x && w_static && state_in && kv_cache && pos_buf);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = x;
+    result->src[1] = w_static;
+    result->src[2] = state_in;
+    result->src[3] = state_out;
+    result->src[4] = dyn_taps;
+    result->src[5] = kv_cache;
+    result->src[6] = pos_buf;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_SCONV_KV_WRITE);
+    ggml_set_op_params_i32(result, 1, state_chan_offset);
+    ggml_set_op_params_i32(result, 2, head_dim);
+    ggml_set_op_params_i32(result, 3, n_head_kv);
+    ggml_set_op_params_i32(result, 4, is_v);
+    ggml_set_op_params_i32(result, 5, swa_window);
+    ggml_set_op_params_f32(result, 6, threshold);
+    ggml_set_op_params_f32(result, 7, eps);
+    ggml_set_op_params_i32(result, 8, write_mode);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_clip_r_rel_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r_raw,
+        struct ggml_tensor  * r_clip_w,
+        struct ggml_tensor  * pos_buf,
+        struct ggml_tensor  * rel_bias,
+        struct ggml_tensor  * sink,
+        int                   d_rel,
+        int                   n_head,
+        float                 threshold,
+        float                 eps,
+        int                   log_floor,
+        float                 log_alpha) {
+    GGML_ASSERT(r_raw && rel_bias && sink);
+    const int64_t rel_extent = rel_bias->ne[1];
+    const int64_t n_tokens   = r_raw->ne[1];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rel_extent + 1, n_head, n_tokens);
+    result->op = GGML_OP_INKLING2_OP;
+    result->src[0] = r_raw;
+    result->src[1] = r_clip_w;
+    result->src[2] = pos_buf;
+    result->src[3] = rel_bias;
+    result->src[4] = sink;
+    ggml_set_op_params_i32(result, 0, GGML_INKLING2_CLIP_R_REL_TABLE);
+    ggml_set_op_params_i32(result, 1, d_rel);
+    ggml_set_op_params_i32(result, 2, n_head);
+    ggml_set_op_params_f32(result, 3, threshold);
+    ggml_set_op_params_f32(result, 4, eps);
+    ggml_set_op_params_i32(result, 5, log_floor);
+    ggml_set_op_params_f32(result, 6, log_alpha);
+    return result;
 }

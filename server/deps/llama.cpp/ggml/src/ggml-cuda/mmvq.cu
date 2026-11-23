@@ -775,6 +775,7 @@ static bool mmid_grouped_type_ok(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q5_K:
+        case GGML_TYPE_IQ4_NL:
             return (mask & 4) != 0;
         case GGML_TYPE_Q2_0_ROCMFP2:
             return (mask & 8) != 0;
@@ -823,7 +824,9 @@ static bool mmid_grouped_selected(ggml_type type, int cc) {
         return mmid_grouped_env() && mmid_grouped_type_ok(type);
     }
 #ifdef GGML_USE_HIP
-    return type == GGML_TYPE_Q5_1 && GGML_CUDA_CC_IS_RDNA3_5(cc);
+    return (type == GGML_TYPE_Q5_1 && GGML_CUDA_CC_IS_RDNA3_5(cc)) ||
+           ((type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0) &&
+            (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)));
 #else
     return mmid_grouped_type_ok(type);
 #endif
@@ -853,8 +856,9 @@ static int get_mmvq_mmid_max_batch_regular(ggml_type type, int cc) {
     // routed pairs) falls back to the MoE kernel compiled for that ceiling.
     // Q5_0 support is shape-specific and must not raise the MMVQ batch ceiling
     // for the shapes that still use the legacy kernel.
-    if (type != GGML_TYPE_Q5_0 && mmid_grouped_env() && mmid_grouped_type_ok(type) &&
-        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
+    if (type != GGML_TYPE_Q5_0 &&
+        ((mmid_grouped_env() && mmid_grouped_type_ok(type) && mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) ||
+         ((type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0) && mmid_grouped_selected(type, cc)))) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
     // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
@@ -2563,6 +2567,10 @@ static bool mul_mat_vec_q_grouped_dispatch(
             return true;
         case GGML_TYPE_Q6_K:
             mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_Q6_K>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
+            return true;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_vec_q_moe_grouped_launch<GGML_TYPE_IQ4_NL>(vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:

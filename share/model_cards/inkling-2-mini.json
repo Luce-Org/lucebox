@@ -1,0 +1,44 @@
+{
+  "name": "Inkling 2 Mini",
+  "source": "https://huggingface.co/thinkingmachines/Inkling-2-Mini",
+  "verified_at": "2026-11-21",
+  "max_tokens": 32768,
+  "complex_problem_max_tokens": 65536,
+  "hard_limit_reply_budget": 4096,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "profiles": {
+    "inkling2-r9700-strix": {
+      "summary": "Inkling 2 Mini with full model + DSpark speculator on R9700 (gfx1201), adaptive speculation width, 3-pass wavefront prefill, and dynamic 74/26 MoE expert verify + 79/21 LM-head split + Split-KV Global Attention on Strix Halo (gfx1151)",
+      "gpus": ["gfx1201", "gfx1151"],
+      "flags": {
+        "--target-device": "hip:0",
+        "--expert-device": "hip:1",
+        "--max-ctx": "auto"
+      }
+    },
+    "inkling2-r9700": {
+      "summary": "Inkling 2 Mini monolithic on R9700 (gfx1201) with auto-discovered DSpark speculator and Q8_0 KV cache",
+      "gpus": ["gfx1201"],
+      "flags": {
+        "--target-device": "hip:0",
+        "--max-ctx": "65536"
+      }
+    },
+    "inkling2-strix": {
+      "summary": "Inkling 2 Mini monolithic on Strix Halo (gfx1151) with auto-discovered DSpark speculator and long context",
+      "gpus": ["gfx1151"],
+      "flags": {
+        "--target-device": "hip:1",
+        "--max-ctx": "262144"
+      }
+    }
+  },
+  "notes": "Thinking Machines Lab Inkling 2 Mini (inkling2_loop, 24 physical layers -> 48 effective visits, 128 MoE top-8 with SITU, 40 SWA-1024 + 8 Global layers, bundled DSpark block-8 speculator in mtp.safetensors)."
+}

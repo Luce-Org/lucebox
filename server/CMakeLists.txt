@@ -573,6 +573,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -590,6 +591,10 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/qwen4exp/qwen4exp_hot.cpp
+    src/inkling2/inkling2_loader.cpp
+    src/inkling2/inkling2_cache.cpp
+    src/inkling2/inkling2_graph.cpp
+    src/inkling2/inkling2_backend.cpp
     src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
@@ -2316,6 +2321,18 @@ if(LUCE_TESTS)
         add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)
         target_include_directories(smoke_qwen4exp_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen4exp_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_ops.cpp")
+        add_executable(test_inkling2_ops test/unit/test_inkling2_ops.cpp)
+        target_include_directories(test_inkling2_ops PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_inkling2_ops PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME inkling2_ops COMMAND test_inkling2_ops)
+        set_tests_properties(inkling2_ops PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_inkling2_forward.cpp")
+        add_executable(smoke_inkling2_forward test/smoke/smoke_inkling2_forward.cpp)
+        target_include_directories(smoke_inkling2_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_inkling2_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_batched.cpp")
         add_executable(smoke_qwen4exp_batched test/smoke/smoke_qwen4exp_batched.cpp)
