@@ -594,6 +594,9 @@ add_library(luce_common STATIC
     src/inkling2/inkling2_loader.cpp
     src/inkling2/inkling2_cache.cpp
     src/inkling2/inkling2_graph.cpp
+    src/inkling2/inkling2_2dsd_draft.cpp
+    src/inkling2/inkling2_2dsd_graph.cpp
+    src/inkling2/inkling2_2dsd_executor.cpp
     src/inkling2/inkling2_backend.cpp
     src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp

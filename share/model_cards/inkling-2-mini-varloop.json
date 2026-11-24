@@ -1,0 +1,81 @@
+{
+  "name": "Inkling 2 Mini VarLoop (2DSD)",
+  "source": "https://huggingface.co/thinkingmachines/TML-d24-varloop-research",
+  "verified_at": "2026-11-24",
+  "download_urls": {
+    "IQ4_NL-target": "https://huggingface.co/ggml-org/TML-d24-varloop-research-GGUF/resolve/main/TML-d24-varloop-research-IQ4_NL.gguf",
+    "Q8_0-target": "https://huggingface.co/ggml-org/TML-d24-varloop-research-GGUF/resolve/main/TML-d24-varloop-research-Q8_0.gguf",
+    "2DSD-DSpark-draft": "https://huggingface.co/minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter"
+  },
+  "chat_codec": "inkling2",
+  "thinking_marker": "<|end_message|>",
+  "thinking_terminator_hint": "<|end_message|><|message_model|><|content_text|>",
+  "max_tokens": 32768,
+  "complex_problem_max_tokens": 65536,
+  "hard_limit_reply_budget": 4096,
+  "sampling": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "default_profile": [
+    "inkling2-varloop-r9700-strix",
+    "inkling2-varloop-r9700",
+    "inkling2-varloop-strix"
+  ],
+  "profiles": {
+    "inkling2-varloop-r9700-strix": {
+      "summary": "TML-d24-varloop-research with 2DSD (stage2b, d1=1, d2=2, R=3, k=8 + draft confidence) on Lucebox (R9700 + Strix Halo parallel MoE & LM-head split)",
+      "gpus": ["gfx1201", "gfx1151"],
+      "min_gpu_memory_gib": [30, 32],
+      "flags": {
+        "--target-device": "hip:0",
+        "--expert-device": "hip:1",
+        "--max-ctx": "auto",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Pass --draft-model pointing to a local checkout of minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter. Tune static confidence cutoff with LUCE_INKLING2_2DSD_CONF."
+    },
+    "inkling2-varloop-r9700": {
+      "summary": "TML-d24-varloop-research with 2DSD monolithic on one R9700 (gfx1201) and Q8_0 KV cache",
+      "gpus": ["gfx1201"],
+      "min_gpu_memory_gib": [30],
+      "flags": {
+        "--target-device": "hip:0",
+        "--max-ctx": "auto",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Pass --draft-model pointing to minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter."
+    },
+    "inkling2-varloop-strix": {
+      "summary": "TML-d24-varloop-research with 2DSD monolithic on Strix Halo (gfx1151, hip:0)",
+      "gpus": ["gfx1151"],
+      "min_gpu_memory_gib": [24],
+      "flags": {
+        "--target-device": "hip:0",
+        "--max-ctx": "65536",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Pass --draft-model pointing to minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter."
+    },
+    "inkling2-varloop-halo": {
+      "summary": "TML-d24-varloop-research with 2DSD on a Lucebox's Strix Halo (hip:1), leaving R9700 (hip:0) free",
+      "gpus": ["gfx1201", "gfx1151"],
+      "min_gpu_memory_gib": [0, 24],
+      "flags": {
+        "--target-device": "hip:1",
+        "--max-ctx": "65536",
+        "--cache-type-k": "q8_0",
+        "--cache-type-v": "q8_0"
+      },
+      "notes": "Pass --draft-model pointing to minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter."
+    }
+  },
+  "notes": "Thinking Machines Lab TML-d24-varloop-research (variable-loop Inkling 2 Mini) accelerated by SqueezeAILab 2DSD (minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter): 5-layer loop-context DFlash + vanilla rank-256 DSpark Markov head + confidence head, fused multi-pass Core execution, greedy-only v1 (non-greedy falls back to AR)."
+}

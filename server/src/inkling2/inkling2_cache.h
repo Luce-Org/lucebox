@@ -12,11 +12,17 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <vector>
 
 namespace luce::common {
 
-constexpr int kInkling2MaxVerify = 8; // 1 anchor + up to 7 DSpark drafts
+constexpr int kInkling2MaxVerify     = 8;   // 1 anchor + up to 7 DSpark drafts
+constexpr int kInkling2TwoDSDMaxNodes = 128; // live tree slots (slot 128 = scratch padding)
+constexpr int kInkling2TwoDSDMaxCommit = 16; // max committed path length per step
+constexpr int kInkling2TwoDSDFlagsLater   = 1;
+constexpr int kInkling2TwoDSDFlagsPadding = 2;
 
 struct Inkling2GraphWorkspace {
     ggml_context *       ctx     = nullptr;
@@ -87,6 +93,106 @@ struct Inkling2DSparkWorkspace {
     bool           rb_built    = false;
 };
 
+// Cached static-bucket HIP graph for one 2DSD target phase (prelude / core / coda).
+struct Inkling2TwoDSDPhaseGraph {
+    ggml_context *       ctx   = nullptr;
+    ggml_gallocr_t       alloc = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_cgraph *        gf    = nullptr;
+    bool                 built = false;
+
+    ggml_tensor * inp_meta       = nullptr; // I32 [m_stride, T]
+    ggml_tensor * inp_prefix_len = nullptr; // I32 [1]
+    ggml_tensor * inp_pos        = nullptr; // I32 [T]
+    ggml_tensor * inp_flags      = nullptr; // I32 [T]
+    ggml_tensor * inp_tokens     = nullptr; // I32 [T] (prelude only)
+    ggml_tensor * inp_slot       = nullptr; // I32 [T] (0..S-1)
+    ggml_tensor * inp_flat_cur   = nullptr; // I32 [T] (plane*S + slot)
+    ggml_tensor * inp_flat_prev  = nullptr; // I32 [T] (max(0,plane-1)*S + slot)
+    ggml_tensor * out_greedy     = nullptr; // I32 [T] (coda only)
+    std::vector<ggml_tensor *> expert_nodes;
+};
+
+// Cached static-bucket HIP graph for one 2DSD multi-leaf loop-context draft batch.
+struct Inkling2TwoDSDDraftGraph {
+    ggml_context * ctx   = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_cgraph *  gf    = nullptr;
+    bool           built = false;
+
+    ggml_tensor * inp_heads      = nullptr; // I32 [L_b]
+    ggml_tensor * inp_block_pos  = nullptr; // I32 [8 * L_b]
+    ggml_tensor * inp_block_wpos = nullptr; // I32 [8 * L_b]
+    ggml_tensor * inp_span_idx   = nullptr; // I32 [S_b * L_b] (depth_idx*S + slot)
+    ggml_tensor * inp_span_pos   = nullptr; // I32 [S_b * L_b]
+    ggml_tensor * inp_span_wpos  = nullptr; // I32 [S_b * L_b]
+    ggml_tensor * inp_draft_meta = nullptr; // I32 [3 + L_b]
+    ggml_tensor * out_tokens     = nullptr; // I32 [L_b, 7] (7 steps x L_b leaves)
+    ggml_tensor * out_conf       = nullptr; // F32 [7 * L_b]
+};
+
+struct Inkling2TwoDSDCommitGraph {
+    ggml_context * ctx   = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_cgraph *  gf    = nullptr;
+    ggml_tensor *  slots = nullptr; // I32 [kInkling2TwoDSDMaxCommit]
+    ggml_tensor *  meta  = nullptr; // I32 [2]: {prefix_len, n_commit}
+    bool           built = false;
+};
+
+struct Inkling2TwoDSDPrefixStoreGraph {
+    ggml_context * ctx   = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_cgraph *  gf    = nullptr;
+    ggml_tensor *  feats = nullptr; // F16 [5*H, T] (or gather idx I32 [T])
+    ggml_tensor *  pos   = nullptr; // I32 [T]
+    bool           built = false;
+};
+
+// 60-plane contiguous target cache + tree scratch + 5-layer drafter KV + graph caches.
+struct Inkling2TreeCache {
+    bool active    = false;
+    int  max_nodes = kInkling2TwoDSDMaxNodes; // live slots [0..max_nodes-1]; scratch = max_nodes
+    int  n_depths  = 3;                       // coda planes for readout depths {1, 2, 3}
+    int  prefix_len = 0;
+
+    // Flat 4D per-physical-layer tensors (24 physical layers):
+    //   planes[ip]: 1 for prelude (0..5), 3 for core (6..17), 3 for coda (18..23) -> 60 planes total
+    std::vector<int>           planes;      // size 24
+    std::vector<ggml_tensor *> prefix_k;    // [D, cap, Hk, P] (Q8_0 or F16)
+    std::vector<ggml_tensor *> prefix_v;    // [D, cap, Hk, P]
+    std::vector<ggml_tensor *> tree_k;      // [D, S, Hk, P]
+    std::vector<ggml_tensor *> tree_v;      // [D, S, Hk, P]
+    std::vector<ggml_tensor *> prefix_conv; // [3, sconv_channels, P] F32
+    std::vector<ggml_tensor *> tree_conv;   // [sconv_channels, S, P] F32
+
+    // Per-node recurrent & feature pools (S = max_nodes + 1):
+    std::vector<ggml_tensor *> pre_blocks;   // [H, S] F32 each (1 block for prelude L0..5)
+    ggml_tensor *              pre_partial  = nullptr; // [H, S] F32
+    ggml_tensor *              pre_tap      = nullptr; // [H, S] F32 (layer 2 input)
+    std::vector<ggml_tensor *> core_blocks;  // [H, S*3] F32 each (2 blocks for core L6..17)
+    ggml_tensor *              core_partial = nullptr; // [H, S*3] F32
+    std::array<ggml_tensor *, 3> core_taps  = {};      // [H, S*3] F32 (layers 7, 12, 17 inputs)
+    ggml_tensor *              node_features = nullptr; // [5*H, S*3] F16 (depth_idx*S + slot)
+
+    // 5-layer loop-context drafter prefix KV cache (F16 [128, max_ctx + 256, 8] per layer)
+    std::vector<ggml_tensor *> draft_k; // size 5
+    std::vector<ggml_tensor *> draft_v; // size 5
+    int                        draft_cap = 0;
+
+    // Zero-copy view context aliasing legacy 48-slot k_cache/v_cache/conv_state into prefix_*
+    ggml_context * alias_ctx = nullptr;
+
+    // Cached HIP graphs:
+    // phase_key = (phase_id: 0=prelude 1=core 2=coda, row_bucket, path_bucket, has_later, use_split)
+    std::map<std::tuple<int, int, int, int, int>, Inkling2TwoDSDPhaseGraph> phase_graphs;
+    // draft_key = (L_bucket, S_bucket, kv_span_bucket)
+    std::map<std::tuple<int, int, int64_t>, Inkling2TwoDSDDraftGraph>       draft_graphs;
+    Inkling2TwoDSDCommitGraph                                               commit_graph;
+    // Per-commit-count prefix KV store graphs (gather directly from node_features[2, slot]!)
+    std::array<Inkling2TwoDSDPrefixStoreGraph, kInkling2TwoDSDMaxCommit + 1> prefix_store_graphs;
+};
+
 struct Inkling2Cache {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -134,6 +240,7 @@ struct Inkling2Cache {
     Inkling2GraphWorkspace decode_ws;
     std::array<Inkling2GraphWorkspace, kInkling2MaxVerify + 1> verify_ws;
     Inkling2DSparkWorkspace dspark_ws;
+    Inkling2TreeCache       tree;
 };
 
 bool create_inkling2_cache(ggml_backend_t target_backend,

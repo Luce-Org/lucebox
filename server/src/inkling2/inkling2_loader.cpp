@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <unordered_map>
@@ -51,10 +52,16 @@ struct ConcatSpec {
 } // namespace
 
 void free_inkling2_weights(Inkling2Weights & w) {
+    if (w.twodsd.buf) { ggml_backend_buffer_free(w.twodsd.buf); w.twodsd.buf = nullptr; }
+    if (w.twodsd.ctx) { ggml_free(w.twodsd.ctx); w.twodsd.ctx = nullptr; }
+    w.twodsd.layers.clear();
+    w.twodsd.loaded = false;
+
     if (w.dspark.buf) { ggml_backend_buffer_free(w.dspark.buf); w.dspark.buf = nullptr; }
     if (w.dspark.ctx) { ggml_free(w.dspark.ctx); w.dspark.ctx = nullptr; }
     w.dspark.layers.clear();
     w.dspark.loaded = false;
+    w.draft_mode = Inkling2DraftMode::None;
 
     if (w.expert_buf)  { ggml_backend_buffer_free(w.expert_buf); w.expert_buf = nullptr; }
     if (w.expert_ctx)  { ggml_free(w.expert_ctx); w.expert_ctx = nullptr; }
@@ -894,11 +901,505 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
     }
 
     ds.loaded = true;
+    weights.draft_mode = Inkling2DraftMode::BundledMtp;
     std::fprintf(stderr,
         "[inkling2] DSpark loaded from %s: 3 layers + rnn_hidden Markov (rank=%d, block=%d, folded lm_head=%.1f MiB, total=%.1f MiB)\n",
         path.c_str(), R, ds.block_size,
         (double) ggml_nbytes(ds.fold_weight) / 1048576.0,
         (double) ggml_backend_buffer_get_size(ds.buf) / 1048576.0);
+    return true;
+}
+
+// ─── Direct Uncompressed PyTorch ZIP `.pt` Reader for `mask_embedding.pt` ──
+bool load_inkling2_mask_embedding_pt(const std::string & pt_path,
+                                     int n_embd,
+                                     std::vector<float> & out,
+                                     std::string & error) {
+    GgufMmap mm;
+    if (!mm.open(pt_path, error) || mm.size() < 30) {
+        if (error.empty()) error = "inkling2_2dsd: failed to open " + pt_path;
+        return false;
+    }
+    const uint8_t * bytes = static_cast<const uint8_t *>(mm.data());
+    const size_t total = mm.size();
+
+    auto rd16 = [&](size_t off) -> uint16_t {
+        uint16_t v = 0;
+        std::memcpy(&v, bytes + off, sizeof(v));
+        return v;
+    };
+    auto rd32 = [&](size_t off) -> uint32_t {
+        uint32_t v = 0;
+        std::memcpy(&v, bytes + off, sizeof(v));
+        return v;
+    };
+
+    // Parse ZIP entries for `*/data.pkl` and `*/data/0`.
+    // Prefer the Central Directory (EOCD 0x06054b50 -> CD 0x02014b50 -> LFH 0x04034b50)
+    // because PyTorch `torch.save` sets ZIP data-descriptor flag (0x0008), leaving sizes 0
+    // in local file headers and storing authoritative sizes in the Central Directory.
+    std::string pkl_text;
+    const uint8_t * data_ptr = nullptr;
+    size_t data_len = 0;
+
+    auto record_entry = [&](const std::string & name, uint16_t method, size_t payload_off, size_t sz) {
+        if (method != 0 || payload_off > total || sz > total - payload_off) return;
+        if (name.size() >= 8 && name.compare(name.size() - 8, 8, "data.pkl") == 0) {
+            pkl_text.assign(reinterpret_cast<const char *>(bytes + payload_off), sz);
+        } else if (name.size() >= 6 && name.compare(name.size() - 6, 6, "data/0") == 0) {
+            data_ptr = bytes + payload_off;
+            data_len = sz;
+        }
+    };
+
+    bool parsed_cd = false;
+    const size_t min_eocd = (total > 65557) ? (total - 65557) : 0;
+    for (size_t e = (total >= 22) ? (total - 22) : 0; total >= 22; --e) {
+        if (rd32(e) == 0x06054b50u) {
+            const uint16_t n_entries = rd16(e + 10);
+            const uint32_t cd_size   = rd32(e + 12);
+            const uint32_t cd_off    = rd32(e + 16);
+            if ((size_t) cd_off <= total && (size_t) cd_size <= total - cd_off) {
+                size_t p = cd_off;
+                const size_t cd_end = (size_t) cd_off + cd_size;
+                for (uint16_t idx = 0; idx < n_entries && p + 46 <= cd_end; ++idx) {
+                    if (rd32(p) != 0x02014b50u) break;
+                    const uint16_t method     = rd16(p + 10);
+                    const uint32_t comp_size  = rd32(p + 20);
+                    const uint16_t name_len   = rd16(p + 28);
+                    const uint16_t extra_len  = rd16(p + 30);
+                    const uint16_t comm_len   = rd16(p + 32);
+                    const uint32_t lfh_off    = rd32(p + 42);
+                    if (p + 46 + name_len + extra_len + comm_len > cd_end) break;
+                    const std::string name(reinterpret_cast<const char *>(bytes + p + 46), name_len);
+                    if ((size_t) lfh_off + 30 <= total && rd32(lfh_off) == 0x04034b50u) {
+                        const uint16_t l_name  = rd16(lfh_off + 26);
+                        const uint16_t l_extra = rd16(lfh_off + 28);
+                        const size_t payload_off = (size_t) lfh_off + 30 + l_name + l_extra;
+                        record_entry(name, method, payload_off, comp_size);
+                    }
+                    p += 46 + name_len + extra_len + comm_len;
+                }
+                parsed_cd = true;
+            }
+            break;
+        }
+        if (e == min_eocd) break;
+    }
+
+    if (!parsed_cd) {
+        size_t pos = 0;
+        while (pos + 30 <= total && rd32(pos) == 0x04034b50u) {
+            const uint16_t flags     = rd16(pos + 6);
+            const uint16_t method    = rd16(pos + 8);
+            const uint32_t comp_size = rd32(pos + 18);
+            const uint16_t name_len  = rd16(pos + 26);
+            const uint16_t extra_len = rd16(pos + 28);
+            const size_t name_off = pos + 30;
+            const size_t payload_off = name_off + name_len + extra_len;
+            if (payload_off > total || comp_size > total - payload_off) {
+                error = "inkling2_2dsd: truncated ZIP entry in " + pt_path;
+                return false;
+            }
+            const std::string name(reinterpret_cast<const char *>(bytes + name_off), name_len);
+            record_entry(name, method, payload_off, comp_size);
+            pos = payload_off + comp_size;
+            if ((flags & 0x08u) != 0 && pos + 16 <= total && rd32(pos) == 0x08074b50u) {
+                pos += 16;
+            }
+        }
+    }
+
+    if (!data_ptr) {
+        error = "inkling2_2dsd: could not locate uncompressed data/0 entry in " + pt_path;
+        return false;
+    }
+
+    const bool is_bf16 = pkl_text.find("BFloat16Storage") != std::string::npos;
+    const bool is_f16  = pkl_text.find("HalfStorage") != std::string::npos;
+    const bool is_f32  = pkl_text.find("FloatStorage") != std::string::npos;
+
+    out.resize((size_t) n_embd);
+    if ((is_bf16 || (!is_f16 && !is_f32)) && data_len == (size_t) n_embd * 2) {
+        const auto * src = reinterpret_cast<const uint16_t *>(data_ptr);
+        for (int i = 0; i < n_embd; ++i) out[i] = bf16_to_f32(src[i]);
+        return true;
+    }
+    if (is_f16 && data_len == (size_t) n_embd * 2) {
+        const auto * src = reinterpret_cast<const ggml_fp16_t *>(data_ptr);
+        for (int i = 0; i < n_embd; ++i) out[i] = ggml_fp16_to_fp32(src[i]);
+        return true;
+    }
+    if (is_f32 && data_len == (size_t) n_embd * 4) {
+        std::memcpy(out.data(), data_ptr, data_len);
+        return true;
+    }
+
+    error = "inkling2_2dsd: unexpected mask_embedding.pt size (" + std::to_string(data_len) +
+            " bytes for n_embd=" + std::to_string(n_embd) + ") in " + pt_path;
+    return false;
+}
+
+bool is_inkling2_2dsd_drafter_path(const std::string & path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p(path);
+    fs::path cfg_path;
+    if (fs::is_directory(p, ec)) {
+        cfg_path = p / "config.json";
+    } else if (fs::is_regular_file(p, ec)) {
+        cfg_path = p.parent_path() / "config.json";
+    } else {
+        return false;
+    }
+    if (!fs::is_regular_file(cfg_path, ec)) return false;
+    std::ifstream ifs(cfg_path);
+    if (!ifs) return false;
+    try {
+        nlohmann::json j = nlohmann::json::parse(ifs);
+        return j.contains("loopedtf_drafter") && j["loopedtf_drafter"].is_object();
+    } catch (...) {
+        return false;
+    }
+}
+
+// ─── Native Loader for 2DSD Loop-Context DFlash + Vanilla DSpark Drafter ──
+bool load_inkling2_2dsd_drafter(const std::string & path,
+                                ggml_backend_t backend,
+                                Inkling2Weights & weights,
+                                std::string & error) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path dir = fs::is_directory(path, ec) ? fs::path(path) : fs::path(path).parent_path();
+    fs::path cfg_path = dir / "config.json";
+    fs::path st_path  = fs::is_directory(path, ec) ? (dir / "model.safetensors") : fs::path(path);
+    fs::path pt_path  = dir / "mask_embedding.pt";
+
+    if (!fs::is_regular_file(cfg_path, ec)) {
+        error = "inkling2_2dsd: missing config.json in " + dir.string();
+        return false;
+    }
+    if (!fs::is_regular_file(st_path, ec)) {
+        error = "inkling2_2dsd: missing model.safetensors at " + st_path.string();
+        return false;
+    }
+
+    nlohmann::json cfg;
+    try {
+        std::ifstream ifs(cfg_path);
+        cfg = nlohmann::json::parse(ifs);
+    } catch (const std::exception & e) {
+        error = std::string("inkling2_2dsd: failed to parse config.json: ") + e.what();
+        return false;
+    }
+
+    if (!cfg.contains("loopedtf_drafter") || !cfg["loopedtf_drafter"].is_object()) {
+        error = "inkling2_2dsd: config.json missing loopedtf_drafter metadata";
+        return false;
+    }
+    const auto & ltf = cfg["loopedtf_drafter"];
+    if (ltf.value("input_format", "") != "loop-context") {
+        error = "inkling2_2dsd: unsupported input_format (expected 'loop-context')";
+        return false;
+    }
+    if (!ltf.contains("dspark") || !ltf["dspark"].is_object()) {
+        error = "inkling2_2dsd: config.json missing loopedtf_drafter.dspark";
+        return false;
+    }
+    const auto & ds_cfg = ltf["dspark"];
+    if (ds_cfg.value("markov_head_type", "") != "vanilla") {
+        error = "inkling2_2dsd: only vanilla DSpark Markov head is supported in v1";
+        return false;
+    }
+
+    auto & td = weights.twodsd;
+    if (td.buf) { ggml_backend_buffer_free(td.buf); td.buf = nullptr; }
+    if (td.ctx) { ggml_free(td.ctx); td.ctx = nullptr; }
+    td.layers.clear();
+    td.loaded = false;
+
+    td.n_layer      = cfg.value("num_hidden_layers", 5);
+    td.n_embd       = cfg.value("hidden_size", weights.n_embd);
+    td.n_head       = cfg.value("num_attention_heads", 24);
+    td.n_head_kv    = cfg.value("num_key_value_heads", 8);
+    td.head_dim     = cfg.value("head_dim", 128);
+    td.n_ff         = cfg.value("intermediate_size", 9216);
+    td.block_size   = cfg.value("block_size", 8);
+    td.vocab_size   = cfg.value("vocab_size", weights.n_vocab_unpadded);
+    td.rope_theta   = cfg.value("rope_theta", 1000000.0f);
+    td.rms_eps      = cfg.value("rms_norm_eps", 1e-6f);
+    td.markov_rank  = ds_cfg.value("markov_rank", 256);
+    td.target_loops = ltf.value("target_loops", weights.n_passes);
+    td.feature_layers = ltf.value("feature_layers_per_loop", std::vector<int>{2, 7, 12, 17, 22});
+
+    if (td.n_embd != weights.n_embd) {
+        error = "inkling2_2dsd: drafter hidden_size mismatch with target";
+        return false;
+    }
+    if (td.target_loops != weights.n_passes) {
+        error = "inkling2_2dsd: drafter target_loops (" + std::to_string(td.target_loops) +
+                ") != target n_passes (" + std::to_string(weights.n_passes) + ")";
+        return false;
+    }
+    if (td.vocab_size != weights.n_vocab_unpadded || td.block_size != 8 || td.markov_rank != 256) {
+        error = "inkling2_2dsd: unsupported vocab_size/block_size/markov_rank";
+        return false;
+    }
+    if (td.feature_layers.size() != 5) {
+        error = "inkling2_2dsd: expected 5 feature_layers_per_loop";
+        return false;
+    }
+
+    // Load learned mask_embedding from sibling `mask_embedding.pt` (or safetensors fallback)
+    std::vector<float> mask_vec;
+    bool have_mask_pt = false;
+    if (fs::is_regular_file(pt_path, ec)) {
+        if (!load_inkling2_mask_embedding_pt(pt_path.string(), td.n_embd, mask_vec, error)) {
+            return false;
+        }
+        have_mask_pt = true;
+    }
+
+    // Memory-map & parse model.safetensors
+    GgufMmap mm;
+    if (!mm.open(st_path.string(), error) || mm.size() < 16) {
+        if (error.empty()) error = "inkling2_2dsd: failed to mmap " + st_path.string();
+        return false;
+    }
+    const uint8_t * mm_bytes = static_cast<const uint8_t *>(mm.data());
+    uint64_t hdr_len = 0;
+    std::memcpy(&hdr_len, mm_bytes, sizeof(hdr_len));
+    if (hdr_len > mm.size() - 8) {
+        error = "inkling2_2dsd: corrupt safetensors header";
+        return false;
+    }
+    nlohmann::json hdr;
+    try {
+        const char * hdr_begin = reinterpret_cast<const char *>(mm_bytes + 8);
+        hdr = nlohmann::json::parse(hdr_begin, hdr_begin + hdr_len);
+    } catch (const std::exception & e) {
+        error = std::string("inkling2_2dsd: safetensors header parse failed: ") + e.what();
+        return false;
+    }
+    const uint8_t * base = mm_bytes + 8 + hdr_len;
+    const size_t data_bytes = mm.size() - (size_t) (8 + hdr_len);
+    struct STEntry {
+        std::string dtype;
+        std::vector<int64_t> shape;
+        size_t off = 0;
+        size_t len = 0;
+    };
+    std::unordered_map<std::string, STEntry> entries;
+    for (auto & it : hdr.items()) {
+        if (it.key() == "__metadata__") continue;
+        const auto & val = it.value();
+        if (!val.is_object() || !val.contains("dtype") || !val.contains("shape") || !val.contains("data_offsets")) continue;
+        STEntry e;
+        e.dtype = val.at("dtype").get<std::string>();
+        e.shape = val.at("shape").get<std::vector<int64_t>>();
+        auto offs = val.at("data_offsets").get<std::vector<size_t>>();
+        if (offs.size() != 2 || offs[1] < offs[0] || offs[1] > data_bytes) {
+            error = "inkling2_2dsd: out-of-bounds data_offsets for " + it.key();
+            return false;
+        }
+        e.off = offs[0];
+        e.len = offs[1] - offs[0];
+        entries[it.key()] = std::move(e);
+    }
+
+    auto get_f32 = [&](const std::string & name, std::vector<float> & out_vec, size_t expected_elems) -> bool {
+        auto it = entries.find(name);
+        if (it == entries.end()) {
+            error = "inkling2_2dsd: missing tensor " + name;
+            return false;
+        }
+        const auto & e = it->second;
+        size_t elem_bytes = (e.dtype == "BF16" || e.dtype == "F16") ? 2 : (e.dtype == "F32" ? 4 : 0);
+        if (elem_bytes == 0) {
+            error = "inkling2_2dsd: unsupported dtype " + e.dtype + " for " + name;
+            return false;
+        }
+        size_t n = 1;
+        for (int64_t d : e.shape) n *= (size_t) d;
+        if (n != expected_elems || n * elem_bytes > e.len) {
+            error = "inkling2_2dsd: shape mismatch for " + name +
+                    " (got " + std::to_string(n) + ", expected " + std::to_string(expected_elems) + ")";
+            return false;
+        }
+        out_vec.resize(n);
+        if (e.dtype == "BF16") {
+            const auto * src = reinterpret_cast<const uint16_t *>(base + e.off);
+            for (size_t i = 0; i < n; ++i) out_vec[i] = bf16_to_f32(src[i]);
+        } else if (e.dtype == "F32") {
+            std::memcpy(out_vec.data(), base + e.off, n * sizeof(float));
+        } else {
+            const auto * src = reinterpret_cast<const ggml_fp16_t *>(base + e.off);
+            for (size_t i = 0; i < n; ++i) out_vec[i] = ggml_fp16_to_fp32(src[i]);
+        }
+        return true;
+    };
+
+    if (!have_mask_pt) {
+        if (!get_f32("mask_embedding", mask_vec, (size_t) td.n_embd) &&
+            !get_f32("mask_embed", mask_vec, (size_t) td.n_embd)) {
+            error = "inkling2_2dsd: missing mask_embedding.pt (and no mask_embedding tensor in safetensors)";
+            return false;
+        }
+    }
+
+    const int H     = td.n_embd;
+    const int F     = (int) td.feature_layers.size() * H; // 5 * 2304 = 11520
+    const int R     = td.markov_rank;
+    const int V     = td.vocab_size;
+    const int q_sz  = td.n_head * td.head_dim;
+    const int kv_sz = td.n_head_kv * td.head_dim;
+
+    const bool f16_draft = (std::getenv("LUCE_INKLING2_F16_DSPARK") != nullptr &&
+                            std::atoi(std::getenv("LUCE_INKLING2_F16_DSPARK")) != 0);
+    const ggml_type lin_type = f16_draft ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+
+    const size_t n_tensors = (size_t) td.n_layer * 8 + 16;
+    struct ggml_init_params gp = { n_tensors * ggml_tensor_overhead() + 4096, nullptr, true };
+    td.ctx = ggml_init(gp);
+
+    td.fc          = ggml_new_tensor_2d(td.ctx, lin_type, F, H);
+    td.hidden_norm = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H);
+    td.norm        = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H);
+    td.mask_embed  = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H);
+
+    td.layers.resize(td.n_layer);
+    for (int i = 0; i < td.n_layer; ++i) {
+        auto & L = td.layers[i];
+        L.inp_norm  = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H);
+        L.post_norm = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H);
+        L.q_norm    = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, td.head_dim);
+        L.k_norm    = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, td.head_dim);
+        L.wqkv      = ggml_new_tensor_2d(td.ctx, lin_type, H, q_sz + 2 * kv_sz);
+        L.wo        = ggml_new_tensor_2d(td.ctx, lin_type, q_sz, H);
+        L.w_gate_up = ggml_new_tensor_2d(td.ctx, lin_type, H, 2 * td.n_ff);
+        L.w_down    = ggml_new_tensor_2d(td.ctx, lin_type, td.n_ff, H);
+    }
+
+    td.markov_w1 = ggml_new_tensor_2d(td.ctx, GGML_TYPE_F16, R, V);
+    td.markov_w2 = ggml_new_tensor_2d(td.ctx, lin_type, R, V);
+    td.conf_w    = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, H + R);
+    td.conf_b    = ggml_new_tensor_1d(td.ctx, GGML_TYPE_F32, 1);
+
+    const bool use_q4_head = (std::getenv("LUCE_INKLING2_DSPARK_Q4_HEAD") == nullptr ||
+                              std::atoi(std::getenv("LUCE_INKLING2_DSPARK_Q4_HEAD")) != 0);
+    if (use_q4_head && weights.output && weights.output->type == GGML_TYPE_Q8_0) {
+        td.lm_head_q4 = ggml_new_tensor_2d(td.ctx, GGML_TYPE_Q4_0, H, V);
+    }
+
+    td.buf = ggml_backend_alloc_ctx_tensors(td.ctx, backend);
+    if (!td.buf) {
+        error = "inkling2_2dsd: failed to allocate 2DSD drafter weight buffer";
+        ggml_free(td.ctx); td.ctx = nullptr;
+        td.layers.clear();
+        return false;
+    }
+
+    auto cleanup_fail = [&]() -> bool {
+        if (td.buf) { ggml_backend_buffer_free(td.buf); td.buf = nullptr; }
+        if (td.ctx) { ggml_free(td.ctx); td.ctx = nullptr; }
+        td.layers.clear();
+        td.loaded = false;
+        return false;
+    };
+
+    auto upload_lin = [&](ggml_tensor * dst, const std::vector<float> & src, int64_t n_cols, int64_t n_rows, size_t dst_off) {
+        if (dst->type == GGML_TYPE_Q8_0) {
+            const size_t nb = (size_t) n_rows * ggml_row_size(GGML_TYPE_Q8_0, n_cols);
+            std::vector<uint8_t> q8(nb);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, src.data(), q8.data(), 0, n_rows, n_cols, nullptr);
+            ggml_backend_tensor_set(dst, q8.data(), dst_off, nb);
+        } else {
+            std::vector<ggml_fp16_t> v16(src.size());
+            for (size_t i = 0; i < src.size(); ++i) v16[i] = ggml_fp32_to_fp16(src[i]);
+            ggml_backend_tensor_set(dst, v16.data(), dst_off, v16.size() * sizeof(ggml_fp16_t));
+        }
+    };
+
+    std::vector<float> tmp, tmp2, tmp3;
+    if (!get_f32("fc.weight", tmp, (size_t) H * F)) return cleanup_fail();
+    upload_lin(td.fc, tmp, F, H, 0);
+    if (!get_f32("hidden_norm.weight", tmp, (size_t) H)) return cleanup_fail();
+    ggml_backend_tensor_set(td.hidden_norm, tmp.data(), 0, tmp.size() * sizeof(float));
+    if (!get_f32("norm.weight", tmp, (size_t) H)) return cleanup_fail();
+    ggml_backend_tensor_set(td.norm, tmp.data(), 0, tmp.size() * sizeof(float));
+    ggml_backend_tensor_set(td.mask_embed, mask_vec.data(), 0, mask_vec.size() * sizeof(float));
+
+    const size_t rs_h = ggml_row_size(lin_type, H);
+    for (int i = 0; i < td.n_layer; ++i) {
+        auto & L = td.layers[i];
+        const std::string p = "layers." + std::to_string(i) + ".";
+        auto load_f32 = [&](const std::string & k, ggml_tensor * dst) {
+            if (!get_f32(p + k, tmp, (size_t) ggml_nelements(dst))) return false;
+            ggml_backend_tensor_set(dst, tmp.data(), 0, tmp.size() * sizeof(float));
+            return true;
+        };
+        if (!load_f32("input_layernorm.weight", L.inp_norm)) return cleanup_fail();
+        if (!load_f32("post_attention_layernorm.weight", L.post_norm)) return cleanup_fail();
+        if (!load_f32("self_attn.q_norm.weight", L.q_norm)) return cleanup_fail();
+        if (!load_f32("self_attn.k_norm.weight", L.k_norm)) return cleanup_fail();
+
+        if (!get_f32(p + "self_attn.q_proj.weight", tmp, (size_t) q_sz * H) ||
+            !get_f32(p + "self_attn.k_proj.weight", tmp2, (size_t) kv_sz * H) ||
+            !get_f32(p + "self_attn.v_proj.weight", tmp3, (size_t) kv_sz * H)) return cleanup_fail();
+        upload_lin(L.wqkv, tmp,  H, q_sz,  0);
+        upload_lin(L.wqkv, tmp2, H, kv_sz, (size_t) q_sz * rs_h);
+        upload_lin(L.wqkv, tmp3, H, kv_sz, (size_t) (q_sz + kv_sz) * rs_h);
+
+        if (!get_f32(p + "self_attn.o_proj.weight", tmp, (size_t) H * q_sz)) return cleanup_fail();
+        upload_lin(L.wo, tmp, q_sz, H, 0);
+
+        if (!get_f32(p + "mlp.gate_proj.weight", tmp, (size_t) td.n_ff * H) ||
+            !get_f32(p + "mlp.up_proj.weight", tmp2, (size_t) td.n_ff * H)) return cleanup_fail();
+        upload_lin(L.w_gate_up, tmp,  H, td.n_ff, 0);
+        upload_lin(L.w_gate_up, tmp2, H, td.n_ff, (size_t) td.n_ff * rs_h);
+
+        if (!get_f32(p + "mlp.down_proj.weight", tmp, (size_t) H * td.n_ff)) return cleanup_fail();
+        upload_lin(L.w_down, tmp, td.n_ff, H, 0);
+    }
+
+    // Vanilla DSpark Markov head + confidence head
+    if (!get_f32("markov_head.markov_w1.weight", tmp, (size_t) V * R)) return cleanup_fail();
+    {
+        std::vector<ggml_fp16_t> w1_16(tmp.size());
+        for (size_t i = 0; i < tmp.size(); ++i) w1_16[i] = ggml_fp32_to_fp16(tmp[i]);
+        ggml_backend_tensor_set(td.markov_w1, w1_16.data(), 0, w1_16.size() * sizeof(ggml_fp16_t));
+    }
+    if (!get_f32("markov_head.markov_w2.weight", tmp, (size_t) V * R)) return cleanup_fail();
+    upload_lin(td.markov_w2, tmp, R, V, 0);
+
+    if (!get_f32("confidence_head.proj.weight", tmp, (size_t) (H + R))) return cleanup_fail();
+    ggml_backend_tensor_set(td.conf_w, tmp.data(), 0, tmp.size() * sizeof(float));
+    if (!get_f32("confidence_head.proj.bias", tmp, 1)) return cleanup_fail();
+    ggml_backend_tensor_set(td.conf_b, tmp.data(), 0, sizeof(float));
+
+    // Quantize fast Q4_0 unpadded draft-only LM-head copy (first V=200058 rows of weights.output)
+    if (td.lm_head_q4 && weights.output) {
+        const size_t q8_row = ggml_row_size(GGML_TYPE_Q8_0, H);
+        const size_t q4_row = ggml_row_size(GGML_TYPE_Q4_0, H);
+        std::vector<uint8_t> src_q8((size_t) V * q8_row);
+        ggml_backend_tensor_get(weights.output, src_q8.data(), 0, src_q8.size());
+        std::vector<uint8_t> dst_q4((size_t) V * q4_row);
+        const auto * traits_q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        #pragma omp parallel for schedule(static)
+        for (int v = 0; v < V; ++v) {
+            float row_f32[4096];
+            traits_q8->to_float(src_q8.data() + (size_t) v * q8_row, row_f32, H);
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, row_f32, dst_q4.data() + (size_t) v * q4_row, 0, 1, H, nullptr);
+        }
+        ggml_backend_tensor_set(td.lm_head_q4, dst_q4.data(), 0, dst_q4.size());
+    }
+
+    td.loaded = true;
+    weights.draft_mode = Inkling2DraftMode::TwoDSD;
+    std::fprintf(stderr,
+        "[inkling2] 2DSD drafter loaded from %s: %d layers + vanilla Markov(rank=%d) + confidence head (block=%d, total=%.1f MiB)\n",
+        dir.c_str(), td.n_layer, R, td.block_size,
+        (double) ggml_backend_buffer_get_size(td.buf) / 1048576.0);
     return true;
 }
 

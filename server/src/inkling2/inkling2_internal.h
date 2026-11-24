@@ -153,6 +153,59 @@ struct Inkling2DSparkWeights {
     ggml_tensor * lm_head_q4         = nullptr;
 };
 
+// 2DSD depth-conditioned 5-layer Qwen3-DFlash + vanilla DSpark + confidence drafter
+// (`minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter`).
+struct Inkling2TwoDSDLayer {
+    ggml_tensor * inp_norm  = nullptr; // [n_embd] F32
+    ggml_tensor * post_norm = nullptr; // [n_embd] F32
+    ggml_tensor * q_norm    = nullptr; // [head_dim] F32
+    ggml_tensor * k_norm    = nullptr; // [head_dim] F32
+    ggml_tensor * wqkv      = nullptr; // Fused [n_embd, Hq*D + 2*Hk*D] Q8_0/F16
+    ggml_tensor * wo        = nullptr; // [Hq*D, n_embd] Q8_0/F16
+    ggml_tensor * w_gate_up = nullptr; // Fused [n_embd, 2*n_ff] Q8_0/F16
+    ggml_tensor * w_down    = nullptr; // [n_ff, n_embd] Q8_0/F16
+};
+
+struct Inkling2TwoDSDWeights {
+    bool loaded = false;
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+
+    int n_layer       = 5;
+    int n_embd        = 2304;
+    int n_head        = 24;
+    int n_head_kv     = 8;
+    int head_dim      = 128;
+    int n_ff          = 9216;
+    int block_size    = 8;
+    int markov_rank   = 256;
+    int vocab_size    = 200058;
+    int target_loops  = 3;
+    float rope_theta  = 1000000.0f;
+    float rms_eps     = 1e-6f;
+    std::vector<int> feature_layers = {2, 7, 12, 17, 22};
+
+    ggml_tensor * fc          = nullptr; // [5*n_embd, n_embd] Q8_0/F16
+    ggml_tensor * hidden_norm = nullptr; // [n_embd] F32
+    ggml_tensor * norm        = nullptr; // [n_embd] F32
+    ggml_tensor * mask_embed  = nullptr; // [n_embd] F32 (learned, from mask_embedding.pt)
+    std::vector<Inkling2TwoDSDLayer> layers;
+
+    // Vanilla DSpark Markov head + confidence head
+    ggml_tensor * markov_w1   = nullptr; // [rank, vocab_size] F16
+    ggml_tensor * markov_w2   = nullptr; // [rank, vocab_size] Q8_0/F16
+    ggml_tensor * conf_w      = nullptr; // [n_embd + rank] F32
+    ggml_tensor * conf_b      = nullptr; // [1] F32
+    // Q4_0 draft-only unpadded LM head copy [n_embd, vocab_size] (no softcap!)
+    ggml_tensor * lm_head_q4  = nullptr;
+};
+
+enum class Inkling2DraftMode {
+    None = 0,
+    BundledMtp = 1, // 1D bundled `mtp.safetensors`
+    TwoDSD = 2,     // 2D loop-context DFlash + vanilla DSpark + confidence head
+};
+
 struct Inkling2Weights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
@@ -189,6 +242,8 @@ struct Inkling2Weights {
     std::vector<Inkling2LoopLayer> loop_layers; // size = core_end - core_start (12)
 
     Inkling2DSparkWeights dspark;
+    Inkling2TwoDSDWeights twodsd;
+    Inkling2DraftMode     draft_mode = Inkling2DraftMode::None;
 
     // Architecture hyperparameters
     bool  is_loop          = true;
@@ -255,6 +310,22 @@ bool load_inkling2_dspark_safetensors(const std::string & path,
                                       ggml_backend_t backend,
                                       Inkling2Weights & weights,
                                       std::string & error);
+
+// Load a 2DSD HF drafter directory (containing config.json + model.safetensors +
+// mask_embedding.pt) or a direct path to its model.safetensors.
+bool load_inkling2_2dsd_drafter(const std::string & path,
+                                ggml_backend_t backend,
+                                Inkling2Weights & weights,
+                                std::string & error);
+
+// Detect whether `path` points to a 2DSD loop-context drafter export.
+bool is_inkling2_2dsd_drafter_path(const std::string & path);
+
+// Parse raw [n_embd] mask embedding vector directly from PyTorch uncompressed ZIP `.pt`.
+bool load_inkling2_mask_embedding_pt(const std::string & pt_path,
+                                     int n_embd,
+                                     std::vector<float> & out,
+                                     std::string & error);
 
 void free_inkling2_weights(Inkling2Weights & w);
 

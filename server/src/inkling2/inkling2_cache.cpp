@@ -38,6 +38,52 @@ static void free_dspark_workspace(Inkling2DSparkWorkspace & ws) {
     ws.rb_built = false;
 }
 
+static void free_tree_cache(Inkling2TreeCache & tc) {
+    for (auto & kv : tc.phase_graphs) {
+        auto & g = kv.second;
+        if (g.sched) { ggml_backend_sched_free(g.sched); g.sched = nullptr; }
+        if (g.alloc) { ggml_gallocr_free(g.alloc); g.alloc = nullptr; }
+        if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
+    }
+    tc.phase_graphs.clear();
+    for (auto & kv : tc.draft_graphs) {
+        auto & g = kv.second;
+        if (g.alloc) { ggml_gallocr_free(g.alloc); g.alloc = nullptr; }
+        if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
+    }
+    tc.draft_graphs.clear();
+    if (tc.commit_graph.alloc) { ggml_gallocr_free(tc.commit_graph.alloc); tc.commit_graph.alloc = nullptr; }
+    if (tc.commit_graph.ctx)   { ggml_free(tc.commit_graph.ctx); tc.commit_graph.ctx = nullptr; }
+    tc.commit_graph.gf = nullptr;
+    tc.commit_graph.built = false;
+    for (auto & g : tc.prefix_store_graphs) {
+        if (g.alloc) { ggml_gallocr_free(g.alloc); g.alloc = nullptr; }
+        if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
+        g.gf = nullptr;
+        g.built = false;
+    }
+    if (tc.alias_ctx) { ggml_free(tc.alias_ctx); tc.alias_ctx = nullptr; }
+    tc.planes.clear();
+    tc.prefix_k.clear();
+    tc.prefix_v.clear();
+    tc.tree_k.clear();
+    tc.tree_v.clear();
+    tc.prefix_conv.clear();
+    tc.tree_conv.clear();
+    tc.pre_blocks.clear();
+    tc.core_blocks.clear();
+    tc.pre_partial = nullptr;
+    tc.pre_tap = nullptr;
+    tc.core_partial = nullptr;
+    tc.core_taps = {};
+    tc.node_features = nullptr;
+    tc.draft_k.clear();
+    tc.draft_v.clear();
+    tc.draft_cap = 0;
+    tc.prefix_len = 0;
+    tc.active = false;
+}
+
 bool create_inkling2_cache(ggml_backend_t target_backend,
                            ggml_backend_t expert_backend,
                            const Inkling2Weights & w,
@@ -100,72 +146,197 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
         }
     }
 
+    const bool is_2dsd = (w.draft_mode == Inkling2DraftMode::TwoDSD && w.twodsd.loaded);
     const int n_slots = w.n_layer_eff;
-    const size_t n_tensors = (size_t) n_slots * 4 + 8;
-    struct ggml_init_params gp = { n_tensors * ggml_tensor_overhead() + 4096, nullptr, true };
-    out.ctx = ggml_init(gp);
-    if (!out.ctx) {
-        error = "inkling2_cache: ggml_init failed";
-        return false;
-    }
 
-    out.k_cache.resize(n_slots, nullptr);
-    out.v_cache.resize(n_slots, nullptr);
-    out.conv_state.resize(n_slots, nullptr);
-    out.conv_ring.resize(n_slots, nullptr);
+    if (is_2dsd) {
+        // 60-plane contiguous target prefix + tree scratch + per-node pools (ZERO duplicate KV!).
+        // Legacy 48-slot k_cache/v_cache/conv_state alias straight into tree.prefix_* for AR fallback.
+        auto & tc = out.tree;
+        tc.active = true;
+        tc.max_nodes = kInkling2TwoDSDMaxNodes;
+        tc.n_depths = w.n_passes; // 3 readout depths {1, 2, 3}
+        tc.prefix_len = 0;
+        const int S = tc.max_nodes + 1; // last slot = scratch padding
 
-    for (int il = 0; il < n_slots; ++il) {
-        const int ip = w.phys_layer_for_slot(il);
-        const bool is_swa = w.layers[ip].is_swa;
-        const int cap = is_swa ? out.swa_cap : out.global_local_cap;
-        out.k_cache[il] = ggml_new_tensor_3d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv);
-        out.v_cache[il] = ggml_new_tensor_3d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv);
-        out.conv_state[il] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
-        out.conv_ring[il]  = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels, kInkling2MaxVerify);
-    }
-    out.last_taps_dev = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.n_embd, 4, 1);
-
-    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, target_backend);
-    if (!out.buf) {
-        error = "inkling2_cache: failed to allocate target KV/conv cache buffer";
-        free_inkling2_cache(out);
-        return false;
-    }
-
-    if (out.remote_backend && out.remote_cap > 0) {
-        struct ggml_init_params rgp = { ((size_t) n_global * 2 + 4) * ggml_tensor_overhead() + 1024, nullptr, true };
-        out.remote_ctx = ggml_init(rgp);
-        out.remote_k.resize(n_global, nullptr);
-        out.remote_v.resize(n_global, nullptr);
-        for (int g = 0; g < n_global; ++g) {
-            out.remote_k[g] = ggml_new_tensor_3d(out.remote_ctx, out.kv_type, w.head_dim, out.remote_cap, w.n_head_kv);
-            out.remote_v[g] = ggml_new_tensor_3d(out.remote_ctx, out.kv_type, w.head_dim, out.remote_cap, w.n_head_kv);
+        int pre_n_blk = 0;
+        for (int ip = 0; ip < w.core_start; ++ip) {
+            if (ip % w.attn_res_block == 0) ++pre_n_blk;
         }
-        out.remote_buf = ggml_backend_alloc_ctx_tensors(out.remote_ctx, out.remote_backend);
-        if (!out.remote_buf) {
-            error = "inkling2_cache: failed to allocate remote Split-KV buffer on expert device";
+        int core_n_blk = 0;
+        for (int ip = w.core_start; ip < w.core_end; ++ip) {
+            if (ip % w.attn_res_block == 0) ++core_n_blk;
+        }
+
+        const size_t n_tensors = (size_t) w.n_layer_phys * 6 + (size_t) pre_n_blk + (size_t) core_n_blk + 16;
+        struct ggml_init_params gp = { n_tensors * ggml_tensor_overhead() + 8192, nullptr, true };
+        out.ctx = ggml_init(gp);
+        if (!out.ctx) {
+            error = "inkling2_cache: ggml_init failed for 2DSD tree cache";
+            return false;
+        }
+
+        tc.planes.resize(w.n_layer_phys, 1);
+        tc.prefix_k.resize(w.n_layer_phys, nullptr);
+        tc.prefix_v.resize(w.n_layer_phys, nullptr);
+        tc.tree_k.resize(w.n_layer_phys, nullptr);
+        tc.tree_v.resize(w.n_layer_phys, nullptr);
+        tc.prefix_conv.resize(w.n_layer_phys, nullptr);
+        tc.tree_conv.resize(w.n_layer_phys, nullptr);
+
+        for (int ip = 0; ip < w.n_layer_phys; ++ip) {
+            const int P = (ip < w.core_start) ? 1 : (ip < w.core_end ? w.n_passes : tc.n_depths);
+            tc.planes[ip] = P;
+            const bool is_swa = w.layers[ip].is_swa;
+            const int cap = is_swa ? out.swa_cap : out.max_ctx;
+            tc.prefix_k[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P);
+            tc.prefix_v[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P);
+            tc.tree_k[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P);
+            tc.tree_v[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P);
+            tc.prefix_conv[ip] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels, P);
+            tc.tree_conv[ip]   = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_channels, S, P);
+        }
+
+        tc.pre_blocks.resize(pre_n_blk, nullptr);
+        for (int b = 0; b < pre_n_blk; ++b) {
+            tc.pre_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
+        }
+        tc.pre_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
+        tc.pre_tap     = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
+
+        tc.core_blocks.resize(core_n_blk, nullptr);
+        for (int b = 0; b < core_n_blk; ++b) {
+            tc.core_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+        }
+        tc.core_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+        for (int ti = 0; ti < 3; ++ti) {
+            tc.core_taps[ti] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+        }
+        tc.node_features = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, 5 * w.n_embd, S * tc.n_depths);
+        out.last_taps_dev = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.n_embd, 4, 1);
+
+        out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, target_backend);
+        if (!out.buf) {
+            error = "inkling2_cache: failed to allocate 2DSD 60-plane + tree cache buffer";
             free_inkling2_cache(out);
             return false;
         }
-    }
 
-    if (w.dspark.loaded) {
-        const int d_layers = w.dspark.n_layer;
+        // Disable Split-KV remote pool in 2DSD v1 (all 60 planes live on target GPU).
+        out.remote_backend = nullptr;
+        out.remote_split_pos = 0;
+        out.remote_cap = 0;
+        out.global_local_cap = out.max_ctx;
+
+        // Zero-copy alias legacy 48-slot k_cache/v_cache/conv_state into tree.prefix_* so AR fallback
+        // (force_ar_decode / non-greedy temp > 0) uses the exact same physical buffer with 0 extra VRAM!
+        struct ggml_init_params agp = { ((size_t) n_slots * 3 + 8) * ggml_tensor_overhead() + 4096, nullptr, true };
+        tc.alias_ctx = ggml_init(agp);
+        out.k_cache.resize(n_slots, nullptr);
+        out.v_cache.resize(n_slots, nullptr);
+        out.conv_state.resize(n_slots, nullptr);
+        out.conv_ring.assign(n_slots, nullptr);
+        for (const auto & vi : w.schedule) {
+            const int il = vi.slot;
+            const int ip = vi.phys;
+            const int plane = (ip < w.core_start) ? 0 : (ip < w.core_end ? vi.pass : (tc.n_depths - 1));
+            ggml_tensor * pk = tc.prefix_k[ip];
+            ggml_tensor * pv = tc.prefix_v[ip];
+            ggml_tensor * pc = tc.prefix_conv[ip];
+            out.k_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pk->ne[1], w.n_head_kv);
+            out.k_cache[il]->data   = (char *) pk->data + (size_t) plane * pk->nb[3];
+            out.k_cache[il]->buffer = pk->buffer;
+            out.v_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pv->ne[1], w.n_head_kv);
+            out.v_cache[il]->data   = (char *) pv->data + (size_t) plane * pv->nb[3];
+            out.v_cache[il]->buffer = pv->buffer;
+            out.conv_state[il] = ggml_new_tensor_2d(tc.alias_ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
+            out.conv_state[il]->data   = (char *) pc->data + (size_t) plane * pc->nb[2];
+            out.conv_state[il]->buffer = pc->buffer;
+        }
+
+        // Allocate 5-layer loop-context drafter prefix KV cache (slack = 256 for multi-leaf span + block)
+        const int d_layers = w.twodsd.n_layer;
+        tc.draft_cap = out.max_ctx + 256;
         struct ggml_init_params dgp = { ((size_t) d_layers * 2 + 4) * ggml_tensor_overhead() + 1024, nullptr, true };
         out.dspark_kv_ctx = ggml_init(dgp);
-        out.dspark_k.resize(d_layers, nullptr);
-        out.dspark_v.resize(d_layers, nullptr);
-        // Draft KV: layer 0 & 2 are local (1024 + block_size), layer 1 is global (max_ctx + block_size)
+        tc.draft_k.resize(d_layers, nullptr);
+        tc.draft_v.resize(d_layers, nullptr);
         for (int i = 0; i < d_layers; ++i) {
-            const int cap = out.max_ctx + w.dspark.block_size + 16;
-            out.dspark_k[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.dspark.head_dim, cap, w.dspark.n_head_kv);
-            out.dspark_v[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.dspark.head_dim, cap, w.dspark.n_head_kv);
+            tc.draft_k[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
+            tc.draft_v[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
         }
         out.dspark_kv_buf = ggml_backend_alloc_ctx_tensors(out.dspark_kv_ctx, target_backend);
         if (!out.dspark_kv_buf) {
-            error = "inkling2_cache: failed to allocate DSpark draft KV cache";
+            error = "inkling2_cache: failed to allocate 2DSD 5-layer drafter KV cache";
             free_inkling2_cache(out);
             return false;
+        }
+    } else {
+        const size_t n_tensors = (size_t) n_slots * 4 + 8;
+        struct ggml_init_params gp = { n_tensors * ggml_tensor_overhead() + 4096, nullptr, true };
+        out.ctx = ggml_init(gp);
+        if (!out.ctx) {
+            error = "inkling2_cache: ggml_init failed";
+            return false;
+        }
+
+        out.k_cache.resize(n_slots, nullptr);
+        out.v_cache.resize(n_slots, nullptr);
+        out.conv_state.resize(n_slots, nullptr);
+        out.conv_ring.resize(n_slots, nullptr);
+
+        for (int il = 0; il < n_slots; ++il) {
+            const int ip = w.phys_layer_for_slot(il);
+            const bool is_swa = w.layers[ip].is_swa;
+            const int cap = is_swa ? out.swa_cap : out.global_local_cap;
+            out.k_cache[il] = ggml_new_tensor_3d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv);
+            out.v_cache[il] = ggml_new_tensor_3d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv);
+            out.conv_state[il] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
+            out.conv_ring[il]  = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels, kInkling2MaxVerify);
+        }
+        out.last_taps_dev = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.n_embd, 4, 1);
+
+        out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, target_backend);
+        if (!out.buf) {
+            error = "inkling2_cache: failed to allocate target KV/conv cache buffer";
+            free_inkling2_cache(out);
+            return false;
+        }
+
+        if (out.remote_backend && out.remote_cap > 0) {
+            struct ggml_init_params rgp = { ((size_t) n_global * 2 + 4) * ggml_tensor_overhead() + 1024, nullptr, true };
+            out.remote_ctx = ggml_init(rgp);
+            out.remote_k.resize(n_global, nullptr);
+            out.remote_v.resize(n_global, nullptr);
+            for (int g = 0; g < n_global; ++g) {
+                out.remote_k[g] = ggml_new_tensor_3d(out.remote_ctx, out.kv_type, w.head_dim, out.remote_cap, w.n_head_kv);
+                out.remote_v[g] = ggml_new_tensor_3d(out.remote_ctx, out.kv_type, w.head_dim, out.remote_cap, w.n_head_kv);
+            }
+            out.remote_buf = ggml_backend_alloc_ctx_tensors(out.remote_ctx, out.remote_backend);
+            if (!out.remote_buf) {
+                error = "inkling2_cache: failed to allocate remote Split-KV buffer on expert device";
+                free_inkling2_cache(out);
+                return false;
+            }
+        }
+
+        if (w.dspark.loaded) {
+            const int d_layers = w.dspark.n_layer;
+            struct ggml_init_params dgp = { ((size_t) d_layers * 2 + 4) * ggml_tensor_overhead() + 1024, nullptr, true };
+            out.dspark_kv_ctx = ggml_init(dgp);
+            out.dspark_k.resize(d_layers, nullptr);
+            out.dspark_v.resize(d_layers, nullptr);
+            for (int i = 0; i < d_layers; ++i) {
+                const int cap = out.max_ctx + w.dspark.block_size + 16;
+                out.dspark_k[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.dspark.head_dim, cap, w.dspark.n_head_kv);
+                out.dspark_v[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.dspark.head_dim, cap, w.dspark.n_head_kv);
+            }
+            out.dspark_kv_buf = ggml_backend_alloc_ctx_tensors(out.dspark_kv_ctx, target_backend);
+            if (!out.dspark_kv_buf) {
+                error = "inkling2_cache: failed to allocate DSpark draft KV cache";
+                free_inkling2_cache(out);
+                return false;
+            }
         }
     }
 
@@ -182,10 +353,33 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
 void reset_inkling2_cache(Inkling2Cache & cache) {
     cache.cur_pos = 0;
     cache.dspark_ctx_pos = 0;
+    cache.tree.prefix_len = 0;
     if (cache.buf) {
-        // Zero conv states & last_taps_dev (KV slots are masked by kv_len/pos so only conv needs zeroing)
-        for (ggml_tensor * st : cache.conv_state) {
-            if (st) ggml_backend_tensor_memset(st, 0, 0, ggml_nbytes(st));
+        if (cache.tree.active) {
+            for (ggml_tensor * pc : cache.tree.prefix_conv) {
+                if (pc) ggml_backend_tensor_memset(pc, 0, 0, ggml_nbytes(pc));
+            }
+            for (ggml_tensor * tc : cache.tree.tree_conv) {
+                if (tc) ggml_backend_tensor_memset(tc, 0, 0, ggml_nbytes(tc));
+            }
+            for (ggml_tensor * pb : cache.tree.pre_blocks) {
+                if (pb) ggml_backend_tensor_memset(pb, 0, 0, ggml_nbytes(pb));
+            }
+            if (cache.tree.pre_partial) ggml_backend_tensor_memset(cache.tree.pre_partial, 0, 0, ggml_nbytes(cache.tree.pre_partial));
+            if (cache.tree.pre_tap) ggml_backend_tensor_memset(cache.tree.pre_tap, 0, 0, ggml_nbytes(cache.tree.pre_tap));
+            for (ggml_tensor * cb : cache.tree.core_blocks) {
+                if (cb) ggml_backend_tensor_memset(cb, 0, 0, ggml_nbytes(cb));
+            }
+            if (cache.tree.core_partial) ggml_backend_tensor_memset(cache.tree.core_partial, 0, 0, ggml_nbytes(cache.tree.core_partial));
+            for (ggml_tensor * ct : cache.tree.core_taps) {
+                if (ct) ggml_backend_tensor_memset(ct, 0, 0, ggml_nbytes(ct));
+            }
+            if (cache.tree.node_features) ggml_backend_tensor_memset(cache.tree.node_features, 0, 0, ggml_nbytes(cache.tree.node_features));
+        } else {
+            // Zero conv states & last_taps_dev (KV slots are masked by kv_len/pos so only conv needs zeroing)
+            for (ggml_tensor * st : cache.conv_state) {
+                if (st) ggml_backend_tensor_memset(st, 0, 0, ggml_nbytes(st));
+            }
         }
         if (cache.last_taps_dev) {
             ggml_backend_tensor_memset(cache.last_taps_dev, 0, 0, ggml_nbytes(cache.last_taps_dev));
@@ -197,6 +391,7 @@ void free_inkling2_cache(Inkling2Cache & cache) {
     free_inkling2_workspace(cache.decode_ws);
     for (auto & ws : cache.verify_ws) free_inkling2_workspace(ws);
     free_dspark_workspace(cache.dspark_ws);
+    free_tree_cache(cache.tree);
 
     if (cache.dspark_kv_buf) { ggml_backend_buffer_free(cache.dspark_kv_buf); cache.dspark_kv_buf = nullptr; }
     if (cache.dspark_kv_ctx) { ggml_free(cache.dspark_kv_ctx); cache.dspark_kv_ctx = nullptr; }

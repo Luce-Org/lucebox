@@ -1,6 +1,9 @@
 // Inkling2Backend — ModelBackend implementation for Inkling 2 / Inkling 2 Mini.
 
 #include "inkling2_backend.h"
+#include "inkling2_2dsd_draft.h"
+#include "inkling2_2dsd_executor.h"
+#include "inkling2_2dsd_graph.h"
 
 #include "common/peer_access.h"
 #include "common/sampler.h"
@@ -96,11 +99,15 @@ bool Inkling2Backend::load_all() {
         return false;
     }
 
-    // Load bundled DSpark speculator (`mtp.safetensors`) if found/requested.
+    // Load bundled DSpark speculator (`mtp.safetensors`) or 2DSD drafter directory if found/requested.
     const std::string dspark_path = resolve_dspark_path();
     if (!dspark_path.empty()) {
         std::string derr;
-        if (!load_inkling2_dspark_safetensors(dspark_path, backend_, weights_, derr)) {
+        if (is_inkling2_2dsd_drafter_path(dspark_path)) {
+            if (!load_inkling2_2dsd_drafter(dspark_path, backend_, weights_, derr)) {
+                std::fprintf(stderr, "[inkling2] warning: 2DSD drafter load failed (%s); continuing in AR mode\n", derr.c_str());
+            }
+        } else if (!load_inkling2_dspark_safetensors(dspark_path, backend_, weights_, derr)) {
             std::fprintf(stderr, "[inkling2] warning: DSpark load failed (%s); continuing in AR mode\n", derr.c_str());
         }
     }
@@ -130,10 +137,14 @@ bool Inkling2Backend::load_all() {
             if (expert_backend_) {
                 ggml_backend_cuda_get_device_memory(cfg_.expert_device->gpu, &efree, &etotal);
             }
-            const size_t n_global = weights_.global_slots.size();
+            const size_t n_global = (weights_.draft_mode == Inkling2DraftMode::TwoDSD)
+                ? (weights_.global_slots.size() + 2) // +2 extra coda depth planes for L23
+                : weights_.global_slots.size();
             const size_t kv_row_b = ggml_row_size(kv_type, weights_.head_dim);
-            const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b
-                                       + (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
+            const size_t draft_kv_b = (weights_.draft_mode == Inkling2DraftMode::TwoDSD)
+                ? ((size_t) weights_.twodsd.n_layer * 2 * weights_.twodsd.n_head_kv * weights_.twodsd.head_dim * 2)
+                : (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
+            const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b + draft_kv_b;
             const size_t reserve = (size_t) 4 << 30;
             const size_t usable = (tfree > reserve ? tfree - reserve : 0)
                                 + (expert_backend_ && efree > reserve ? efree - reserve : 0);
@@ -187,6 +198,17 @@ void Inkling2Backend::shutdown() {
 
 void Inkling2Backend::print_ready_banner() const {
     const auto & w = weights_;
+    std::string spec_str = "off";
+    if (w.draft_mode == Inkling2DraftMode::TwoDSD && w.twodsd.loaded) {
+        const auto tdcfg = inkling2_2dsd_config_from_env(w.n_passes, w.twodsd.block_size);
+        const char * sname = (tdcfg.stage == Inkling2TwoDSDStage::Stage1) ? "stage1"
+                           : (tdcfg.stage == Inkling2TwoDSDStage::Stage2a) ? "stage2a" : "stage2b";
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "2dsd(%s,k=%d,conf=%.2f)", sname, tdcfg.k, tdcfg.draft_confidence);
+        spec_str = buf;
+    } else if (w.dspark.loaded) {
+        spec_str = "on(block=8)";
+    }
     std::printf(
         "[inkling2-daemon] ready arch=%s phys=%d eff=%d (core=[%d,%d)x%d) "
         "experts=%d/%d kv=%s ctx=%d chunk=%d dspark=%s dual_gpu=%s\n",
@@ -194,7 +216,7 @@ void Inkling2Backend::print_ready_banner() const {
         w.n_layer_phys, w.n_layer_eff, w.core_start, w.core_end, w.n_passes,
         w.n_expert_used, w.n_expert, ggml_type_name(cache_.kv_type),
         cache_.max_ctx, chunk_,
-        w.dspark.loaded ? "on(block=8)" : "off",
+        spec_str.c_str(),
         (w.expert_backend && w.split_exp > 0) ? "on" : "off");
     std::fflush(stdout);
 }
@@ -238,8 +260,8 @@ ModelBackend::Residency Inkling2Backend::residency() const {
     }
     const size_t target_bytes =
         buf_size(weights_.buf) + buf_size(weights_.derived_buf) +
-        buf_size(weights_.dspark.buf) + buf_size(cache_.buf) +
-        buf_size(cache_.dspark_kv_buf);
+        buf_size(weights_.dspark.buf) + buf_size(weights_.twodsd.buf) +
+        buf_size(cache_.buf) + buf_size(cache_.dspark_kv_buf);
     r.bytes.push_back(target_bytes);
     if (cfg_.expert_device.has_value()) {
         const size_t expert_bytes =
@@ -303,8 +325,8 @@ size_t Inkling2Backend::snapshot_bytes_estimate(int tokens) const {
 
 bool Inkling2Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= kMaxSlots || parked_ || released_ || cache_.cur_pos <= 0) return false;
-    // Skip snapshots when Split-KV remote pool is active (simplifies v1 snapshot path)
-    if (cache_.remote_backend) return false;
+    // Skip snapshots when Split-KV remote pool or 2DSD 60-plane tree cache is active (v1)
+    if (cache_.remote_backend || cache_.tree.active) return false;
 
     Inkling2Snapshot & s = snapshots_[slot];
     free_snapshot(s);
@@ -481,6 +503,117 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     }
 
     const bool is_greedy = sample_logits_is_argmax(req.sampler);
+    // ─── 2DSD Greedy Path (Stage 2b default with static draft_confidence pruning) ──
+    const bool use_2dsd = (weights_.draft_mode == Inkling2DraftMode::TwoDSD) &&
+                          weights_.twodsd.loaded && cache_.tree.active &&
+                          !req.force_ar_decode && vw != 1 && is_greedy && req.n_gen > 2 && restored == 0;
+    if (use_2dsd) {
+        const auto t_pre0 = std::chrono::steady_clock::now();
+        int pos_2d = 0;
+        int32_t first_tok = -1;
+        while (pos_2d < (int) req.prompt.size()) {
+            if (io.is_cancelled()) {
+                result.fail(GenerateErrorCode::Cancelled, "cancelled during 2dsd prefill");
+                return result;
+            }
+            const int end = std::min((int) req.prompt.size(), pos_2d + chunk_);
+            const int n   = end - pos_2d;
+            const bool is_last = (end == (int) req.prompt.size());
+            if (!inkling2_2dsd_prefill_chunk(backend_, weights_, cache_, req.prompt.data() + pos_2d, n, pos_2d, is_last, first_tok)) {
+                result.fail(GenerateErrorCode::PrefillFailed, "inkling2 2dsd prefill failed");
+                return result;
+            }
+            pos_2d = end;
+            if (io.observer) io.observer("prefill_chunk", { pos_2d, (int) req.prompt.size() });
+        }
+        const auto t_pre1 = std::chrono::steady_clock::now();
+        result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
+
+        if (req.n_gen <= 0) {
+            result.succeed();
+            return result;
+        }
+
+        ThinkingBudget budget(req.budget_hook, req.n_gen);
+        bool cancelled = false;
+        auto commit_2d = [&](int32_t & tok) -> bool {
+            tok = budget.apply(tok).token;
+            result.budget_forced_close = budget.forced_close();
+            result.tokens.push_back(tok);
+            io.emit(tok);
+            if (io.is_cancelled()) {
+                cancelled = true;
+                return false;
+            }
+            return tok != weights_.eos_id && tok != weights_.eos_chat_id && (int) result.tokens.size() < req.n_gen;
+        };
+
+        class GpuTwoDSDRunner final : public Inkling2TwoDSDRunner {
+        public:
+            GpuTwoDSDRunner(ggml_backend_t b, const Inkling2Weights & w, Inkling2Cache & c, bool split)
+                : b_(b), w_(w), c_(c), split_(split) {}
+            int prefix_length() const override { return c_.tree.prefix_len; }
+            int max_nodes() const override { return c_.tree.max_nodes; }
+            int max_ctx() const override { return c_.max_ctx; }
+            bool advance_nodes(const std::vector<Inkling2TwoDSDNodeDesc> & nodes,
+                               uint32_t readout_mask,
+                               std::vector<int> & out_rows,
+                               std::vector<int32_t> & out_argmax) override {
+                return inkling2_2dsd_advance_nodes(b_, w_, c_, nodes, readout_mask, split_, out_rows, out_argmax);
+            }
+            bool commit_nodes(const int * slots, int n) override {
+                return inkling2_2dsd_commit_nodes(b_, w_, c_, slots, n);
+            }
+            bool draft_batch(const std::vector<Inkling2TwoDSDDraftReq> & reqs,
+                             std::vector<Inkling2TwoDSDDraftOut> & out) override {
+                return inkling2_2dsd_draft_batch(b_, w_, c_, reqs, out);
+            }
+        private:
+            ggml_backend_t b_;
+            const Inkling2Weights & w_;
+            Inkling2Cache & c_;
+            bool split_;
+        };
+
+        const auto td_cfg = inkling2_2dsd_config_from_env(weights_.n_passes, weights_.twodsd.block_size);
+        GpuTwoDSDRunner runner(backend_, weights_, cache_, is_dual);
+        Inkling2TwoDSDStats td_stats;
+        std::string td_err;
+
+        const auto t_dec0 = std::chrono::steady_clock::now();
+        const bool ok_2d = inkling2_2dsd_run_greedy(runner, td_cfg, first_tok, req.n_gen, commit_2d, td_stats, td_err);
+        const auto t_dec1 = std::chrono::steady_clock::now();
+
+        if (!ok_2d) {
+            result.fail(GenerateErrorCode::DecodeFailed, td_err);
+            return result;
+        }
+        if (cancelled) {
+            result.fail(GenerateErrorCode::Cancelled, "cancelled during 2dsd decode");
+            return result;
+        }
+        result.spec_decode_ran = (td_stats.target_calls > 0);
+        result.decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
+        result.accept_rate = td_stats.draft_slots > 0 ? (double) td_stats.commit_draft / (double) td_stats.draft_slots : 0.0;
+        const double s_count = td_stats.target_calls > 0
+            ? (double) td_cfg.R * (double) std::max<size_t>(1, result.tokens.size()) / (double) td_stats.target_calls
+            : 0.0;
+        std::fprintf(stderr,
+            "[inkling2-2dsd] decode: %zu tok in %.3f s (%.1f tok/s) | calls=%lld S_count=%.2f avg_cells=%.1f max_live=%d | "
+            "commits(main=%lld frozen=%lld fork=%lld bonus=%lld) promo=%lld forks=%lld | "
+            "draft=%.3f s batches=%lld slots=%lld cut=%lld (conf=%.2f)\n",
+            result.tokens.size(), result.decode_s,
+            result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0,
+            td_stats.target_calls, s_count,
+            td_stats.target_calls > 0 ? (double) td_stats.target_cells / (double) td_stats.target_calls : 0.0,
+            td_stats.max_live_nodes,
+            td_stats.commit_main, td_stats.commit_frozen, td_stats.commit_fork, td_stats.commit_bonus,
+            td_stats.promotions, td_stats.forks,
+            td_stats.draft_s, td_stats.drafter_batches, td_stats.draft_slots, td_stats.draft_slots_cut,
+            td_cfg.draft_confidence);
+        result.succeed();
+        return result;
+    }
     // Exact GPU top-candidate fast path for standard stochastic sampling (temp > 0, no penalties/grammar):
     // Extracts <=256 candidates + exact full-vocab Z on GPU in ~20 us (cuts non-greedy CPU stall from 17 ms -> 0.02 ms!).
     const bool use_fast_gpu_sample = !is_greedy && req.sampler.temp > 0.0f &&
