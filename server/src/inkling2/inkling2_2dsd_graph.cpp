@@ -3117,6 +3117,12 @@ bool inkling2_2dsd_commit_nodes(
     const bool use_paged = (cache.kvflash && cache.kvflash->active());
     const int  kf_bs     = use_paged ? cache.kvflash->block_size() : 0;
     if (use_paged) {
+        // Ensure any prior async TREE_COMMIT writes to prefix_k/v have completed on target_backend
+        // before KvFlashPager's page_stream_ can D2H-evict a newly filled block!
+        const int c_end = (tc.prefix_len + n_commit - 1) / kf_bs;
+        if (tc.prefix_len == 0 || (tc.prefix_len - 1) / kf_bs < c_end) {
+            ggml_backend_synchronize(target_backend);
+        }
         if (!cache.kvflash->prepare_span(tc.prefix_len, n_commit)) return false;
     }
 

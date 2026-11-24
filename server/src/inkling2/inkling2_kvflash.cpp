@@ -139,6 +139,7 @@ Inkling2KvFlashConfig Inkling2KvFlashConfig::from_env(
     cfg.tier15_pool_tokens = 0;
     if (expert_backend && max_ctx > cfg.tier0_pool_tokens) {
         const char * env_w = std::getenv("LUCE_KVFLASH_WARM_POOL");
+        if (!env_w || !*env_w) env_w = std::getenv("LUCE_KVFLASH_TIER15");
         if (env_w && (std::strcmp(env_w, "0") == 0 || std::strcmp(env_w, "off") == 0)) {
             cfg.tier15_pool_tokens = 0;
         } else if (env_w && *env_w) {

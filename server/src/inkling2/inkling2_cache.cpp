@@ -535,6 +535,7 @@ bool make_inkling2_slot_view(Inkling2Cache & multi,
     view_out.global_local_cap   = multi.global_local_cap;
     view_out.target_backend_ref = multi.target_backend_ref;
     view_out.remote_backend     = multi.remote_backend;
+    view_out.split_cpu          = multi.split_cpu;
     view_out.remote_split_pos   = multi.remote_split_pos;
     view_out.remote_cap         = multi.remote_cap;
     view_out.kvflash_cfg        = multi.kvflash_cfg;
@@ -727,6 +728,7 @@ void reset_inkling2_cache(Inkling2Cache & cache) {
 }
 
 void free_inkling2_cache(Inkling2Cache & cache) {
+    const bool is_view = cache.tree.is_slot_view;
     if (cache.kvflash) { cache.kvflash->detach(); cache.kvflash.reset(); }
     if (cache.kvflash_alias_ctx) { ggml_free(cache.kvflash_alias_ctx); cache.kvflash_alias_ctx = nullptr; }
     free_inkling2_workspace(cache.decode_ws);
@@ -741,7 +743,7 @@ void free_inkling2_cache(Inkling2Cache & cache) {
 
     if (cache.remote_buf) { ggml_backend_buffer_free(cache.remote_buf); cache.remote_buf = nullptr; }
     if (cache.remote_ctx) { ggml_free(cache.remote_ctx); cache.remote_ctx = nullptr; }
-    if (cache.split_cpu)  { ggml_backend_free(cache.split_cpu); cache.split_cpu = nullptr; }
+    if (cache.split_cpu)  { if (!is_view) ggml_backend_free(cache.split_cpu); cache.split_cpu = nullptr; }
     cache.remote_k.clear();
     cache.remote_v.clear();
 
