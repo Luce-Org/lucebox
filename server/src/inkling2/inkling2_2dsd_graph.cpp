@@ -1225,7 +1225,7 @@ static bool run_phase(
             if (status == GGML_STATUS_SUCCESS && w.expert_backend && out_greedy) {
                 ggml_backend_cuda_hold(w.expert_backend, 8000);
             }
-            if (status == GGML_STATUS_SUCCESS && (out_greedy || out_sample || prof)) {
+            if (status == GGML_STATUS_SUCCESS && (out_greedy || out_sample || prof || use_tier15)) {
                 ggml_backend_sched_synchronize(g.sched);
             }
         } else {
@@ -3095,6 +3095,14 @@ bool inkling2_2dsd_advance_nodes_batched(
             return false;
         }
         out_readout_argmax.assign(greedy_out.begin(), greedy_out.end());
+    } else {
+        // No Coda phase ran to synchronize this step (e.g. cold-start steps before depth R):
+        // sync now so the next advance_nodes_batched() call never overwrites g.inp_* on
+        // cudaStreamPerThread / UMA while the Core graph is still executing!
+        ggml_backend_synchronize(target_backend);
+        if (allow_split && w.expert_backend) {
+            ggml_backend_synchronize(w.expert_backend);
+        }
     }
     return true;
 }
@@ -3128,6 +3136,7 @@ bool inkling2_2dsd_commit_nodes(
     if (n_commit > kInkling2TwoDSDMaxCommit) {
         for (int off = 0; off < n_commit; off += kInkling2TwoDSDMaxCommit) {
             const int m = std::min(kInkling2TwoDSDMaxCommit, n_commit - off);
+            if (off > 0) ggml_backend_synchronize(target_backend);
             if (!inkling2_2dsd_commit_nodes(target_backend, w, cache, commit_slots + off, m)) return false;
         }
         return true;

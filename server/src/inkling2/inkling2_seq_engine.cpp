@@ -539,7 +539,9 @@ SeqEngine::StepResult Inkling2SeqEngine::step_batched_2dsd_(const StepPlan & pla
 
         int32_t first_tok = -1;
         std::vector<float> last_logits;
-        const bool ok = (take > prefill_chunk_ && weights_.is_loop && weights_.n_passes == 3)
+        const bool allow_wf = (std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL") == nullptr ||
+                               std::atoi(std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL")) != 0);
+        const bool ok = (allow_wf && take > prefill_chunk_ && weights_.is_loop && weights_.n_passes == 3)
             ? inkling2_2dsd_prefill_wavefront(
                 backend_, weights_, sc, st.prompt.data() + st.prefill_pos, take, st.prefill_pos,
                 prefill_chunk_, first_tok, (is_last && !is_greedy) ? &last_logits : nullptr, cap_q, is_last)

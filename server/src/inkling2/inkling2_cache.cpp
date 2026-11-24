@@ -313,15 +313,22 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
             out.global_local_cap = out.max_ctx;
         }
 
-        // Zero-copy alias legacy 48-slot k_cache/v_cache/conv_state into tree.prefix_* (slot 0)
-        // so single-slot AR fallback uses the exact same physical buffer with 0 extra VRAM!
+        // Zero-copy alias legacy 48-slot k_cache/v_cache/conv_state (+ Tier-1.5 remote_k/v)
+        // into tree.prefix_* (slot 0) so single-slot AR fallback uses the exact same physical
+        // buffer with 0 extra VRAM!
         if (n_seq_slots == 1) {
-            struct ggml_init_params agp = { ((size_t) n_slots * 3 + 8) * ggml_tensor_overhead() + 4096, nullptr, true };
+            const bool alias_remote = (out.remote_backend != nullptr && !tc.remote_prefix_k.empty());
+            const size_t n_alias_t = (size_t) n_slots * 3 + (alias_remote ? w.global_slots.size() * 2 : 0) + 8;
+            struct ggml_init_params agp = { n_alias_t * ggml_tensor_overhead() + 4096, nullptr, true };
             tc.alias_ctx = ggml_init(agp);
             out.k_cache.resize(n_slots, nullptr);
             out.v_cache.resize(n_slots, nullptr);
             out.conv_state.resize(n_slots, nullptr);
             out.conv_ring.assign(n_slots, nullptr);
+            if (alias_remote) {
+                out.remote_k.assign(w.global_slots.size(), nullptr);
+                out.remote_v.assign(w.global_slots.size(), nullptr);
+            }
             for (const auto & vi : w.schedule) {
                 const int il = vi.slot;
                 const int ip = vi.phys;
@@ -345,6 +352,24 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
                 out.conv_state[il] = ggml_new_tensor_2d(tc.alias_ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
                 out.conv_state[il]->data   = (char *) pc->data + (size_t) plane * pc->nb[2];
                 out.conv_state[il]->buffer = pc->buffer;
+                if (alias_remote && !w.layers[ip].is_swa && ip < (int) tc.remote_prefix_k.size() && tc.remote_prefix_k[ip]) {
+                    const int gidx = w.slot_to_global_idx[il];
+                    if (gidx >= 0 && gidx < (int) out.remote_k.size()) {
+                        ggml_tensor * rk = tc.remote_prefix_k[ip];
+                        ggml_tensor * rv = tc.remote_prefix_v[ip];
+                        const int rp_alias = (rk->ne[3] == 1) ? 0 : plane;
+                        out.remote_k[gidx] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, rk->ne[1], w.n_head_kv);
+                        out.remote_k[gidx]->nb[1]  = rk->nb[1];
+                        out.remote_k[gidx]->nb[2]  = rk->nb[2];
+                        out.remote_k[gidx]->data   = (char *) rk->data + (size_t) rp_alias * rk->nb[3];
+                        out.remote_k[gidx]->buffer = rk->buffer;
+                        out.remote_v[gidx] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, rv->ne[1], w.n_head_kv);
+                        out.remote_v[gidx]->nb[1]  = rv->nb[1];
+                        out.remote_v[gidx]->nb[2]  = rv->nb[2];
+                        out.remote_v[gidx]->data   = (char *) rv->data + (size_t) rp_alias * rv->nb[3];
+                        out.remote_v[gidx]->buffer = rv->buffer;
+                    }
+                }
             }
         }
 

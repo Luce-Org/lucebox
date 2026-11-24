@@ -511,7 +511,7 @@ static bool build_inkling2_target_graph(
             ggml_tensor * v_dep = ggml_inkling2_sconv_kv_write_paged(
                 c, V_raw, L.attn_v_conv, state_live, state_dst, v_dyn, cache.v_cache[il], ws.inp_pos,
                 ws.inp_bt_local, kf_block_size, kv_sz, D, Hk, 1, w.qk_clip, w.rms_eps, write_mode);
-            if (use_split_kv && gidx >= 0 && cache.remote_backend && cache.remote_k[gidx]) {
+            if (use_split_kv && gidx >= 0 && gidx < (int) cache.remote_k.size() && cache.remote_backend && cache.remote_k[gidx]) {
                 ggml_tensor * part_r = ggml_inkling2_attn_rel_paged(
                     c, Q, cache.remote_k[gidx], cache.remote_v[gidx], rel_table, ws.inp_meta_r,
                     nullptr, nullptr, nullptr, ws.inp_bt_remote, kf_block_size,
@@ -972,11 +972,53 @@ Inkling2ForwardOut inkling2_forward(
         ggml_backend_tensor_get(ws->logits, out.logits.data(), 0, out.logits.size() * sizeof(float));
     }
 
-    // Capture global queries for Mode-4 exact chunk scoring when requested
+    // Capture global queries for Mode-4 exact chunk scoring when requested.
+    // When 1D AR runs on a 2DSD cache (n_global_planes == 10 for per-loop Coda or 4 for Shared-KV,
+    // vs w.global_slots.size() == 8), remap each captured query row into the exact kvflash plane layout
+    // so append_queries() never over-reads q_host and Mode-4 scores match 2DSD!
     if (use_paged_kv && ws->q_cap_out && ws->q_cap_n > 0) {
         std::vector<float> q_host((size_t) ggml_nelements(ws->q_cap_out));
         ggml_backend_tensor_get(ws->q_cap_out, q_host.data(), 0, ggml_nbytes(ws->q_cap_out));
-        cache.kvflash->append_queries(q_host.data(), ws->q_cap_n);
+        const int n_1d = (int) w.global_slots.size();
+        const int n_kf = cache.kvflash->n_global_planes();
+        if (n_kf == n_1d) {
+            cache.kvflash->append_queries(q_host.data(), ws->q_cap_n);
+        } else if (n_kf > 0 && n_1d > 0) {
+            const size_t plane_elems = (size_t) w.n_head * w.head_dim;
+            std::vector<float> q_remap((size_t) ws->q_cap_n * (size_t) n_kf * plane_elems, 0.0f);
+            // Build mapping from each 2DSD kvflash global plane index -> 1D global_slots index
+            std::vector<int> src_gidx((size_t) n_kf, -1);
+            int dst_g = 0;
+            if (cache.tree.active) {
+                for (int ip = 0; ip < w.n_layer_phys && dst_g < n_kf; ++ip) {
+                    if (w.layers[ip].is_swa) continue;
+                    const int p_st = (int) cache.tree.prefix_k[ip]->ne[3];
+                    const int P    = cache.tree.planes[ip];
+                    for (int p = 0; p < p_st && dst_g < n_kf; ++p) {
+                        const int eff_p = (p_st == 1 && P > 1) ? (P - 1) : p;
+                        int matched = -1;
+                        for (const auto & vi : w.schedule) {
+                            if (vi.phys != ip) continue;
+                            const int vp = (ip < w.core_start) ? 0 : (ip < w.core_end ? vi.pass : (cache.tree.n_depths - 1));
+                            if (vp == eff_p) { matched = w.slot_to_global_idx[vi.slot]; break; }
+                            if (ip >= w.core_end) matched = w.slot_to_global_idx[vi.slot];
+                        }
+                        src_gidx[(size_t) dst_g++] = matched;
+                    }
+                }
+            }
+            for (int q = 0; q < ws->q_cap_n; ++q) {
+                for (int l = 0; l < n_kf; ++l) {
+                    const int sg = src_gidx[(size_t) l];
+                    if (sg >= 0 && sg < n_1d) {
+                        const float * src = q_host.data() + ((size_t) q * n_1d + sg) * plane_elems;
+                        float * dst = q_remap.data() + ((size_t) q * n_kf + l) * plane_elems;
+                        std::memcpy(dst, src, plane_elems * sizeof(float));
+                    }
+                }
+            }
+            cache.kvflash->append_queries(q_remap.data(), ws->q_cap_n);
+        }
     }
 
     // For non-verify forwards (prefill / T=1 decode), immediately commit captured taps to DSpark KV cache
