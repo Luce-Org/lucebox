@@ -796,7 +796,7 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
     const std::string text = "a  1\t\t42  中文x 12345";
     for (const char * pre : {"joyai-llm", "deepseek-v3", "qwen35"}) {
         const std::string path = write_pflash_bpe_tokenizer_fixture(
-            {"  ", "\t\t", "42", "中文", "123", "45"}, text, {}, {}, pre);
+            {"  ", "\t\t", "42", "中文", " 中文", "123", "45"}, text, {}, {}, pre);
         Tokenizer tok;
         TEST_ASSERT(tok.load_from_gguf(path.c_str()));
         unlink(path.c_str());
@@ -810,6 +810,8 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
         };
         if (std::strcmp(pre, "qwen35") == 0) {
             TEST_ASSERT(tok.encode("a  1") == ids({"a", " ", " ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t4") == ids({"\t", "\t", "4"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({" ", " 中文"}));
         } else {
             TEST_ASSERT(tok.encode("a  1") == ids({"a", "  ", "1"}));
             TEST_ASSERT(tok.encode("\t\t42") == ids({"\t\t", "42"}));
