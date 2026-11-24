@@ -3749,7 +3749,7 @@ static __global__ void inkling2_tree_attn_rel_kernel(
     const int32_t * mt  = meta + (size_t) q_tok * m_stride;
     const int q_pos     = mt[1];
     const int plane     = mt[2];
-    const int n_seq          = (block_size > 0 && prefix_len_rows > 1) ? prefix_len_rows : 1;
+    const int n_seq          = (prefix_len_rows > 1) ? prefix_len_rows : 1;
     const int planes_per_seq = (planes_per_seq_arg > 0) ? planes_per_seq_arg
                              : ((n_seq > 1) ? max(1, p_logical / n_seq) : p_logical);
     const int seq_slot       = (n_seq > 1) ? (plane / planes_per_seq) : 0;
@@ -3760,6 +3760,8 @@ static __global__ void inkling2_tree_attn_rel_kernel(
         const int32_t * pl_row = prefix_len_buf + (size_t) seq_slot * (2 + max_blocks);
         pref_len = pl_row[0];
         block_table = pl_row + 2;
+    } else if (prefix_len_rows > 1) {
+        pref_len = prefix_len_buf[(size_t) seq_slot * prefix_len_n];
     } else {
         pref_len = (prefix_len_n > 1) ? prefix_len_buf[plane] : prefix_len_buf[0];
     }

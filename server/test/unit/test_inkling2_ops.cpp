@@ -3264,9 +3264,71 @@ static bool test_2dsd_paged_clone_and_multislot_paged(ggml_backend_t backend) {
         }
     }
     const float ms_err = max_abs_diff(got, ref);
-    std::printf("[test_inkling2_ops] 2dsd_paged_clone_and_ms_dual: clone_ok=%d ms_dual_err=%.3e\n",
-                clone_ok ? 1 : 0, ms_err);
-    return clone_ok && ms_err < 2e-3f;
+
+    // Part C: SWA layer (block_size=0, swa_window=32) alongside 2D paged buffer & dedicated SWA prefix_len_buf
+    // verifies multi-plane multi-slot SWA reads the exact per-slot prefix_len (regression test for plane>0 reading 0!).
+    const int swa_win = 32;
+    std::vector<float> got_swa_2d((size_t) D * Hq * T, 0.0f), got_swa_1d((size_t) D * Hq * T, 0.0f);
+    {
+        struct ggml_init_params gp = { 64 * ggml_tensor_overhead() + ggml_graph_overhead() + 8192, nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * t_Q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hq, T);
+        ggml_tensor * t_lk   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, cap, Hk, P_tot);
+        ggml_tensor * t_lv   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, cap, Hk, P_tot);
+        ggml_tensor * t_tk   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S_max, Hk, P_tot);
+        ggml_tensor * t_tv   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S_max, Hk, P_tot);
+        ggml_tensor * t_rt   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rel_ext + 1, Hq, T);
+        ggml_tensor * t_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m_stride, T);
+        ggml_tensor * t_pll  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, pl_cols, n_seq);
+        ggml_tensor * t_pswa = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, P_tot);
+        ggml_tensor * t_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D * Hq, T);
+        ggml_set_input(t_Q); ggml_set_input(t_lk); ggml_set_input(t_lv);
+        ggml_set_input(t_tk); ggml_set_input(t_tv); ggml_set_input(t_rt);
+        ggml_set_input(t_meta); ggml_set_input(t_pll); ggml_set_input(t_pswa); ggml_set_input(t_gate);
+
+        auto build_swa = [&](ggml_tensor * pl_t) {
+            ggml_tensor * o = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D * Hq, T);
+            o->op = GGML_OP_INKLING2_OP;
+            o->src[0] = t_Q; o->src[1] = t_lk; o->src[2] = t_lv;
+            o->src[3] = t_tk; o->src[4] = t_tv;
+            o->src[5] = t_rt; o->src[6] = t_meta; o->src[7] = pl_t; o->src[8] = t_gate;
+            test_set_op_i32(o, 0, 35); test_set_op_i32(o, 1, swa_win); test_set_op_i32(o, 2, rel_ext);
+            test_set_op_i32(o, 3, m_stride); test_set_op_i32(o, 4, path_w); test_set_op_i32(o, 5, 0);
+            test_set_op_i32(o, 6, 0); test_set_op_i32(o, 7, 0); test_set_op_i32(o, 8, 0);
+            test_set_op_i32(o, 9, 0); test_set_op_i32(o, 10, P);
+            ggml_set_output(o);
+            return o;
+        };
+        ggml_tensor * o_2d = build_swa(t_pll);
+        ggml_tensor * o_1d = build_swa(t_pswa);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, o_2d);
+        ggml_build_forward_expand(gf, o_1d);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+        std::vector<int32_t> pl_swa(P_tot);
+        for (int s = 0; s < n_seq; ++s) for (int p = 0; p < P; ++p) pl_swa[s * P + p] = pref_lens[s];
+        ggml_backend_tensor_set(t_Q, q_in.data(), 0, q_in.size() * sizeof(float));
+        ggml_backend_tensor_set(t_lk, lk16.data(), 0, lk16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_lv, lv16.data(), 0, lv16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_tk, tk16.data(), 0, tk16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_tv, tv16.data(), 0, tv16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_rt, rt_in.data(), 0, rt_in.size() * sizeof(float));
+        ggml_backend_tensor_set(t_meta, meta.data(), 0, meta.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(t_pll, pl_loc.data(), 0, pl_loc.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(t_pswa, pl_swa.data(), 0, pl_swa.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(t_gate, gate_in.data(), 0, gate_in.size() * sizeof(float));
+        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_tensor_get(o_2d, got_swa_2d.data(), 0, got_swa_2d.size() * sizeof(float));
+        ggml_backend_tensor_get(o_1d, got_swa_1d.data(), 0, got_swa_1d.size() * sizeof(float));
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+    }
+    const float swa_2d_diff = max_abs_diff(got_swa_2d, got_swa_1d);
+    std::printf("[test_inkling2_ops] 2dsd_paged_clone_and_ms_dual: clone_ok=%d ms_dual_err=%.3e swa_2d_diff=%.3e\n",
+                clone_ok ? 1 : 0, ms_err, swa_2d_diff);
+    return clone_ok && ms_err < 2e-3f && swa_2d_diff < 1e-6f;
 }
 
 } // namespace

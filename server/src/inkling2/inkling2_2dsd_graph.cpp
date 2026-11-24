@@ -621,9 +621,10 @@ static ggml_tensor * build_tree_layer(
             /*planes_per_seq=*/tc.planes[ip]);
         attn_out = ggml_inkling2_attn_split_combine(c, part_r, part_l, Gate, D, Hq);
     } else {
+        ggml_tensor * pl_in = (L.is_swa && g.inp_prefix_len_swa) ? g.inp_prefix_len_swa : g.inp_prefix_len;
         attn_out = make_tree_attn_rel(
             c, Q, tc.prefix_k[ip], tc.prefix_v[ip], tc.tree_k[ip], tc.tree_v[ip],
-            rt, g.inp_meta, g.inp_prefix_len, Gate, dep_kv, swa, w.rel_extent, m_stride, path_b,
+            rt, g.inp_meta, pl_in, Gate, dep_kv, swa, w.rel_extent, m_stride, path_b,
             /*block_size=*/(!L.is_swa && kf_block_size > 0) ? kf_block_size : 0,
             /*partial_out=*/0, /*exclude_sink=*/0,
             shared_global ? tc.shared_kv_window : 0,
@@ -810,11 +811,17 @@ static bool build_phase_graph(
         g.inp_prefix_len = ggml_new_tensor_1d(c, GGML_TYPE_I32, pref_elems);
     }
     g.inp_prefix_len_r = nullptr;
-    if (use_paged && use_tier15) {
-        g.inp_prefix_len_r = (tc.n_seq_slots > 1)
-            ? ggml_new_tensor_2d(c, GGML_TYPE_I32, pref_elems, tc.n_seq_slots)
-            : ggml_new_tensor_1d(c, GGML_TYPE_I32, pref_elems);
-        ggml_set_input(g.inp_prefix_len_r);
+    g.inp_prefix_len_swa = nullptr;
+    if (use_paged) {
+        const int swa_elems = (tc.n_seq_slots > 1) ? (n_planes_phase * tc.n_seq_slots) : 1;
+        g.inp_prefix_len_swa = ggml_new_tensor_1d(c, GGML_TYPE_I32, swa_elems);
+        ggml_set_input(g.inp_prefix_len_swa);
+        if (use_tier15) {
+            g.inp_prefix_len_r = (tc.n_seq_slots > 1)
+                ? ggml_new_tensor_2d(c, GGML_TYPE_I32, pref_elems, tc.n_seq_slots)
+                : ggml_new_tensor_1d(c, GGML_TYPE_I32, pref_elems);
+            ggml_set_input(g.inp_prefix_len_r);
+        }
     }
     g.inp_pos        = ggml_new_tensor_1d(c, GGML_TYPE_I32, row_b);
     g.inp_flags      = ggml_new_tensor_1d(c, GGML_TYPE_I32, row_b);
@@ -1149,6 +1156,16 @@ static bool run_phase(
                 }
             }
             ggml_backend_tensor_set(g.inp_prefix_len, pl_buf.data(), 0, pl_buf.size() * sizeof(int32_t));
+            if (g.inp_prefix_len_swa) {
+                std::vector<int32_t> pl_swa((size_t) n_planes_phase * tc.n_seq_slots, 0);
+                for (int s = 0; s < tc.n_seq_slots; ++s) {
+                    const int32_t pl = (prefix_lens && s < n_seq_slots) ? prefix_lens[s] : 0;
+                    for (int p = 0; p < n_planes_phase; ++p) {
+                        pl_swa[(size_t) s * n_planes_phase + p] = pl;
+                    }
+                }
+                ggml_backend_tensor_set(g.inp_prefix_len_swa, pl_swa.data(), 0, pl_swa.size() * sizeof(int32_t));
+            }
             if (use_tier15 && g.inp_prefix_len_r) {
                 std::fill(pl_buf.begin(), pl_buf.end(), -1);
                 for (int s = 0; s < tc.n_seq_slots; ++s) {
@@ -1170,6 +1187,9 @@ static bool run_phase(
             std::vector<int32_t> pbuf;
             any_kf->fill_tree_prefix_buf(pref_len, /*remote=*/false, pbuf);
             ggml_backend_tensor_set(g.inp_prefix_len, pbuf.data(), 0, pbuf.size() * sizeof(int32_t));
+            if (g.inp_prefix_len_swa) {
+                ggml_backend_tensor_set(g.inp_prefix_len_swa, &pref_len, 0, sizeof(pref_len));
+            }
             if (use_tier15 && g.inp_prefix_len_r) {
                 any_kf->fill_tree_prefix_buf(pref_len, /*remote=*/true, pbuf);
                 ggml_backend_tensor_set(g.inp_prefix_len_r, pbuf.data(), 0, pbuf.size() * sizeof(int32_t));

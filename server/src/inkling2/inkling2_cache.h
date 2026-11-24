@@ -110,9 +110,10 @@ struct Inkling2TwoDSDPhaseGraph {
     ggml_cgraph *        gf    = nullptr;
     bool                 built = false;
 
-    ggml_tensor * inp_meta         = nullptr; // I32 [m_stride, T]
-    ggml_tensor * inp_prefix_len   = nullptr; // contiguous: I32 [1] or [P]; paged: I32 [2 + max_blocks, n_seq_slots]
-    ggml_tensor * inp_prefix_len_r = nullptr; // paged Tier 1.5: I32 [2 + max_blocks, n_seq_slots] on expert_backend
+    ggml_tensor * inp_meta           = nullptr; // I32 [m_stride, T]
+    ggml_tensor * inp_prefix_len     = nullptr; // contiguous: I32 [1] or [P]; paged: I32 [2 + max_blocks, n_seq_slots]
+    ggml_tensor * inp_prefix_len_r   = nullptr; // paged Tier 1.5: I32 [2 + max_blocks, n_seq_slots] on expert_backend
+    ggml_tensor * inp_prefix_len_swa = nullptr; // paged mode SWA layers: I32 [1] or [n_planes_phase * n_seq_slots]
     ggml_tensor * inp_pos          = nullptr; // I32 [T]
     ggml_tensor * inp_flags      = nullptr; // I32 [T]
     ggml_tensor * inp_tokens     = nullptr; // I32 [T] (prelude only)
