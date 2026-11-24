@@ -335,8 +335,13 @@ public:
         // no usable row output. Validation
         // failures occur before mutation; a device/build/compute failure may
         // leave backend state partially advanced, so the caller must retire
-        // every live sequence before invoking step() again.
+        // every live sequence before invoking step() again — unless
+        // `state_clean` is true, meaning the engine guarantees no live slot's
+        // device or host state was mutated (e.g. pre-compute staging/graph
+        // allocation failure cleanly rolled back), allowing the scheduler to
+        // shed prefills and retry decode-only.
         std::string error;
+        bool state_clean = false;
 
         bool ok() const { return error.empty(); }
     };
@@ -368,6 +373,18 @@ public:
         size_t bytes = 0;        // checkpoint payload bytes (0 when recompute)
     };
     virtual KvOffloadState kv_offload_state(int) const { return {}; }
+
+    // Physical KV pool footprint for offload victim ranking: `total_tokens`
+    // counts all blocks held by the slot (including shared prefix blocks);
+    // `reclaimable_tokens` counts only exclusive blocks immediately returned
+    // to the free list if this slot is suspended or evicted. Negative values
+    // mean the engine does not report per-slot block sharing (fall back to
+    // admission order).
+    struct KvOffloadFootprint {
+        int64_t total_tokens = -1;
+        int64_t reclaimable_tokens = -1;
+    };
+    virtual KvOffloadFootprint kv_offload_footprint(int) const { return {}; }
 
     // Suspend in place: retain the slot, sampler, recurrent/draft state and
     // request identity, but save paged KV to bounded host RAM and release its

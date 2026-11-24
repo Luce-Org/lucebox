@@ -257,6 +257,22 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
     return out;
 }
 
+bool SeqSlotManager::rollback_prefill(int slot, int n_tokens) {
+    if (!is_prefilling(slot) || n_tokens < 1) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (n_tokens > s.cur_pos) return false;
+    const PagedKvStatus status =
+        kv_.rollback_append(s.handle, static_cast<uint32_t>(n_tokens));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr,
+            "[parallel] slot %d prefill rollback failed: %s\n",
+            slot, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos -= n_tokens;
+    return true;
+}
+
 SeqSlotManager::PrefillChunk SeqSlotManager::seed_restored_prefix(
         int slot, int restored_tokens) {
     if (!is_prefilling(slot) || slots_[(size_t)slot].cur_pos != 0 ||
@@ -544,15 +560,40 @@ bool SeqSlotManager::kv_restore_feasible(int slot) const {
     const uint64_t capacity = resume_token_capacity(s);
     const uint64_t needed = capacity == 0 ? 0 :
         1 + (capacity - 1) / kv_.block_size();
-    // Restoring into a tight pool would re-trigger parking on the next
-    // step: keep one growth block per resident plus the resumed slot itself.
-    uint64_t margin = 1;
+    uint64_t active_residents = 0;
     for (const SeqSlot & o : slots_) {
-        margin += o.active() && !o.parked() ? 1 : 0;
+        active_residents += o.active() && !o.parked() ? 1 : 0;
+    }
+    // Restoring into a tight pool while peers are actively decoding (especially
+    // with speculative bursts) would immediately re-trigger suspension. Keep
+    // hysteresis headroom proportional to resident count and resumed footprint;
+    // when alone (active_residents == 0), a single growth block suffices.
+    uint64_t margin = 1;
+    if (active_residents > 0) {
+        const uint64_t cohort = active_residents + 1;
+        margin = std::max<uint64_t>(
+            2 * cohort,
+            std::min<uint64_t>(needed / 8, 64 * cohort));
     }
     return needed + margin <=
         static_cast<uint64_t>(kv_.free_block_count()) +
         kv_.reclaimable_block_count();
+}
+
+SeqEngine::KvOffloadFootprint SeqSlotManager::kv_offload_footprint(int slot) const {
+    if (!is_active(slot)) return {0, 0};
+    const SeqSlot & s = slots_[(size_t)slot];
+    if (s.parked()) return {0, 0};
+    uint32_t owned = 0, exclusive = 0;
+    if (kv_.owned_block_count(s.handle, owned) != PagedKvStatus::Ok ||
+        kv_.exclusive_block_count(s.handle, exclusive) != PagedKvStatus::Ok) {
+        return {};
+    }
+    const int64_t block = static_cast<int64_t>(kv_.block_size());
+    return {
+        static_cast<int64_t>(owned) * block,
+        static_cast<int64_t>(exclusive) * block,
+    };
 }
 
 void SeqSlotManager::retire(int slot) {

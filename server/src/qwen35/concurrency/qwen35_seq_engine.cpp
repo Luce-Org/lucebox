@@ -1138,6 +1138,8 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     if (!upload_block_table_delta(
             slot, chunk.first_new_block, chunk.new_blocks.data(),
             chunk.new_blocks.size())) {
+        // step() reports a clean failure: no rows of this chunk may stay.
+        slots_.rollback_prefill(slot, stage.chunk);
         fail_prefill(
             slot, prefill_outputs, "prefill block-table delta exceeds device capacity",
             "prefill block-table update failed");
@@ -1148,6 +1150,7 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     if (!b_.w_.embedder.embed(
             seq.sample_history.data() + stage.kv_pos, stage.chunk,
             embeddings)) {
+        slots_.rollback_prefill(slot, stage.chunk);
         fail_prefill(slot, prefill_outputs, "prefill embed failed",
                      "prefill embedding failed");
         return PrefillStage{};
@@ -2335,8 +2338,14 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     if ((size_t)planned_prefill_tokens +
             (size_t)chain_decode_bucket_width((int)inputs.size()) >
         embed_rows_cap_) {
+        result.state_clean = true;
         return fail_step("step exceeds the input embedding rows");
     }
+
+    // A failure before the compute (staging, graph build or alloc OOM) undoes
+    // the appends, so the scheduler can shed prefills and keep the decoders.
+    SeqSlotManager::StagedAppends staged_rollback(slots_, inputs.size(), plan.prefills.size());
+
     int max_kv_len = 1;
     for (const StepInput & in : inputs) {
         DecodeOutput out;
@@ -2361,11 +2370,13 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         if (app.new_block >= 0 &&
             !upload_block_table_delta(
                 in.slot, app.new_block_index, &app.new_block, 1)) {
+            slots_.rollback_step(in.slot);
             out.error = "decode block-table entry exceeds device capacity";
             decode_outputs.push_back(std::move(out));
             output_rows_.push_back(compact_row);
             continue;
         }
+        staged_rollback.decode(in.slot);
         compact_row = (int)live_tokens_.size();
         live_tokens_.push_back(in.token);
         live_positions_.push_back(app.position);
@@ -2392,8 +2403,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                     "prefill made no progress despite reserved capacity",
                     "prefill scheduler made no progress");
             }
+            result.state_clean = true;
             return fail_step("selected prefill work made no progress");
         }
+        staged_rollback.prefill(slice.slot, prefill.chunk);
         staged_rows += prefill.chunk;
         prefills.push_back(std::move(prefill));
     }
@@ -2510,6 +2523,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         (with_prefill &&
          (!sg.paged_query_seq_ids || !sg.paged_query_positions ||
           !sg.logits_row_indices))) {
+        result.state_clean = true;
         return fail_step("packed prefill/decode graph build failed");
     }
 
@@ -2518,6 +2532,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     if (with_decode) {
         float * dec_embed = embed_rows_ + (size_t)hidden * n_prefill;
         if (!w.embedder.embed(dec_tokens_.data(), live_count, dec_embed)) {
+            result.state_clean = true;
             return fail_step("decode embedding failed");
         }
         if (decode_bucket > live_count) {
@@ -2683,6 +2698,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
         seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
 
+    staged_rollback.commit();
     ggml_status st = GGML_STATUS_FAILED;
     {
         const Qwen35RoctxRange roctx_compute(

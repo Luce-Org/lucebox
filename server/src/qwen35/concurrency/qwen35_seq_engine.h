@@ -127,6 +127,9 @@ public:
     bool reserve_decode(const StepPlan & plan) override;
     size_t kv_offload_capacity() const override { return offload_.capacity(); }
     KvOffloadState kv_offload_state(int slot) const override { return offload_.state(slot); }
+    KvOffloadFootprint kv_offload_footprint(int slot) const override {
+        return slots_.kv_offload_footprint(slot);
+    }
     bool offload_kv(int slot, size_t bytes, std::string & error) override {
         return offload_.suspend(slot, bytes, error);
     }

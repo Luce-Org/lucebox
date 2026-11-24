@@ -26,6 +26,9 @@ public:
     virtual PagedKvStatus clear(PagedKvSequenceHandle handle) = 0;
     virtual PagedKvStatus release(PagedKvSequenceHandle handle) = 0;
     virtual PagedKvStatus owned_block_count(PagedKvSequenceHandle handle, uint32_t & out_count) const = 0;
+    virtual PagedKvStatus exclusive_block_count(PagedKvSequenceHandle handle, uint32_t & out_count) const {
+        return owned_block_count(handle, out_count);
+    }
     virtual PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle, const uint32_t *, uint32_t,
                                              uint32_t) {
         return PagedKvStatus::InvalidArgument;
@@ -60,6 +63,9 @@ public:
     PagedKvStatus release(PagedKvSequenceHandle h) override { return pool_.release(h); }
     PagedKvStatus owned_block_count(PagedKvSequenceHandle h, uint32_t & n) const override {
         return pool_.owned_block_count(h, n);
+    }
+    PagedKvStatus exclusive_block_count(PagedKvSequenceHandle h, uint32_t & n) const override {
+        return pool_.exclusive_block_count(h, n);
     }
     PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle h, const uint32_t * shared,
                                      uint32_t shared_count, uint32_t tokens) override {

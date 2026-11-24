@@ -174,6 +174,19 @@ int PrefixCache::kv_source_slot(int slot) const {
     return source < 0 ? -1 : entries_[(size_t)source].slot;
 }
 
+int PrefixCache::fast_cached_prefix_len(
+        const std::vector<int32_t> & prompt_ids) const {
+    if (disabled()) return 0;
+    int best = 0;
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        const LruEntry & e = entries_[(size_t)i];
+        if ((int)e.ids.size() <= best || !is_strict_prefix(e.ids, prompt_ids)) continue;
+        if (e.state_only && kv_source_index(i) < 0) continue;
+        best = (int)e.ids.size();
+    }
+    return best;
+}
+
 int PrefixCache::tokens(int slot) const {
     const int idx = find_slot_entry(slot);
     return idx < 0 ? 0 : (int)entries_[(size_t)idx].ids.size();

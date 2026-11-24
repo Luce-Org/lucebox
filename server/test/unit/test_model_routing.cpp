@@ -93,9 +93,11 @@ public:
                       const SamplerCfg & sampler) override {
         std::lock_guard<std::mutex> lock(mu);
         ++attempts;
+        attempted_sizes.push_back(prompt.size());
         cv.notify_all();
         if (prompt.size() > prompt_capacity) return {AdmitResult::Status::capacity_exceeded, -1, "prompt exceeds pool"};
-        if (capacity_busy || suspended[0] || suspended[1])
+        if (capacity_busy || prompt.size() > max_admit_tokens_now || prompt == busy_prompt ||
+            suspended[0] || suspended[1])
             return {AdmitResult::Status::busy, -1, "KV headroom occupied"};
         if (fail_next) {
             fail_next = false;
@@ -120,6 +122,13 @@ public:
             cv.wait(lock, [&] { return !block_step; });
         }
         StepResult result;
+        if (fail_mixed_clean && !plan.decode.empty() && !plan.prefills.empty()) {
+            ++mixed_clean_failures;
+            result.error = "mixed prefill+decode scratch OOM";
+            result.state_clean = true;
+            cv.notify_all();
+            return result;
+        }
         if (speculative_pressure && plan.decode.size() > 1 &&
             std::any_of(plan.decode.begin(), plan.decode.end(),
                 [](const auto & input) { return input.allow_speculation; })) {
@@ -143,10 +152,13 @@ public:
             ++steps;
             result.decode.push_back({input.slot, token, false, {}});
         }
+        if (!plan.decode.empty()) cv.notify_all();
+        const auto step_delay = !plan.decode.empty() ? decode_step_delay : std::chrono::milliseconds{0};
         // An unfinished fake prefill yields control to the real scheduler,
         // allowing admission and cancellation without timing-based completion.
         lock.unlock();
-        std::this_thread::yield();
+        if (step_delay.count() > 0) std::this_thread::sleep_for(step_delay);
+        else std::this_thread::yield();
         return result;
     }
     void retire(int slot) override {
@@ -159,6 +171,12 @@ public:
     }
     bool reserve_decode(const StepPlan & plan) override {
         std::lock_guard<std::mutex> lock(mu);
+        // Chain rounds run only in steps without prompt work; here they never fit.
+        if (speculation_without_prefill_overflows && plan.prefills.empty() &&
+            std::any_of(plan.decode.begin(), plan.decode.end(),
+                [](const auto & input) { return input.allow_speculation; })) {
+            return false;
+        }
         if (speculative_pressure && plan.decode.size() > 1 &&
             std::any_of(plan.decode.begin(), plan.decode.end(),
                 [](const auto & input) { return input.allow_speculation; })) {
@@ -175,11 +193,16 @@ public:
         const bool recomputing = recompute.at((size_t)slot);
         return {parked, recomputing, parked && !recomputing ? 64u : 0u};
     }
+    KvOffloadFootprint kv_offload_footprint(int slot) const override {
+        std::lock_guard<std::mutex> lock(mu);
+        return footprint.at((size_t)slot);
+    }
     bool offload_kv(int slot, size_t available, std::string & error) override {
         std::lock_guard<std::mutex> lock(mu);
         if (available < 64) { error = "RAM budget exhausted"; return false; }
         ROUTING_CHECK(active.at((size_t)slot) && !suspended.at((size_t)slot));
         suspended[(size_t)slot] = true;
+        last_suspended_slot = slot;
         ++suspensions;
         block_step = hold_on_suspend;
         cv.notify_all();
@@ -269,6 +292,7 @@ public:
     std::array<bool, 2> active{}, suspended{}, recompute{}, non_eos{};
     std::array<int, 2> decode_steps{};
     std::chrono::milliseconds first_decode_delay{0};
+    std::chrono::milliseconds decode_step_delay{0};
     bool decode_pressure = false, hold_on_suspend = false, fail_restore = false;
     bool speculative_pressure = false;
     int speculative_retries = 0;
@@ -278,9 +302,17 @@ public:
     bool resumed_with_resident = false;
     int suspensions = 0, resumptions = 0, evictions = 0;
     size_t prompt_capacity = 64;
+    size_t max_admit_tokens_now = 64;
+    std::vector<int32_t> busy_prompt;  // this prompt never fits
     bool capacity_busy = false;
+    bool fail_mixed_clean = false;
+    bool speculation_without_prefill_overflows = false;
+    int mixed_clean_failures = 0;
+    std::array<KvOffloadFootprint, 2> footprint{};
+    int last_suspended_slot = -1;
     bool release = false, fail_next = false, block_step = false, inside_block = false;
     int attempts = 0;
+    std::vector<size_t> attempted_sizes;
     int admissions = 0, retirements = 0;
     int32_t subsequent_first_token = 0;
     std::array<int, 2> admission_of{};
@@ -398,7 +430,8 @@ public:
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
                            bool reverse_priority = false, size_t offload_bytes = 0,
-                           const char * first_output = "q", int model_queue_limit = -1) {
+                           const char * first_output = "q", int model_queue_limit = -1,
+                           int default_max_tokens = 4) {
         load_tokenizer(first_tok, false, first_output);
         load_tokenizer(second_tok, true, "s");
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
@@ -418,7 +451,7 @@ public:
         config.routing_queue_limit = queue_limit;
         config.queue_limit = model_queue_limit;
         config.decode_kv_offload_bytes = offload_bytes;
-        config.default_max_tokens = 4;
+        config.default_max_tokens = default_max_tokens;
         config.prefix_cache_cap = 0;
         config.shared_prefix = SharedPrefixMode::off;
         config.admission_coalesce_ms = 0;
@@ -515,8 +548,8 @@ json chat(const char * model = "qwen", bool stream = false) {
 // One model served alone, as a box runs it, with --queue-limit `limit`
 // (negative: none). `single`: the single-request worker instead of slots.
 struct OneModel : RunningModels {
-    explicit OneModel(int limit, bool single = false)
-        : RunningModels(false, single, false, 0, false, 0, "q", limit) {}
+    explicit OneModel(int limit, bool single = false, int default_max_tokens = 4)
+        : RunningModels(false, single, false, 0, false, 0, "q", limit, default_max_tokens) {}
 };
 
 json chat_saying(const char * content) {
@@ -1458,6 +1491,114 @@ TEST_CASE(ModelRoutingFixture, test_load_answers_while_a_step_runs) {
     ROUTING_CHECK(load["slots_busy"] == 1 && load["kv_free_tokens"] == 96);
     engine.finish();
     ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
+}
+
+// Shared-block-aware offload victim selection: when the newer slot shares 100%
+// of its KV blocks (0 reclaimable tokens) and the older slot holds exclusive
+// blocks, the scheduler suspends the older slot instead of wasting a RAM copy.
+TEST_CASE(ModelRoutingFixture, test_offload_victim_skips_zero_reclaimable_shared_slot) {
+    RunningModels models(false, false, true, 1, false, 64);
+    {
+        std::lock_guard<std::mutex> lock(models.first.engine.mu);
+        models.first.engine.footprint[0] = {128, 128};  // older, exclusive
+        models.first.engine.footprint[1] = {128, 0};    // newer, 100% shared
+    }
+    auto a = models.post(chat("qwen", false));
+    models.first.engine.wait_admissions(1);
+    auto b = models.post(chat("qwen", false));
+    models.first.engine.wait_admissions(2);
+    models.first.engine.start_decode_pressure(false);
+    ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(b.read())["model"] == "qwen");
+    models.wait_load(0, 0);
+    ROUTING_CHECK(models.first.engine.suspensions == 1);
+    ROUTING_CHECK(models.first.engine.last_suspended_slot == 0);
+}
+
+// Clean mixed-step failure isolation: when a mixed prefill+decode step fails
+// with state_clean=true, the scheduler sheds prefills and retries decode-only,
+// keeping the live decoder healthy and failing only the unservable prefill.
+TEST_CASE(ModelRoutingFixture, test_clean_mixed_step_failure_sheds_prefill_preserves_decoder) {
+    OneModel model(-1, false, 60);
+    auto & engine = model.first.engine;
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        engine.release = true;
+        engine.non_eos[0] = true;
+        engine.decode_step_delay = 10ms;
+        engine.speculation_without_prefill_overflows = true;
+    }
+    json decode_req = chat("qwen", false);
+    decode_req["max_tokens"] = 60;
+    auto decoder = model.post(decode_req);
+    engine.wait_admissions(1);
+    // Let slot 0 transition into decode before admitting the failing prefill.
+    {
+        std::unique_lock<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.cv.wait_for(lock, 5s, [&] { return engine.decode_steps[0] >= 1; }));
+        engine.fail_mixed_clean = true;
+    }
+    auto prefiller = model.post(chat("qwen", false));
+    // Wait until the prefill has been cleanly shed 3 times and retired.
+    const auto prefill_resp = response_body(prefiller.read(), 500);
+    ROUTING_CHECK(prefill_resp["error"]["code"] == "prefill_failed");
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.mixed_clean_failures >= 3);
+        engine.non_eos[0] = false;
+        engine.decode_step_delay = 0ms;
+    }
+    const auto decode_resp = response_body(decoder.read(), 200);
+    ROUTING_CHECK(decode_resp["model"] == "qwen");
+    model.wait_engine_load(0, 0);
+}
+
+// Bounded short-prompt backfill: while a large prompt is deferred for KV
+// capacity, a strictly shorter prompt that fits the free pool backfills into
+// the open slot instead of being head-of-line blocked.
+TEST_CASE(ModelRoutingFixture, test_deferred_short_prompt_backfills_behind_large_prompt) {
+    OneModel model(-1);
+    auto & engine = model.first.engine;
+    auto a = model.post(chat_saying("x"));
+    engine.wait_admissions(1);
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        engine.max_admit_tokens_now = 4;
+    }
+    // Large prompt (16 tokens) gets deferred on KV capacity.
+    auto large = model.post(chat_saying("yyyyyyyyyyyyyyyy"));
+    {
+        std::unique_lock<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.cv.wait_for(lock, 5s, [&] { return engine.attempts >= 2; }));
+    }
+    // A short prompt that does not fit is not retried while the large one
+    // waits: the equally short one behind it backfills into slot 1.
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        engine.busy_prompt = {3, 3};
+    }
+    auto busy = model.post(chat_saying("yy"));
+    {
+        std::unique_lock<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.cv.wait_for(lock, 5s, [&] {
+            return std::count(engine.attempted_sizes.begin(), engine.attempted_sizes.end(), 2u) > 0;
+        }));
+    }
+    auto small = model.post(chat_saying("ss"));
+    engine.wait_admissions(2);
+    {
+        std::lock_guard<std::mutex> lock(engine.mu);
+        ROUTING_CHECK(engine.prompts.size() == 2 &&
+                      engine.prompts[1] == std::vector<int32_t>({4, 4}));
+        engine.max_admit_tokens_now = 64;
+        engine.busy_prompt.clear();
+    }
+    engine.finish();
+    ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(small.read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(large.read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(busy.read())["model"] == "qwen");
+    model.wait_engine_load(0, 0);
 }
 
 #undef ROUTING_CHECK

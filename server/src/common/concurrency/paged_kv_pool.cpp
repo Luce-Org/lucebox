@@ -324,6 +324,28 @@ PagedKvStatus PagedKvPool::owned_block_count(
     return PagedKvStatus::Ok;
 }
 
+PagedKvStatus PagedKvPool::exclusive_block_count(
+        PagedKvSequenceHandle handle, uint32_t & out_count) const {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    const SequenceState & sequence = sequences_[handle.slot];
+    uint32_t exclusive = 0;
+    auto count_exclusive = [&](const std::vector<uint32_t> & blocks) {
+        for (uint32_t b : blocks) {
+            if (b < physical_block_count_ &&
+                seq_refcounts_[b] == 1 && pin_refcounts_[b] == 0) {
+                ++exclusive;
+            }
+        }
+    };
+    count_exclusive(sequence.block_table);
+    count_exclusive(sequence.retry_blocks);
+    count_exclusive(sequence.reserved_blocks);
+    out_count = exclusive;
+    return PagedKvStatus::Ok;
+}
+
 PagedKvStatus PagedKvPool::pin_prefix_blocks(
         PagedKvSequenceHandle handle, uint32_t full_block_count,
         std::vector<uint32_t> & out_blocks) {
