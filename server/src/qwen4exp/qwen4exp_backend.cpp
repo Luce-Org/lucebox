@@ -1,6 +1,7 @@
 #include "qwen4exp_backend.h"
 #include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
+#include "qwen4exp_recall.h"
 
 #include "common/moe_hybrid_routing_stats.h"
 #include "common/peer_access.h"
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <random>
 #include <string>
 #include <utility>
@@ -414,9 +416,15 @@ bool Qwen4ExpBackend::init() {
         return false;
     }
     // Prefix snapshots stay in the gfx1151 iGPU's memory, which is the system's. Beside a GPU with its own memory
-    // they go to system memory (create_snapshot_backend), which leaves that memory to the KV caches.
-    snap_backend_ = ggml_backend_cuda_qwen4exp_supported(backend_) ? backend_ : create_snapshot_backend(backend_);
-    if (!snap_backend_) return false;
+    // they live in system memory (create_snapshot_backend); LUCE_Q4_SNAPSHOT_DEVICE=1 lets load_target move them
+    // onto the target when they fit.
+    if (!ggml_backend_cuda_qwen4exp_supported(backend_) && !(snap_host_ = create_snapshot_backend(backend_)))
+        return false;
+    const char * dev_env = std::getenv("LUCE_Q4_SNAPSHOT_DEVICE");
+    const int dev_flag = qwen4exp_snapshot_device_from_env(dev_env);
+    snapshots_device_ = dev_flag == 1;
+    if (dev_flag < 0)
+        std::fprintf(stderr, "[qwen4exp] LUCE_Q4_SNAPSHOT_DEVICE=%s refused (use 1, or unset/0 for off)\n", dev_env);
     if (!cfg_.expert_placement_path.empty() && !cfg_.expert_device) {
         std::fprintf(stderr, "[qwen4exp] --expert-placement needs --expert-device\n");
         return false;
@@ -442,6 +450,7 @@ bool Qwen4ExpBackend::init() {
 }
 
 bool Qwen4ExpBackend::load_target() {
+    snap_backend_ = snap_host_ ? snap_host_ : backend_;
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
@@ -449,6 +458,7 @@ bool Qwen4ExpBackend::load_target() {
         return false;
     }
     load_qwen4exp_output_tail(weights_, backend_);
+    resolve_indexer_recall();   // before the pool is sized: recall's rows come out of the auto budget
     size_kvflash_pool();
     if (!create_main_cache()) {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
@@ -512,13 +522,42 @@ bool Qwen4ExpBackend::load_target() {
             return false;
         }
     }
+    settle_indexer_recall();
+    // Beside a GPU with its own memory the fit above counted no snapshots, so the context is what it would be with
+    // them in system memory. On request they take the target only from what it leaves: the planner's whole
+    // allowance must fit, and the prompt chunk must stay as wide.
+    Qwen4ExpChunkPlan room;
+    if (snap_host_ && snapshots_device_ && cfg_.chunk <= 0) plan_chunk(&room);
+    const size_t allowance = snapshot_count() * snapshot_bytes_estimate(cache_.max_ctx);
+    Qwen4ExpSnapshotPlacement home = qwen4exp_place_snapshots(!snap_host_, snapshots_device_, cfg_.chunk > 0,
+                                                              room.required, room.available, allowance);
+    // The server budgets the whole allowance (sized for the target's own buffers once they live there): a part of it
+    // would make alternating prefixes evict each other.
+    const auto whole = [this] { return snapshot_budget_ >= snapshot_count() * snapshot_bytes_estimate(cache_.max_ctx); };
+    if (snap_host_ && home.on_device) {
+        const int host_chunk = chunk_;
+        snap_backend_ = backend_;
+        chunk_ = plan_chunk(&room);   // reserves the allowance beside the chunk
+        if (chunk_ < host_chunk || !whole()) {
+            snap_backend_ = snap_host_;
+            chunk_ = plan_chunk();
+            home = {false, "the whole allowance does not fit beside the full prompt chunk"};
+        }
+    }
+    if (snap_host_)
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots %s: %s\n",
+                     home.on_device ? "on the target GPU" : "in system memory", home.reason);
     if (!load_hot_experts()) return false;
+    if (snap_host_ && snap_backend_ == backend_ && !whole()) {   // the hot experts' re-plan cut the allowance
+        snap_backend_ = snap_host_;
+        chunk_ = plan_chunk();
+        std::fprintf(stderr, "[qwen4exp] prefix snapshots back in system memory: the hot experts' re-plan cut the "
+                     "allowance\n");
+    }
     if (snapshot_budget_ == 0)
         std::fprintf(stderr, "[qwen4exp] prefix snapshots disabled: memory allowance insufficient for one checkpoint\n");
     else if (snapshot_budget_ != SIZE_MAX)
         std::fprintf(stderr, "[qwen4exp] prefix snapshot allowance=%zu bytes\n", snapshot_budget_);
-    else if (snap_backend_ != backend_)
-        std::fprintf(stderr, "[qwen4exp] prefix snapshots in system memory\n");
     if (chunk_ <= 0) {
         std::fprintf(stderr, "[qwen4exp] insufficient prefill memory at the configured context\n");
         return false;
@@ -544,7 +583,7 @@ bool Qwen4ExpBackend::load_target() {
 // Split mode, one sequence, with --expert-placement: hot expert slots on the target for decode and verify steps (a
 // prompt chunk keeps every pick on the expert device), started from the placement and then following the served
 // picks (Qwen4ExpHotSet). They take the memory the fitted context and the prompt chunk leave, at most
-// LUCE_EXPERT_BUDGET_MB, so they shrink neither. Concurrent serving keeps every pick on the expert device, so a
+// LUCE_EXPERT_BUDGET_MB, so they shrink neither (nor the snapshot allowance LUCE_Q4_SNAPSHOT_DEVICE=1 puts there). Concurrent serving keeps every pick on the expert device, so a
 // request computes the same alone and beside other requests: no hot copies. The expert device's read-ahead (no
 // effect on the output) is built either way.
 bool Qwen4ExpBackend::load_hot_experts() {
@@ -592,7 +631,7 @@ int Qwen4ExpBackend::plan_chunk(Qwen4ExpChunkPlan * plan) {
     // head, the server's concurrent prefix budget. One sequence keeps three.
     const int slots = cfg_.max_concurrency;
     const int fit = qwen4exp_select_chunk(backend_, weights_, cache_, slots, 1,
-                                          allowance(slots > 1 ? 2 * (size_t) slots + 1 : 3), plan,
+                                          allowance(snapshot_count()), plan,
                                           snapshot_bytes_estimate(cache_.max_ctx),
                                           pflash_reserve(backend_),
                                           restore_point_spacing());
@@ -623,8 +662,9 @@ bool Qwen4ExpBackend::create_main_cache() {
     if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
             cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
             slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx),
-            take_kept_remote(0)))
+            take_kept_remote(0), recall_mode_ > 0 && remote_layers_ == 0 ? recall_queries_ : 0))
         return false;
+    cache_.pool_qsa = pool_qsa_ && qwen4exp_pool_qsa_supported(backend_, weights_, cache_);
     disk_layout_ = qwen4exp_disk_layout(cache_);
     return true;
 }
@@ -633,16 +673,123 @@ bool Qwen4ExpBackend::create_main_cache() {
 // memory). It holds the full-attention layers' F16 K/V; the MTP draft layer keeps one row per position.
 void Qwen4ExpBackend::size_kvflash_pool() {
     const Qwen4ExpWeights & w = weights_;
-    int64_t n_full = 0;
-    for (int il = 0; il < w.n_layer; ++il) n_full += w.layers[il].is_full_attention;
+    int64_t n_full = 0, recall_bytes = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        n_full += w.layers[il].is_full_attention;
+        if (recall_mode_ > 0 && w.layers[il].is_full_attention)
+            recall_bytes += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size,
+                                                  il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0);
+    }
     KvFlashAutoBudget budget;
     budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
     // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
-    // No cache yet: the drafter's per-token room is counted at the configured context.
-    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
+    // No cache yet: the drafter's per-token room is counted at the configured context. recall_bytes: the indexer rows
+    // a recall mode keeps at the full context beside the pool (settling may still drop them; the pool then just stays smaller).
+    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx) + recall_bytes;
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+}
+
+// LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall), LUCE_Q4_RECALL_QUERIES and LUCE_Q4_RECALL_TAIL. An invalid value
+// falls back to its default with one line; a refused mode runs as 0.
+void Qwen4ExpBackend::resolve_indexer_recall() {
+    const auto env_int = [](const char * name, int lo, int hi, int def) {
+        const char * v = std::getenv(name);
+        const Q4EnvInt r = q4_parse_env_int(v, lo, hi, def);
+        if (r.refused)
+            std::fprintf(stderr, "[q4-recall] %s=\"%s\" is not an integer in [%d, %d]; using %d\n", name, v, lo, hi, r.value);
+        return r.value;
+    };
+    recall_mode_ = env_int("LUCE_Q4_INDEXER_RECALL", 0, 2, 0);
+    recall_queries_ = env_int("LUCE_Q4_RECALL_QUERIES", 2, 256, 64);
+    recall_tail_ = env_int("LUCE_Q4_RECALL_TAIL", 0, kQ4RecallTailMax, kQ4RecallTailDefault);
+    pool_qsa_ = env_int("LUCE_Q4_POOL_QSA", 0, 1, 1) == 1;
+    if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
+                     "running with 0\n", recall_mode_, cfg_.max_concurrency);
+        recall_mode_ = 0;
+    }
+    if (recall_mode_ > 0 && !weights_.qsa) {
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused: this model has no QSA indexer; running with 0\n",
+                     recall_mode_);
+        recall_mode_ = 0;
+    }
+    // Before the cache is sized, so the pin equals --verify-width 5. ponytail: a later settle to score only keeps the pin.
+    if (const int w = q4_recall_verify_width(recall_mode_, cfg_.verify_width); w != cfg_.verify_width) {
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=2 pins the MTP verify width to %d (the adaptive width "
+                     "varies with step timings, which changes recall's picks run to run; --verify-width overrides)\n", w);
+        cfg_.verify_width = w;
+    }
+}
+
+// The layout context fitting settled (pool vs context, attention placement) decides what recall can do; the cache is
+// built with recall storage only where this keeps a mode, so a downgrade here never leaves unused buffers.
+void Qwen4ExpBackend::settle_indexer_recall() {
+    const Q4RecallSettled s = q4_recall_settle(recall_mode_, cache_.remote_layers, cache_.kvflash != nullptr);
+    if (s.why)
+        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
+    recall_mode_ = s.mode;
+    if (cache_.pool_qsa)
+        std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; the "
+                     "replayed tail densely; LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
+}
+
+// After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.
+void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) {
+    const auto t0 = std::chrono::steady_clock::now();
+    KvFlashPager * pager = cache_.kvflash.get();
+    const int n_pos = cache_.cur_pos;
+    const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
+    const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
+    if (pager && !q4_recall_pages(n_pos, pager->pool_tokens())) return;   // nothing paged out: nothing to recall
+    Qwen4ExpRecallPicks picks;
+    if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
+        if (picks.graph_failed) std::fprintf(stderr, "[q4-recall] FAILED: the pick graph did not allocate or compute (%d positions)\n", n_pos);
+        else std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
+        return;
+    }
+    const int bpc = chunk_tokens / picks.ratio, n_chunks = (n_pos + chunk_tokens - 1) / chunk_tokens;
+    if (chunk_tokens % picks.ratio != 0) {
+        std::fprintf(stderr, "[q4-recall] chunk of %d tokens is not a multiple of the %d-token block; skipping\n",
+                     chunk_tokens, picks.ratio);
+        return;
+    }
+    std::vector<int> visible((size_t) picks.queries);   // query t sees the blocks complete at its own position
+    for (int t = 0; t < picks.queries; ++t) visible[(size_t) t] = (picks.pos0 + t + 1) / picks.ratio;
+    const std::vector<float> votes = q4_recall_chunk_votes(picks.ids, picks.layers, picks.queries, picks.budget, bpc,
+                                                           n_chunks, &visible);
+    const std::vector<float> scores = q4_recall_chunk_scores(votes);
+    double total = 0;
+    for (float v : votes) total += v;
+    const std::vector<int> top = q4_recall_top(scores, pool_chunks > 0 ? pool_chunks : 8);
+    std::string top_s;
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%s%d:%d", i ? "," : "", top[i], (int) votes[(size_t) top[i]]);
+        top_s += b;
+    }
+    int nonres = 0;
+    for (int c : top) nonres += !(pager && pager->is_resident(c));
+    char resid[48] = "n/a";
+    if (pager) std::snprintf(resid, sizeof resid, "%d/%d", nonres, pool_chunks);
+    const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
+    std::fprintf(stderr, "[q4-recall] n_chunks=%d pool_chunks=%d top=[%s] nonresident_in_top=%s votes_total=%.0f ms=%.1f\n",
+                 n_chunks, pool_chunks, top_s.c_str(), resid, total, ms());
+    if (recall_mode_ < 2 || !pager) return;
+
+    // Mode 2: rank every chunk (resident or paged out) by votes. Chunks past the prompt (generated ones) outrank every
+    // prompt chunk so the decode's evictions take prompt chunks first. The hook stays for this request's decode.
+    keep.emplace(*pager);
+    pager->score_hook = [scores](int c) { return c < (int) scores.size() ? scores[(size_t) c] : 1e6f + (float) c; };
+    // ponytail: the newest chunks (the last turn) are protected by widening reselect's tail to the captured queries' span.
+    const int tail = std::min(4 + (picks.queries + chunk_tokens - 1) / chunk_tokens, pool_chunks / 2);
+    std::vector<uint8_t> was(n_chunks);
+    for (int c = 0; c < n_chunks; ++c) was[(size_t) c] = pager->is_resident(c);
+    const int events = pager->reselect(tail);
+    int page_ins = 0;
+    for (int c = 0; c < n_chunks; ++c) page_ins += !was[(size_t) c] && pager->is_resident(c);
+    std::fprintf(stderr, "[q4-recall] reselect tail=%d page_ins=%d page_events=%d ms=%.1f\n", tail, page_ins, events, ms());
 }
 
 // A pool that holds the whole context pages nothing: such a context keeps one row per position (and QSA).
@@ -750,7 +897,8 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
 // everything else on the target. A release of the target device keeps the stacks where they are, so bringing the
 // model back uploads only the target's part (7 GiB) and rebuilds the caches. The layout found at first load (the
 // fitted context, the slots, the attention layers moved to the expert device) is reused as it is, and the prefix
-// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release.
+// snapshots and the sequence engine's checkpoints, which live in system memory, stay through the release (with
+// LUCE_Q4_SNAPSHOT_DEVICE=1 putting them on the target, residency() refuses the release).
 
 ModelBackend::Residency Qwen4ExpBackend::residency() const {
     Residency r;
@@ -758,6 +906,8 @@ ModelBackend::Residency Qwen4ExpBackend::residency() const {
     if (expert_gpu() >= 0) r.gpus.push_back(expert_gpu());
     if (cache_.kvflash || kvflash_pool_ > 0) {
         r.reason = "qwen4exp: --kvflash pages KV rows the release would drop";
+    } else if (snap_host_ && snap_backend_ == backend_) {
+        r.reason = "qwen4exp: prefix snapshots on the target GPU (LUCE_Q4_SNAPSHOT_DEVICE=1) would not survive the release";
     } else if (!backend_) {
         r.reason = "qwen4exp: not loaded";
     } else {
@@ -959,6 +1109,41 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     std::vector<float> logits = logits_;
     const int chunk = chunk_;
     int pos = restored;
+    // LUCE_Q4_INDEXER_RECALL: the forwards of the prompt's last recall_queries_ tokens append their indexer queries
+    // to recall_q; a cut starts a forward exactly there.
+    const bool recall_on = recall_mode_ > 0 && cache_.recall_queries > 0;
+    const int pool_tokens = cache_.kvflash ? cache_.kvflash->pool_tokens() : 0;
+    const bool recall = recall_on && q4_recall_pages((int) req.prompt.size(), pool_tokens);
+    cache_.recall_q_n = 0;
+    std::optional<ScopedScoreHook> recall_hook;
+    // LUCE_Q4_RECALL_TAIL (mode 2, past the pool): prefill the prompt's last recall_tail_ tokens twice. The first pass
+    // captures the queries recall ranks the chunks by; the state then rolls back to the tail's start, and the second
+    // pass attends to the recalled chunks, which the decode keeps.
+    const bool tail_armed = recall_on && recall_mode_ == 2 && cache_.kvflash;
+    const Q4TailPath tail_path = tail_armed
+        ? q4_recall_tail_path(pos, (int) req.prompt.size(), recall_tail_, pool_tokens, req.n_gen) : Q4TailPath::Off;
+    int tail_pos = tail_path == Q4TailPath::TwoPass
+        ? q4_recall_tail_pos(pos, (int) req.prompt.size(), recall_tail_, pool_tokens) : -1;
+    Qwen4ExpSnapshot tail_snap;
+    const auto drop_tail = [&] { free_qwen4exp_snapshot(tail_snap); tail_snap_bytes_ = 0; };
+    struct TailSnapFree { const decltype(drop_tail) & drop; ~TailSnapFree() { drop(); } } tail_free{drop_tail};
+    Qwen4ExpMtpPending tail_mtp;
+    // One [q4-tail] line per mode-2 request, written when it leaves: the path that ran and how the prefill ended.
+    struct TailLog {
+        bool armed;
+        Q4TailPath path;
+        Q4TailStage stage = Q4TailStage::Planned;
+        const char * status = "failed";
+        bool recalled = false;
+        int prompt, restored, pool, tail;
+        ~TailLog() {
+            if (armed)
+                std::fprintf(stderr, "[q4-tail] %s status=%s recalled=%d (prompt=%d restored=%d pool=%d tail=%d)\n",
+                             q4_tail_outcome(path, stage), status, (int) recalled, prompt, restored, pool, tail);
+        }
+    };
+    TailLog tail_log{tail_armed, tail_path, Q4TailStage::Planned, "failed", false,
+                     (int) req.prompt.size(), pos, pool_tokens, recall_tail_};
 
     // MTP speculation (sidecar loaded, default graph, a budget that leaves room for a draft): the draft head
     // predicts x_{p+2} from the pair (h_p, x_{p+1}), h_p being the trunk's final HC residual at p. The pairs not yet
@@ -976,9 +1161,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
 
     // Each restore point starts a chunk in both cold and resumed requests.
     // Capture cuts are restore points too, including a one-token interval.
-    std::vector<int> cuts = req.restore_points;
-    if (req.snap_slot >= 0 && req.snap_pos > 0) cuts.push_back(req.snap_pos);
-    std::sort(cuts.begin(), cuts.end());
+    const int snap_cut = req.snap_slot >= 0 ? req.snap_pos : -1;
+    std::vector<int> cuts = q4_prefill_cuts(req.restore_points, pos, snap_cut,
+                                            recall ? (int) req.prompt.size() - recall_queries_ : -1, tail_pos);
     auto capture = [&]() {
         if (req.snap_slot >= 0 && req.snap_pos == pos) snapshot_save_replacing(req.snap_slot, restore_slot);
     };
@@ -1001,22 +1186,74 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     };
     capture();
     auto inputs = pos < (int) req.prompt.size() ? prepare(pos) : Qwen4ExpInputs{};
-    while (pos < (int) req.prompt.size()) {
+    bool replay = false;   // the second tail pass: prompt chunks attend the pool densely
+    auto tail_rewind = [&]() {
+        if (!tail_snap.buf) return false;
+        run_indexer_recall(recall_hook);
+        tail_log.recalled = recall_hook.has_value();
+        if (!recall_hook) {   // the pool is as the first pass left it: the replay would reproduce that pass exactly
+            tail_log.stage = Q4TailStage::NothingRecalled;
+            drop_tail();
+            return false;
+        }
+        const bool ok = restore_qwen4exp_snapshot(backend_, tail_snap, cache_);
+        tail_log.stage = ok ? Q4TailStage::Rewound : Q4TailStage::RewindFailed;
+        drop_tail();
+        if (!ok) return false;
+        pos = tail_pos;
+        tail_pos = -1;
+        replay = true;
+        cuts = q4_prefill_cuts(req.restore_points, pos, snap_cut, -1, -1);
+        tokens_.resize((size_t) pos);
+        mtp_pending = tail_mtp;
+        cache_.recall_q_n = 0;
+        inputs = prepare(pos);
+        return true;
+    };
+    while (pos < (int) req.prompt.size() || tail_rewind()) {
         if (io.is_cancelled()) {
+            tail_log.status = "cancelled";
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
+        }
+        if (pos == tail_pos && !tail_snap.buf) {
+            if (save_qwen4exp_snapshot(backend_, snap_backend_, cache_, tail_snap)) {
+                tail_mtp = mtp_pending;
+                // Past the pool it holds the point state alone. On a GPU with its own memory (LUCE_Q4_SNAPSHOT_DEVICE)
+                // captures leave it room while it lives, so it never takes memory the allowance promised them.
+                tail_snap_bytes_ = snap_host_ && snap_backend_ == backend_
+                                 ? ggml_backend_buffer_get_size(tail_snap.buf) : 0;
+            } else {
+                tail_pos = -1;
+                tail_log.stage = Q4TailStage::SnapFailed;
+            }
         }
         const int end = chunk_end(pos);
         const int n = end - pos;
         std::future<Qwen4ExpInputs> pending;
         if (end < (int) req.prompt.size()) pending = std::async(std::launch::async, prepare, end);
         const bool mtp_prefill = mtp && n > 1;
+        // Every forward inside the last recall_queries_ tokens appends its queries: restore points (the prefix
+        // snapshot sits before the reply template) split that span, and its last forward alone holds ~6 template
+        // tokens. A one-row forward (no capture path) restarts the run so the captured positions stay contiguous,
+        // unless it is the last: the rows before it stay.
+        const bool in_tail = recall && !recall_hook && pos >= (int) req.prompt.size() - recall_queries_;
+        if (in_tail && q4_recall_run_breaks(n, end, (int) req.prompt.size())) cache_.recall_q_n = 0;
+        cache_.recall_capture = in_tail && n > 1;
+        const bool captured = cache_.recall_capture;
+        cache_.pool_prompt_dense = replay;
         const Qwen4ExpForwardResult r = qwen4exp_forward(
             backend_, weights_, cache_, req.prompt.data() + pos, n, pos, logits, mtp ? &hidden : nullptr,
             false, mtp_prefill, &inputs);
+        cache_.recall_capture = false;
+        cache_.pool_prompt_dense = false;
         if (!r.ok) {
             result.fail(GenerateErrorCode::PrefillFailed, "qwen4exp prefill forward failed");
             return result;
+        }
+        if (captured) {
+            if (cache_.recall_q_n == 0) cache_.recall_q_pos0 = pos;
+            cache_.recall_q_n += n;
         }
         if (mtp_prefill) {
             mtp_pending.h.swap(hidden);
@@ -1036,11 +1273,15 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         logits_ = logits;
         capture();
         if (io.is_cancelled()) {
+            tail_log.status = "cancelled";
             result.fail(GenerateErrorCode::Cancelled, "cancelled during prefill");
             return result;
         }
         if (pending.valid()) inputs = pending.get();
     }
+    // A failed rewind leaves the first pass's state in place: the prefill is complete and the request goes on to
+    // generate, only the tail replay is missing.
+    tail_log.status = tail_log.stage == Q4TailStage::RewindFailed ? "no-replay" : "ok";
     const auto t_pre1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();
     if (req.n_gen <= 0) {
@@ -1048,6 +1289,9 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
         result.succeed();
         return result;
     }
+
+    if (recall && !recall_hook && tail_log.stage != Q4TailStage::NothingRecalled) run_indexer_recall(recall_hook);
+    tail_log.recalled = recall_hook.has_value();
 
     std::mt19937_64 rng(request_rng_seed(req.sampler));
     std::vector<int32_t> history = req.prompt;
@@ -1379,7 +1623,8 @@ bool Qwen4ExpBackend::snapshot_fits(int slot, int replaced) const {
                                      : snapshots_[i].state_only || snapshots_[i].rows_in_pager;
         return snapshot_bytes(live ? cache_.cur_pos : snapshots_[i].cur_pos, /*rows=*/!point_only);
     };
-    size_t remaining = snapshot_budget_;
+    if (tail_snap_bytes_ > snapshot_budget_) return false;
+    size_t remaining = snapshot_budget_ - tail_snap_bytes_;
     for (int i = 0; i < kMaxSlots; ++i) {
         if (i == slot || i == replaced || !snapshot_used(i)) continue;
         const size_t bytes = charge(i);
@@ -1494,8 +1739,8 @@ void Qwen4ExpBackend::shutdown() {
     free_drafter();
     free_kept_remote_bufs();
     if (backend_) release_target();
-    free_snapshot_backend(snap_backend_, backend_);
-    snap_backend_ = nullptr;
+    free_snapshot_backend(snap_host_, backend_);
+    snap_host_ = snap_backend_ = nullptr;
     if (weights_.expert_backend) {
         ggml_backend_free(weights_.expert_backend);
         weights_.expert_backend = nullptr;

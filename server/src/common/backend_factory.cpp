@@ -17,6 +17,7 @@
 #include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
 #include "glm5_backend.h"
+#include "inkling2_backend.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
 
@@ -106,6 +107,8 @@ LUCE_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfi
 LUCE_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("deepseek41", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 LUCE_CHECK_ARCH("glm5-next", Glm5BackendConfig,     NoLayerSplitConfig);
+LUCE_CHECK_ARCH("inkling2_loop", Inkling2BackendConfig, NoLayerSplitConfig);
+LUCE_CHECK_ARCH("inkling2",      Inkling2BackendConfig, NoLayerSplitConfig);
 
 // These sit outside the bundle because the field-presence trait cannot
 // separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
@@ -161,6 +164,8 @@ static_assert(std::is_same_v<
     decltype(DeepSeek4LayerSplitAdapterConfig{}.target_path), std::string>);
 static_assert(std::is_same_v<
     decltype(Glm5BackendConfig{}.model_path), std::string>);
+static_assert(std::is_save_v<
+    decltype(Inkling2BackendConfig{}.model_path), std::string>);
 
 std::unique_ptr<ModelBackend> construct_backend(
     const BackendPlan & plan) {
@@ -296,6 +301,24 @@ std::unique_ptr<ModelBackend> construct_backend(
         auto backend = std::make_unique<Qwen4ExpBackend>(std::move(cfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen4ExpBackend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "inkling2_loop" || arch == "inkling2") {
+        Inkling2BackendConfig cfg;
+        cfg.model_path    = model.path;
+        cfg.draft_path    = speculation.draft_path;
+        cfg.verify_width  = speculation.verify_width;
+        cfg.device        = placement.target;
+        cfg.expert_device = placement.expert;
+        cfg.chunk         = execution.chunk;
+        cfg.cache_type_k  = cache.cache_type_k;
+        cfg.cache_type_v  = cache.cache_type_v;
+
+        auto backend = std::make_unique<Inkling2Backend>(std::move(cfg));
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] Inkling2Backend init failed\n");
             return nullptr;
         }
         return backend;

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Fast local pre-push check on committed changes for every pushed ref.
+
+Install with: make install-hooks  (or: git config core.hooksPath .githooks)
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ZERO_SHA = "0" * 40
+RUFF_INCLUDED_PREFIXES = (
+    "harness/",
+    "scripts/",
+    "server/test/python/",
+    ".github/ci/",
+)
+RUFF_EXCLUDED_PARTS = {"megakernel", "pflash"}
+
+
+def git_output(args: list[str], *, cwd: Path, text: bool = True) -> str | bytes:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=text,
+    )
+    return proc.stdout
+
+
+def git_ok(args: list[str], *, cwd: Path) -> bool:
+    return (
+        subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def resolve_base(local_ref: str, local_sha: str, remote_sha: str, cwd: Path) -> str | None:
+    if (
+        remote_sha
+        and remote_sha != ZERO_SHA
+        and git_ok(["cat-file", "-e", f"{remote_sha}^{{commit}}"], cwd=cwd)
+        and git_ok(["merge-base", "--is-ancestor", remote_sha, local_sha], cwd=cwd)
+    ):
+        return remote_sha
+
+    for candidate in ("origin/main", "main"):
+        if git_ok(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=cwd):
+            return str(git_output(["merge-base", candidate, local_sha], cwd=cwd)).strip()
+
+    if (
+        remote_sha
+        and remote_sha != ZERO_SHA
+        and git_ok(["cat-file", "-e", f"{remote_sha}^{{commit}}"], cwd=cwd)
+    ):
+        return str(git_output(["merge-base", remote_sha, local_sha], cwd=cwd)).strip()
+
+    print(
+        f"pre-push: cannot determine base commit for {local_ref} ({local_sha[:8]}); "
+        "run 'git fetch origin main' to enable full range checks",
+        file=sys.stderr,
+    )
+    return None
+
+
+def is_ruff_gated(path: str) -> bool:
+    if not path.endswith(".py"):
+        return False
+    if path.startswith("server/deps/"):
+        return False
+    if RUFF_EXCLUDED_PARTS.intersection(Path(path).parts):
+        return False
+    return path == "conftest.py" or path.startswith(RUFF_INCLUDED_PREFIXES)
+
+
+def is_workflow_yaml(path: str) -> bool:
+    return path.startswith(".github/workflows/") and path.endswith((".yml", ".yaml"))
+
+
+def find_ruff(root: Path) -> str | None:
+    venv_ruff = root / ".venv" / "bin" / "ruff"
+    if venv_ruff.is_file() and os.access(venv_ruff, os.X_OK):
+        return str(venv_ruff)
+    return shutil.which("ruff")
+
+
+def find_yaml_python(root: Path) -> str | None:
+    candidates: list[str] = []
+    venv_py = root / ".venv" / "bin" / "python"
+    if venv_py.is_file() and os.access(venv_py, os.X_OK):
+        candidates.append(str(venv_py))
+    if sys.executable and sys.executable not in candidates:
+        candidates.append(sys.executable)
+
+    for py in candidates:
+        res = subprocess.run(
+            [py, "-c", "import yaml"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0:
+            return py
+    return None
+
+
+def read_updates(cwd: Path) -> list[tuple[str, str, str]]:
+    if sys.stdin.isatty():
+        head = str(git_output(["rev-parse", "HEAD"], cwd=cwd)).strip()
+        return [("HEAD", head, ZERO_SHA)]
+
+    updates: list[tuple[str, str, str]] = []
+    for raw in sys.stdin:
+        parts = raw.strip().split()
+        if len(parts) < 4:
+            continue
+        local_ref, local_sha, _remote_ref, remote_sha = parts[:4]
+        if local_sha == ZERO_SHA:
+            continue
+        updates.append((local_ref, local_sha, remote_sha))
+    return updates
+
+
+def main() -> int:
+    root = Path(str(git_output(["rev-parse", "--show-toplevel"], cwd=Path.cwd())).strip())
+    updates = read_updates(root)
+    if not updates:
+        return 0
+
+    checker = root / ".github" / "ci" / "check_commit_messages.py"
+    ruff_bin = find_ruff(root)
+    yaml_py: str | None = None
+    yaml_checked = False
+    warned_no_ruff = False
+    warned_no_yaml = False
+    failed = False
+
+    for local_ref, local_sha, remote_sha in updates:
+        base = resolve_base(local_ref, local_sha, remote_sha, root)
+        if not base or base == local_sha:
+            continue
+
+        # 1. Commit message style (matches .github/workflows/commit-style.yml).
+        if checker.is_file():
+            res = subprocess.run(
+                [sys.executable, str(checker), "--base", base, "--head", local_sha],
+                cwd=root,
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                failed = True
+                if res.stdout:
+                    print(res.stdout, end="", file=sys.stderr)
+                if res.stderr:
+                    print(res.stderr, end="", file=sys.stderr)
+
+        diff_out = str(
+            git_output(
+                ["diff", "--name-only", "--diff-filter=ACMR", "-z", base, local_sha],
+                cwd=root,
+            )
+        )
+        changed = [p for p in diff_out.split("\0") if p]
+        py_files = [p for p in changed if is_ruff_gated(p)]
+        yaml_files = [p for p in changed if is_workflow_yaml(p)]
+
+        # 2. Lint committed contents of gated Python files (matches ci.yml).
+        if py_files:
+            if ruff_bin:
+                for path in py_files:
+                    blob = git_output(["show", f"{local_sha}:{path}"], cwd=root, text=False)
+                    assert isinstance(blob, bytes)
+                    res = subprocess.run(
+                        [ruff_bin, "check", "--stdin-filename", path, "-"],
+                        cwd=root,
+                        input=blob,
+                        capture_output=True,
+                    )
+                    if res.returncode != 0:
+                        failed = True
+                        if res.stdout:
+                            sys.stderr.buffer.write(res.stdout)
+                        if res.stderr:
+                            sys.stderr.buffer.write(res.stderr)
+            elif not warned_no_ruff:
+                warned_no_ruff = True
+                print(
+                    "pre-push: ruff not found in .venv or PATH; run 'make sync' "
+                    "or install ruff to lint changed Python files",
+                    file=sys.stderr,
+                )
+
+        # 3. Validate committed contents of changed GitHub Actions workflow YAML.
+        if yaml_files:
+            if not yaml_checked:
+                yaml_py = find_yaml_python(root)
+                yaml_checked = True
+            if yaml_py:
+                for path in yaml_files:
+                    blob = git_output(["show", f"{local_sha}:{path}"], cwd=root, text=False)
+                    assert isinstance(blob, bytes)
+                    res = subprocess.run(
+                        [
+                            yaml_py,
+                            "-c",
+                            "import sys, yaml; yaml.safe_load(sys.stdin.buffer.read())",
+                        ],
+                        cwd=root,
+                        input=blob,
+                        capture_output=True,
+                    )
+                    if res.returncode != 0:
+                        failed = True
+                        print(f"pre-push: invalid workflow YAML in {path} ({local_sha[:8]}):", file=sys.stderr)
+                        if res.stderr:
+                            sys.stderr.buffer.write(res.stderr)
+            elif not warned_no_yaml:
+                warned_no_yaml = True
+                print(
+                    "pre-push: PyYAML not available in .venv or PATH python; "
+                    "run 'make sync' or install PyYAML to validate workflow YAML",
+                    file=sys.stderr,
+                )
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

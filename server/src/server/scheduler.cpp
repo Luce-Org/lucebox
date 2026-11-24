@@ -402,7 +402,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
         } else if (req.stream && !s.client_disconnected) {
-            const bool is_eos = !s.gen_tokens.empty() &&
+            const bool is_eos = !request_ignores_eos(req) && !s.gen_tokens.empty() &&
                 engine.token_is_eos(s.gen_tokens.back());
             auto final_chunks =
                 s.emitter->emit_finish(

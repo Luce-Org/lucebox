@@ -19,6 +19,8 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -122,48 +124,123 @@ static bool run_case(
         return false;
     }
 
-    std::mt19937 rng(20260713u + (unsigned) type * 97u + (unsigned) width);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> weights_f;
-    if (!benchmark) {
-        weights_f.resize((size_t) k_dim * n_rows * n_experts);
-    }
-    std::vector<float> input_f((size_t) k_dim * shape.input_channels * width);
-    for (float & value : weights_f) {
-        value = dist(rng);
-    }
-    for (float & value : input_f) {
-        value = dist(rng);
-    }
+    struct CachedCaseInputs {
+        ggml_type type = GGML_TYPE_COUNT;
+        int width = -1;
+        int k_dim = -1;
+        int n_rows = -1;
+        int n_experts = -1;
+        int input_channels = -1;
+        bool benchmark = false;
+        std::vector<uint8_t> weights_q;
+        std::vector<float> input_f;
+    };
+    static CachedCaseInputs cache;
+    const bool cache_hit =
+        cache.type == type && cache.width == width && cache.k_dim == k_dim &&
+        cache.n_rows == n_rows && cache.n_experts == n_experts &&
+        cache.input_channels == shape.input_channels && cache.benchmark == benchmark &&
+        cache.weights_q.size() == ggml_nbytes(weights);
+    if (!cache_hit) {
+        const size_t need_bytes = ggml_nbytes(weights);
+        const bool reuse_zero_weights =
+            benchmark && cache.benchmark && cache.weights_q.size() == need_bytes;
+        // Release previous cached buffers before allocating replacements so large
+        // multi-width benchmarks never hold two weight tensors in host RAM at once.
+        std::vector<float>().swap(cache.input_f);
+        if (!reuse_zero_weights) {
+            std::vector<uint8_t>().swap(cache.weights_q);
+        }
+        cache.type = GGML_TYPE_COUNT;
 
-    std::vector<uint8_t> weights_q(ggml_nbytes(weights));
-    // A zero-filled quantized tensor is valid and exercises the identical GPU
-    // load/dequantize path without constructing multi-gigabyte F32 weights for
-    // realistic expert-count benchmarks. Correctness runs still use quantized
-    // randomized weights.
-    const size_t quantized = benchmark ? weights_q.size() :
-        type == GGML_TYPE_Q2_0_ROCMFP2
-            ? rocmfpx_quantize_fp2(
-                  weights_f.data(), weights_q.data(), n_rows * n_experts,
-                  k_dim, nullptr)
-        : type == GGML_TYPE_Q3_0_ROCMFPX
-            ? rocmfpx_quantize_fp3(
-                  weights_f.data(), weights_q.data(), n_rows * n_experts,
-                  k_dim, nullptr)
-        : type == GGML_TYPE_Q4_0_ROCMFP4_FAST
-            ? rocmfp4_quantize_q4_0_fast(
-                  weights_f.data(), weights_q.data(), n_rows * n_experts,
-                  k_dim, nullptr)
-            : ggml_quantize_chunk(
-                  type, weights_f.data(), weights_q.data(), 0,
-                  n_rows * n_experts, k_dim, nullptr);
-    if (quantized != weights_q.size()) {
-        std::fprintf(stderr, "quantize size mismatch type=%s got=%zu expected=%zu\n",
-                     ggml_type_name(type), quantized, weights_q.size());
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return false;
+        std::mt19937 rng(20260713u + (unsigned) type * 97u + (unsigned) width);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> weights_f;
+        if (!benchmark) {
+            weights_f.resize((size_t) k_dim * n_rows * n_experts);
+        }
+        std::vector<float> input_f((size_t) k_dim * shape.input_channels * width);
+        for (float & value : weights_f) {
+            value = dist(rng);
+        }
+        for (float & value : input_f) {
+            value = dist(rng);
+        }
+
+        std::vector<uint8_t> weights_q;
+        if (reuse_zero_weights) {
+            weights_q = std::move(cache.weights_q);
+        } else {
+            weights_q.resize(need_bytes);
+        }
+        // A zero-filled quantized tensor is valid and exercises the identical GPU
+        // load/dequantize path without constructing multi-gigabyte F32 weights for
+        // realistic expert-count benchmarks. Correctness runs still use quantized
+        // randomized weights (parallelized by independent rows, bit-identical).
+        size_t quantized = 0;
+        if (benchmark) {
+            quantized = weights_q.size();
+        } else {
+            const int64_t total_rows = (int64_t) n_rows * n_experts;
+            const size_t row_bytes = ggml_row_size(type, k_dim);
+            const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+            const unsigned n_threads = (unsigned) std::min<int64_t>((int64_t) hw, std::max<int64_t>(1, total_rows));
+            std::vector<size_t> part_bytes(n_threads, 0);
+            auto quant_worker = [&](unsigned tid) {
+                const int64_t r0 = total_rows * tid / n_threads;
+                const int64_t r1 = total_rows * (tid + 1) / n_threads;
+                const int64_t nr = r1 - r0;
+                if (nr <= 0) return;
+                const float * src = weights_f.data() + (size_t) r0 * k_dim;
+                uint8_t * dst = weights_q.data() + (size_t) r0 * row_bytes;
+                part_bytes[tid] =
+                    type == GGML_TYPE_Q2_0_ROCMFP2
+                        ? rocmfpx_quantize_fp2(src, dst, nr, k_dim, nullptr)
+                    : type == GGML_TYPE_Q3_0_ROCMFPX
+                        ? rocmfpx_quantize_fp3(src, dst, nr, k_dim, nullptr)
+                    : type == GGML_TYPE_Q4_0_ROCMFP4_FAST
+                        ? rocmfp4_quantize_q4_0_fast(src, dst, nr, k_dim, nullptr)
+                        : ggml_quantize_chunk(type, src, dst, 0, nr, k_dim, nullptr);
+            };
+            if (n_threads <= 1) {
+                quant_worker(0);
+            } else {
+                std::vector<std::thread> threads;
+                threads.reserve(n_threads);
+                unsigned launched = 0;
+                for (; launched < n_threads; ++launched) {
+                    try {
+                        threads.emplace_back(quant_worker, launched);
+                    } catch (const std::system_error &) {
+                        break;
+                    }
+                }
+                for (unsigned t = launched; t < n_threads; ++t) {
+                    quant_worker(t);
+                }
+                for (auto & th : threads) th.join();
+            }
+            for (size_t b : part_bytes) quantized += b;
+        }
+        if (quantized != weights_q.size()) {
+            std::fprintf(stderr, "quantize size mismatch type=%s got=%zu expected=%zu\n",
+                         ggml_type_name(type), quantized, weights_q.size());
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            return false;
+        }
+        cache.type = type;
+        cache.width = width;
+        cache.k_dim = k_dim;
+        cache.n_rows = n_rows;
+        cache.n_experts = n_experts;
+        cache.input_channels = shape.input_channels;
+        cache.benchmark = benchmark;
+        cache.weights_q = std::move(weights_q);
+        cache.input_f = std::move(input_f);
     }
+    const std::vector<uint8_t> & weights_q = cache.weights_q;
+    const std::vector<float> & input_f = cache.input_f;
 
     std::vector<int32_t> ids_h((size_t) top_k * width);
     const bool masked_owner_routes =

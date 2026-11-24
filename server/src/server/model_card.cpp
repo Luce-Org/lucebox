@@ -373,6 +373,17 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
         out.source_label = "family:deepseek4";
         return true;
     }
+    if (arch_is_inkling2_family(arch)) {
+        out.max_tokens                 = 32768;
+        out.complex_problem_max_tokens = 65536;
+        out.hard_limit_reply_budget    = 4096;
+        out.sampling.temperature       = 1.0f;
+        out.sampling.top_p             = 0.95f;
+        out.sampling.has_temperature   = true;
+        out.sampling.has_top_p         = true;
+        out.source_label               = "family:inkling2";
+        return true;
+    }
     return false;
 }
 

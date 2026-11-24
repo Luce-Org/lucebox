@@ -348,6 +348,12 @@ TokenDelivery classify_generated_token(
         return TokenDelivery::kSkip;
     }
 
+    // Inkling 2 sub-message protocol (<|message_model|> [name] <|content_*|> ... <|end_message|>).
+    const int ink = emitter.consume_inkling_protocol_token(raw, tokenizer.token_text(token), text);
+    if (ink == 1) return TokenDelivery::kSkip;
+    if (ink == 2) return TokenDelivery::kText;
+    if (ink == 3) return TokenDelivery::kThinkTag;
+
     // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
     // thinking markers share one mapped dialect. The Qwen markers
     // <think> (id 248068) and </think> (id 248069) are SINGLE special
@@ -392,7 +398,7 @@ TokenDelivery classify_generated_token(
 
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter, int generation_cap) {
+        SseEmitter & emitter, int generation_cap, bool ignore_eos) {
     // The live token callback already classified these tokens on this
     // emitter; a reply cut off inside a suppressed block left it open.
     emitter.restart_tool_protocol_suppression();
@@ -410,7 +416,7 @@ CompletionTokenCounts feed_non_streaming_tokens(
 
     CompletionTokenCounts counts;
     counts.total = (int) tokens.size();
-    const bool is_eos = !tokens.empty() &&
+    const bool is_eos = !ignore_eos && !tokens.empty() &&
         (tokens.back() == tokenizer.eos_id() ||
          tokens.back() == tokenizer.eos_chat_id());
     emitter.emit_finish(counts.total, nullptr, generation_cap, is_eos);
@@ -469,7 +475,7 @@ json build_openai_completion_response(
     // daemon hit the n_gen cap. Derive "length" from the committed-token
     // count — OpenAI-compatible clients (open-webui, Cline) gate retry
     // logic on finish_reason == "length".
-    const bool is_eos = tokenizer && !result.tokens.empty() &&
+    const bool is_eos = tokenizer && !request_ignores_eos(req) && !result.tokens.empty() &&
         (result.tokens.back() == tokenizer->eos_id() ||
          result.tokens.back() == tokenizer->eos_chat_id());
     std::string finish_reason = emitter.finish_reason();
@@ -580,7 +586,7 @@ json build_anthropic_response(
     // stop_reason is Anthropic's analog of finish_reason, with the same
     // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
     // retry logic on stop_reason == "max_tokens".
-    const bool is_eos = tokenizer && !result.tokens.empty() &&
+    const bool is_eos = tokenizer && !request_ignores_eos(req) && !result.tokens.empty() &&
         (result.tokens.back() == tokenizer->eos_id() ||
          result.tokens.back() == tokenizer->eos_chat_id());
     // A degenerate decode (the repetition watchdog) is "max_tokens", as
@@ -673,7 +679,7 @@ json build_non_streaming_response(
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
         SseEmitter & emitter) {
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter, generation_cap);
+        result.tokens, tokenizer, emitter, generation_cap, request_ignores_eos(req));
     return build_non_streaming_response(
         req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }

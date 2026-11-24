@@ -1560,6 +1560,116 @@ bool DeepSeek4Backend::run_staged_chunk(StagedPrefill & item, int max_rows,
         error = "image encoding failed";
         return false;
     }
+    // Layer-major staged text prefill (+ decoder SWA bounded replay when
+    // LUCE_DS41_DECODER_BOUNDED_REPLAY=1): reads each expert weight matrix ONCE
+    // per layer per pass and skips layers > replay_cut for tokens before the
+    // final n_swa window (since import_deepseek4_paged_slot only imports the
+    // 128-row raw ring for layers past the deepest KV compressor source).
+    const int remaining = item.stop() - item.done;
+    if (!images && moe_hybrid_ && remaining >= 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+        constexpr int band_cfg = 1024;
+        const int cut = bounded_replay_cut();
+        const bool use_replay = (cut >= 0 && cut + 1 < w_.n_layer &&
+                                 item.cuts.empty() &&
+                                 item.prefix > w_.n_swa + 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+                                 w_.n_swa >= DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS &&
+                                 item.done < item.prefix - w_.n_swa);
+        const int replay_from = use_replay ? (item.prefix - w_.n_swa) : item.stop();
+        const int target_end  = use_replay ? replay_from : item.stop();
+        const int rem_target  = target_end - item.done;
+
+        const int dev_rows = deepseek4_layer_major_device_rows(cfg_.device.gpu, w_);
+        const int pass_cap = std::min({
+            rem_target,
+            std::max(max_rows, 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS),
+            DS4_LAYER_MAJOR_PROMPT_SPAN,
+            dev_rows >= 2 * DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ? dev_rows : DS4_LAYER_MAJOR_PROMPT_SPAN,
+        });
+        const int band_cap = std::min(band_cfg, std::max(DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS, hybrid_prefill_chunk_cap_));
+        std::vector<int> bands;
+        int span = 0;
+        while (span < pass_cap) {
+            const int left_pass = pass_cap - span;
+            const int left_total = rem_target - span;
+            int b = deepseek4_hybrid_prefill_step_tokens(band_cap, item.done + span, left_pass);
+            b = std::min(b, left_pass);
+            if (b < left_total && left_total - b < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+                if (left_total <= pass_cap && left_total <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS) {
+                    b = left_total;
+                } else if (b > DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) {
+                    b = left_total - DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+                }
+            }
+            if (b < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS) break;
+            bands.push_back(b);
+            span += b;
+        }
+        const bool with_tail = use_replay && !bands.empty() && (item.done + span == replay_from);
+        const int tail_rows  = with_tail ? w_.n_swa : 0;
+        if ((bands.size() >= 2 || with_tail) && span > 0) {
+            const bool tail_merged = with_tail &&
+                bands.back() + tail_rows <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+            if (tail_merged) bands.back() += tail_rows;
+            else if (with_tail) bands.push_back(tail_rows);
+
+            const int pass_rows = span + tail_rows;
+            std::vector<float> embed(size_t(pass_rows) * size_t(w_.n_embd));
+            if (!w_.embedder.embed(item.prompt.data() + item.done, pass_rows, embed.data())) {
+                error = "staged prefill embedding failed";
+                return false;
+            }
+            DeepSeek4LayerMajorTail replay_tail;
+            replay_tail.rows = tail_rows;
+            if (!deepseek4_prefill_layer_major(
+                    backend_, cfg_.device.gpu, w_, *item.staging, embed.data(),
+                    item.prompt.data() + item.done, item.done, bands, nullptr,
+                    moe_hybrid_.get(), expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                    routing_stats_.get(), use_replay ? (cut + 1) : -1,
+                    with_tail ? &replay_tail : nullptr)) {
+                error = "staged text layer-major prefill failed";
+                return false;
+            }
+            if (with_tail) {
+                item.staging->cur_pos = replay_from;
+                for (int il = cut + 1; il < w_.n_layer; ++il) {
+                    item.staging->layers[(size_t) il].swa_floor = replay_from;
+                }
+                DeepSeek4LayerMajorBand tail_band;
+                tail_band.staggered_pre = &replay_tail.pre;
+                tail_band.selection_first = replay_tail.selection_first;
+                tail_band.selection_columns = replay_tail.selection_columns;
+                item.staging->layer_major_band = &tail_band;
+                std::vector<float> hc_state;
+                const bool tail_ok = deepseek4_step_layer_range(
+                    backend_, cfg_.device.gpu, w_, *item.staging, hc_state,
+                    replay_tail.residual.data(), tail_rows, replay_from,
+                    cut + 1, w_.n_layer, nullptr,
+                    item.prompt.data() + replay_from, nullptr,
+                    /*allow_decode_graph_reuse=*/false, nullptr,
+                    moe_hybrid_.get(),
+                    expert_runtime_.compute ? &expert_runtime_ : nullptr,
+                    routing_stats_.get(), vision::ImageSpanView{});
+                item.staging->layer_major_band = nullptr;
+                for (int il = cut + 1; il < w_.n_layer; ++il) {
+                    item.staging->layers[(size_t) il].swa_floor = 0;
+                }
+                if (!tail_ok) {
+                    error = "staged text bounded replay tail failed";
+                    return false;
+                }
+                std::fprintf(stderr,
+                             "[deepseek4] staged layer-major replay: %d+%d tokens (cut=%d) in %zu bands at pos=%d\n",
+                             span, tail_rows, cut, bands.size(), item.done);
+                item.done = item.prefix;
+                return true;
+            }
+            std::fprintf(stderr, "[deepseek4] staged layer-major prefill: %d tokens (layers 0-%d) in %zu bands at pos=%d\n",
+                         span, use_replay ? cut : (w_.n_layer - 1), bands.size(), item.done);
+            item.done += span;
+            return true;
+        }
+    }
+
     const int n = staged_chunk_rows(item, max_rows);
     if (n <= 0) {
         error = "staged prefill could not be chunked";

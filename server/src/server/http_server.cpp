@@ -6765,7 +6765,8 @@ json HttpServer::memory_json() const {
 }
 
 bool HttpServer::think_tags_are_tokens() const {
-    return chat_codec_ && think_close_token(tokenizer_) >= 0;
+    return chat_codec_ &&
+        (think_close_token(tokenizer_) >= 0 || chat_codec_->id().rfind("inkling2/", 0) == 0);
 }
 
 bool HttpServer::save_generated_turn(
@@ -7251,7 +7252,7 @@ void HttpServer::send_nonstream_response(
         const luce::common::SpecAcceptanceStats * acceptance) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
-    const bool is_eos = !gen_tokens.empty() &&
+    const bool is_eos = !request_ignores_eos(req) && !gen_tokens.empty() &&
         (gen_tokens.back() == tokenizer_.eos_id() ||
          gen_tokens.back() == tokenizer_.eos_chat_id());
     emitter.emit_finish(counts.total, nullptr, n_gen_cap, is_eos);
@@ -7633,7 +7634,7 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
-    const bool is_eos = !result.tokens.empty() &&
+    const bool is_eos = !request_ignores_eos(req) && !result.tokens.empty() &&
         (result.tokens.back() == tokenizer_.eos_id() ||
          result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
