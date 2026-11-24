@@ -19031,6 +19031,77 @@ TEST_CASE(ServerUnitFixture, test_ignore_eos_at_cap_finishes_as_length) {
     }
 }
 
+#if !defined(_WIN32)  // socketpair()
+// A non-streamed reply that matched a stop sequence ended there, as when streamed, even at
+// max_tokens: "stop", and the stream's "end_turn" for Anthropic, not "length" / "max_tokens".
+// The serial path cuts the reply at the stop sequence once generated, so the reply can run
+// on to the cap; under continuous batching the stop sequence can end on the cap token.
+TEST_CASE(ServerUnitFixture, test_nonstream_stop_sequence_at_cap_finishes_as_stop) {
+    const std::string path = write_thinking_tool_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    std::string failures;
+    struct Case { bool concurrent; bool anthropic; };
+    for (const Case c : {Case{false, false}, Case{false, true}, Case{true, false}, Case{true, true}}) {
+        const bool concurrent = c.concurrent, anthropic = c.anthropic;
+        // No end of turn: the reply runs to max_tokens.
+        const std::vector<int32_t> reply =
+            tokenizer.encode(concurrent ? "Hello END" : "Hello END and more text");
+        std::unique_ptr<MockBackend> backend_owner;
+        if (concurrent) {
+            auto seq_backend = std::make_unique<ScriptedReplySeqBackend>();
+            seq_backend->engine.eos = tokenizer.eos_chat_id();
+            seq_backend->engine.reply = reply;
+            backend_owner = std::move(seq_backend);
+        } else {
+            auto serial_backend = std::make_unique<ScriptedReplyBackend>();
+            serial_backend->reply = reply;
+            backend_owner = std::move(serial_backend);
+        }
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.arch = "qwen35";
+        config.max_ctx = 4096;
+        config.prefix_cache_cap = 0;
+        config.admission_coalesce_ms = 0;
+        HttpServer server(engine, tokenizer, config);
+        TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+        json body = {
+            {"model", "test"},
+            {"messages", json::array({{{"role", "user"}, {"content", "Say hello."}}})},
+            {"max_tokens", (int) reply.size()},
+            {"chat_template_kwargs", {{"enable_thinking", false}}},
+            {"tool_checks", false},
+        };
+        body[anthropic ? "stop_sequences" : "stop"] = json::array({"END"});
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        TEST_ASSERT(SchedulerTestHarness::route(
+            server, sockets[0], anthropic ? "/v1/messages" : "/v1/chat/completions", body));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        ssize_t n = 0;
+        while ((n = read(sockets[1], buf, sizeof(buf))) > 0) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        const size_t body_at = wire.find("\r\n\r\n");
+        TEST_ASSERT_MSG(body_at != std::string::npos, wire);
+        const json response = json::parse(wire.substr(body_at + 4));
+        const bool ok = anthropic
+            ? response["stop_reason"] == "end_turn" && response["content"][0]["text"] == "Hello "
+            : response["choices"][0]["finish_reason"] == "stop" &&
+                  response["choices"][0]["message"]["content"] == "Hello ";
+        if (!ok) {
+            failures += std::string(concurrent ? "concurrent" : "serial") + ", " +
+                        (anthropic ? "anthropic" : "openai") + ": " + response.dump() + "\n";
+        }
+    }
+    TEST_ASSERT_MSG(failures.empty(), failures);
+}
+#endif  // !defined(_WIN32)
+
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_empty_invoke_zero_args) {
     json tools = json::array({
         {

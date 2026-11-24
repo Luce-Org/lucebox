@@ -474,12 +474,14 @@ json build_openai_completion_response(
     // The emitter only knows "stop" / "tool_calls"; it cannot see that the
     // daemon hit the n_gen cap. Derive "length" from the committed-token
     // count — OpenAI-compatible clients (open-webui, Cline) gate retry
-    // logic on finish_reason == "length".
+    // logic on finish_reason == "length". A matched stop sequence ends the
+    // reply even at the cap, as in the stream.
     const bool is_eos = tokenizer && !request_ignores_eos(req) && !result.tokens.empty() &&
         (result.tokens.back() == tokenizer->eos_id() ||
          result.tokens.back() == tokenizer->eos_chat_id());
     std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
+    if (finish_reason == "stop" && !emitter.stop_hit() && !is_eos &&
+        counts.total >= generation_cap) {
         finish_reason = "length";
     }
     // Degenerate decode (post-close repetition-loop watchdog) also reports
@@ -596,7 +598,7 @@ json build_anthropic_response(
         stop_reason = "max_tokens";
     } else if (emitter.finish_reason() == "tool_calls") {
         stop_reason = "tool_use";
-    } else if (!is_eos && counts.total >= generation_cap) {
+    } else if (!emitter.stop_hit() && !is_eos && counts.total >= generation_cap) {
         stop_reason = "max_tokens";
     } else {
         stop_reason = "end_turn";
