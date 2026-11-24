@@ -310,6 +310,58 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
     return pieces;
 }
 
+// The CJK class of DeepSeek's second split, [一-龥぀-ゟ゠-ヿ]: CJK Unified
+// Ideographs U+4E00..U+9FA5, Hiragana and Katakana.
+static bool is_deepseek_cjk(uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF);
+}
+
+// DeepSeek V3/V4's tokenizer.json runs Split(\p{N}{1,3}), then
+// Split([一-龥぀-ゟ゠-ヿ]+), both Isolated, before the main pattern, which then
+// sees each piece on its own. The main pattern's \s+(?!\S) therefore keeps a
+// whitespace run before a number or CJK text whole: "a  1" is a | "  " | 1,
+// where one pass of the main pattern gives a | " " | " " | 1. The two classes
+// are disjoint, so one scan isolating both equals the two splits in order.
+std::vector<std::string> Tokenizer::pre_split(const std::string & text) const {
+    if (pre_type_ != PreTokenizer::DEEPSEEK3) return pre_tokenize(text);
+
+    std::vector<std::string> pieces;
+    const auto main_split = [&](size_t from, size_t to) {
+        if (to <= from) return;
+        for (auto & piece : pre_tokenize(text.substr(from, to - from))) {
+            pieces.push_back(std::move(piece));
+        }
+    };
+    const char * s = text.c_str();
+    const size_t len = text.size();
+    size_t seg = 0, pos = 0;
+    while (pos < len) {
+        int cplen = 0;
+        const uint32_t cp = utf8_decode(s + pos, len - pos, &cplen);
+        if (cplen <= 0) cplen = 1;
+        const bool digit = is_digit(cp);
+        if (!digit && !is_deepseek_cjk(cp)) {
+            pos += cplen;
+            continue;
+        }
+        size_t end = pos;
+        int run = 0;
+        while (end < len) {
+            int cl = 0;
+            const uint32_t c = utf8_decode(s + end, len - end, &cl);
+            if (cl <= 0) cl = 1;
+            if (digit ? (run == 3 || !is_digit(c)) : !is_deepseek_cjk(c)) break;
+            end += cl;
+            ++run;
+        }
+        main_split(seg, pos);
+        main_split(pos, end);
+        seg = pos = end;
+    }
+    main_split(seg, len);
+    return pieces;
+}
+
 // ─── BPE encoding ──────────────────────────────────────────────────────
 
 // GPT-2 byte-level BPE maps printable byte ranges directly to codepoints,
@@ -653,6 +705,10 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         const char * pre = gguf_get_val_str(gctx, pre_key);
         if (pre && std::strcmp(pre, "qwen35") == 0) {
             pre_type_ = PreTokenizer::QWEN35;
+        } else if (pre && (std::strcmp(pre, "deepseek-v3") == 0 ||
+                           std::strcmp(pre, "joyai-llm") == 0)) {
+            // llama.cpp's DEEPSEEK3_LLM / JOYAI_LLM pre types.
+            pre_type_ = PreTokenizer::DEEPSEEK3;
         } else {
             pre_type_ = PreTokenizer::QWEN2;
         }
@@ -697,7 +753,9 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 
     std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 pre_type_ == PreTokenizer::QWEN35      ? "qwen35"
+                 : pre_type_ == PreTokenizer::DEEPSEEK3 ? "deepseek3"
+                                                        : "qwen2",
                  is_sentencepiece_ ? "yes" : "no");
     return true;
 }
@@ -728,7 +786,7 @@ std::vector<int32_t> Tokenizer::encode_matching(
     std::vector<int32_t> ids;
     // Pre-tokenize + BPE a run of plain text.
     const auto plain = [&](const std::string & segment) {
-        for (const auto & piece : pre_tokenize(segment)) {
+        for (const auto & piece : pre_split(segment)) {
             auto piece_ids = bpe_encode_piece(piece);
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }
