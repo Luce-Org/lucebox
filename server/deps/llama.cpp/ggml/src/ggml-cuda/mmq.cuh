@@ -5306,16 +5306,15 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }();
     int requested_mmq_x = 0;  // 0: automatic selection
     if (requested_mmq_x == 0 && adaptive_moe_x_mode != 0 &&
-        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
         args.expert_bounds != nullptr && args.nchannels_x > 0) {
         // Grouped MoE routes are sparse across experts. Sizing the X tile from
         // the full token width makes almost every workgroup carry padding. Use
         // the mean live-route density as a model-neutral trigger, then select
-        // the measured gfx1151 tile for each unpack format. The grid still
-        // spans ncols_max, so skewed experts remain fully covered.
+        // the measured tile for each unpack format. The grid still spans
+        // ncols_max, so skewed experts remain fully covered.
         const int64_t routes_per_expert =
             (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
-        if (routes_per_expert <= 16) {
+        if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && routes_per_expert <= 16) {
             switch (type) {
                 case GGML_TYPE_Q2_0_ROCMFP2:      if (adaptive_moe_x_mode == 1) requested_mmq_x = 32; break;
                 case GGML_TYPE_Q3_0_ROCMFPX:      if (adaptive_moe_x_mode == 1) requested_mmq_x = 48; break;
@@ -5325,7 +5324,29 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
                 // pad, 16/24 slower), outputs identical; denser routes unchanged.
                 case GGML_TYPE_Q2_1_ROCMFP2_MIX:  requested_mmq_x = 32; break;
                 case GGML_TYPE_Q3_1_ROCMFP3_MIX:  requested_mmq_x = 32; break;
+                // Sparse IQ4_NL MoE (e.g. 128-expert Top-8 2DSD batches of 20..64 rows,
+                // ~1-4 routes/expert): mmq_x=32 doubles WMMA work and spills VGPRs under
+                // RDNA3 __launch_bounds__(256, 2) (+167 us/layer cliff on gfx1151).
+                // Keeping mmq_x=16 is bit-exact and eliminates the >16 row cliff.
+                case GGML_TYPE_IQ4_NL:            if (routes_per_expert <= 8) requested_mmq_x = 16; break;
                 default: break;
+            }
+        }
+        // On RDNA4 (gfx1201), sparse IQ4_NL MoE (<=8 routes/expert) also hits the slow
+        // mmq_x=32 tile of the q8_0 MMA path at row_b=20..32; mmq_x=16 is bit-exact and
+        // measured -9.6% to -10.0% faster on 12-layer Core at row_b=20..24.
+        if (requested_mmq_x == 0 && type == GGML_TYPE_IQ4_NL &&
+            GGML_CUDA_CC_IS_RDNA4(cc) && routes_per_expert <= 8) {
+            requested_mmq_x = 16;
+        }
+        if (type == GGML_TYPE_IQ4_NL && routes_per_expert <= 8 &&
+            (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+            static const int iq4_nl_moe_x = []() {
+                const char * raw = std::getenv("LUCE_MMQ_IQ4_NL_MOE_X");
+                return (raw && *raw) ? std::atoi(raw) : -1;
+            }();
+            if (iq4_nl_moe_x >= 0) {
+                requested_mmq_x = iq4_nl_moe_x;
             }
         }
     }

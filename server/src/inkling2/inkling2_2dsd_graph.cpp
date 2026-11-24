@@ -7,6 +7,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -209,9 +210,16 @@ static bool prefill_share_coda_enabled() {
 static int dual_2dsd_min_rows() {
     if (const char * e = std::getenv("LUCE_INKLING2_2DSD_DUAL_MIN_ROWS")) {
         const int v = std::atoi(e);
-        if (v >= 2 && v <= 64) return v;
+        if (v >= 1 && v <= 64) return v;
     }
-    return 32;
+    return 6;
+}
+
+static int dual_2dsd_phases_mask() {
+    if (const char * e = std::getenv("LUCE_INKLING2_2DSD_DUAL_PHASES")) {
+        return std::atoi(e);
+    }
+    return 7; // bit 0 = prelude, bit 1 = core, bit 2 = coda
 }
 
 static int dual_2dsd_split_pct(const Inkling2Weights & w) {
@@ -219,7 +227,34 @@ static int dual_2dsd_split_pct(const Inkling2Weights & w) {
         const int v = std::atoi(e);
         if (v >= 50 && v <= 99) return v;
     }
-    return std::max(w.split_pct, 84);
+    return w.split_pct;
+}
+
+static bool dual_2dsd_f16_transport() {
+    const char * e = std::getenv("LUCE_INKLING2_2DSD_DUAL_F16");
+    return (e != nullptr && std::atoi(e) != 0);
+}
+
+static int dual_2dsd_lm_split_max() {
+    if (const char * e = std::getenv("LUCE_INKLING2_2DSD_LM_SPLIT_MAX")) {
+        const int v = std::atoi(e);
+        if (v >= 0 && v <= 64) return v;
+    }
+    // Keep 2DSD Coda's Q8_0 LM head on target_backend (R9700): even at row_b=4..8,
+    // copying 0.6-1.1 MB of F32 tail logits over PCIe + ggml_concat costs +0.30-0.37 ms
+    // vs running w.output directly on R9700, while Coda's 6 MoE layers still split cleanly.
+    return 0;
+}
+
+static bool dual_2dsd_batch_copies() {
+    const char * e = std::getenv("LUCE_INKLING2_2DSD_BATCH_COPIES");
+    return (e != nullptr && std::atoi(e) != 0);
+}
+
+static bool twodsd_profile_enabled() {
+    static const bool on = (std::getenv("LUCE_INKLING2_2DSD_PROFILE") != nullptr &&
+                            std::atoi(std::getenv("LUCE_INKLING2_2DSD_PROFILE")) != 0);
+    return on;
 }
 
 static ggml_tensor * make_tree_commit(
@@ -584,8 +619,9 @@ static ggml_tensor * build_tree_layer(
         ggml_tensor * hot_act  = ggml_inkling2_situ(c, hot_gu, w.situ_beta, w.situ_linear_beta);
         ggml_tensor * hot_down = ggml_mul_mat_id(c, L.ffn_down_exps, hot_act, hot_sel);
 
-        const int cold_sum_f16 = (row_b > 16) ? 1 : 0;
-        ggml_tensor * cold_in  = (row_b > 32) ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
+        const bool use_f16_x = dual_2dsd_f16_transport();
+        const int cold_sum_f16 = (use_f16_x && row_b >= 8) || (row_b > 32) ? 1 : 0;
+        ggml_tensor * cold_in  = ((use_f16_x && row_b >= 8) || row_b > 32) ? ggml_cast(c, cur, GGML_TYPE_F16) : cur;
         ggml_tensor * cold_f32 = (cold_in->type == GGML_TYPE_F16) ? ggml_cast(c, cold_in, GGML_TYPE_F32) : cold_in;
         if (cold_f32 != cold_in) g.expert_nodes.push_back(cold_f32);
         ggml_tensor * cold_x3   = ggml_reshape_3d(c, cold_f32, w.n_embd, 1, row_b);
@@ -596,7 +632,13 @@ static ggml_tensor * build_tree_layer(
         g.expert_nodes.insert(g.expert_nodes.end(), { cold_gu, cold_act, cold_down, cold_sum });
         ggml_build_forward_expand(gf, cold_sum);
         ggml_build_forward_expand(gf, hot_down);
-        prefetch_next_tree_layer(c, gf, hot_down, ip, phase_id, has_later, w);
+        // Optional MALL prefetch (off by default matching inkling2_graph.cpp: reading ~35 MB/layer
+        // unconditionally blocks the join kernel and adds ~1.3 ms/step on R9700!).
+        const bool do_pf = (std::getenv("LUCE_INKLING2_PREFETCH") != nullptr &&
+                            std::atoi(std::getenv("LUCE_INKLING2_PREFETCH")) != 0);
+        if (do_pf) {
+            prefetch_next_tree_layer(c, gf, hot_down, ip, phase_id, has_later, w);
+        }
 
         // Fused MoE masked sum + peer join + tree ffn_post ShortConv + residual add (subop 42)
         cur = make_moe_masked_sum_tree_sconv_add(
@@ -635,6 +677,9 @@ static bool alloc_phase_graph(
         g.sched = ggml_backend_sched_new(backends, nullptr, 3, max_nodes, true, false);
         if (!g.sched) return false;
         ggml_backend_sched_set_late_cross_input_split(g.sched, true);
+        if (dual_2dsd_batch_copies()) {
+            ggml_backend_sched_set_batch_split_copies(g.sched, true);
+        }
         ggml_backend_cuda_set_copy_tail(target_backend, true);
         ggml_backend_cuda_set_copy_tail(w.expert_backend, true);
         ggml_backend_sched_reset(g.sched);
@@ -798,7 +843,7 @@ static bool build_phase_graph(
             blocks.empty() ? nullptr : blocks.data(), (int) blocks.size(), w.rms_eps);
 
         ggml_tensor * raw_logits = nullptr;
-        if (use_split && w.expert_backend && w.output_tail && row_b <= 32) {
+        if (use_split && w.expert_backend && w.output_tail && row_b <= dual_2dsd_lm_split_max()) {
             const int64_t head_rows = w.output->ne[1] - w.output_tail->ne[1];
             ggml_tensor * head_w = ggml_view_2d(c, w.output, w.output->ne[0], head_rows, w.output->nb[1], 0);
             ggml_tensor * head   = ggml_mul_mat(c, head_w, out_norm);
@@ -943,7 +988,9 @@ static bool run_phase(
         std::vector<int32_t> * out_greedy = nullptr) {
     auto & tc = cache.tree;
     const int min_dual = dual_2dsd_min_rows();
-    const bool use_split = allow_split && w.expert_backend && w.split_exp > 0 && st.row_b >= min_dual && st.row_b <= 64;
+    const bool phase_split_ok = ((dual_2dsd_phases_mask() & (1 << phase_id)) != 0);
+    const bool use_split = allow_split && phase_split_ok && w.expert_backend && w.split_exp > 0 &&
+                           st.row_b >= min_dual && st.row_b <= 64;
     const auto key = std::make_tuple(phase_id, st.row_b, st.path_b, has_later ? 1 : 0, use_split ? 1 : 0);
     auto & g = tc.phase_graphs[key];
     if (!g.built) {
@@ -951,6 +998,9 @@ static bool run_phase(
             return false;
         }
     }
+
+    const bool prof = twodsd_profile_enabled();
+    const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     const int32_t pref_len = tc.prefix_len;
     ggml_backend_tensor_set(g.inp_meta,       st.meta.data(),  0, st.meta.size()  * sizeof(int32_t));
@@ -965,16 +1015,18 @@ static bool run_phase(
     ggml_status status = GGML_STATUS_SUCCESS;
     if (g.sched) {
         status = ggml_backend_sched_graph_compute_async(g.sched, g.gf);
-        if (status == GGML_STATUS_SUCCESS && w.expert_backend) {
+        // Only issue Strix idle hold on Coda (or when explicitly synced) to keep Strix warm across
+        // the ~2.6 ms drafter window without injecting a hold barrier between Prelude -> Core -> Coda!
+        if (status == GGML_STATUS_SUCCESS && w.expert_backend && out_greedy) {
             ggml_backend_cuda_hold(w.expert_backend, 8000);
         }
-        if (status == GGML_STATUS_SUCCESS) {
+        if (status == GGML_STATUS_SUCCESS && (out_greedy || prof)) {
             ggml_backend_sched_synchronize(g.sched);
         }
     } else {
         // Chain Prelude/Core asynchronously on the same GPU stream when no host readback is requested;
         // Coda (with out_greedy) performs the single end-of-step sync!
-        status = out_greedy
+        status = (out_greedy || prof)
             ? ggml_backend_graph_compute(target_backend, g.gf)
             : ggml_backend_graph_compute_async(target_backend, g.gf);
     }
@@ -983,6 +1035,12 @@ static bool run_phase(
     if (out_greedy && g.out_greedy) {
         out_greedy->resize((size_t) st.row_b);
         ggml_backend_tensor_get(g.out_greedy, out_greedy->data(), 0, (size_t) st.row_b * sizeof(int32_t));
+    }
+    if (prof) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static const char * kNames[3] = { "Prelude", "Core", "Coda" };
+        std::fprintf(stderr, "[2dsd-prof] %-7s row_b=%d path_b=%d split=%d ms=%.3f\n",
+                     kNames[phase_id], st.row_b, st.path_b, use_split ? 1 : 0, ms);
     }
     return true;
 }
