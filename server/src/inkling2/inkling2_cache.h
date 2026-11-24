@@ -145,7 +145,8 @@ struct Inkling2TwoDSDPrefixStoreGraph {
     ggml_gallocr_t alloc = nullptr;
     ggml_cgraph *  gf    = nullptr;
     ggml_tensor *  feats = nullptr; // F16 [5*H, T] (or gather idx I32 [T])
-    ggml_tensor *  pos   = nullptr; // I32 [T]
+    ggml_tensor *  pos   = nullptr; // I32 [T] (true absolute RoPE position)
+    ggml_tensor *  wpos  = nullptr; // I32 [T] (compact draft KV write slot = pos - draft_pref_start)
     bool           built = false;
 };
 
@@ -155,6 +156,7 @@ struct Inkling2TreeCache {
     int  max_nodes = kInkling2TwoDSDMaxNodes; // live slots [0..max_nodes-1]; scratch = max_nodes
     int  n_depths  = 3;                       // coda planes for readout depths {1, 2, 3}
     int  prefix_len = 0;
+    int  draft_pref_start = 0;                // tail-only drafter prefix start (0 = full prefix)
 
     // Flat 4D per-physical-layer tensors (24 physical layers):
     //   planes[ip]: 1 for prelude (0..5), 3 for core (6..17), 3 for coda (18..23) -> 60 planes total

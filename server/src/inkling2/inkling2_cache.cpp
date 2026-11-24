@@ -354,6 +354,7 @@ void reset_inkling2_cache(Inkling2Cache & cache) {
     cache.cur_pos = 0;
     cache.dspark_ctx_pos = 0;
     cache.tree.prefix_len = 0;
+    cache.tree.draft_pref_start = 0;
     if (cache.buf) {
         if (cache.tree.active) {
             for (ggml_tensor * pc : cache.tree.prefix_conv) {

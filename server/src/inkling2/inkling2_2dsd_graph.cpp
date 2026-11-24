@@ -184,6 +184,44 @@ static ggml_tensor * make_tree_attn_rel(
     return res;
 }
 
+static ggml_tensor * make_tree_prefill_clone_coda(
+        ggml_context * c,
+        ggml_tensor * prefix_k, ggml_tensor * prefix_v, ggml_tensor * prefix_conv,
+        ggml_tensor * dep, int pos0, int n_tokens, int swa_window) {
+    ggml_tensor * res = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = prefix_k;
+    res->src[1] = prefix_v;
+    res->src[2] = prefix_conv;
+    res->src[3] = dep;
+    set_op_i32(res, 0, 43);
+    set_op_i32(res, 1, pos0);
+    set_op_i32(res, 2, n_tokens);
+    set_op_i32(res, 3, swa_window);
+    return res;
+}
+
+static bool prefill_share_coda_enabled() {
+    const char * e = std::getenv("LUCE_INKLING2_2DSD_PREFILL_SHARE_CODA");
+    return (e == nullptr || std::atoi(e) != 0);
+}
+
+static int dual_2dsd_min_rows() {
+    if (const char * e = std::getenv("LUCE_INKLING2_2DSD_DUAL_MIN_ROWS")) {
+        const int v = std::atoi(e);
+        if (v >= 2 && v <= 64) return v;
+    }
+    return 32;
+}
+
+static int dual_2dsd_split_pct(const Inkling2Weights & w) {
+    if (const char * e = std::getenv("LUCE_INKLING2_2DSD_SPLIT_PCT")) {
+        const int v = std::atoi(e);
+        if (v >= 50 && v <= 99) return v;
+    }
+    return std::max(w.split_pct, 84);
+}
+
 static ggml_tensor * make_tree_commit(
         ggml_context * c,
         ggml_tensor * prefix_k, ggml_tensor * prefix_v,
@@ -531,8 +569,9 @@ static ggml_tensor * build_tree_layer(
     ggml_tensor * w_router = L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp;
 
     if (do_split) {
+        const int spct = dual_2dsd_split_pct(w);
         ggml_tensor * packed = make_fused_router_q8_topk(
-            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, w.split_pct);
+            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, spct);
         ggml_tensor * hot_sel  = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], 0);
         ggml_tensor * cold_sel = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], packed->nb[2]);
         ggml_tensor * wsel     = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], 2 * packed->nb[2]);
@@ -903,7 +942,8 @@ static bool run_phase(
         bool allow_split,
         std::vector<int32_t> * out_greedy = nullptr) {
     auto & tc = cache.tree;
-    const bool use_split = allow_split && w.expert_backend && w.split_exp > 0 && st.row_b >= 2 && st.row_b <= 64;
+    const int min_dual = dual_2dsd_min_rows();
+    const bool use_split = allow_split && w.expert_backend && w.split_exp > 0 && st.row_b >= min_dual && st.row_b <= 64;
     const auto key = std::make_tuple(phase_id, st.row_b, st.path_b, has_later ? 1 : 0, use_split ? 1 : 0);
     auto & g = tc.phase_graphs[key];
     if (!g.built) {
@@ -1141,7 +1181,10 @@ bool inkling2_2dsd_prefill_chunk(
     }
     ggml_tensor * prelude_cur = cur;
 
-    // 2. For each pass p in 0..n_passes-1: run Core (L6..17, plane p) AND Coda (L18..23, plane p)
+    // 2. For each pass p in 0..n_passes-1: run Core (L6..17, plane p).
+    // When prefill_share_coda_enabled() (default ON): run Coda (L18..23) ONLY on final depth-3
+    // pass (48 layers = exact AR cost!) and clone depth-3 prefix KV/conv -> planes 0 & 1 (~40 us!).
+    const bool share_coda = prefill_share_coda_enabled();
     std::vector<ggml_tensor *> bank;
     ggml_tensor * bank_out = nullptr;
     ggml_tensor * loop3_taps[5] = { tap_l2, nullptr, nullptr, nullptr, nullptr };
@@ -1164,33 +1207,52 @@ bool inkling2_2dsd_prefill_chunk(
         std::vector<ggml_tensor *> next_bank(blocks.begin() + (ptrdiff_t) prelude_blocks.size() + 1, blocks.end());
         ggml_tensor * next_bank_out = p_cur;
 
-        // Coda for depth = pass + 1 (populates Coda plane `pass` KV & conv states!)
-        std::vector<ggml_tensor *> coda_blocks = blocks;
-        ggml_tensor * c_cur = p_cur;
-        for (int ip = w.core_end; ip < w.n_layer_phys; ++ip) {
-            if (pass == w.n_passes - 1 && ip == w.twodsd.feature_layers[4]) {
-                loop3_taps[4] = c_cur;
+        if (!share_coda || pass == w.n_passes - 1) {
+            std::vector<ggml_tensor *> coda_blocks = blocks;
+            ggml_tensor * c_cur = p_cur;
+            for (int ip = w.core_end; ip < w.n_layer_phys; ++ip) {
+                if (pass == w.n_passes - 1 && ip == w.twodsd.feature_layers[4]) {
+                    loop3_taps[4] = c_cur;
+                }
+                c_cur = run_prefill_layer(ip, pass, c_cur, coda_blocks, nullptr, nullptr);
+                if (share_coda && pass == w.n_passes - 1) {
+                    const int swa = w.layers[ip].is_swa ? w.swa_window : 0;
+                    ggml_build_forward_expand(gf, make_tree_prefill_clone_coda(
+                        c, tc.prefix_k[ip], tc.prefix_v[ip], tc.prefix_conv[ip], c_cur, pos0, n_tokens, swa));
+                }
             }
-            c_cur = run_prefill_layer(ip, pass, c_cur, coda_blocks, nullptr, nullptr);
-        }
-        if (pass == w.n_passes - 1) {
-            final_out_norm = ggml_inkling2_attn_res_mix(
-                c, c_cur, w.output_res_query, w.output_norm,
-                coda_blocks.empty() ? nullptr : coda_blocks.data(), (int) coda_blocks.size(), w.rms_eps);
-        } else {
-            ggml_build_forward_expand(gf, c_cur);
+            if (pass == w.n_passes - 1) {
+                final_out_norm = ggml_inkling2_attn_res_mix(
+                    c, c_cur, w.output_res_query, w.output_norm,
+                    coda_blocks.empty() ? nullptr : coda_blocks.data(), (int) coda_blocks.size(), w.rms_eps);
+            } else {
+                ggml_build_forward_expand(gf, c_cur);
+            }
         }
 
         bank = std::move(next_bank);
         bank_out = next_bank_out;
     }
 
-    // Pack loop-3 5-tap features [5*H, n_tokens]
-    ggml_tensor * f01 = ggml_concat(c, loop3_taps[0], loop3_taps[1], 0);
-    ggml_tensor * f23 = ggml_concat(c, loop3_taps[2], loop3_taps[3], 0);
-    ggml_tensor * feats_out = ggml_concat(c, ggml_concat(c, f01, f23, 0), loop3_taps[4], 0);
-    ggml_set_output(feats_out);
-    ggml_build_forward_expand(gf, feats_out);
+    // Fused in-graph tail-only drafter prefix KV projection (zero extra gallocr / copy / sync!)
+    const int tail_beg = std::max(0, tc.draft_pref_start - pos0);
+    const int tail_n   = std::max(0, n_tokens - tail_beg);
+    ggml_tensor * inp_dr_pos  = nullptr;
+    ggml_tensor * inp_dr_wpos = nullptr;
+    if (tail_n > 0) {
+        auto slice_tail = [&](ggml_tensor * t) -> ggml_tensor * {
+            if (tail_beg == 0 && tail_n == n_tokens) return t;
+            return ggml_view_2d(c, t, t->ne[0], tail_n, t->nb[1], (size_t) tail_beg * t->nb[1]);
+        };
+        ggml_tensor * f01 = ggml_concat(c, slice_tail(loop3_taps[0]), slice_tail(loop3_taps[1]), 0);
+        ggml_tensor * f23 = ggml_concat(c, slice_tail(loop3_taps[2]), slice_tail(loop3_taps[3]), 0);
+        ggml_tensor * feats_tail = ggml_concat(c, ggml_concat(c, f01, f23, 0), slice_tail(loop3_taps[4]), 0);
+        inp_dr_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, tail_n);
+        inp_dr_wpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, tail_n);
+        ggml_set_input(inp_dr_pos);
+        ggml_set_input(inp_dr_wpos);
+        inkling2_2dsd_append_prefix_kv_graph(c, gf, w.twodsd, tc, feats_tail, inp_dr_pos, inp_dr_wpos);
+    }
 
     ggml_tensor * greedy_t = nullptr;
     if (is_last_chunk) {
@@ -1218,20 +1280,28 @@ bool inkling2_2dsd_prefill_chunk(
     ggml_backend_tensor_set(inp_tok,  tokens,     0, (size_t) n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(inp_pos,  pos.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(inp_meta, meta,       0, sizeof(meta));
+    if (tail_n > 0) {
+        std::vector<int32_t> dr_pos(tail_n), dr_wpos(tail_n);
+        for (int i = 0; i < tail_n; ++i) {
+            dr_pos[i]  = pos0 + tail_beg + i;
+            dr_wpos[i] = (pos0 + tail_beg - tc.draft_pref_start) + i;
+        }
+        ggml_backend_tensor_set(inp_dr_pos,  dr_pos.data(),  0, (size_t) tail_n * sizeof(int32_t));
+        ggml_backend_tensor_set(inp_dr_wpos, dr_wpos.data(), 0, (size_t) tail_n * sizeof(int32_t));
+    }
 
     const bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
-    bool draft_ok = false;
     if (ok) {
-        draft_ok = inkling2_2dsd_commit_prefix_kv_from_feats(target_backend, w, cache, feats_out, pos0, n_tokens);
-        if (draft_ok && is_last_chunk && greedy_t) {
+        if (is_last_chunk && greedy_t) {
             ggml_backend_tensor_get(greedy_t, &out_greedy_tok, 0, sizeof(int32_t));
         }
         tc.prefix_len = pos0 + n_tokens;
         cache.cur_pos = pos0 + n_tokens;
+        if (tail_n > 0) cache.dspark_ctx_pos = pos0 + n_tokens;
     }
     ggml_gallocr_free(ga);
     ggml_free(c);
-    return ok && draft_ok;
+    return ok;
 }
 
 // ─── 3-Pass Wavefront 60-Plane Prefill (60 -> 24 MoE Weight Reads / Chunk!) ─
@@ -1741,8 +1811,23 @@ bool inkling2_2dsd_prefill_wavefront(
             if (!ok) { free_ring(); return false; }
         }
 
-        // ── Stage 3: Fused 3-Depth Coda (L18..23 ONCE for all ready depths {3, 2, 1}!) ──
-        {
+        // ── Stage 3: Coda (L18..23) + Fused In-Graph Tail Drafter KV Commit ──
+        // When share_coda == true (default): runs ONLY depth-3 (pass==2, step>=2 -> exact AR 48-layer cost!)
+        // and clones depth-3 prefix KV/conv -> planes 0 & 1 (~40 us!).
+        // When share_coda == false: runs Fused 3-Depth Coda across all active depths {3, 2, 1}.
+        const bool share_coda = prefill_share_coda_enabled();
+        std::vector<StreamDesc> c_streams;
+        int C_tot = 0;
+        for (const auto & sd : streams) {
+            if (!share_coda || sd.pass == 2) {
+                StreamDesc cs_d = sd;
+                cs_d.tok_off = C_tot;
+                c_streams.push_back(cs_d);
+                C_tot += sd.len;
+            }
+        }
+        if (!c_streams.empty()) {
+            const int c_n = (int) c_streams.size();
             const size_t max_nodes = 12288;
             struct ggml_init_params gp = { max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false) + (12 << 20), nullptr, true };
             ggml_context * c = ggml_init(gp);
@@ -1755,8 +1840,8 @@ bool inkling2_2dsd_prefill_wavefront(
             std::vector<ggml_tensor *> c_blocks[3];
             int pass2_si = -1;
 
-            for (int si = 0; si < n_s; ++si) {
-                const auto & sd = streams[si];
+            for (int si = 0; si < c_n; ++si) {
+                const auto & sd = c_streams[si];
                 const auto & cs = ring[sd.ring_slot];
                 c_pos[si]  = ggml_new_tensor_1d(c, GGML_TYPE_I32, sd.len);
                 c_meta[si] = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
@@ -1767,14 +1852,14 @@ bool inkling2_2dsd_prefill_wavefront(
                 if (sd.pass == 2) pass2_si = si;
             }
 
-            auto concat_s = [&](ggml_tensor * arr[3]) -> ggml_tensor * {
+            auto concat_c = [&](ggml_tensor * arr[3]) -> ggml_tensor * {
                 ggml_tensor * r = arr[0];
-                for (int si = 1; si < n_s; ++si) r = ggml_concat(c, r, arr[si], 1);
+                for (int si = 1; si < c_n; ++si) r = ggml_concat(c, r, arr[si], 1);
                 return r;
             };
-            auto slice_s = [&](ggml_tensor * big, int si) -> ggml_tensor * {
-                if (n_s == 1) return big;
-                return ggml_view_2d(c, big, big->ne[0], streams[si].len, big->nb[1], (size_t) streams[si].tok_off * big->nb[1]);
+            auto slice_c = [&](ggml_tensor * big, int si) -> ggml_tensor * {
+                if (c_n == 1) return big;
+                return ggml_view_2d(c, big, big->ne[0], c_streams[si].len, big->nb[1], (size_t) c_streams[si].tok_off * big->nb[1]);
             };
 
             ggml_tensor * tap_l22 = nullptr;
@@ -1786,8 +1871,8 @@ bool inkling2_2dsd_prefill_wavefront(
 
                 ggml_tensor * inpSA[3] = {};
                 ggml_tensor * in_q[3] = {}, * in_k[3] = {}, * in_v[3] = {};
-                for (int si = 0; si < n_s; ++si) {
-                    const auto & sd = streams[si];
+                for (int si = 0; si < c_n; ++si) {
+                    const auto & sd = c_streams[si];
                     inpSA[si] = c_cur[si];
                     if (L.is_swa) {
                         in_q[si] = ggml_inkling2_attn_res_mix(
@@ -1804,18 +1889,18 @@ bool inkling2_2dsd_prefill_wavefront(
                     }
                 }
 
-                // ONE FUSED QKV/Gate/R/Sink GEMM ACROSS ALL 3 CODA DEPTHS!
+                // Fused QKV/Gate/R/Sink GEMM across active Coda stream(s)
                 ggml_tensor * proj_all = nullptr;
                 ggml_tensor * qgrs_all = nullptr;
                 ggml_tensor * q_sep = nullptr, * g_sep = nullptr, * r_sep = nullptr, * s_sep = nullptr;
                 ggml_tensor * k_all = nullptr, * v_all = nullptr, * kd_sep = nullptr, * vd_sep = nullptr;
                 const bool use_kv_dyn = (!L.is_swa && L.wk_dyn && L.wv_dyn);
                 if (L.is_swa && L.wqkvgrs) {
-                    proj_all = ggml_mul_mat(c, L.wqkvgrs, concat_s(in_q));
+                    proj_all = ggml_mul_mat(c, L.wqkvgrs, concat_c(in_q));
                 } else {
-                    ggml_tensor * q_in_cat = concat_s(in_q);
-                    ggml_tensor * k_in_cat = concat_s(in_k);
-                    ggml_tensor * v_in_cat = concat_s(in_v);
+                    ggml_tensor * q_in_cat = concat_c(in_q);
+                    ggml_tensor * k_in_cat = concat_c(in_k);
+                    ggml_tensor * v_in_cat = concat_c(in_v);
                     if (L.wqgrs) {
                         qgrs_all = ggml_mul_mat(c, L.wqgrs, q_in_cat);
                     } else {
@@ -1834,8 +1919,8 @@ bool inkling2_2dsd_prefill_wavefront(
 
                 ggml_tensor * ao_s[3] = {};
                 const int swa = L.is_swa ? w.swa_window : 0;
-                for (int si = 0; si < n_s; ++si) {
-                    const auto & sd = streams[si];
+                for (int si = 0; si < c_n; ++si) {
+                    const auto & sd = c_streams[si];
                     ggml_tensor * k_p = plane_view_kv(c, tc.prefix_k[ip], sd.pass);
                     ggml_tensor * v_p = plane_view_kv(c, tc.prefix_v[ip], sd.pass);
                     ggml_tensor * st  = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
@@ -1843,7 +1928,7 @@ bool inkling2_2dsd_prefill_wavefront(
                     ggml_tensor * Q_raw, * K_raw, * V_raw, * Gate, * R_raw, * Sink;
                     ggml_tensor * k_dyn = nullptr, * v_dyn = nullptr;
                     if (proj_all) {
-                        ggml_tensor * pp = slice_s(proj_all, si);
+                        ggml_tensor * pp = slice_c(proj_all, si);
                         Q_raw = row_view_2d(c, pp, 0, q_sz);
                         Gate  = row_view_2d(c, pp, q_sz, q_sz);
                         R_raw = row_view_2d(c, pp, 2 * q_sz, r_sz);
@@ -1852,25 +1937,25 @@ bool inkling2_2dsd_prefill_wavefront(
                         V_raw = row_view_2d(c, pp, 2 * q_sz + r_sz + Hq + kv_sz, kv_sz);
                     } else {
                         if (qgrs_all) {
-                            ggml_tensor * pq = slice_s(qgrs_all, si);
+                            ggml_tensor * pq = slice_c(qgrs_all, si);
                             Q_raw = row_view_2d(c, pq, 0, q_sz);
                             Gate  = row_view_2d(c, pq, q_sz, q_sz);
                             R_raw = row_view_2d(c, pq, 2 * q_sz, r_sz);
                             Sink  = row_view_2d(c, pq, 2 * q_sz + r_sz, Hq);
                         } else {
-                            Q_raw = slice_s(q_sep, si);
-                            Gate  = slice_s(g_sep, si);
-                            R_raw = slice_s(r_sep, si);
-                            Sink  = slice_s(s_sep, si);
+                            Q_raw = slice_c(q_sep, si);
+                            Gate  = slice_c(g_sep, si);
+                            R_raw = slice_c(r_sep, si);
+                            Sink  = slice_c(s_sep, si);
                         }
-                        ggml_tensor * pk = slice_s(k_all, si);
-                        ggml_tensor * pv = slice_s(v_all, si);
+                        ggml_tensor * pk = slice_c(k_all, si);
+                        ggml_tensor * pv = slice_c(v_all, si);
                         K_raw = use_kv_dyn ? row_view_2d(c, pk, 0, kv_sz) : pk;
                         k_dyn = use_kv_dyn ? row_view_2d(c, pk, kv_sz, (int64_t) w.sconv_kernel * Hk)
-                                           : (kd_sep ? slice_s(kd_sep, si) : nullptr);
+                                           : (kd_sep ? slice_c(kd_sep, si) : nullptr);
                         V_raw = use_kv_dyn ? row_view_2d(c, pv, 0, kv_sz) : pv;
                         v_dyn = use_kv_dyn ? row_view_2d(c, pv, kv_sz, (int64_t) w.sconv_kernel * Hk)
-                                           : (vd_sep ? slice_s(vd_sep, si) : nullptr);
+                                           : (vd_sep ? slice_c(vd_sep, si) : nullptr);
                     }
 
                     ggml_tensor * Q = nullptr, * rt = nullptr;
@@ -1890,20 +1975,20 @@ bool inkling2_2dsd_prefill_wavefront(
                         c, Q, k_p, v_p, rt, c_meta[si], kd_dep, vd_dep, Gate, swa, w.rel_extent, 0, 1);
                 }
 
-                // ONE FUSED O-PROJ GEMM ACROSS ALL 3 CODA DEPTHS!
-                ggml_tensor * wo_all = ggml_mul_mat(c, L.wo, concat_s(ao_s));
+                // O-proj across active Coda stream(s)
+                ggml_tensor * wo_all = ggml_mul_mat(c, L.wo, concat_c(ao_s));
 
                 ggml_tensor * ffn_inp[3]  = {};
                 ggml_tensor * ffn_in_s[3] = {};
-                for (int si = 0; si < n_s; ++si) {
-                    const auto & sd = streams[si];
+                for (int si = 0; si < c_n; ++si) {
+                    const auto & sd = c_streams[si];
                     ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
                     ggml_tensor * x  = nullptr;
                     if (ip % w.attn_res_block == 0) {
-                        x = ggml_inkling2_sconv(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, 2 * kv_sz, 0, 1);
+                        x = ggml_inkling2_sconv(c, slice_c(wo_all, si), L.attn_post_conv, st, st, nullptr, 2 * kv_sz, 0, 1);
                         c_blocks[si].push_back(inpSA[si]);
                     } else {
-                        x = ggml_inkling2_sconv_add(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, inpSA[si], 2 * kv_sz, 0, 1);
+                        x = ggml_inkling2_sconv_add(c, slice_c(wo_all, si), L.attn_post_conv, st, st, nullptr, inpSA[si], 2 * kv_sz, 0, 1);
                     }
                     ffn_inp[si]  = x;
                     ffn_in_s[si] = ggml_inkling2_attn_res_mix(
@@ -1911,40 +1996,57 @@ bool inkling2_2dsd_prefill_wavefront(
                         c_blocks[si].empty() ? nullptr : c_blocks[si].data(), (int) c_blocks[si].size(), w.rms_eps);
                 }
 
-                // ONE FUSED ROUTER + 128-EXPERT MoE PASS ACROSS ALL 3 CODA DEPTHS!
-                ggml_tensor * ffn_cat = concat_s(ffn_in_s);
+                // Router + 128-expert MoE across active Coda stream(s)
+                ggml_tensor * ffn_cat = concat_c(ffn_in_s);
                 ggml_tensor * rl   = ggml_mul_mat(c, L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp, ffn_cat);
                 ggml_tensor * sel  = ggml_inkling2_sigmoid_topk_ids(c, rl, L.ffn_exp_probs_b, w.n_expert_used);
                 ggml_tensor * wsel = ggml_inkling2_sigmoid_topk_wts(c, rl, sel, w.route_scale, 1e-20f);
-                ggml_tensor * x3   = ggml_reshape_3d(c, ffn_cat, w.n_embd, 1, T_tot);
+                ggml_tensor * x3   = ggml_reshape_3d(c, ffn_cat, w.n_embd, 1, C_tot);
                 ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
                 ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
                 ggml_tensor * dn   = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
                 ggml_tensor * moe_all = ggml_ds4_moe_fused_combine_shared(c, dn, wsel, nullptr);
 
-                for (int si = 0; si < n_s; ++si) {
-                    const auto & sd = streams[si];
+                for (int si = 0; si < c_n; ++si) {
+                    const auto & sd = c_streams[si];
                     ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
                     c_cur[si] = ggml_inkling2_sconv_add(
-                        c, slice_s(moe_all, si), L.ffn_post_conv, st, st, nullptr, ffn_inp[si], 2 * kv_sz + w.n_embd, 0, 1);
+                        c, slice_c(moe_all, si), L.ffn_post_conv, st, st, nullptr, ffn_inp[si], 2 * kv_sz + w.n_embd, 0, 1);
+                    if (share_coda && sd.pass == 2) {
+                        ggml_build_forward_expand(gf, make_tree_prefill_clone_coda(
+                            c, tc.prefix_k[ip], tc.prefix_v[ip], tc.prefix_conv[ip], c_cur[si], sd.pos, sd.len, swa));
+                    }
                 }
             }
 
-            for (int si = 0; si < n_s; ++si) {
+            for (int si = 0; si < c_n; ++si) {
                 ggml_build_forward_expand(gf, c_cur[si]);
             }
 
-            ggml_tensor * feats_out = nullptr;
-            ggml_tensor * greedy_t  = nullptr;
-            const bool is_last_pass2 = (pass2_si >= 0 && streams[pass2_si].chunk_idx == M - 1);
+            ggml_tensor * greedy_t    = nullptr;
+            ggml_tensor * inp_dr_pos  = nullptr;
+            ggml_tensor * inp_dr_wpos = nullptr;
+            int tail_beg = 0, tail_n = 0;
+            const bool is_last_pass2 = (pass2_si >= 0 && c_streams[pass2_si].chunk_idx == M - 1);
             if (pass2_si >= 0) {
-                const auto & sd2 = streams[pass2_si];
+                const auto & sd2 = c_streams[pass2_si];
                 const auto & cs2 = ring[sd2.ring_slot];
-                ggml_tensor * f01 = ggml_concat(c, cs2.tap_l2, cs2.core_taps[0], 0);
-                ggml_tensor * f23 = ggml_concat(c, cs2.core_taps[1], cs2.core_taps[2], 0);
-                feats_out = ggml_concat(c, ggml_concat(c, f01, f23, 0), tap_l22, 0);
-                ggml_set_output(feats_out);
-                ggml_build_forward_expand(gf, feats_out);
+                tail_beg = std::max(0, tc.draft_pref_start - sd2.pos);
+                tail_n   = std::max(0, sd2.len - tail_beg);
+                if (tail_n > 0) {
+                    auto slice_tail = [&](ggml_tensor * t) -> ggml_tensor * {
+                        if (tail_beg == 0 && tail_n == sd2.len) return t;
+                        return ggml_view_2d(c, t, t->ne[0], tail_n, t->nb[1], (size_t) tail_beg * t->nb[1]);
+                    };
+                    ggml_tensor * f01 = ggml_concat(c, slice_tail(cs2.tap_l2), slice_tail(cs2.core_taps[0]), 0);
+                    ggml_tensor * f23 = ggml_concat(c, slice_tail(cs2.core_taps[1]), slice_tail(cs2.core_taps[2]), 0);
+                    ggml_tensor * feats_tail = ggml_concat(c, ggml_concat(c, f01, f23, 0), slice_tail(tap_l22), 0);
+                    inp_dr_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, tail_n);
+                    inp_dr_wpos = ggml_new_tensor_1d(c, GGML_TYPE_I32, tail_n);
+                    ggml_set_input(inp_dr_pos);
+                    ggml_set_input(inp_dr_wpos);
+                    inkling2_2dsd_append_prefix_kv_graph(c, gf, w.twodsd, tc, feats_tail, inp_dr_pos, inp_dr_wpos);
+                }
 
                 if (is_last_pass2) {
                     ggml_tensor * final_out_norm = ggml_inkling2_attn_res_mix(
@@ -1969,19 +2071,29 @@ bool inkling2_2dsd_prefill_wavefront(
                 free_ring();
                 return false;
             }
-            for (int si = 0; si < n_s; ++si) {
-                const auto & sd = streams[si];
+            for (int si = 0; si < c_n; ++si) {
+                const auto & sd = c_streams[si];
                 std::vector<int32_t> pos_v(sd.len);
                 for (int i = 0; i < sd.len; ++i) pos_v[i] = sd.pos + i;
                 int32_t meta[4] = { sd.pos, sd.pos + sd.len, 0, sd.pos + sd.len };
                 ggml_backend_tensor_set(c_pos[si],  pos_v.data(), 0, (size_t) sd.len * sizeof(int32_t));
                 ggml_backend_tensor_set(c_meta[si], meta,         0, sizeof(meta));
             }
-            bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
-            if (ok && pass2_si >= 0 && feats_out) {
-                const auto & sd2 = streams[pass2_si];
-                ok = inkling2_2dsd_commit_prefix_kv_from_feats(target_backend, w, cache, feats_out, sd2.pos, sd2.len);
-                if (ok && is_last_pass2 && greedy_t) {
+            if (pass2_si >= 0 && tail_n > 0) {
+                const auto & sd2 = c_streams[pass2_si];
+                std::vector<int32_t> dr_pos(tail_n), dr_wpos(tail_n);
+                for (int i = 0; i < tail_n; ++i) {
+                    dr_pos[i]  = sd2.pos + tail_beg + i;
+                    dr_wpos[i] = (sd2.pos + tail_beg - tc.draft_pref_start) + i;
+                }
+                ggml_backend_tensor_set(inp_dr_pos,  dr_pos.data(),  0, (size_t) tail_n * sizeof(int32_t));
+                ggml_backend_tensor_set(inp_dr_wpos, dr_wpos.data(), 0, (size_t) tail_n * sizeof(int32_t));
+            }
+            const bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
+            if (ok && pass2_si >= 0) {
+                const auto & sd2 = c_streams[pass2_si];
+                if (tail_n > 0) cache.dspark_ctx_pos = sd2.pos + sd2.len;
+                if (is_last_pass2 && greedy_t) {
                     ggml_backend_tensor_get(greedy_t, &out_greedy_tok, 0, sizeof(int32_t));
                 }
             }

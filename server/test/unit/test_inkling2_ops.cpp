@@ -1642,9 +1642,76 @@ static bool test_2dsd_p0_fused_ops(ggml_backend_t backend) {
         ggml_free(sctx);
     }
 
-    std::printf("[test_inkling2_ops] 2dsd_p0_fused: subop40=%d subop41=%d subop42_err=%.3e\n",
-                ok_40 ? 1 : 0, ok_41 ? 1 : 0, max_err_42);
-    return ok_40 && ok_41 && max_err_42 < 1e-5f;
+    // 4. Subop 43: TREE_PREFILL_CLONE_CODA (F16 global + Q8_0 SWA ring wrap-around + prefix_conv)
+    bool ok_43 = true;
+    for (int swa = 0; swa <= 1; ++swa) {
+        const int D = 128, Hk = 4, cap = swa ? 8 : 16, P = 3, s_ch = 64;
+        const int pos0 = swa ? 6 : 3, n_tok = 5; // swa wraps: slots {6, 7, 0, 1, 2}
+        const ggml_type kv_t = swa ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        struct ggml_init_params sp = { 16 * ggml_tensor_overhead() + ggml_graph_overhead() + (1 << 20), nullptr, true };
+        ggml_context * ctx = ggml_init(sp);
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx, kv_t, D, cap, Hk, P);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx, kv_t, D, cap, Hk, P);
+        ggml_tensor * pc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, s_ch, P);
+        ggml_tensor * dep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_tensor_memset(pk, 0, 0, ggml_nbytes(pk));
+        ggml_backend_tensor_memset(pv, 0, 0, ggml_nbytes(pv));
+        ggml_backend_tensor_memset(pc, 0, 0, ggml_nbytes(pc));
+        ggml_backend_tensor_memset(dep, 0, 0, ggml_nbytes(dep));
+
+        // Populate plane 2 with non-zero distinct bytes
+        std::vector<uint8_t> k_p2(pk->nb[3]), v_p2(pv->nb[3]);
+        for (size_t i = 0; i < k_p2.size(); ++i) { k_p2[i] = (uint8_t) ((i * 13 + 7) & 0xFF); v_p2[i] = (uint8_t) ((i * 29 + 3) & 0xFF); }
+        ggml_backend_tensor_set(pk, k_p2.data(), 2 * pk->nb[3], pk->nb[3]);
+        ggml_backend_tensor_set(pv, v_p2.data(), 2 * pv->nb[3], pv->nb[3]);
+        std::vector<float> c_p2((size_t) 3 * s_ch);
+        for (size_t i = 0; i < c_p2.size(); ++i) c_p2[i] = (float) (i + 1) * 0.25f;
+        ggml_backend_tensor_set(pc, c_p2.data(), 2 * pc->nb[2], pc->nb[2]);
+
+        ggml_tensor * op = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        op->op = GGML_OP_INKLING2_OP;
+        op->src[0] = pk; op->src[1] = pv; op->src[2] = pc; op->src[3] = dep;
+        test_set_op_i32(op, 0, 43); test_set_op_i32(op, 1, pos0);
+        test_set_op_i32(op, 2, n_tok); test_set_op_i32(op, 3, swa ? 4 : 0);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, op);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_graph_compute(backend, gf);
+
+        const size_t rb = pk->nb[1];
+        std::vector<uint8_t> r_ref(rb), r_got(rb);
+        for (int t = 0; t < n_tok; ++t) {
+            const int slot = swa ? ((pos0 + t) % cap) : (pos0 + t);
+            for (int h = 0; h < Hk; ++h) {
+                const size_t off2 = 2 * pk->nb[3] + (size_t) h * pk->nb[2] + (size_t) slot * rb;
+                ggml_backend_tensor_get(pk, r_ref.data(), off2, rb);
+                for (int p = 0; p < 2; ++p) {
+                    ggml_backend_tensor_get(pk, r_got.data(), (size_t) p * pk->nb[3] + (size_t) h * pk->nb[2] + (size_t) slot * rb, rb);
+                    if (r_got != r_ref) ok_43 = false;
+                }
+                ggml_backend_tensor_get(pv, r_ref.data(), off2, rb);
+                for (int p = 0; p < 2; ++p) {
+                    ggml_backend_tensor_get(pv, r_got.data(), (size_t) p * pv->nb[3] + (size_t) h * pv->nb[2] + (size_t) slot * rb, rb);
+                    if (r_got != r_ref) ok_43 = false;
+                }
+            }
+        }
+        std::vector<float> c_got((size_t) 3 * s_ch);
+        for (int p = 0; p < 2; ++p) {
+            ggml_backend_tensor_get(pc, c_got.data(), (size_t) p * pc->nb[2], pc->nb[2]);
+            if (max_abs_diff(c_got, c_p2) > 0.0f) ok_43 = false;
+        }
+        ggml_gallocr_free(ga);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    std::printf("[test_inkling2_ops] 2dsd_p0_fused: subop40=%d subop41=%d subop42_err=%.3e subop43=%d\n",
+                ok_40 ? 1 : 0, ok_41 ? 1 : 0, max_err_42, ok_43 ? 1 : 0);
+    return ok_40 && ok_41 && max_err_42 < 1e-5f && ok_43;
 }
 
 } // namespace

@@ -512,7 +512,17 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         int pos_2d = 0;
         int32_t first_tok = -1;
         const int n_prompt_2d = (int) req.prompt.size();
-        int wf_chunk_2d = (n_prompt_2d >= 3072 && cache_.swa_cap >= 2048) ? std::max(chunk_, 1024) : chunk_;
+        // Tail-only drafter prefix KV window (default 2048 tokens; 0 = full prefix):
+        // skips drafter K/V projection on early prompt chunks and keeps drafter FlashAttention O(1).
+        int draft_win_2d = 2048;
+        if (const char * ew = std::getenv("LUCE_INKLING2_2DSD_DRAFT_WINDOW")) {
+            draft_win_2d = std::atoi(ew);
+        }
+        cache_.tree.draft_pref_start = (draft_win_2d > 0 && n_prompt_2d > draft_win_2d)
+            ? (n_prompt_2d - draft_win_2d)
+            : 0;
+
+        int wf_chunk_2d = (n_prompt_2d >= 2048 && cache_.swa_cap >= 2048) ? std::max(chunk_, 1024) : chunk_;
         if (const char * ec = std::getenv("LUCE_INKLING2_WF_CHUNK")) {
             const int v = std::atoi(ec);
             if (v >= 128 && v <= cache_.swa_cap - weights_.swa_window) wf_chunk_2d = v;

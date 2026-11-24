@@ -159,6 +159,20 @@ static void project_ctx_kv_into_draft_cache(
 
 } // namespace
 
+void inkling2_2dsd_append_prefix_kv_graph(
+        ggml_context * c,
+        ggml_cgraph * gf,
+        const Inkling2TwoDSDWeights & td,
+        const Inkling2TreeCache & tc,
+        ggml_tensor * feats_dev,
+        ggml_tensor * rope_pos,
+        ggml_tensor * write_pos) {
+    if (!td.loaded || !tc.active || !feats_dev || !rope_pos || !write_pos) return;
+    ggml_tensor * in_f32 = (feats_dev->type == GGML_TYPE_F32) ? feats_dev : ggml_cast(c, feats_dev, GGML_TYPE_F32);
+    ggml_tensor * ctx_h  = rms_norm_w(c, ggml_mul_mat(c, td.fc, in_f32), td.hidden_norm, td.rms_eps);
+    project_ctx_kv_into_draft_cache(c, gf, td, tc, ctx_h, rope_pos, write_pos);
+}
+
 bool inkling2_2dsd_commit_prefix_kv_from_feats(
         ggml_backend_t target_backend,
         const Inkling2Weights & w,
@@ -233,13 +247,15 @@ bool inkling2_2dsd_commit_prefix_kv_from_slots(
         g.ctx = ggml_init(gp);
         g.gf  = ggml_new_graph_custom(g.ctx, max_nodes, false);
         g.feats = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_commit); // flat index = 2*S + slot
-        g.pos   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_commit);
+        g.pos   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_commit); // true absolute RoPE pos
+        g.wpos  = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_commit); // compact write slot
         ggml_set_input(g.feats);
         ggml_set_input(g.pos);
+        ggml_set_input(g.wpos);
 
         ggml_tensor * gathered = ggml_get_rows(g.ctx, tc.node_features, g.feats); // F32 [5*H, n_commit]
         ggml_tensor * ctx_h    = rms_norm_w(g.ctx, ggml_mul_mat(g.ctx, td.fc, gathered), td.hidden_norm, td.rms_eps);
-        project_ctx_kv_into_draft_cache(g.ctx, g.gf, td, tc, ctx_h, g.pos, g.pos);
+        project_ctx_kv_into_draft_cache(g.ctx, g.gf, td, tc, ctx_h, g.pos, g.wpos);
 
         g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
         if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.gf)) {
@@ -255,12 +271,15 @@ bool inkling2_2dsd_commit_prefix_kv_from_slots(
     const int depth_base = (tc.n_depths - 1) * S;
     int32_t idx[kInkling2TwoDSDMaxCommit];
     int32_t pos[kInkling2TwoDSDMaxCommit];
+    int32_t wpos[kInkling2TwoDSDMaxCommit];
     for (int i = 0; i < n_commit; ++i) {
-        idx[i] = depth_base + commit_slots[i];
-        pos[i] = pos0 + i;
+        idx[i]  = depth_base + commit_slots[i];
+        pos[i]  = pos0 + i;
+        wpos[i] = std::max(0, (pos0 - tc.draft_pref_start) + i);
     }
-    ggml_backend_tensor_set(g.feats, idx, 0, (size_t) n_commit * sizeof(int32_t));
-    ggml_backend_tensor_set(g.pos,   pos, 0, (size_t) n_commit * sizeof(int32_t));
+    ggml_backend_tensor_set(g.feats, idx,  0, (size_t) n_commit * sizeof(int32_t));
+    ggml_backend_tensor_set(g.pos,   pos,  0, (size_t) n_commit * sizeof(int32_t));
+    ggml_backend_tensor_set(g.wpos,  wpos, 0, (size_t) n_commit * sizeof(int32_t));
 
     const bool ok = (ggml_backend_graph_compute_async(target_backend, g.gf) == GGML_STATUS_SUCCESS);
     if (ok) cache.dspark_ctx_pos = pos0 + n_commit;
@@ -306,8 +325,9 @@ bool inkling2_2dsd_draft_batch(
 
     const int L_b = bucket_leaf(n_req);
     const int S_b = bucket_span(max_span);
-    const int pref_len = tc.prefix_len;
-    const int kv_used  = pref_len + L_b * S_b + L_b * B;
+    const int pref_len    = tc.prefix_len;
+    const int pref_len_kv = std::max(0, tc.prefix_len - tc.draft_pref_start);
+    const int kv_used     = pref_len_kv + L_b * S_b + L_b * B;
     if (kv_used + 1 > tc.draft_cap) {
         std::fprintf(stderr, "[inkling2-2dsd] draft KV overflow (used=%d cap=%d)\n", kv_used, tc.draft_cap);
         return false;
@@ -470,7 +490,7 @@ bool inkling2_2dsd_draft_batch(
     std::vector<int32_t> blk_pos(B * L_b, 0);
     std::vector<int32_t> blk_wpos(B * L_b, scratch_kv);
     std::vector<int32_t> dmeta(3 + L_b, 0);
-    dmeta[0] = pref_len;
+    dmeta[0] = pref_len_kv;
     dmeta[1] = L_b;
     dmeta[2] = S_b;
 
@@ -491,13 +511,13 @@ bool inkling2_2dsd_draft_batch(
         for (int j = 0; j < slen; ++j) {
             const int flat = l * S_b + j;
             span_idx[flat]  = depth_idx * S_pool + req.span_slots[j];
-            span_pos[flat]  = pref_len + j;
-            span_wpos[flat] = pref_len + l * S_b + j;
+            span_pos[flat]  = pref_len + j;                // true absolute RoPE pos
+            span_wpos[flat] = pref_len_kv + l * S_b + j;   // compact KV write slot
         }
         for (int j = 0; j < B; ++j) {
             const int flat = l * B + j;
             blk_pos[flat]  = req.anchor_pos + j;
-            blk_wpos[flat] = pref_len + L_b * S_b + l * B + j;
+            blk_wpos[flat] = pref_len_kv + L_b * S_b + l * B + j;
         }
     }
 

@@ -26,6 +26,19 @@ struct Inkling2TwoDSDDraftOut {
     std::vector<float>   confidence; // size = block_size - 1 (7), probabilities in [0, 1]
 };
 
+// Append fused in-graph projection of loop-R (depth 3) features [5*H, T] into the 5-layer
+// drafter prefix KV cache (`tc.draft_k/v`) using `rope_pos` (true absolute RoPE positions)
+// and `write_pos` (compact KV write slots = rope_pos - tc.draft_pref_start).
+// Eliminates separate gallocr alloc, device-to-device copy, and extra sync during prefill!
+void inkling2_2dsd_append_prefix_kv_graph(
+    ggml_context * c,
+    ggml_cgraph * gf,
+    const Inkling2TwoDSDWeights & td,
+    const Inkling2TreeCache & tc,
+    ggml_tensor * feats_dev,
+    ggml_tensor * rope_pos,
+    ggml_tensor * write_pos);
+
 // Commit loop-R (depth 3) prompt features [5*H, n_tokens] (F32 or F16) into the 5-layer
 // drafter prefix KV cache at positions [pos0 .. pos0 + n_tokens - 1].
 bool inkling2_2dsd_commit_prefix_kv_from_feats(

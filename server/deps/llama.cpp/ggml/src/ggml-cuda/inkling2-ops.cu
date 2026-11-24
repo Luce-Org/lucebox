@@ -4323,6 +4323,52 @@ static __global__ void inkling2_moe_masked_sum_tree_sconv_add_kernel(
     tc_plane[(size_t) slot * s_ch + sc] = cur;
 }
 
+// ─── 43. Prefill Coda Plane Clone (Depth-3 Plane P-1 -> Planes 0..P-2 in ~40 us!) ─
+static __global__ void inkling2_tree_prefill_clone_kv_kernel(
+        char * __restrict__ prefix_k, size_t pk_nb1, size_t pk_nb2, size_t pk_nb3,
+        char * __restrict__ prefix_v, size_t pv_nb1, size_t pv_nb2, size_t pv_nb3,
+        int pos0, int n_tokens, int prefix_cap, int swa_window, int P, int row_u32) {
+    const int h   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (t >= n_tokens || P <= 1) return;
+    const int pos  = pos0 + t;
+    const int slot = (swa_window > 0) ? (pos % prefix_cap) : pos;
+    if (slot < 0 || slot >= prefix_cap) return;
+
+    const int src_p = P - 1;
+    const uint32_t * sk = reinterpret_cast<const uint32_t *>(
+        prefix_k + (size_t) src_p * pk_nb3 + (size_t) h * pk_nb2 + (size_t) slot * pk_nb1);
+    const uint32_t * sv = reinterpret_cast<const uint32_t *>(
+        prefix_v + (size_t) src_p * pv_nb3 + (size_t) h * pv_nb2 + (size_t) slot * pv_nb1);
+    for (int i = tid; i < row_u32; i += blockDim.x) {
+        const uint32_t vk = sk[i];
+        const uint32_t vv = sv[i];
+        for (int p = 0; p < src_p; ++p) {
+            uint32_t * dk = reinterpret_cast<uint32_t *>(
+                prefix_k + (size_t) p * pk_nb3 + (size_t) h * pk_nb2 + (size_t) slot * pk_nb1);
+            uint32_t * dv = reinterpret_cast<uint32_t *>(
+                prefix_v + (size_t) p * pv_nb3 + (size_t) h * pv_nb2 + (size_t) slot * pv_nb1);
+            dk[i] = vk;
+            dv[i] = vv;
+        }
+    }
+}
+
+static __global__ void inkling2_tree_prefill_clone_conv_kernel(
+        float * __restrict__ prefix_conv, // [3, s_ch, P]
+        int s_ch, int P) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= s_ch || P <= 1) return;
+    const int src_p = P - 1;
+    const float * sp = prefix_conv + ((size_t) src_p * s_ch + c) * 3;
+    const float v0 = sp[0], v1 = sp[1], v2 = sp[2];
+    for (int p = 0; p < src_p; ++p) {
+        float * dp = prefix_conv + ((size_t) p * s_ch + c) * 3;
+        dp[0] = v0; dp[1] = v1; dp[2] = v2;
+    }
+}
+
 } // namespace
 
 void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -5562,6 +5608,30 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     (const int32_t *) meta->data,
                     (const float *) addend->data, addend->nb[1] / sizeof(float),
                     (float *) dst->data, H, K, T, wsel_ld, msel_ld, s_ch, s_max, chan_offset, m_stride);
+            }
+            break;
+        }
+        case 43: { // TREE_PREFILL_CLONE_CODA (clone depth-3 plane P-1 KV & conv -> planes 0..P-2)
+            ggml_tensor * prefix_k    = dst->src[0];
+            ggml_tensor * prefix_v    = dst->src[1];
+            ggml_tensor * prefix_conv = dst->src[2];
+            const int pos0       = ggml_get_op_params_i32(dst, 1);
+            const int n_tokens   = ggml_get_op_params_i32(dst, 2);
+            const int swa_window = ggml_get_op_params_i32(dst, 3);
+            const int prefix_cap = (int) prefix_k->ne[1];
+            const int Hk         = (int) prefix_k->ne[2];
+            const int P          = (int) prefix_k->ne[3];
+            const int row_u32    = (int) (prefix_k->nb[1] / sizeof(uint32_t));
+            const int s_ch       = (int) prefix_conv->ne[1];
+            GGML_ASSERT((prefix_k->nb[1] % sizeof(uint32_t)) == 0);
+            if (P > 1 && n_tokens > 0) {
+                dim3 kv_grid(Hk, n_tokens, 1);
+                inkling2_tree_prefill_clone_kv_kernel<<<kv_grid, 64, 0, stream>>>(
+                    (char *) prefix_k->data, prefix_k->nb[1], prefix_k->nb[2], prefix_k->nb[3],
+                    (char *) prefix_v->data, prefix_v->nb[1], prefix_v->nb[2], prefix_v->nb[3],
+                    pos0, n_tokens, prefix_cap, swa_window, P, row_u32);
+                inkling2_tree_prefill_clone_conv_kernel<<<(s_ch + 255) / 256, 256, 0, stream>>>(
+                    (float *) prefix_conv->data, s_ch, P);
             }
             break;
         }
