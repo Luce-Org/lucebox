@@ -2820,6 +2820,7 @@ if(LUCE_TESTS)
             test/unit/test_tool_call_tags.cpp
             test/unit/test_gbnf.cpp
             test/unit/test_ds4_spec_sampling.cpp
+            test/unit/test_inkling2_top_cands.cpp
             test/unit/test_penalty_history.cpp
             test/unit/test_chain_sampled_verify.cpp
             test/unit/test_ds4_env.cpp
