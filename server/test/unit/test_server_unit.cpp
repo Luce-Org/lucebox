@@ -793,10 +793,11 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline)
 // number or CJK text ends its segment and stays one piece: HF splits "a  1" as
 // a | "  " | 1. The engine split it as Qwen does: a | " " | " " | 1.
 TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
-    const std::string text = "a  1\t\t42  中文x 12345";
+    const std::string text = "a  1\t\t42  中文x 12345 10² ①②③④";
     for (const char * pre : {"joyai-llm", "deepseek-v3", "qwen35"}) {
         const std::string path = write_pflash_bpe_tokenizer_fixture(
-            {"  ", "\t\t", "42", "中文", " 中文", "123", "45"}, text, {}, {}, pre);
+            {"  ", "\t\t", "42", "中文", " 中文", "123", "45", "²", "10²", "①②③", "④"},
+            text, {}, {}, pre);
         Tokenizer tok;
         TEST_ASSERT(tok.load_from_gguf(path.c_str()));
         unlink(path.c_str());
@@ -817,6 +818,10 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
             TEST_ASSERT(tok.encode("\t\t42") == ids({"\t\t", "42"}));
             TEST_ASSERT(tok.encode("  中文") == ids({"  ", "中文"}));
             TEST_ASSERT(tok.encode("x 12345") == ids({"x", " ", "123", "45"}));
+            // \p{N} is the whole Number category, not only decimal digits.
+            TEST_ASSERT(tok.encode("a  ²") == ids({"a", "  ", "²"}));
+            TEST_ASSERT(tok.encode("x 10²") == ids({"x", " ", "10²"}));
+            TEST_ASSERT(tok.encode("①②③④") == ids({"①②③", "④"}));
         }
         TEST_ASSERT(tok.decode(tok.encode(text)) == text);
     }
