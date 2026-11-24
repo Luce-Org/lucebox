@@ -32,6 +32,20 @@ bool inkling2_2dsd_prefill_chunk(
     bool is_last_chunk,
     int32_t & out_greedy_tok);
 
+// 3-Pass Wavefront 60-Plane Prefill for multi-chunk prompts (`n_tokens > chunk_size`):
+// Fuses all 3 core passes (L6..17) AND all 3 coda depths (L18..23) across up to 3 chunks
+// simultaneously, cutting MoE weight reads from 60 -> 24 per chunk (2.5x) while populating
+// all 60 target planes and 5-layer drafter prefix KV bit-for-bit identically.
+bool inkling2_2dsd_prefill_wavefront(
+    ggml_backend_t target_backend,
+    const Inkling2Weights & w,
+    Inkling2Cache & cache,
+    const int32_t * tokens,
+    int n_tokens,
+    int pos0,
+    int chunk_size,
+    int32_t & out_greedy_tok);
+
 // Advance `nodes` by +1 loop in up to 3 static-bucketed HIP/CUDA graphs:
 //   - Prelude (L0..5) for nodes with depth == 0
 //   - Fused Core (L6..17) for ALL nodes across passes 0/1/2 simultaneously (1 weight read!)

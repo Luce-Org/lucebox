@@ -1358,6 +1358,295 @@ static bool test_2dsd_executor() {
     return all_ok;
 }
 
+// ─── 2DSD Unit Test 5: P0 Fused Kernels (subops 40, 41, 42) ──────────────
+static bool test_2dsd_p0_fused_ops(ggml_backend_t backend) {
+    // 1. Subop 40: 2DSD_MARKOV_TOPK_STEP (paired with subop 18) for both Q8_0 and F16 markov_w2
+    bool ok_40 = true;
+    {
+        const int R = 256, V = 4096, L = 4;
+        std::mt19937 rng(4040);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> base((size_t) V * L), w1_f32((size_t) R * V), w2_f32((size_t) R * V);
+        for (float & v : base)   v = dist(rng);
+        for (float & v : w1_f32) v = dist(rng) * 0.4f;
+        for (float & v : w2_f32) v = dist(rng) * 0.4f;
+        // Inject sharp peaks in each leaf so top-1024 exact match against full-vocab is guaranteed
+        for (int l = 0; l < L; ++l) {
+            base[(size_t) l * V + (317 * (l + 1) % V)] += 10.0f;
+            base[(size_t) l * V + (1993 * (l + 1) % V)] += 9.5f;
+        }
+        std::vector<ggml_fp16_t> w1_f16(w1_f32.size()), w2_f16(w2_f32.size());
+        for (size_t i = 0; i < w1_f32.size(); ++i) {
+            w1_f16[i] = ggml_fp32_to_fp16(w1_f32[i]);
+            w2_f16[i] = ggml_fp32_to_fp16(w2_f32[i]);
+        }
+        std::vector<uint8_t> w2_q8((size_t) V * ggml_row_size(GGML_TYPE_Q8_0, R));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, w2_f32.data(), w2_q8.data(), 0, V, R, nullptr);
+        int32_t prev_tok[L] = { 5, 1021, 2048, 4091 };
+
+        for (int use_q8 = 0; use_q8 <= 1; ++use_q8) {
+            struct ggml_init_params gp = { 32 * ggml_tensor_overhead() + ggml_graph_overhead() + (1 << 20), nullptr, true };
+            ggml_context * ctx = ggml_init(gp);
+            ggml_tensor * t_base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, V, L);
+            ggml_tensor * t_prev = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+            ggml_tensor * t_w1   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, R, V);
+            ggml_tensor * t_w2   = ggml_new_tensor_2d(ctx, use_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, R, V);
+            ggml_set_input(t_base); ggml_set_input(t_prev); ggml_set_input(t_w1); ggml_set_input(t_w2);
+
+            ggml_tensor * cands = ggml_inkling2_dspark_topk_cands(ctx, t_base, V);
+            ggml_tensor * out_fast = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+            out_fast->op = GGML_OP_INKLING2_OP;
+            out_fast->src[0] = cands; out_fast->src[1] = t_base; out_fast->src[2] = t_prev;
+            out_fast->src[3] = t_w1;  out_fast->src[4] = t_w2;
+            test_set_op_i32(out_fast, 0, 40); test_set_op_i32(out_fast, 1, V);
+
+            ggml_tensor * out_full = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+            out_full->op = GGML_OP_INKLING2_OP;
+            out_full->src[0] = t_base; out_full->src[1] = t_prev; out_full->src[2] = t_w1; out_full->src[3] = t_w2;
+            test_set_op_i32(out_full, 0, 37); test_set_op_i32(out_full, 1, V);
+
+            ggml_set_output(out_fast); ggml_set_output(out_full);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, out_fast);
+            ggml_build_forward_expand(gf, out_full);
+
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            ggml_gallocr_alloc_graph(ga, gf);
+            ggml_backend_tensor_set(t_base, base.data(), 0, base.size() * sizeof(float));
+            ggml_backend_tensor_set(t_prev, prev_tok, 0, sizeof(prev_tok));
+            ggml_backend_tensor_set(t_w1, w1_f16.data(), 0, w1_f16.size() * sizeof(ggml_fp16_t));
+            if (use_q8) ggml_backend_tensor_set(t_w2, w2_q8.data(), 0, w2_q8.size());
+            else        ggml_backend_tensor_set(t_w2, w2_f16.data(), 0, w2_f16.size() * sizeof(ggml_fp16_t));
+            ggml_backend_graph_compute(backend, gf);
+
+            int32_t got_fast[L] = {}, got_full[L] = {};
+            ggml_backend_tensor_get(out_fast, got_fast, 0, sizeof(got_fast));
+            ggml_backend_tensor_get(out_full, got_full, 0, sizeof(got_full));
+            for (int l = 0; l < L; ++l) {
+                if (got_fast[l] != got_full[l]) ok_40 = false;
+            }
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+        }
+    }
+
+    // 2. Subop 41: TREE_SCONV_KV_WRITE_KV (compare bit-exact vs two subop 34 calls for F16 & Q8_0)
+    bool ok_41 = true;
+    for (int use_q8 = 0; use_q8 <= 1; ++use_q8) {
+        const int D = 128, Hk = 4, kv_sz = D * Hk, H = 512, s_ch = 2 * kv_sz + 2 * H;
+        const int P = 3, max_nodes = 16, s_max = max_nodes + 1, T = 4, path_w = 8, m_stride = 11 + path_w;
+        const ggml_type kv_t = use_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        std::mt19937 rng(4141 + use_q8);
+        std::uniform_real_distribution<float> dist(-0.8f, 0.8f);
+
+        std::vector<float> x_k((size_t) kv_sz * T), x_v((size_t) kv_sz * T), wk((size_t) 4 * kv_sz), wv((size_t) 4 * kv_sz);
+        std::vector<float> pc((size_t) 3 * s_ch * P, 0.0f);
+        for (float & v : x_k) v = dist(rng);
+        for (float & v : x_v) v = dist(rng);
+        for (float & v : wk)  v = dist(rng) * 0.25f;
+        for (float & v : wv)  v = dist(rng) * 0.25f;
+        for (float & v : pc)  v = dist(rng) * 0.2f;
+
+        std::vector<int32_t> meta((size_t) T * m_stride, -1);
+        const int slots[T] = { 2, 5, 7, 9 };
+        const int hrow[T][3]  = { {-1,-1,-1}, {-1,-1,0}, {-1,0,1}, {-1,-1,0} };
+        const int hslot[T][3] = { {-1,-2,-3}, {-2,-3,2}, {-3,2,5}, {-2,-3,2} };
+        for (int r = 0; r < T; ++r) {
+            int32_t * mt = meta.data() + (size_t) r * m_stride;
+            mt[0] = slots[r]; mt[1] = 10 + r; mt[2] = 1; mt[3] = 0; mt[4] = 0;
+            for (int j = 0; j < 3; ++j) { mt[5 + j] = hrow[r][j]; mt[8 + j] = hslot[r][j]; }
+            mt[11] = slots[r];
+        }
+
+        struct ggml_init_params sp = { 16 * ggml_tensor_overhead() + 4096, nullptr, true };
+        ggml_context * sctx = ggml_init(sp);
+        ggml_tensor * tk_a = ggml_new_tensor_4d(sctx, kv_t, D, s_max, Hk, P);
+        ggml_tensor * tv_a = ggml_new_tensor_4d(sctx, kv_t, D, s_max, Hk, P);
+        ggml_tensor * tc_a = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, s_ch, s_max, P);
+        ggml_tensor * tk_b = ggml_new_tensor_4d(sctx, kv_t, D, s_max, Hk, P);
+        ggml_tensor * tv_b = ggml_new_tensor_4d(sctx, kv_t, D, s_max, Hk, P);
+        ggml_tensor * tc_b = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, s_ch, s_max, P);
+        ggml_tensor * t_pc = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, 3, s_ch, P);
+        ggml_backend_buffer_t sbuf = ggml_backend_alloc_ctx_tensors(sctx, backend);
+        ggml_backend_tensor_memset(tk_a, 0, 0, ggml_nbytes(tk_a));
+        ggml_backend_tensor_memset(tv_a, 0, 0, ggml_nbytes(tv_a));
+        ggml_backend_tensor_memset(tc_a, 0, 0, ggml_nbytes(tc_a));
+        ggml_backend_tensor_memset(tk_b, 0, 0, ggml_nbytes(tk_b));
+        ggml_backend_tensor_memset(tv_b, 0, 0, ggml_nbytes(tv_b));
+        ggml_backend_tensor_memset(tc_b, 0, 0, ggml_nbytes(tc_b));
+        ggml_backend_tensor_set(t_pc, pc.data(), 0, pc.size() * sizeof(float));
+
+        struct ggml_init_params gp = { 32 * ggml_tensor_overhead() + ggml_graph_overhead() + (1 << 20), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * t_xk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_sz, T);
+        ggml_tensor * t_xv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_sz, T);
+        ggml_tensor * t_wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, kv_sz);
+        ggml_tensor * t_wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, kv_sz);
+        ggml_tensor * t_mt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m_stride, T);
+        ggml_set_input(t_xk); ggml_set_input(t_xv); ggml_set_input(t_wk); ggml_set_input(t_wv); ggml_set_input(t_mt);
+
+        // Reference: two subop 34 calls -> (tk_a, tv_a, tc_a)
+        ggml_tensor * ref_k = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ref_k->op = GGML_OP_INKLING2_OP;
+        ref_k->src[0] = t_xk; ref_k->src[1] = t_wk; ref_k->src[2] = t_pc; ref_k->src[3] = tc_a;
+        ref_k->src[4] = t_mt; ref_k->src[5] = nullptr; ref_k->src[6] = tk_a; ref_k->src[7] = nullptr;
+        test_set_op_i32(ref_k, 0, 34); test_set_op_i32(ref_k, 1, 0); test_set_op_i32(ref_k, 2, D);
+        test_set_op_i32(ref_k, 3, Hk); test_set_op_i32(ref_k, 4, 0); test_set_op_i32(ref_k, 5, m_stride);
+        test_set_op_f32(ref_k, 6, 4.0f); test_set_op_f32(ref_k, 7, 1e-6f);
+
+        ggml_tensor * ref_v = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ref_v->op = GGML_OP_INKLING2_OP;
+        ref_v->src[0] = t_xv; ref_v->src[1] = t_wv; ref_v->src[2] = t_pc; ref_v->src[3] = tc_a;
+        ref_v->src[4] = t_mt; ref_v->src[5] = nullptr; ref_v->src[6] = tv_a; ref_v->src[7] = ref_k;
+        test_set_op_i32(ref_v, 0, 34); test_set_op_i32(ref_v, 1, kv_sz); test_set_op_i32(ref_v, 2, D);
+        test_set_op_i32(ref_v, 3, Hk); test_set_op_i32(ref_v, 4, 1); test_set_op_i32(ref_v, 5, m_stride);
+        test_set_op_f32(ref_v, 6, 4.0f); test_set_op_f32(ref_v, 7, 1e-6f);
+
+        // Fused subop 41 -> (tk_b, tv_b, tc_b)
+        ggml_tensor * fused_kv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        fused_kv->op = GGML_OP_INKLING2_OP;
+        fused_kv->src[0] = t_xk; fused_kv->src[1] = t_xv; fused_kv->src[2] = t_wk; fused_kv->src[3] = t_wv;
+        fused_kv->src[4] = t_pc; fused_kv->src[5] = tc_b; fused_kv->src[6] = t_mt; fused_kv->src[7] = tk_b; fused_kv->src[8] = tv_b;
+        test_set_op_i32(fused_kv, 0, 41); test_set_op_i32(fused_kv, 1, D); test_set_op_i32(fused_kv, 2, Hk);
+        test_set_op_i32(fused_kv, 3, m_stride); test_set_op_f32(fused_kv, 4, 4.0f); test_set_op_f32(fused_kv, 5, 1e-6f);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, ref_v);
+        ggml_build_forward_expand(gf, fused_kv);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_tensor_set(t_xk, x_k.data(), 0, x_k.size() * sizeof(float));
+        ggml_backend_tensor_set(t_xv, x_v.data(), 0, x_v.size() * sizeof(float));
+        ggml_backend_tensor_set(t_wk, wk.data(),  0, wk.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_wv, wv.data(),  0, wv.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_mt, meta.data(), 0, meta.size() * sizeof(int32_t));
+        ggml_backend_graph_compute(backend, gf);
+
+        std::vector<uint8_t> ba(ggml_nbytes(tk_a)), bb(ggml_nbytes(tk_b));
+        ggml_backend_tensor_get(tk_a, ba.data(), 0, ba.size());
+        ggml_backend_tensor_get(tk_b, bb.data(), 0, bb.size());
+        if (ba != bb) ok_41 = false;
+        ggml_backend_tensor_get(tv_a, ba.data(), 0, ba.size());
+        ggml_backend_tensor_get(tv_b, bb.data(), 0, bb.size());
+        if (ba != bb) ok_41 = false;
+        std::vector<float> ca(ggml_nelements(tc_a)), cb(ggml_nelements(tc_b));
+        ggml_backend_tensor_get(tc_a, ca.data(), 0, ggml_nbytes(tc_a));
+        ggml_backend_tensor_get(tc_b, cb.data(), 0, ggml_nbytes(tc_b));
+        if (max_abs_diff(ca, cb) > 1e-6f) ok_41 = false;
+
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(sbuf);
+        ggml_free(sctx);
+    }
+
+    // 3. Subop 42: FUSED_MOE_MASKED_SUM_TREE_SCONV_ADD (single-GPU + dual-GPU F16 peer + same-call chain)
+    float max_err_42 = 0.0f;
+    for (int with_peer = 0; with_peer <= 1; ++with_peer) {
+        const int H = 512, K = 8, T = 4, P = 3, max_nodes = 16, s_max = max_nodes + 1;
+        const int chan_off = 256, s_ch = chan_off + H, path_w = 8, m_stride = 11 + path_w;
+        std::mt19937 rng(4242 + with_peer);
+        std::uniform_real_distribution<float> dist(-0.7f, 0.7f);
+
+        std::vector<float> down((size_t) H * K * T), wsel((size_t) K * T), peer_f32((size_t) H * T);
+        std::vector<int32_t> msel((size_t) K * T);
+        std::vector<float> w_sc((size_t) 4 * H), addend((size_t) H * T), pc((size_t) 3 * s_ch * P);
+        for (float & v : down)     v = dist(rng);
+        for (float & v : wsel)     v = std::fabs(dist(rng)) * 0.3f;
+        for (float & v : peer_f32) v = dist(rng) * 0.5f;
+        for (size_t i = 0; i < msel.size(); ++i) msel[i] = (i % 3 == 0) ? -1 : (int32_t) (i % 128);
+        for (float & v : w_sc)   v = dist(rng) * 0.25f;
+        for (float & v : addend) v = dist(rng);
+        for (float & v : pc)     v = dist(rng) * 0.2f;
+        std::vector<ggml_fp16_t> peer_f16(peer_f32.size());
+        for (size_t i = 0; i < peer_f32.size(); ++i) peer_f16[i] = ggml_fp32_to_fp16(peer_f32[i]);
+
+        std::vector<int32_t> meta((size_t) T * m_stride, -1);
+        const int slots[T] = { 1, 3, 6, 8 };
+        const int hrow[T][3]  = { {-1,-1,-1}, {-1,-1,0}, {-1,0,1}, {-1,-1,0} };
+        const int hslot[T][3] = { {-1,-2,-3}, {-2,-3,1}, {-3,1,3}, {-2,-3,1} };
+        for (int r = 0; r < T; ++r) {
+            int32_t * mt = meta.data() + (size_t) r * m_stride;
+            mt[0] = slots[r]; mt[1] = 10 + r; mt[2] = 2; mt[3] = 0; mt[4] = 0;
+            for (int j = 0; j < 3; ++j) { mt[5 + j] = hrow[r][j]; mt[8 + j] = hslot[r][j]; }
+            mt[11] = slots[r];
+        }
+
+        struct ggml_init_params sp = { 8 * ggml_tensor_overhead() + 4096, nullptr, true };
+        ggml_context * sctx = ggml_init(sp);
+        ggml_tensor * tc_a = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, s_ch, s_max, P);
+        ggml_tensor * tc_b = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, s_ch, s_max, P);
+        ggml_tensor * t_pc = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, 3, s_ch, P);
+        ggml_backend_buffer_t sbuf = ggml_backend_alloc_ctx_tensors(sctx, backend);
+        ggml_backend_tensor_memset(tc_a, 0, 0, ggml_nbytes(tc_a));
+        ggml_backend_tensor_memset(tc_b, 0, 0, ggml_nbytes(tc_b));
+        ggml_backend_tensor_set(t_pc, pc.data(), 0, pc.size() * sizeof(float));
+
+        struct ggml_init_params gp = { 32 * ggml_tensor_overhead() + ggml_graph_overhead() + (1 << 20), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * t_dn   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, K, T);
+        ggml_tensor * t_ws   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
+        ggml_tensor * t_ms   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, T);
+        ggml_tensor * t_peer = with_peer ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, H, T) : nullptr;
+        ggml_tensor * t_wsc  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, H);
+        ggml_tensor * t_add  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+        ggml_tensor * t_mt   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m_stride, T);
+        ggml_set_input(t_dn); ggml_set_input(t_ws); ggml_set_input(t_ms);
+        if (t_peer) ggml_set_input(t_peer);
+        ggml_set_input(t_wsc); ggml_set_input(t_add); ggml_set_input(t_mt);
+
+        // Reference: subop 20 + subop 33
+        ggml_tensor * ref_sum = ggml_inkling2_moe_masked_sum(ctx, t_dn, t_ws, t_ms, t_peer, 0);
+        ggml_tensor * ref_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+        ref_out->op = GGML_OP_INKLING2_OP;
+        ref_out->src[0] = ref_sum; ref_out->src[1] = t_wsc; ref_out->src[2] = t_pc; ref_out->src[3] = tc_a;
+        ref_out->src[4] = t_mt; ref_out->src[5] = nullptr; ref_out->src[6] = t_add;
+        test_set_op_i32(ref_out, 0, 33); test_set_op_i32(ref_out, 1, chan_off);
+        test_set_op_i32(ref_out, 2, 0);  test_set_op_i32(ref_out, 3, m_stride);
+
+        // Fused subop 42
+        ggml_tensor * fus_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+        fus_out->op = GGML_OP_INKLING2_OP;
+        fus_out->src[0] = t_dn; fus_out->src[1] = t_ws; fus_out->src[2] = t_ms; fus_out->src[3] = t_peer;
+        fus_out->src[4] = t_wsc; fus_out->src[5] = t_pc; fus_out->src[6] = tc_b; fus_out->src[7] = t_mt; fus_out->src[8] = t_add;
+        test_set_op_i32(fus_out, 0, 42); test_set_op_i32(fus_out, 1, chan_off); test_set_op_i32(fus_out, 2, m_stride);
+
+        ggml_set_output(ref_out); ggml_set_output(fus_out);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, ref_out);
+        ggml_build_forward_expand(gf, fus_out);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_tensor_set(t_dn,  down.data(),   0, down.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_ws,  wsel.data(),   0, wsel.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_ms,  msel.data(),   0, msel.size()   * sizeof(int32_t));
+        if (t_peer) ggml_backend_tensor_set(t_peer, peer_f16.data(), 0, peer_f16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_wsc, w_sc.data(),   0, w_sc.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_add, addend.data(), 0, addend.size() * sizeof(float));
+        ggml_backend_tensor_set(t_mt,  meta.data(),   0, meta.size()   * sizeof(int32_t));
+        ggml_backend_graph_compute(backend, gf);
+
+        std::vector<float> ra((size_t) H * T), rb((size_t) H * T);
+        ggml_backend_tensor_get(ref_out, ra.data(), 0, ra.size() * sizeof(float));
+        ggml_backend_tensor_get(fus_out, rb.data(), 0, rb.size() * sizeof(float));
+        max_err_42 = std::max(max_err_42, max_abs_diff(ra, rb));
+
+        std::vector<float> ca(ggml_nelements(tc_a)), cb(ggml_nelements(tc_b));
+        ggml_backend_tensor_get(tc_a, ca.data(), 0, ggml_nbytes(tc_a));
+        ggml_backend_tensor_get(tc_b, cb.data(), 0, ggml_nbytes(tc_b));
+        max_err_42 = std::max(max_err_42, max_abs_diff(ca, cb));
+
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(sbuf);
+        ggml_free(sctx);
+    }
+
+    std::printf("[test_inkling2_ops] 2dsd_p0_fused: subop40=%d subop41=%d subop42_err=%.3e\n",
+                ok_40 ? 1 : 0, ok_41 ? 1 : 0, max_err_42);
+    return ok_40 && ok_41 && max_err_42 < 1e-5f;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -1390,6 +1679,7 @@ int main(int argc, char ** argv) {
     ok &= test_2dsd_drafter_and_flags(backend);
     ok &= test_2dsd_mask_embedding_pt();
     ok &= test_2dsd_executor();
+    ok &= test_2dsd_p0_fused_ops(backend);
 
     ggml_backend_free(backend);
     std::printf("[test_inkling2_ops] %s\n", ok ? "ALL PASSED" : "FAILED");

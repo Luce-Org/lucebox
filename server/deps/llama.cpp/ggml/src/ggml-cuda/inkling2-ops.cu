@@ -4048,6 +4048,281 @@ static __global__ void inkling2_2dsd_draft_mask_kernel(
     }
 }
 
+// ─── 40. Batched 2DSD Top-1024 Candidate Vanilla Markov Argmax (32-Block Full-GPU Parallel!) ─
+template <bool IS_Q8>
+static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
+        const int32_t * __restrict__ cand_ids,    size_t cand_stride, // [1024, L]
+        const float   * __restrict__ base_logits, size_t base_stride, // [V, L]
+        const int32_t * __restrict__ prev_tok,                        // [L]
+        const half    * __restrict__ markov_w1,   size_t w1_stride,   // [256, V] F16
+        const char    * __restrict__ markov_w2,   size_t w2_nb1,      // [256, V] Q8_0 or F16
+        float         * __restrict__ part_val,                        // [32, L]
+        int32_t       * __restrict__ part_id,                         // [32, L]
+        int n_vocab, int n_cands) {
+    // grid = (32, L, 1), block = (32, 8, 1) -> 32 CUs/leaf, only 4 candidates/warp (25x faster!)
+    const int lane = threadIdx.x; // 0..31
+    const int warp = threadIdx.y; // 0..7
+    const int tid  = warp * WARP_SIZE + lane; // 0..255
+    const int leaf = blockIdx.y;
+
+    __shared__ float s_lat[256];
+    const int tok = max(0, min(n_vocab - 1, prev_tok[leaf]));
+    s_lat[tid] = __half2float(markov_w1[(size_t) tok * w1_stride + tid]);
+    __syncthreads();
+
+    const int32_t * cp       = cand_ids    + (size_t) leaf * cand_stride;
+    const float   * base_row = base_logits + (size_t) leaf * base_stride;
+    const int chunk = (n_cands + 31) >> 5;
+    const int k_beg = blockIdx.x * chunk;
+    const int k_end = min(n_cands, k_beg + chunk);
+
+    float best_v = -INFINITY;
+    int32_t best_id = 0;
+
+    if constexpr (IS_Q8) {
+        const int blk = lane >> 2;
+        const int sub = lane & 3;
+        const float * lp = s_lat + blk * 32 + sub * 8;
+        const float l0 = lp[0], l1 = lp[1], l2 = lp[2], l3 = lp[3];
+        const float l4 = lp[4], l5 = lp[5], l6 = lp[6], l7 = lp[7];
+        for (int k = k_beg + warp; k < k_end; k += 8) {
+            const int32_t v = cp[k];
+            const block_q8_0 * bp = reinterpret_cast<const block_q8_0 *>(markov_w2 + (size_t) v * w2_nb1) + blk;
+            const uint16_t * hp = reinterpret_cast<const uint16_t *>(bp->qs + sub * 8);
+            const uint16_t p0 = hp[0], p1 = hp[1], p2 = hp[2], p3 = hp[3];
+            float acc = (float)(int8_t)(p0 & 0xFFu) * l0 + (float)(int8_t)(p0 >> 8) * l1
+                      + (float)(int8_t)(p1 & 0xFFu) * l2 + (float)(int8_t)(p1 >> 8) * l3
+                      + (float)(int8_t)(p2 & 0xFFu) * l4 + (float)(int8_t)(p2 >> 8) * l5
+                      + (float)(int8_t)(p3 & 0xFFu) * l6 + (float)(int8_t)(p3 >> 8) * l7;
+            const float dot = warp_reduce_sum(acc * __half2float(bp->d));
+            if (lane == 0) {
+                const float sc = base_row[v] + dot;
+                if (sc > best_v || (sc == best_v && v < best_id)) {
+                    best_v = sc;
+                    best_id = v;
+                }
+            }
+        }
+    } else {
+        const float * lp = s_lat + lane * 8;
+        const float l0 = lp[0], l1 = lp[1], l2 = lp[2], l3 = lp[3];
+        const float l4 = lp[4], l5 = lp[5], l6 = lp[6], l7 = lp[7];
+        for (int k = k_beg + warp; k < k_end; k += 8) {
+            const int32_t v = cp[k];
+            const half2 * h2p = reinterpret_cast<const half2 *>(markov_w2 + (size_t) v * w2_nb1) + lane * 4;
+            const float2 f0 = __half22float2(h2p[0]);
+            const float2 f1 = __half22float2(h2p[1]);
+            const float2 f2 = __half22float2(h2p[2]);
+            const float2 f3 = __half22float2(h2p[3]);
+            float acc = f0.x * l0 + f0.y * l1 + f1.x * l2 + f1.y * l3
+                      + f2.x * l4 + f2.y * l5 + f3.x * l6 + f3.y * l7;
+            const float dot = warp_reduce_sum(acc);
+            if (lane == 0) {
+                const float sc = base_row[v] + dot;
+                if (sc > best_v || (sc == best_v && v < best_id)) {
+                    best_v = sc;
+                    best_id = v;
+                }
+            }
+        }
+    }
+
+    __shared__ float s_wv[8];
+    __shared__ int32_t s_wi[8];
+    if (lane == 0) {
+        s_wv[warp] = best_v;
+        s_wi[warp] = best_id;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        float bv = s_wv[0];
+        int32_t bi = s_wi[0];
+        for (int w = 1; w < 8; ++w) {
+            if (s_wv[w] > bv || (s_wv[w] == bv && s_wi[w] < bi)) {
+                bv = s_wv[w];
+                bi = s_wi[w];
+            }
+        }
+        part_val[(size_t) leaf * 32 + blockIdx.x] = bv;
+        part_id[(size_t) leaf * 32 + blockIdx.x]  = bi;
+    }
+}
+
+static __global__ void inkling2_2dsd_markov_topk_stage2_kernel(
+        const float   * __restrict__ part_val, // [32, L]
+        const int32_t * __restrict__ part_id,  // [32, L]
+        int32_t       * __restrict__ out_best) { // [L]
+    // 1 warp per leaf, zero __syncthreads(), 5 warp shuffles!
+    const int lane = threadIdx.x;
+    const int leaf = blockIdx.x;
+    float   bv = part_val[(size_t) leaf * 32 + lane];
+    int32_t bi = part_id[(size_t) leaf * 32 + lane];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float   ov = i2_shfl_xor(bv, off);
+        const int32_t oi = i2_shfl_xor(bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) out_best[leaf] = bi;
+}
+
+// ─── 41. Fused SWA Tree K+V ShortConv + KV-Write (1 Launch for Both K and V!) ──
+template <bool KV_Q8_0>
+static __global__ void inkling2_tree_sconv_kv_write_kv_kernel(
+        const float   * __restrict__ x_k, size_t xk_stride,
+        const float   * __restrict__ x_v, size_t xv_stride,
+        const float   * __restrict__ wk_static,
+        const float   * __restrict__ wv_static,
+        const float   * __restrict__ prefix_conv, // [3, S_ch, P]
+        float         * __restrict__ tree_conv,   // [S_ch, S_max, P]
+        const int32_t * __restrict__ meta,        // [m_stride, T]
+        char          * __restrict__ tree_k, size_t tk_nb1, size_t tk_nb2, size_t tk_nb3,
+        char          * __restrict__ tree_v, size_t tv_nb1, size_t tv_nb2, size_t tv_nb3,
+        int n_head_kv, int s_ch, int s_max, int m_stride, float threshold, float eps) {
+    const int is_v = (blockIdx.x >= n_head_kv) ? 1 : 0;
+    const int h    = is_v ? (blockIdx.x - n_head_kv) : blockIdx.x;
+    const int t    = blockIdx.y;
+    const int d    = threadIdx.x; // 0..127
+    const int c    = h * 128 + d;
+    const int sc   = (is_v ? n_head_kv * 128 : 0) + c;
+
+    const float * x        = is_v ? x_v : x_k;
+    const size_t  x_stride = is_v ? xv_stride : xk_stride;
+    const float * w_static = is_v ? wv_static : wk_static;
+    char        * tree_kv  = is_v ? tree_v : tree_k;
+    const size_t  kv_nb1   = is_v ? tv_nb1 : tk_nb1;
+    const size_t  kv_nb2   = is_v ? tv_nb2 : tk_nb2;
+    const size_t  kv_nb3   = is_v ? tv_nb3 : tk_nb3;
+
+    const int32_t * mt = meta + (size_t) t * m_stride;
+    const int slot  = mt[0];
+    const int plane = mt[2];
+    const float cur = x[(size_t) t * x_stride + c];
+
+    const float * pc_plane = prefix_conv + (size_t) plane * s_ch * 3 + (size_t) sc * 3;
+    float * tc_plane       = tree_conv   + (size_t) plane * s_max * s_ch;
+
+    float hist[3];
+    #pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int hr = mt[5 + j];
+        if (hr >= 0) {
+            hist[j] = x[(size_t) hr * x_stride + c];
+        } else {
+            const int hs = mt[8 + j];
+            hist[j] = (hs >= 0) ? tc_plane[(size_t) hs * s_ch + sc] : pc_plane[-(hs + 1)];
+        }
+    }
+
+    const float * wc = w_static + (size_t) c * 4;
+    const float acc  = wc[0] * hist[0] + wc[1] * hist[1] + wc[2] * hist[2] + wc[3] * cur;
+    __shared__ float s_val[128];
+    s_val[d] = (cur + acc) * rsqrtf(5.0f);
+    tc_plane[(size_t) slot * s_ch + sc] = cur;
+    __syncthreads();
+
+    if (d < WARP_SIZE) {
+        const int lane = d;
+        const float v0 = s_val[lane +  0];
+        const float v1 = s_val[lane + 32];
+        const float v2 = s_val[lane + 64];
+        const float v3 = s_val[lane + 96];
+        const float ss = warp_reduce_sum(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        const float mult = is_v
+            ? rsqrtf(ss / 128.0f + eps)
+            : fminf(1.0f, threshold / (sqrtf(ss) + eps));
+        char * dst_row = tree_kv + (size_t) plane * kv_nb3 + (size_t) h * kv_nb2 + (size_t) slot * kv_nb1;
+        if constexpr (KV_Q8_0) {
+            block_q8_0 * bp = reinterpret_cast<block_q8_0 *>(dst_row);
+            const float vs[4] = { v0 * mult, v1 * mult, v2 * mult, v3 * mult };
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const float amax = warp_reduce_max(fabsf(vs[b]));
+                const float d_q = amax / 127.0f;
+                bp[b].qs[lane] = (amax == 0.0f) ? 0 : (int8_t) __float2int_rn(vs[b] / d_q);
+                if (lane == 0) bp[b].d = __float2half(d_q);
+            }
+        } else {
+            half * hp = reinterpret_cast<half *>(dst_row);
+            hp[lane +  0] = __float2half(v0 * mult);
+            hp[lane + 32] = __float2half(v1 * mult);
+            hp[lane + 64] = __float2half(v2 * mult);
+            hp[lane + 96] = __float2half(v3 * mult);
+        }
+    }
+}
+
+// ─── 42. Fused MoE Masked-Sum (+ Peer Join) + Tree FFN Post-Conv + Residual Add ──
+template <bool PEER_F16>
+static __global__ void inkling2_moe_masked_sum_tree_sconv_add_kernel(
+        const float   * __restrict__ down,        // [H, K, T]
+        const float   * __restrict__ wsel,        // [K, T]
+        const int32_t * __restrict__ mask_sel,    // [K, T]
+        const void    * __restrict__ peer_sum,    // nullptr or [H, T] (F16 or F32)
+        const float   * __restrict__ w_static,    // [4, H]
+        const float   * __restrict__ prefix_conv, // [3, S_ch, P]
+        float         * __restrict__ tree_conv,   // [S_ch, S_max, P]
+        const int32_t * __restrict__ meta,        // [m_stride, T]
+        const float   * __restrict__ addend, size_t add_stride, // [H, T]
+        float         * __restrict__ dst,         // [H, T]
+        int H, int K, int T, int wsel_ld, int msel_ld,
+        int s_ch, int s_max, int chan_offset, int m_stride) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= H || t >= T) return;
+
+    auto eval_moe = [&](int row) -> float {
+        const float   * dp = down     + (size_t) row * K * H + c;
+        const float   * wp = wsel     + (size_t) row * wsel_ld;
+        const int32_t * mp = mask_sel + (size_t) row * msel_ld;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k < K && mp[k] >= 0) {
+                acc += wp[k] * dp[(size_t) k * H];
+            }
+        }
+        if (peer_sum) {
+            const size_t pidx = (size_t) row * H + c;
+            if constexpr (PEER_F16) {
+                acc += __half2float(reinterpret_cast<const half *>(peer_sum)[pidx]);
+            } else {
+                acc += reinterpret_cast<const float *>(peer_sum)[pidx];
+            }
+        }
+        return acc;
+    };
+
+    const int32_t * mt = meta + (size_t) t * m_stride;
+    const int slot  = mt[0];
+    const int plane = mt[2];
+    const int sc    = chan_offset + c;
+
+    const float * pc_plane = prefix_conv + (size_t) plane * s_ch * 3 + (size_t) sc * 3;
+    float * tc_plane       = tree_conv   + (size_t) plane * s_max * s_ch;
+
+    const float cur = eval_moe(t);
+    float hist[3];
+    #pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int hr = mt[5 + j];
+        if (hr >= 0) {
+            hist[j] = eval_moe(hr);
+        } else {
+            const int hs = mt[8 + j];
+            hist[j] = (hs >= 0) ? tc_plane[(size_t) hs * s_ch + sc] : pc_plane[-(hs + 1)];
+        }
+    }
+
+    const float * wc = w_static + (size_t) c * 4;
+    const float acc  = wc[0] * hist[0] + wc[1] * hist[1] + wc[2] * hist[2] + wc[3] * cur;
+    dst[(size_t) t * H + c] = (cur + acc) * rsqrtf(5.0f) + addend[(size_t) t * add_stride + c];
+    tc_plane[(size_t) slot * s_ch + sc] = cur;
+}
+
 } // namespace
 
 void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -5168,6 +5443,126 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             dim3 grid((kv_span + 255) / 256, L_b, 1);
             inkling2_2dsd_draft_mask_kernel<<<grid, 256, 0, stream>>>(
                 (const int32_t *) draft_meta->data, (half *) dst->data, kv_span, B);
+            break;
+        }
+        case 40: { // 2DSD_MARKOV_TOPK_STEP (32-block/leaf parallel top-1024 vanilla Markov argmax)
+            const ggml_tensor * cand_ids    = dst->src[0];
+            const ggml_tensor * base_logits = dst->src[1];
+            const ggml_tensor * prev_tok    = dst->src[2];
+            const ggml_tensor * markov_w1   = dst->src[3];
+            const ggml_tensor * markov_w2   = dst->src[4];
+            const int n_vocab = ggml_get_op_params_i32(dst, 1);
+            const int n_cands = (int) cand_ids->ne[0];
+            const int L       = (int) prev_tok->ne[0];
+            GGML_ASSERT(markov_w1->ne[0] == 256 && markov_w1->type == GGML_TYPE_F16);
+            ggml_cuda_pool_alloc<float>   part_v(ctx.pool(), (size_t) 32 * L);
+            ggml_cuda_pool_alloc<int32_t> part_i(ctx.pool(), (size_t) 32 * L);
+            dim3 grid1(32, L, 1);
+            dim3 block1(WARP_SIZE, 8, 1);
+            if (markov_w2->type == GGML_TYPE_Q8_0) {
+                inkling2_2dsd_markov_topk_stage1_kernel<true><<<grid1, block1, 0, stream>>>(
+                    (const int32_t *) cand_ids->data, cand_ids->nb[1] / sizeof(int32_t),
+                    (const float *) base_logits->data, base_logits->nb[1] / sizeof(float),
+                    (const int32_t *) prev_tok->data,
+                    (const half *) markov_w1->data, markov_w1->nb[1] / sizeof(half),
+                    (const char *) markov_w2->data, markov_w2->nb[1],
+                    part_v.get(), part_i.get(), n_vocab, n_cands);
+            } else {
+                GGML_ASSERT(markov_w2->type == GGML_TYPE_F16);
+                inkling2_2dsd_markov_topk_stage1_kernel<false><<<grid1, block1, 0, stream>>>(
+                    (const int32_t *) cand_ids->data, cand_ids->nb[1] / sizeof(int32_t),
+                    (const float *) base_logits->data, base_logits->nb[1] / sizeof(float),
+                    (const int32_t *) prev_tok->data,
+                    (const half *) markov_w1->data, markov_w1->nb[1] / sizeof(half),
+                    (const char *) markov_w2->data, markov_w2->nb[1],
+                    part_v.get(), part_i.get(), n_vocab, n_cands);
+            }
+            inkling2_2dsd_markov_topk_stage2_kernel<<<L, WARP_SIZE, 0, stream>>>(
+                part_v.get(), part_i.get(), (int32_t *) dst->data);
+            break;
+        }
+        case 41: { // TREE_SCONV_KV_WRITE_KV (1 launch for both K and V on SWA layers!)
+            const ggml_tensor * x_k         = dst->src[0];
+            const ggml_tensor * x_v         = dst->src[1];
+            const ggml_tensor * wk_static   = dst->src[2];
+            const ggml_tensor * wv_static   = dst->src[3];
+            const ggml_tensor * prefix_conv = dst->src[4];
+            ggml_tensor       * tree_conv   = dst->src[5];
+            const ggml_tensor * meta        = dst->src[6];
+            ggml_tensor       * tree_k      = dst->src[7];
+            ggml_tensor       * tree_v      = dst->src[8];
+            const int head_dim    = ggml_get_op_params_i32(dst, 1);
+            const int n_head_kv   = ggml_get_op_params_i32(dst, 2);
+            const int m_stride    = ggml_get_op_params_i32(dst, 3);
+            const float threshold = ggml_get_op_params_f32(dst, 4);
+            const float eps       = ggml_get_op_params_f32(dst, 5);
+            const int n_tokens = (int) x_k->ne[1];
+            const int s_ch     = (int) tree_conv->ne[0];
+            const int s_max    = (int) tree_conv->ne[1];
+            GGML_ASSERT(head_dim == 128);
+            dim3 grid(n_head_kv * 2, n_tokens, 1);
+            if (tree_k->type == GGML_TYPE_Q8_0) {
+                inkling2_tree_sconv_kv_write_kv_kernel<true><<<grid, 128, 0, stream>>>(
+                    (const float *) x_k->data, x_k->nb[1] / sizeof(float),
+                    (const float *) x_v->data, x_v->nb[1] / sizeof(float),
+                    (const float *) wk_static->data, (const float *) wv_static->data,
+                    (const float *) prefix_conv->data, (float *) tree_conv->data,
+                    (const int32_t *) meta->data,
+                    (char *) tree_k->data, tree_k->nb[1], tree_k->nb[2], tree_k->nb[3],
+                    (char *) tree_v->data, tree_v->nb[1], tree_v->nb[2], tree_v->nb[3],
+                    n_head_kv, s_ch, s_max, m_stride, threshold, eps);
+            } else {
+                GGML_ASSERT(tree_k->type == GGML_TYPE_F16);
+                inkling2_tree_sconv_kv_write_kv_kernel<false><<<grid, 128, 0, stream>>>(
+                    (const float *) x_k->data, x_k->nb[1] / sizeof(float),
+                    (const float *) x_v->data, x_v->nb[1] / sizeof(float),
+                    (const float *) wk_static->data, (const float *) wv_static->data,
+                    (const float *) prefix_conv->data, (float *) tree_conv->data,
+                    (const int32_t *) meta->data,
+                    (char *) tree_k->data, tree_k->nb[1], tree_k->nb[2], tree_k->nb[3],
+                    (char *) tree_v->data, tree_v->nb[1], tree_v->nb[2], tree_v->nb[3],
+                    n_head_kv, s_ch, s_max, m_stride, threshold, eps);
+            }
+            break;
+        }
+        case 42: { // FUSED_MOE_MASKED_SUM_TREE_SCONV_ADD
+            const ggml_tensor * down        = dst->src[0];
+            const ggml_tensor * wsel        = dst->src[1];
+            const ggml_tensor * mask_sel    = dst->src[2];
+            const ggml_tensor * peer_sum    = dst->src[3];
+            const ggml_tensor * w_static    = dst->src[4];
+            const ggml_tensor * prefix_conv = dst->src[5];
+            ggml_tensor       * tree_conv   = dst->src[6];
+            const ggml_tensor * meta        = dst->src[7];
+            const ggml_tensor * addend      = dst->src[8];
+            const int chan_offset = ggml_get_op_params_i32(dst, 1);
+            const int m_stride    = ggml_get_op_params_i32(dst, 2);
+            const int H = (int) down->ne[0];
+            const int K = (int) down->ne[1];
+            const int T = (int) down->ne[2];
+            const int wsel_ld = (int) (wsel->nb[1] / sizeof(float));
+            const int msel_ld = (int) (mask_sel->nb[1] / sizeof(int32_t));
+            const int s_ch    = (int) tree_conv->ne[0];
+            const int s_max   = (int) tree_conv->ne[1];
+            const bool peer_f16 = (peer_sum && peer_sum->type == GGML_TYPE_F16);
+            dim3 grid((H + 255) / 256, T, 1);
+            if (peer_f16) {
+                inkling2_moe_masked_sum_tree_sconv_add_kernel<true><<<grid, 256, 0, stream>>>(
+                    (const float *) down->data, (const float *) wsel->data, (const int32_t *) mask_sel->data,
+                    peer_sum->data, (const float *) w_static->data,
+                    (const float *) prefix_conv->data, (float *) tree_conv->data,
+                    (const int32_t *) meta->data,
+                    (const float *) addend->data, addend->nb[1] / sizeof(float),
+                    (float *) dst->data, H, K, T, wsel_ld, msel_ld, s_ch, s_max, chan_offset, m_stride);
+            } else {
+                inkling2_moe_masked_sum_tree_sconv_add_kernel<false><<<grid, 256, 0, stream>>>(
+                    (const float *) down->data, (const float *) wsel->data, (const int32_t *) mask_sel->data,
+                    peer_sum ? peer_sum->data : nullptr, (const float *) w_static->data,
+                    (const float *) prefix_conv->data, (float *) tree_conv->data,
+                    (const int32_t *) meta->data,
+                    (const float *) addend->data, addend->nb[1] / sizeof(float),
+                    (float *) dst->data, H, K, T, wsel_ld, msel_ld, s_ch, s_max, chan_offset, m_stride);
+            }
             break;
         }
         default:

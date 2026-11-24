@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace luce::common {
@@ -37,6 +38,27 @@ static ggml_tensor * inkling2_2dsd_markov_step(
     res->src[2] = markov_w1;
     res->src[3] = markov_w2;
     set_op_i32(res, 0, 37);
+    set_op_i32(res, 1, n_vocab);
+    return res;
+}
+
+// Subop 40: single-launch batched top-1024 candidate vanilla DSpark Markov argmax across L_b leaves.
+static ggml_tensor * inkling2_2dsd_markov_topk_step(
+        ggml_context * c,
+        ggml_tensor * cand_ids,    // I32 [1024, L_b]
+        ggml_tensor * base_logits, // F32 [V, L_b]
+        ggml_tensor * prev_tok,    // I32 [L_b]
+        ggml_tensor * markov_w1,   // F16 [R, V]
+        ggml_tensor * markov_w2,   // Q8_0/F16 [R, V]
+        int n_vocab) {
+    ggml_tensor * res = ggml_new_tensor_1d(c, GGML_TYPE_I32, prev_tok->ne[0]);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = cand_ids;
+    res->src[1] = base_logits;
+    res->src[2] = prev_tok;
+    res->src[3] = markov_w1;
+    res->src[4] = markov_w2;
+    set_op_i32(res, 0, 40);
     set_op_i32(res, 1, n_vocab);
     return res;
 }
@@ -78,12 +100,14 @@ static ggml_tensor * inkling2_2dsd_draft_mask(
 static int bucket_leaf(int n) {
     if (n <= 1) return 1;
     if (n <= 2) return 2;
+    if (n <= 3) return 3;
     if (n <= 4) return 4;
     return 8;
 }
 
 static int bucket_span(int m) {
     if (m <= 0) return 0;
+    if (m <= 4) return 4;
     if (m <= 8) return 8;
     return 16;
 }
@@ -326,16 +350,12 @@ bool inkling2_2dsd_draft_batch(
                                             &span_k_upd, &span_v_upd);
         }
 
-        // Build [anchor_normed, 7 * mask_embed] per leaf -> [H, B * L_b]
+        // Build [anchor_normed, 7 * mask_embed] per leaf -> [H, B * L_b] in ONE 3D concat!
         ggml_tensor * anch_all = rms_norm_w(c, ggml_get_rows(c, w.tok_embd, g.inp_heads), w.tok_norm, w.rms_eps); // [H, L_b]
-        ggml_tensor * masks_7  = ggml_repeat_4d(c, ggml_reshape_2d(c, td.mask_embed, td.n_embd, 1),
-                                                td.n_embd, B - 1, 1, 1); // [H, 7]
-        ggml_tensor * x = nullptr;
-        for (int l = 0; l < L_b; ++l) {
-            ggml_tensor * anch_l = ggml_view_2d(c, anch_all, td.n_embd, 1, anch_all->nb[1], (size_t) l * anch_all->nb[1]);
-            ggml_tensor * blk_l  = ggml_concat(c, anch_l, masks_7, 1); // [H, 8]
-            x = (l == 0) ? blk_l : ggml_concat(c, x, blk_l, 1);
-        }
+        ggml_tensor * anch_3d  = ggml_reshape_3d(c, anch_all, td.n_embd, 1, L_b);
+        ggml_tensor * masks_3d = ggml_repeat_4d(c, ggml_reshape_3d(c, td.mask_embed, td.n_embd, 1, 1),
+                                                td.n_embd, B - 1, L_b, 1);
+        ggml_tensor * x = ggml_reshape_2d(c, ggml_concat(c, anch_3d, masks_3d, 1), td.n_embd, B * L_b);
         // On-device multi-leaf loop-context mask [kv_span, B * L_b]
         ggml_tensor * attn_mask = inkling2_2dsd_draft_mask(c, g.inp_draft_meta, kv_span, B, L_b);
 
@@ -381,18 +401,12 @@ bool inkling2_2dsd_draft_batch(
         }
 
         // Final norm -> gather slots 1..7 for each leaf, ordered slot-major [H, L_b, 7]
-        // so step s takes a single contiguous [H, L_b] slice for base_logits!
-        ggml_tensor * h_all = rms_norm_w(c, x, td.norm, td.rms_eps); // [H, 8 * L_b]
-        ggml_tensor * h_slot_major = nullptr;
-        for (int s = 0; s < n_spec; ++s) {
-            ggml_tensor * h_s = nullptr;
-            for (int l = 0; l < L_b; ++l) {
-                const int col = l * B + (1 + s);
-                ggml_tensor * v = ggml_view_2d(c, h_all, td.n_embd, 1, h_all->nb[1], (size_t) col * h_all->nb[1]);
-                h_s = (l == 0) ? v : ggml_concat(c, h_s, v, 1);
-            }
-            h_slot_major = (s == 0) ? h_s : ggml_concat(c, h_slot_major, h_s, 1); // [H, L_b * 7]
-        }
+        // in ONE single permute+cont kernel (replaces up to 55 sequential ggml_concat launches!).
+        ggml_tensor * h_all = rms_norm_w(c, x, td.norm, td.rms_eps); // [H, B * L_b]
+        ggml_tensor * h_3d  = ggml_reshape_3d(c, h_all, td.n_embd, B, L_b);
+        ggml_tensor * h_sp  = ggml_view_3d(c, h_3d, td.n_embd, n_spec, L_b, h_3d->nb[1], h_3d->nb[2], h_3d->nb[1]);
+        ggml_tensor * h_slot_major = ggml_reshape_2d(
+            c, ggml_cont(c, ggml_permute(c, h_sp, 0, 2, 1, 3)), td.n_embd, L_b * n_spec); // [H, L_b * 7]
 
         // Base logits (NO softcap! Unpadded V = 200058)
         ggml_tensor * draft_lm = td.lm_head_q4
@@ -401,6 +415,15 @@ bool inkling2_2dsd_draft_batch(
         ggml_tensor * base_logits = ggml_mul_mat(c, draft_lm, h_slot_major); // F32 [V, L_b * 7]
 
         // Unrolled 7-step batched vanilla DSpark Markov argmax chain across all L_b leaves!
+        // Default fast path: 1-pass top-1024 candidate extraction (subop 18) + 1-launch top-1024
+        // Markov scoring per step (subop 40, ~195x less weight bandwidth than full 200k scan).
+        // Set LUCE_INKLING2_2DSD_FULL_MARKOV=1 to force exact full-200k scan (subop 37).
+        const bool use_full_markov = (std::getenv("LUCE_INKLING2_2DSD_FULL_MARKOV") != nullptr &&
+                                      std::atoi(std::getenv("LUCE_INKLING2_2DSD_FULL_MARKOV")) != 0);
+        ggml_tensor * topk_cands = (!use_full_markov && td.vocab_size >= 1024)
+            ? ggml_inkling2_dspark_topk_cands(c, base_logits, td.vocab_size) // I32 [1024, L_b * 7]
+            : nullptr;
+
         ggml_tensor * prev = g.inp_heads; // I32 [L_b]
         ggml_tensor * before_all = nullptr;
         ggml_tensor * tokens_all = nullptr;
@@ -409,7 +432,14 @@ bool inkling2_2dsd_draft_batch(
             ggml_tensor * base_s = ggml_view_2d(
                 c, base_logits, td.vocab_size, L_b, base_logits->nb[1],
                 (size_t) (s * L_b) * base_logits->nb[1]);
-            prev = inkling2_2dsd_markov_step(c, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+            if (topk_cands) {
+                ggml_tensor * cands_s = ggml_view_2d(
+                    c, topk_cands, 1024, L_b, topk_cands->nb[1],
+                    (size_t) (s * L_b) * topk_cands->nb[1]);
+                prev = inkling2_2dsd_markov_topk_step(c, cands_s, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+            } else {
+                prev = inkling2_2dsd_markov_step(c, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+            }
             tokens_all = (s == 0) ? prev : ggml_concat(c, tokens_all, prev, 0); // I32 [L_b * 7]
         }
 

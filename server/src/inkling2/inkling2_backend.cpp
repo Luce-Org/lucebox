@@ -511,20 +511,43 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         const auto t_pre0 = std::chrono::steady_clock::now();
         int pos_2d = 0;
         int32_t first_tok = -1;
-        while (pos_2d < (int) req.prompt.size()) {
+        const int n_prompt_2d = (int) req.prompt.size();
+        int wf_chunk_2d = (n_prompt_2d >= 3072 && cache_.swa_cap >= 2048) ? std::max(chunk_, 1024) : chunk_;
+        if (const char * ec = std::getenv("LUCE_INKLING2_WF_CHUNK")) {
+            const int v = std::atoi(ec);
+            if (v >= 128 && v <= cache_.swa_cap - weights_.swa_window) wf_chunk_2d = v;
+        }
+        const bool use_2dsd_wf = weights_.is_loop && weights_.n_passes == 3 &&
+            !cache_.remote_backend && n_prompt_2d > wf_chunk_2d &&
+            (std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL") == nullptr ||
+             std::atoi(std::getenv("LUCE_INKLING2_WAVEFRONT_PREFILL")) != 0);
+        if (use_2dsd_wf) {
             if (io.is_cancelled()) {
                 result.fail(GenerateErrorCode::Cancelled, "cancelled during 2dsd prefill");
                 return result;
             }
-            const int end = std::min((int) req.prompt.size(), pos_2d + chunk_);
+            if (!inkling2_2dsd_prefill_wavefront(backend_, weights_, cache_, req.prompt.data(),
+                                                 n_prompt_2d, 0, wf_chunk_2d, first_tok)) {
+                result.fail(GenerateErrorCode::PrefillFailed, "inkling2 2dsd wavefront prefill failed");
+                return result;
+            }
+            pos_2d = n_prompt_2d;
+            if (io.observer) io.observer("prefill_chunk", { pos_2d, n_prompt_2d });
+        }
+        while (pos_2d < n_prompt_2d) {
+            if (io.is_cancelled()) {
+                result.fail(GenerateErrorCode::Cancelled, "cancelled during 2dsd prefill");
+                return result;
+            }
+            const int end = std::min(n_prompt_2d, pos_2d + chunk_);
             const int n   = end - pos_2d;
-            const bool is_last = (end == (int) req.prompt.size());
+            const bool is_last = (end == n_prompt_2d);
             if (!inkling2_2dsd_prefill_chunk(backend_, weights_, cache_, req.prompt.data() + pos_2d, n, pos_2d, is_last, first_tok)) {
                 result.fail(GenerateErrorCode::PrefillFailed, "inkling2 2dsd prefill failed");
                 return result;
             }
             pos_2d = end;
-            if (io.observer) io.observer("prefill_chunk", { pos_2d, (int) req.prompt.size() });
+            if (io.observer) io.observer("prefill_chunk", { pos_2d, n_prompt_2d });
         }
         const auto t_pre1 = std::chrono::steady_clock::now();
         result.prefill_s = std::chrono::duration<double>(t_pre1 - t_pre0).count();

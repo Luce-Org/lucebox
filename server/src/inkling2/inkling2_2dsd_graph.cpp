@@ -8,12 +8,15 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace luce::common {
 namespace {
+
+static constexpr size_t kInkling2TwoDSDPrefetchBytes = (size_t) 56 << 20;
 
 static inline void set_op_i32(ggml_tensor * t, int idx, int32_t v) {
     std::memcpy(&t->op_params[idx], &v, sizeof(v));
@@ -203,8 +206,115 @@ static ggml_tensor * make_tree_commit(
     return res;
 }
 
+static ggml_tensor * make_fused_loop_ctrl_pre_down(
+        ggml_context * c, ggml_tensor * cur, ggml_tensor * msg, ggml_tensor * w_q8, float eps) {
+    ggml_tensor * res = (msg->ne[2] > 1)
+        ? ggml_new_tensor_3d(c, GGML_TYPE_F32, w_q8->ne[1], msg->ne[1], msg->ne[2])
+        : ggml_new_tensor_2d(c, GGML_TYPE_F32, w_q8->ne[1], msg->ne[1]);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = cur;
+    res->src[1] = msg;
+    res->src[2] = w_q8;
+    set_op_i32(res, 0, 25);
+    set_op_f32(res, 1, eps);
+    return res;
+}
+
+static ggml_tensor * make_tree_sconv_kv_write_kv(
+        ggml_context * c,
+        ggml_tensor * x_k, ggml_tensor * x_v,
+        ggml_tensor * wk_static, ggml_tensor * wv_static,
+        ggml_tensor * prefix_conv, ggml_tensor * tree_conv,
+        ggml_tensor * meta,
+        ggml_tensor * tree_k, ggml_tensor * tree_v,
+        int head_dim, int n_head_kv, int m_stride, float threshold, float eps) {
+    ggml_tensor * res = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = x_k;
+    res->src[1] = x_v;
+    res->src[2] = wk_static;
+    res->src[3] = wv_static;
+    res->src[4] = prefix_conv;
+    res->src[5] = tree_conv;
+    res->src[6] = meta;
+    res->src[7] = tree_k;
+    res->src[8] = tree_v;
+    set_op_i32(res, 0, 41);
+    set_op_i32(res, 1, head_dim);
+    set_op_i32(res, 2, n_head_kv);
+    set_op_i32(res, 3, m_stride);
+    set_op_f32(res, 4, threshold);
+    set_op_f32(res, 5, eps);
+    return res;
+}
+
+static ggml_tensor * make_moe_masked_sum_tree_sconv_add(
+        ggml_context * c,
+        ggml_tensor * down, ggml_tensor * wsel, ggml_tensor * mask_sel, ggml_tensor * peer_sum,
+        ggml_tensor * w_static, ggml_tensor * prefix_conv, ggml_tensor * tree_conv,
+        ggml_tensor * meta, ggml_tensor * addend,
+        int chan_offset, int m_stride) {
+    ggml_tensor * res = ggml_new_tensor_2d(c, GGML_TYPE_F32, down->ne[0], down->ne[2]);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = down;
+    res->src[1] = wsel;
+    res->src[2] = mask_sel;
+    res->src[3] = peer_sum;
+    res->src[4] = w_static;
+    res->src[5] = prefix_conv;
+    res->src[6] = tree_conv;
+    res->src[7] = meta;
+    res->src[8] = addend;
+    set_op_i32(res, 0, 42);
+    set_op_i32(res, 1, chan_offset);
+    set_op_i32(res, 2, m_stride);
+    return res;
+}
+
+// Prefetch next physical layer's attention & router weights into R9700's 64 MB Infinity Cache
+// while waiting for Strix Halo's cold expert picks in Dual-GPU split mode.
+static void prefetch_next_tree_layer(
+        ggml_context * c, ggml_cgraph * gf,
+        ggml_tensor * after, int ip, int phase_id, bool has_later,
+        const Inkling2Weights & w) {
+    if (!w.buf) return;
+    std::vector<ggml_tensor *> next;
+    int next_ip = ip + 1;
+    if (phase_id == 0 && next_ip >= w.core_start) next_ip = w.core_start;
+    if (phase_id == 1 && next_ip >= w.core_end)   next_ip = w.core_end;
+    if (next_ip < w.n_layer_phys) {
+        const auto & NL = w.layers[next_ip];
+        const bool next_same_qkv = NL.is_swa && !(phase_id == 1 && next_ip < w.core_end && has_later);
+        if (next_same_qkv && NL.wqkvgrs) {
+            next = { NL.wqkvgrs, NL.wo, NL.ffn_gate_inp_q8 ? NL.ffn_gate_inp_q8 : NL.ffn_gate_inp };
+        } else if (NL.wqgrs) {
+            next = { NL.wqgrs, NL.wk_dyn ? NL.wk_dyn : NL.wk, NL.wv_dyn ? NL.wv_dyn : NL.wv, NL.wo };
+        } else {
+            next = { NL.wq, NL.wk, NL.wv, NL.wqkv_gate, NL.wo };
+        }
+    } else {
+        next = { w.output };
+    }
+    ggml_tensor * srcs[GGML_MAX_SRC - 1];
+    int n = 0;
+    size_t bytes = 0;
+    ggml_backend_buffer_type_t tbuft = ggml_backend_buffer_get_type(w.buf);
+    ggml_backend_buffer_type_t dbuft = w.derived_buf ? ggml_backend_buffer_get_type(w.derived_buf) : nullptr;
+    for (ggml_tensor * t : next) {
+        if (!t || !t->buffer || !ggml_is_contiguous(t)) continue;
+        ggml_backend_buffer_type_t b = ggml_backend_buffer_get_type(t->buffer);
+        if (b != tbuft && b != dbuft) continue;
+        if (n == GGML_MAX_SRC - 1 || bytes >= kInkling2TwoDSDPrefetchBytes) break;
+        srcs[n++] = t;
+        bytes += ggml_nbytes(t);
+    }
+    if (n > 0) {
+        ggml_build_forward_expand(gf, ggml_moe_fused_prefetch(c, after, srcs, n, kInkling2TwoDSDPrefetchBytes));
+    }
+}
+
 static int bucket_rows(int n) {
-    static constexpr int kBuckets[] = { 1, 2, 4, 8, 12, 16, 24, 32, 48, 64 };
+    static constexpr int kBuckets[] = { 1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64 };
     for (int b : kBuckets) if (n <= b) return b;
     return ((n + 31) / 32) * 32;
 }
@@ -233,6 +343,7 @@ static ggml_tensor * build_tree_layer(
         Inkling2TreeCache & tc,
         Inkling2TwoDSDPhaseGraph & g,
         int ip,
+        int phase_id,
         ggml_tensor * cur,
         std::vector<ggml_tensor *> & blocks,
         const std::vector<ggml_tensor *> * bank_blocks,
@@ -298,8 +409,9 @@ static ggml_tensor * build_tree_layer(
         ggml_tensor * msg_qkv_v = ggml_view_3d(c, messages, w.n_embd, 3, row_b, messages->nb[1], messages->nb[2], 0);
         ggml_tensor * msg_qkv   = ggml_permute(c, msg_qkv_v, 0, 2, 1, 3); // [H, T, 3]
         ggml_tensor * nw_qkv    = L.is_swa ? L.attn_norm : L.attn_qkv_norm;
-        ggml_tensor * cpre      = ggml_inkling2_loop_ctrl_pre(c, pre_qkv, msg_qkv, w.rms_eps);
-        ggml_tensor * gate      = ggml_mul_mat(c, loop->ctrl_down_qkv, cpre);
+        ggml_tensor * gate      = (loop->ctrl_down_qkv->type == GGML_TYPE_Q8_0 && row_b <= 32)
+            ? make_fused_loop_ctrl_pre_down(c, pre_qkv, msg_qkv, loop->ctrl_down_qkv, w.rms_eps)
+            : ggml_mul_mat(c, loop->ctrl_down_qkv, ggml_inkling2_loop_ctrl_pre(c, pre_qkv, msg_qkv, w.rms_eps));
         ggml_tensor * gf_o      = ggml_mul_mat(c, loop->ctrl_gf_qkv, gate);
         ggml_tensor * qkv_in    = make_loop_ctrl_post_flagged(c, pre_qkv, msg_qkv, gf_o, nw_qkv, g.inp_flags, w.rms_eps);
         for (int j = 0; j < 3; ++j) {
@@ -358,13 +470,23 @@ static ggml_tensor * build_tree_layer(
         L.is_swa ? 0 : w.log_scale_floor, L.is_swa ? 0.0f : w.log_scale_alpha,
         &Q, &rt);
 
-    // Tree K/V ShortConv + KV write (chain dep_k -> dep_v so tree_attn needs only 1 dep src!)
-    ggml_tensor * dep_k = make_tree_sconv_kv_write(
-        c, K_raw, L.attn_k_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, k_dyn,
-        tc.tree_k[ip], nullptr, 0, D, Hk, 0, m_stride, w.qk_clip, w.rms_eps);
-    ggml_tensor * dep_kv = make_tree_sconv_kv_write(
-        c, V_raw, L.attn_v_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, v_dyn,
-        tc.tree_v[ip], dep_k, kv_sz, D, Hk, 1, m_stride, w.qk_clip, w.rms_eps);
+    // Tree K/V ShortConv + KV write:
+    // SWA layers (20/24) fuse K+V into 1 launch (subop 41); Global layers keep 2 launches (dynamic taps).
+    ggml_tensor * dep_kv = nullptr;
+    if (L.is_swa) {
+        dep_kv = make_tree_sconv_kv_write_kv(
+            c, K_raw, V_raw, L.attn_k_conv, L.attn_v_conv,
+            tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta,
+            tc.tree_k[ip], tc.tree_v[ip],
+            D, Hk, m_stride, w.qk_clip, w.rms_eps);
+    } else {
+        ggml_tensor * dep_k = make_tree_sconv_kv_write(
+            c, K_raw, L.attn_k_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, k_dyn,
+            tc.tree_k[ip], nullptr, 0, D, Hk, 0, m_stride, w.qk_clip, w.rms_eps);
+        dep_kv = make_tree_sconv_kv_write(
+            c, V_raw, L.attn_v_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, v_dyn,
+            tc.tree_v[ip], dep_k, kv_sz, D, Hk, 1, m_stride, w.qk_clip, w.rms_eps);
+    }
 
     ggml_tensor * attn_out = make_tree_attn_rel(
         c, Q, tc.prefix_k[ip], tc.prefix_v[ip], tc.tree_k[ip], tc.tree_v[ip],
@@ -392,10 +514,13 @@ static ggml_tensor * build_tree_layer(
             c, cur, L.ffn_res_query, nullptr,
             blocks.empty() ? nullptr : blocks.data(), (int) blocks.size(), w.rms_eps);
         ggml_tensor * mf   = get_msg(Inkling2LoopLayer::CTRL_FFN);
-        ggml_tensor * cd_w = loop->ctrl_down_f16[Inkling2LoopLayer::CTRL_FFN]
+        ggml_tensor * cd_q8 = loop->ctrl_down[Inkling2LoopLayer::CTRL_FFN];
+        ggml_tensor * cd_w  = loop->ctrl_down_f16[Inkling2LoopLayer::CTRL_FFN]
             ? loop->ctrl_down_f16[Inkling2LoopLayer::CTRL_FFN]
-            : loop->ctrl_down[Inkling2LoopLayer::CTRL_FFN];
-        ggml_tensor * gate = ggml_mul_mat(c, cd_w, ggml_inkling2_loop_ctrl_pre(c, cur, mf, w.rms_eps));
+            : cd_q8;
+        ggml_tensor * gate = (cd_q8 && cd_q8->type == GGML_TYPE_Q8_0 && row_b <= 32)
+            ? make_fused_loop_ctrl_pre_down(c, cur, mf, cd_q8, w.rms_eps)
+            : ggml_mul_mat(c, cd_w, ggml_inkling2_loop_ctrl_pre(c, cur, mf, w.rms_eps));
         ggml_tensor * gf_o = ggml_mul_mat(c, loop->ctrl_gf[Inkling2LoopLayer::CTRL_FFN], gate);
         cur = make_loop_ctrl_post_flagged(c, cur, mf, gf_o, L.ffn_norm, g.inp_flags, w.rms_eps);
     }
@@ -432,8 +557,13 @@ static ggml_tensor * build_tree_layer(
         g.expert_nodes.insert(g.expert_nodes.end(), { cold_gu, cold_act, cold_down, cold_sum });
         ggml_build_forward_expand(gf, cold_sum);
         ggml_build_forward_expand(gf, hot_down);
+        prefetch_next_tree_layer(c, gf, hot_down, ip, phase_id, has_later, w);
 
-        cur = ggml_inkling2_moe_masked_sum(c, hot_down, wsel, hot_sel, cold_sum, 0);
+        // Fused MoE masked sum + peer join + tree ffn_post ShortConv + residual add (subop 42)
+        cur = make_moe_masked_sum_tree_sconv_add(
+            c, hot_down, wsel, hot_sel, cold_sum,
+            L.ffn_post_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, ffn_inp,
+            2 * kv_sz + w.n_embd, m_stride);
     } else {
         ggml_tensor * packed = make_fused_router_q8_topk(
             c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, 0);
@@ -444,12 +574,12 @@ static ggml_tensor * build_tree_layer(
         ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
         ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
         ggml_tensor * down = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
-        cur = ggml_inkling2_moe_masked_sum(c, down, wsel, sel, nullptr, 0);
+        // Fused MoE masked sum + tree ffn_post ShortConv + residual add (subop 42)
+        cur = make_moe_masked_sum_tree_sconv_add(
+            c, down, wsel, sel, nullptr,
+            L.ffn_post_conv, tc.prefix_conv[ip], tc.tree_conv[ip], g.inp_meta, ffn_inp,
+            2 * kv_sz + w.n_embd, m_stride);
     }
-
-    // Tree ffn_post ShortConv + residual add
-    cur = make_tree_sconv(c, cur, L.ffn_post_conv, tc.prefix_conv[ip], tc.tree_conv[ip],
-                          g.inp_meta, nullptr, ffn_inp, 2 * kv_sz + w.n_embd, 0, m_stride);
     return cur;
 }
 
@@ -536,7 +666,7 @@ static bool build_phase_graph(
 
         for (int ip = 0; ip < w.core_start; ++ip) {
             if (ip == w.twodsd.feature_layers[0]) tap_l2 = cur;
-            cur = build_tree_layer(c, g.gf, w, tc, g, ip, cur, blocks, nullptr, nullptr, false, use_split, row_b, path_b);
+            cur = build_tree_layer(c, g.gf, w, tc, g, ip, 0, cur, blocks, nullptr, nullptr, false, use_split, row_b, path_b);
         }
         for (size_t b = 0; b < tc.pre_blocks.size() && b < blocks.size(); ++b) {
             ggml_build_forward_expand(g.gf, ggml_set_rows(c, tc.pre_blocks[b], blocks[b], g.inp_slot));
@@ -576,7 +706,7 @@ static bool build_phase_graph(
             for (int ti = 0; ti < 3; ++ti) {
                 if (ip == w.twodsd.feature_layers[1 + ti]) core_tap_out[ti] = cur;
             }
-            cur = build_tree_layer(c, g.gf, w, tc, g, ip, cur, blocks,
+            cur = build_tree_layer(c, g.gf, w, tc, g, ip, 1, cur, blocks,
                                    has_later ? &bank_blocks : nullptr, bank_out,
                                    has_later, use_split, row_b, path_b);
         }
@@ -609,7 +739,7 @@ static bool build_phase_graph(
         ggml_tensor * tap_l22 = nullptr;
         for (int ip = w.core_end; ip < w.n_layer_phys; ++ip) {
             if (ip == w.twodsd.feature_layers[4]) tap_l22 = cur;
-            cur = build_tree_layer(c, g.gf, w, tc, g, ip, cur, blocks, nullptr, nullptr, false, use_split, row_b, path_b);
+            cur = build_tree_layer(c, g.gf, w, tc, g, ip, 2, cur, blocks, nullptr, nullptr, false, use_split, row_b, path_b);
         }
 
         // Assemble 5-tap depth features [5*H, row_b] -> write into node_features[depth_idx*S + slot] (F16)
@@ -802,7 +932,11 @@ static bool run_phase(
             ggml_backend_sched_synchronize(g.sched);
         }
     } else {
-        status = ggml_backend_graph_compute(target_backend, g.gf);
+        // Chain Prelude/Core asynchronously on the same GPU stream when no host readback is requested;
+        // Coda (with out_greedy) performs the single end-of-step sync!
+        status = out_greedy
+            ? ggml_backend_graph_compute(target_backend, g.gf)
+            : ggml_backend_graph_compute_async(target_backend, g.gf);
     }
     if (status != GGML_STATUS_SUCCESS) return false;
 
@@ -1098,6 +1232,769 @@ bool inkling2_2dsd_prefill_chunk(
     ggml_gallocr_free(ga);
     ggml_free(c);
     return ok && draft_ok;
+}
+
+// ─── 3-Pass Wavefront 60-Plane Prefill (60 -> 24 MoE Weight Reads / Chunk!) ─
+bool inkling2_2dsd_prefill_wavefront(
+        ggml_backend_t target_backend,
+        const Inkling2Weights & w,
+        Inkling2Cache & cache,
+        const int32_t * tokens,
+        int n_tokens,
+        int pos0,
+        int chunk_size,
+        int32_t & out_greedy_tok) {
+    if (!w.twodsd.loaded || !cache.tree.active || n_tokens <= 0) return false;
+    if (n_tokens <= chunk_size || !w.is_loop || w.n_passes != 3) {
+        return inkling2_2dsd_prefill_chunk(target_backend, w, cache, tokens, n_tokens, pos0, true, out_greedy_tok);
+    }
+
+    auto & tc = cache.tree;
+    const int Hq = w.n_head, Hk = w.n_head_kv, D = w.head_dim;
+    const int q_sz = Hq * D, kv_sz = Hk * D, r_sz = w.d_rel * Hq;
+    const int blk_div = std::max(1, w.attn_res_block);
+    const int max_blocks_core = (w.core_end / blk_div) + 2;
+    const int max_bank = ((w.core_end - w.core_start) / blk_div) + 2;
+
+    struct ChunkInfo { int off; int len; int pos; };
+    std::vector<ChunkInfo> chunks;
+    for (int off = 0; off < n_tokens; off += chunk_size) {
+        const int len = std::min(chunk_size, n_tokens - off);
+        chunks.push_back({ off, len, pos0 + off });
+    }
+    const int M = (int) chunks.size();
+
+    struct ChunkState {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor * prelude_cur = nullptr;
+        ggml_tensor * core_cur    = nullptr;
+        ggml_tensor * bank_out    = nullptr;
+        ggml_tensor * tap_l2      = nullptr;
+        ggml_tensor * core_taps[3] = {};
+        std::vector<ggml_tensor *> blocks;
+        std::vector<ggml_tensor *> bank;
+        int len = 0;
+        int n_prelude_blocks = 0;
+        int n_blocks = 0;
+        int n_bank = 0;
+    };
+    ChunkState ring[3];
+
+    auto free_slot = [&](int s) {
+        if (ring[s].buf) { ggml_backend_buffer_free(ring[s].buf); ring[s].buf = nullptr; }
+        if (ring[s].ctx) { ggml_free(ring[s].ctx); ring[s].ctx = nullptr; }
+        ring[s].blocks.clear();
+        ring[s].bank.clear();
+        ring[s].len = 0;
+    };
+    auto free_ring = [&]() { for (int s = 0; s < 3; ++s) free_slot(s); };
+    auto alloc_slot = [&](int s, int len) -> bool {
+        if (ring[s].len == len && ring[s].buf) return true;
+        free_slot(s);
+        auto & cs = ring[s];
+        const size_t n_t = (size_t) (max_blocks_core + max_bank + 10);
+        struct ggml_init_params gp = { n_t * ggml_tensor_overhead() + 4096, nullptr, true };
+        cs.ctx = ggml_init(gp);
+        if (!cs.ctx) return false;
+        cs.prelude_cur = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.core_cur    = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.bank_out    = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.tap_l2      = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        for (int ti = 0; ti < 3; ++ti) cs.core_taps[ti] = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.blocks.resize(max_blocks_core, nullptr);
+        for (int b = 0; b < max_blocks_core; ++b) cs.blocks[b] = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.bank.resize(max_bank, nullptr);
+        for (int b = 0; b < max_bank; ++b) cs.bank[b] = ggml_new_tensor_2d(cs.ctx, GGML_TYPE_F32, w.n_embd, len);
+        cs.buf = ggml_backend_alloc_ctx_tensors(cs.ctx, target_backend);
+        cs.len = len;
+        return cs.buf != nullptr;
+    };
+
+    // Wavefront schedule: step = 0 .. M + 1
+    for (int step = 0; step <= M + 1; ++step) {
+        // ── Stage 1: Prelude (L0..5, plane 0) for chunk `step` ──────────
+        if (step < M) {
+            const auto & ci = chunks[step];
+            const int s_slot = step % 3;
+            if (!alloc_slot(s_slot, ci.len)) { free_ring(); return false; }
+            auto & cs = ring[s_slot];
+
+            const size_t max_nodes = 4096;
+            struct ggml_init_params gp = { max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false) + (4 << 20), nullptr, true };
+            ggml_context * c = ggml_init(gp);
+            if (!c) { free_ring(); return false; }
+            ggml_cgraph * gf = ggml_new_graph_custom(c, max_nodes, false);
+
+            ggml_tensor * inp_tok  = ggml_new_tensor_1d(c, GGML_TYPE_I32, ci.len);
+            ggml_tensor * inp_pos  = ggml_new_tensor_1d(c, GGML_TYPE_I32, ci.len);
+            ggml_tensor * inp_meta = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
+            ggml_set_input(inp_tok);
+            ggml_set_input(inp_pos);
+            ggml_set_input(inp_meta);
+
+            ggml_tensor * cur = rms_norm_w(c, ggml_get_rows(c, w.tok_embd, inp_tok), w.tok_norm, w.rms_eps);
+            std::vector<ggml_tensor *> blocks;
+            ggml_tensor * tap_l2 = nullptr;
+
+            for (int ip = 0; ip < w.core_start; ++ip) {
+                if (ip == w.twodsd.feature_layers[0]) tap_l2 = cur;
+                const auto & L = w.layers[ip];
+                ggml_tensor * inpSA = cur;
+                ggml_tensor * k_p = plane_view_kv(c, tc.prefix_k[ip], 0);
+                ggml_tensor * v_p = plane_view_kv(c, tc.prefix_v[ip], 0);
+                ggml_tensor * st  = plane_view_conv(c, tc.prefix_conv[ip], 0);
+
+                ggml_tensor * inputs[3] = { cur, cur, cur };
+                if (L.attn_res_query == nullptr) {
+                    inputs[0] = rms_norm_w(c, cur, L.attn_norm, w.rms_eps);
+                    inputs[1] = inputs[2] = inputs[0];
+                } else if (L.is_swa) {
+                    inputs[0] = ggml_inkling2_attn_res_mix(
+                        c, cur, L.attn_res_query, L.attn_norm,
+                        blocks.empty() ? nullptr : blocks.data(), (int) blocks.size(), w.rms_eps);
+                    inputs[1] = inputs[2] = inputs[0];
+                } else {
+                    ggml_tensor * m3 = ggml_inkling2_attn_res_mix(
+                        c, cur, L.attn_res_query, L.attn_qkv_norm,
+                        blocks.empty() ? nullptr : blocks.data(), (int) blocks.size(), w.rms_eps);
+                    for (int j = 0; j < 3; ++j)
+                        inputs[j] = ggml_view_2d(c, m3, w.n_embd, ci.len, m3->nb[2], (size_t) j * m3->nb[1]);
+                }
+
+                ggml_tensor * Q_raw, * K_raw, * V_raw, * Gate, * R_raw, * Sink;
+                ggml_tensor * k_dyn = nullptr, * v_dyn = nullptr;
+                if (L.is_swa && L.wqkvgrs) {
+                    ggml_tensor * proj = ggml_mul_mat(c, L.wqkvgrs, inputs[0]);
+                    Q_raw = row_view_2d(c, proj, 0, q_sz);
+                    Gate  = row_view_2d(c, proj, q_sz, q_sz);
+                    R_raw = row_view_2d(c, proj, 2 * q_sz, r_sz);
+                    Sink  = row_view_2d(c, proj, 2 * q_sz + r_sz, Hq);
+                    K_raw = row_view_2d(c, proj, 2 * q_sz + r_sz + Hq, kv_sz);
+                    V_raw = row_view_2d(c, proj, 2 * q_sz + r_sz + Hq + kv_sz, kv_sz);
+                } else {
+                    if (L.wqgrs) {
+                        ggml_tensor * proj = ggml_mul_mat(c, L.wqgrs, inputs[0]);
+                        Q_raw = row_view_2d(c, proj, 0, q_sz);
+                        Gate  = row_view_2d(c, proj, q_sz, q_sz);
+                        R_raw = row_view_2d(c, proj, 2 * q_sz, r_sz);
+                        Sink  = row_view_2d(c, proj, 2 * q_sz + r_sz, Hq);
+                    } else {
+                        Q_raw = ggml_mul_mat(c, L.wq, inputs[0]);
+                        Gate  = ggml_mul_mat(c, L.wqkv_gate, inputs[0]);
+                        R_raw = ggml_mul_mat(c, L.attn_rel, inputs[0]);
+                        Sink  = ggml_mul_mat(c, L.attn_sink_proj, inputs[0]);
+                    }
+                    if (!L.is_swa && L.wk_dyn && L.wv_dyn) {
+                        ggml_tensor * kd = ggml_mul_mat(c, L.wk_dyn, inputs[1]);
+                        K_raw = row_view_2d(c, kd, 0, kv_sz);
+                        k_dyn = row_view_2d(c, kd, kv_sz, (int64_t) w.sconv_kernel * Hk);
+                        ggml_tensor * vd = ggml_mul_mat(c, L.wv_dyn, inputs[2]);
+                        V_raw = row_view_2d(c, vd, 0, kv_sz);
+                        v_dyn = row_view_2d(c, vd, kv_sz, (int64_t) w.sconv_kernel * Hk);
+                    } else {
+                        K_raw = ggml_mul_mat(c, L.wk, inputs[1]);
+                        V_raw = ggml_mul_mat(c, L.wv, inputs[2]);
+                        if (!L.is_swa) {
+                            k_dyn = ggml_mul_mat(c, L.attn_k_conv_proj, inputs[1]);
+                            v_dyn = ggml_mul_mat(c, L.attn_v_conv_proj, inputs[2]);
+                        }
+                    }
+                }
+
+                const int swa = L.is_swa ? w.swa_window : 0;
+                ggml_tensor * Q = nullptr, * rt = nullptr;
+                make_clip_qr_rel_table(
+                    c, Q_raw, L.attn_q_clip, R_raw, L.attn_rel_clip,
+                    L.is_swa ? nullptr : inp_pos, L.attn_rel_bias, Sink,
+                    D, w.d_rel, Hq, w.qk_clip, w.rel_clip, w.rms_eps,
+                    L.is_swa ? 0 : w.log_scale_floor, L.is_swa ? 0.0f : w.log_scale_alpha,
+                    &Q, &rt);
+                ggml_tensor * kd_dep = ggml_inkling2_sconv_kv_write(
+                    c, K_raw, L.attn_k_conv, st, st, k_dyn, k_p, inp_pos,
+                    0, D, Hk, 0, swa, w.qk_clip, w.rms_eps, 1);
+                ggml_tensor * vd_dep = ggml_inkling2_sconv_kv_write(
+                    c, V_raw, L.attn_v_conv, st, st, v_dyn, v_p, inp_pos,
+                    kv_sz, D, Hk, 1, swa, w.qk_clip, w.rms_eps, 1);
+                ggml_tensor * ao = ggml_inkling2_attn_rel(
+                    c, Q, k_p, v_p, rt, inp_meta, kd_dep, vd_dep, Gate, swa, w.rel_extent, 0, 1);
+
+                cur = ggml_mul_mat(c, L.wo, ao);
+                if (ip % w.attn_res_block == 0) {
+                    cur = ggml_inkling2_sconv(c, cur, L.attn_post_conv, st, st, nullptr, 2 * kv_sz, 0, 1);
+                    blocks.push_back(inpSA);
+                } else {
+                    cur = ggml_inkling2_sconv_add(c, cur, L.attn_post_conv, st, st, nullptr, inpSA, 2 * kv_sz, 0, 1);
+                }
+                ggml_tensor * ffn_inp = cur;
+                cur = ggml_inkling2_attn_res_mix(
+                    c, cur, L.ffn_res_query, L.ffn_norm,
+                    blocks.empty() ? nullptr : blocks.data(), (int) blocks.size(), w.rms_eps);
+                ggml_tensor * rl   = ggml_mul_mat(c, L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp, cur);
+                ggml_tensor * sel  = ggml_inkling2_sigmoid_topk_ids(c, rl, L.ffn_exp_probs_b, w.n_expert_used);
+                ggml_tensor * wsel = ggml_inkling2_sigmoid_topk_wts(c, rl, sel, w.route_scale, 1e-20f);
+                ggml_tensor * x3   = ggml_reshape_3d(c, cur, w.n_embd, 1, ci.len);
+                ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
+                ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
+                ggml_tensor * dn   = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
+                cur = ggml_ds4_moe_fused_combine_shared(c, dn, wsel, nullptr);
+                cur = ggml_inkling2_sconv_add(c, cur, L.ffn_post_conv, st, st, nullptr, ffn_inp, 2 * kv_sz + w.n_embd, 0, 1);
+            }
+
+            ggml_build_forward_expand(gf, ggml_cpy(c, cur, cs.prelude_cur));
+            cs.n_prelude_blocks = (int) blocks.size();
+            for (int b = 0; b < cs.n_prelude_blocks; ++b) {
+                ggml_build_forward_expand(gf, ggml_cpy(c, blocks[b], cs.blocks[b]));
+            }
+            if (tap_l2) {
+                ggml_build_forward_expand(gf, ggml_cpy(c, tap_l2, cs.tap_l2));
+            }
+
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
+            if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+                if (ga) ggml_gallocr_free(ga);
+                ggml_free(c);
+                free_ring();
+                return false;
+            }
+            std::vector<int32_t> pos_v(ci.len);
+            for (int i = 0; i < ci.len; ++i) pos_v[i] = ci.pos + i;
+            int32_t meta[4] = { ci.pos, ci.pos + ci.len, 0, ci.pos + ci.len };
+            ggml_backend_tensor_set(inp_tok,  tokens + ci.off, 0, (size_t) ci.len * sizeof(int32_t));
+            ggml_backend_tensor_set(inp_pos,  pos_v.data(),    0, (size_t) ci.len * sizeof(int32_t));
+            ggml_backend_tensor_set(inp_meta, meta,            0, sizeof(meta));
+            const bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            if (!ok) { free_ring(); return false; }
+        }
+
+        // Active wavefront streams at `step`: (pass=2, cidx=step-2), (pass=1, cidx=step-1), (pass=0, cidx=step)
+        struct StreamDesc { int chunk_idx; int ring_slot; int pass; int len; int pos; int tok_off; };
+        std::vector<StreamDesc> streams;
+        int T_tot = 0;
+        for (int pass = 2; pass >= 0; --pass) {
+            const int cidx = step - pass;
+            if (cidx >= 0 && cidx < M) {
+                streams.push_back({ cidx, cidx % 3, pass, chunks[cidx].len, chunks[cidx].pos, T_tot });
+                T_tot += chunks[cidx].len;
+            }
+        }
+        if (streams.empty()) continue;
+        const int n_s = (int) streams.size();
+
+        // ── Stage 2: Fused 3-Pass Loop Core (L6..17 ONCE for up to 3 chunks!) ──
+        {
+            const size_t max_nodes = 16384;
+            struct ggml_init_params gp = { max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false) + (16 << 20), nullptr, true };
+            ggml_context * c = ggml_init(gp);
+            if (!c) { free_ring(); return false; }
+            ggml_cgraph * gf = ggml_new_graph_custom(c, max_nodes, false);
+
+            ggml_tensor * s_pos[3]      = {};
+            ggml_tensor * s_meta[3]     = {};
+            ggml_tensor * s_cur[3]      = {};
+            ggml_tensor * s_bank_out[3] = {};
+            std::vector<ggml_tensor *> s_blocks[3];
+            std::vector<ggml_tensor *> s_bank[3];
+
+            for (int si = 0; si < n_s; ++si) {
+                const auto & sd = streams[si];
+                const auto & cs = ring[sd.ring_slot];
+                s_pos[si]  = ggml_new_tensor_1d(c, GGML_TYPE_I32, sd.len);
+                s_meta[si] = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
+                ggml_set_input(s_pos[si]);
+                ggml_set_input(s_meta[si]);
+
+                s_cur[si] = cs.prelude_cur;
+                for (int b = 0; b < cs.n_prelude_blocks; ++b) s_blocks[si].push_back(cs.blocks[b]);
+                if (sd.pass > 0) {
+                    s_bank_out[si] = cs.bank_out;
+                    for (int b = 0; b < cs.n_bank; ++b) s_bank[si].push_back(cs.bank[b]);
+                }
+            }
+
+            auto concat_s = [&](ggml_tensor * arr[3]) -> ggml_tensor * {
+                ggml_tensor * r = arr[0];
+                for (int si = 1; si < n_s; ++si) r = ggml_concat(c, r, arr[si], 1);
+                return r;
+            };
+            auto slice_s = [&](ggml_tensor * big, int si) -> ggml_tensor * {
+                if (n_s == 1) return big;
+                return ggml_view_2d(c, big, big->ne[0], streams[si].len, big->nb[1], (size_t) streams[si].tok_off * big->nb[1]);
+            };
+
+            ggml_tensor * s_core_taps[3][3] = {};
+            for (int ip = w.core_start; ip < w.core_end; ++ip) {
+                const auto & L    = w.layers[ip];
+                const auto & loop = w.loop_layers[ip - w.core_start];
+
+                ggml_tensor * inpSA[3] = {};
+                ggml_tensor * in_q[3] = {}, * in_k[3] = {}, * in_v[3] = {};
+                ggml_tensor * msgs[3] = {};
+
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    if (sd.pass == 2) {
+                        for (int ti = 0; ti < 3; ++ti) {
+                            if (ip == w.twodsd.feature_layers[1 + ti]) s_core_taps[si][ti] = s_cur[si];
+                        }
+                    }
+                    inpSA[si] = s_cur[si];
+                    if (sd.pass > 0) {
+                        msgs[si] = ggml_inkling2_attn_res_mix(
+                            c, s_bank_out[si], loop.msg_query, nullptr,
+                            s_bank[si].empty() ? nullptr : s_bank[si].data(), (int) s_bank[si].size(), w.rms_eps);
+                    }
+                    if (sd.pass == 0) {
+                        if (L.is_swa) {
+                            in_q[si] = ggml_inkling2_attn_res_mix(
+                                c, s_cur[si], L.attn_res_query, L.attn_norm,
+                                s_blocks[si].empty() ? nullptr : s_blocks[si].data(), (int) s_blocks[si].size(), w.rms_eps);
+                            in_k[si] = in_v[si] = in_q[si];
+                        } else {
+                            ggml_tensor * m3 = ggml_inkling2_attn_res_mix(
+                                c, s_cur[si], L.attn_res_query, L.attn_qkv_norm,
+                                s_blocks[si].empty() ? nullptr : s_blocks[si].data(), (int) s_blocks[si].size(), w.rms_eps);
+                            in_q[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], 0);
+                            in_k[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], m3->nb[1]);
+                            in_v[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], 2 * m3->nb[1]);
+                        }
+                    } else {
+                        ggml_tensor * mx = ggml_inkling2_attn_res_mix(
+                            c, s_cur[si], L.attn_res_query, nullptr,
+                            s_blocks[si].empty() ? nullptr : s_blocks[si].data(), (int) s_blocks[si].size(), w.rms_eps);
+                        ggml_tensor * pre_qkv   = L.is_swa ? mx : ggml_permute(c, mx, 0, 2, 1, 3);
+                        ggml_tensor * msg_qkv_v = ggml_view_3d(c, msgs[si], w.n_embd, 3, sd.len, msgs[si]->nb[1], msgs[si]->nb[2], 0);
+                        ggml_tensor * msg_qkv   = ggml_permute(c, msg_qkv_v, 0, 2, 1, 3);
+                        ggml_tensor * nw_qkv    = L.is_swa ? L.attn_norm : L.attn_qkv_norm;
+                        ggml_tensor * cpre      = ggml_inkling2_loop_ctrl_pre(c, pre_qkv, msg_qkv, w.rms_eps);
+                        ggml_tensor * gate      = ggml_mul_mat(c, loop.ctrl_down_qkv, cpre);
+                        ggml_tensor * gfo       = ggml_mul_mat(c, loop.ctrl_gf_qkv, gate);
+                        ggml_tensor * qkv_in    = ggml_inkling2_loop_ctrl_post(c, pre_qkv, msg_qkv, gfo, nw_qkv, w.rms_eps);
+                        in_q[si] = ggml_view_2d(c, qkv_in, w.n_embd, sd.len, qkv_in->nb[1], 0);
+                        in_k[si] = ggml_view_2d(c, qkv_in, w.n_embd, sd.len, qkv_in->nb[1], qkv_in->nb[2]);
+                        in_v[si] = ggml_view_2d(c, qkv_in, w.n_embd, sd.len, qkv_in->nb[1], 2 * qkv_in->nb[2]);
+                    }
+                }
+
+                // ONE FUSED Q/Gate/R/Sink, K, V GEMM ACROSS ALL 3 LOOP PASSES!
+                ggml_tensor * q_in_cat = concat_s(in_q);
+                ggml_tensor * k_in_cat = concat_s(in_k);
+                ggml_tensor * v_in_cat = concat_s(in_v);
+                ggml_tensor * qgrs_all = L.wqgrs ? ggml_mul_mat(c, L.wqgrs, q_in_cat) : nullptr;
+                ggml_tensor * q_sep = qgrs_all ? nullptr : ggml_mul_mat(c, L.wq, q_in_cat);
+                ggml_tensor * g_sep = qgrs_all ? nullptr : ggml_mul_mat(c, L.wqkv_gate, q_in_cat);
+                ggml_tensor * r_sep = qgrs_all ? nullptr : ggml_mul_mat(c, L.attn_rel, q_in_cat);
+                ggml_tensor * s_sep = qgrs_all ? nullptr : ggml_mul_mat(c, L.attn_sink_proj, q_in_cat);
+                const bool use_kv_dyn = (!L.is_swa && L.wk_dyn && L.wv_dyn);
+                ggml_tensor * k_all = ggml_mul_mat(c, use_kv_dyn ? L.wk_dyn : L.wk, k_in_cat);
+                ggml_tensor * v_all = ggml_mul_mat(c, use_kv_dyn ? L.wv_dyn : L.wv, v_in_cat);
+                ggml_tensor * kd_sep = (!L.is_swa && !use_kv_dyn) ? ggml_mul_mat(c, L.attn_k_conv_proj, k_in_cat) : nullptr;
+                ggml_tensor * vd_sep = (!L.is_swa && !use_kv_dyn) ? ggml_mul_mat(c, L.attn_v_conv_proj, v_in_cat) : nullptr;
+
+                ggml_tensor * ao_s[3] = {};
+                const int swa = L.is_swa ? w.swa_window : 0;
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * k_p = plane_view_kv(c, tc.prefix_k[ip], sd.pass);
+                    ggml_tensor * v_p = plane_view_kv(c, tc.prefix_v[ip], sd.pass);
+                    ggml_tensor * st  = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+
+                    ggml_tensor * Q_raw, * Gate, * R_raw, * Sink;
+                    if (qgrs_all) {
+                        ggml_tensor * pq = slice_s(qgrs_all, si);
+                        Q_raw = row_view_2d(c, pq, 0, q_sz);
+                        Gate  = row_view_2d(c, pq, q_sz, q_sz);
+                        R_raw = row_view_2d(c, pq, 2 * q_sz, r_sz);
+                        Sink  = row_view_2d(c, pq, 2 * q_sz + r_sz, Hq);
+                    } else {
+                        Q_raw = slice_s(q_sep, si);
+                        Gate  = slice_s(g_sep, si);
+                        R_raw = slice_s(r_sep, si);
+                        Sink  = slice_s(s_sep, si);
+                    }
+                    ggml_tensor * pk = slice_s(k_all, si);
+                    ggml_tensor * pv = slice_s(v_all, si);
+                    ggml_tensor * K_raw = use_kv_dyn ? row_view_2d(c, pk, 0, kv_sz) : pk;
+                    ggml_tensor * k_dyn = use_kv_dyn ? row_view_2d(c, pk, kv_sz, (int64_t) w.sconv_kernel * Hk)
+                                                     : (kd_sep ? slice_s(kd_sep, si) : nullptr);
+                    ggml_tensor * V_raw = use_kv_dyn ? row_view_2d(c, pv, 0, kv_sz) : pv;
+                    ggml_tensor * v_dyn = use_kv_dyn ? row_view_2d(c, pv, kv_sz, (int64_t) w.sconv_kernel * Hk)
+                                                     : (vd_sep ? slice_s(vd_sep, si) : nullptr);
+
+                    ggml_tensor * Q = nullptr, * rt = nullptr;
+                    make_clip_qr_rel_table(
+                        c, Q_raw, L.attn_q_clip, R_raw, L.attn_rel_clip,
+                        L.is_swa ? nullptr : s_pos[si], L.attn_rel_bias, Sink,
+                        D, w.d_rel, Hq, w.qk_clip, w.rel_clip, w.rms_eps,
+                        L.is_swa ? 0 : w.log_scale_floor, L.is_swa ? 0.0f : w.log_scale_alpha,
+                        &Q, &rt);
+                    ggml_tensor * kd_dep = ggml_inkling2_sconv_kv_write(
+                        c, K_raw, L.attn_k_conv, st, st, k_dyn, k_p, s_pos[si],
+                        0, D, Hk, 0, swa, w.qk_clip, w.rms_eps, 1);
+                    ggml_tensor * vd_dep = ggml_inkling2_sconv_kv_write(
+                        c, V_raw, L.attn_v_conv, st, st, v_dyn, v_p, s_pos[si],
+                        kv_sz, D, Hk, 1, swa, w.qk_clip, w.rms_eps, 1);
+                    ao_s[si] = ggml_inkling2_attn_rel(
+                        c, Q, k_p, v_p, rt, s_meta[si], kd_dep, vd_dep, Gate, swa, w.rel_extent, 0, 1);
+                }
+
+                // ONE FUSED O-PROJ GEMM ACROSS ALL 3 LOOP PASSES!
+                ggml_tensor * wo_all = ggml_mul_mat(c, L.wo, concat_s(ao_s));
+
+                ggml_tensor * ffn_inp[3]  = {};
+                ggml_tensor * ffn_in_s[3] = {};
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+                    ggml_tensor * x  = nullptr;
+                    if (ip % w.attn_res_block == 0) {
+                        x = ggml_inkling2_sconv(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, 2 * kv_sz, 0, 1);
+                        s_blocks[si].push_back(inpSA[si]);
+                    } else {
+                        x = ggml_inkling2_sconv_add(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, inpSA[si], 2 * kv_sz, 0, 1);
+                    }
+                    ffn_inp[si] = x;
+
+                    if (sd.pass == 0) {
+                        ffn_in_s[si] = ggml_inkling2_attn_res_mix(
+                            c, x, L.ffn_res_query, L.ffn_norm,
+                            s_blocks[si].empty() ? nullptr : s_blocks[si].data(), (int) s_blocks[si].size(), w.rms_eps);
+                    } else {
+                        ggml_tensor * mx = ggml_inkling2_attn_res_mix(
+                            c, x, L.ffn_res_query, nullptr,
+                            s_blocks[si].empty() ? nullptr : s_blocks[si].data(), (int) s_blocks[si].size(), w.rms_eps);
+                        ggml_tensor * mf = ggml_view_2d(c, msgs[si], w.n_embd, sd.len, msgs[si]->nb[2],
+                                                        (size_t) Inkling2LoopLayer::CTRL_FFN * msgs[si]->nb[1]);
+                        ggml_tensor * cpre = ggml_inkling2_loop_ctrl_pre(c, mx, mf, w.rms_eps);
+                        ggml_tensor * cd_w = loop.ctrl_down_f16[Inkling2LoopLayer::CTRL_FFN]
+                            ? loop.ctrl_down_f16[Inkling2LoopLayer::CTRL_FFN]
+                            : loop.ctrl_down[Inkling2LoopLayer::CTRL_FFN];
+                        ggml_tensor * gt   = ggml_mul_mat(c, cd_w, cpre);
+                        ggml_tensor * gfo  = ggml_mul_mat(c, loop.ctrl_gf[Inkling2LoopLayer::CTRL_FFN], gt);
+                        ffn_in_s[si] = ggml_inkling2_loop_ctrl_post(c, mx, mf, gfo, L.ffn_norm, w.rms_eps);
+                    }
+                }
+
+                // ONE FUSED ROUTER + 128-EXPERT MoE PASS ACROSS ALL 3 LOOP PASSES!
+                ggml_tensor * ffn_cat = concat_s(ffn_in_s);
+                ggml_tensor * rl   = ggml_mul_mat(c, L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp, ffn_cat);
+                ggml_tensor * sel  = ggml_inkling2_sigmoid_topk_ids(c, rl, L.ffn_exp_probs_b, w.n_expert_used);
+                ggml_tensor * wsel = ggml_inkling2_sigmoid_topk_wts(c, rl, sel, w.route_scale, 1e-20f);
+                ggml_tensor * x3   = ggml_reshape_3d(c, ffn_cat, w.n_embd, 1, T_tot);
+                ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
+                ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
+                ggml_tensor * dn   = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
+                ggml_tensor * moe_all = ggml_ds4_moe_fused_combine_shared(c, dn, wsel, nullptr);
+
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+                    s_cur[si] = ggml_inkling2_sconv_add(
+                        c, slice_s(moe_all, si), L.ffn_post_conv, st, st, nullptr, ffn_inp[si], 2 * kv_sz + w.n_embd, 0, 1);
+                }
+            }
+
+            // Persist each stream's end-of-pass state for immediate Coda (Stage 3) and next Core pass
+            for (int si = 0; si < n_s; ++si) {
+                const auto & sd = streams[si];
+                auto & cs = ring[sd.ring_slot];
+                ggml_build_forward_expand(gf, ggml_cpy(c, s_cur[si], cs.core_cur));
+                cs.n_blocks = (int) s_blocks[si].size();
+                for (int b = cs.n_prelude_blocks; b < cs.n_blocks; ++b) {
+                    ggml_build_forward_expand(gf, ggml_cpy(c, s_blocks[si][b], cs.blocks[b]));
+                }
+                if (sd.pass < 2) {
+                    ggml_build_forward_expand(gf, ggml_cpy(c, s_cur[si], cs.bank_out));
+                    cs.n_bank = std::max(0, cs.n_blocks - cs.n_prelude_blocks - 1);
+                    for (int b = 0; b < cs.n_bank; ++b) {
+                        ggml_build_forward_expand(gf, ggml_cpy(c, s_blocks[si][cs.n_prelude_blocks + 1 + b], cs.bank[b]));
+                    }
+                } else {
+                    for (int ti = 0; ti < 3; ++ti) {
+                        if (s_core_taps[si][ti]) {
+                            ggml_build_forward_expand(gf, ggml_cpy(c, s_core_taps[si][ti], cs.core_taps[ti]));
+                        }
+                    }
+                }
+            }
+
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
+            if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+                if (ga) ggml_gallocr_free(ga);
+                ggml_free(c);
+                free_ring();
+                return false;
+            }
+            for (int si = 0; si < n_s; ++si) {
+                const auto & sd = streams[si];
+                std::vector<int32_t> pos_v(sd.len);
+                for (int i = 0; i < sd.len; ++i) pos_v[i] = sd.pos + i;
+                int32_t meta[4] = { sd.pos, sd.pos + sd.len, 0, sd.pos + sd.len };
+                ggml_backend_tensor_set(s_pos[si],  pos_v.data(), 0, (size_t) sd.len * sizeof(int32_t));
+                ggml_backend_tensor_set(s_meta[si], meta,         0, sizeof(meta));
+            }
+            const bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            if (!ok) { free_ring(); return false; }
+        }
+
+        // ── Stage 3: Fused 3-Depth Coda (L18..23 ONCE for all ready depths {3, 2, 1}!) ──
+        {
+            const size_t max_nodes = 12288;
+            struct ggml_init_params gp = { max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false) + (12 << 20), nullptr, true };
+            ggml_context * c = ggml_init(gp);
+            if (!c) { free_ring(); return false; }
+            ggml_cgraph * gf = ggml_new_graph_custom(c, max_nodes, false);
+
+            ggml_tensor * c_pos[3]  = {};
+            ggml_tensor * c_meta[3] = {};
+            ggml_tensor * c_cur[3]  = {};
+            std::vector<ggml_tensor *> c_blocks[3];
+            int pass2_si = -1;
+
+            for (int si = 0; si < n_s; ++si) {
+                const auto & sd = streams[si];
+                const auto & cs = ring[sd.ring_slot];
+                c_pos[si]  = ggml_new_tensor_1d(c, GGML_TYPE_I32, sd.len);
+                c_meta[si] = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
+                ggml_set_input(c_pos[si]);
+                ggml_set_input(c_meta[si]);
+                c_cur[si] = cs.core_cur;
+                for (int b = 0; b < cs.n_blocks; ++b) c_blocks[si].push_back(cs.blocks[b]);
+                if (sd.pass == 2) pass2_si = si;
+            }
+
+            auto concat_s = [&](ggml_tensor * arr[3]) -> ggml_tensor * {
+                ggml_tensor * r = arr[0];
+                for (int si = 1; si < n_s; ++si) r = ggml_concat(c, r, arr[si], 1);
+                return r;
+            };
+            auto slice_s = [&](ggml_tensor * big, int si) -> ggml_tensor * {
+                if (n_s == 1) return big;
+                return ggml_view_2d(c, big, big->ne[0], streams[si].len, big->nb[1], (size_t) streams[si].tok_off * big->nb[1]);
+            };
+
+            ggml_tensor * tap_l22 = nullptr;
+            for (int ip = w.core_end; ip < w.n_layer_phys; ++ip) {
+                const auto & L = w.layers[ip];
+                if (pass2_si >= 0 && ip == w.twodsd.feature_layers[4]) {
+                    tap_l22 = c_cur[pass2_si];
+                }
+
+                ggml_tensor * inpSA[3] = {};
+                ggml_tensor * in_q[3] = {}, * in_k[3] = {}, * in_v[3] = {};
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    inpSA[si] = c_cur[si];
+                    if (L.is_swa) {
+                        in_q[si] = ggml_inkling2_attn_res_mix(
+                            c, c_cur[si], L.attn_res_query, L.attn_norm,
+                            c_blocks[si].empty() ? nullptr : c_blocks[si].data(), (int) c_blocks[si].size(), w.rms_eps);
+                        in_k[si] = in_v[si] = in_q[si];
+                    } else {
+                        ggml_tensor * m3 = ggml_inkling2_attn_res_mix(
+                            c, c_cur[si], L.attn_res_query, L.attn_qkv_norm,
+                            c_blocks[si].empty() ? nullptr : c_blocks[si].data(), (int) c_blocks[si].size(), w.rms_eps);
+                        in_q[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], 0);
+                        in_k[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], m3->nb[1]);
+                        in_v[si] = ggml_view_2d(c, m3, w.n_embd, sd.len, m3->nb[2], 2 * m3->nb[1]);
+                    }
+                }
+
+                // ONE FUSED QKV/Gate/R/Sink GEMM ACROSS ALL 3 CODA DEPTHS!
+                ggml_tensor * proj_all = nullptr;
+                ggml_tensor * qgrs_all = nullptr;
+                ggml_tensor * q_sep = nullptr, * g_sep = nullptr, * r_sep = nullptr, * s_sep = nullptr;
+                ggml_tensor * k_all = nullptr, * v_all = nullptr, * kd_sep = nullptr, * vd_sep = nullptr;
+                const bool use_kv_dyn = (!L.is_swa && L.wk_dyn && L.wv_dyn);
+                if (L.is_swa && L.wqkvgrs) {
+                    proj_all = ggml_mul_mat(c, L.wqkvgrs, concat_s(in_q));
+                } else {
+                    ggml_tensor * q_in_cat = concat_s(in_q);
+                    ggml_tensor * k_in_cat = concat_s(in_k);
+                    ggml_tensor * v_in_cat = concat_s(in_v);
+                    if (L.wqgrs) {
+                        qgrs_all = ggml_mul_mat(c, L.wqgrs, q_in_cat);
+                    } else {
+                        q_sep = ggml_mul_mat(c, L.wq, q_in_cat);
+                        g_sep = ggml_mul_mat(c, L.wqkv_gate, q_in_cat);
+                        r_sep = ggml_mul_mat(c, L.attn_rel, q_in_cat);
+                        s_sep = ggml_mul_mat(c, L.attn_sink_proj, q_in_cat);
+                    }
+                    k_all = ggml_mul_mat(c, use_kv_dyn ? L.wk_dyn : L.wk, k_in_cat);
+                    v_all = ggml_mul_mat(c, use_kv_dyn ? L.wv_dyn : L.wv, v_in_cat);
+                    if (!L.is_swa && !use_kv_dyn) {
+                        kd_sep = ggml_mul_mat(c, L.attn_k_conv_proj, k_in_cat);
+                        vd_sep = ggml_mul_mat(c, L.attn_v_conv_proj, v_in_cat);
+                    }
+                }
+
+                ggml_tensor * ao_s[3] = {};
+                const int swa = L.is_swa ? w.swa_window : 0;
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * k_p = plane_view_kv(c, tc.prefix_k[ip], sd.pass);
+                    ggml_tensor * v_p = plane_view_kv(c, tc.prefix_v[ip], sd.pass);
+                    ggml_tensor * st  = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+
+                    ggml_tensor * Q_raw, * K_raw, * V_raw, * Gate, * R_raw, * Sink;
+                    ggml_tensor * k_dyn = nullptr, * v_dyn = nullptr;
+                    if (proj_all) {
+                        ggml_tensor * pp = slice_s(proj_all, si);
+                        Q_raw = row_view_2d(c, pp, 0, q_sz);
+                        Gate  = row_view_2d(c, pp, q_sz, q_sz);
+                        R_raw = row_view_2d(c, pp, 2 * q_sz, r_sz);
+                        Sink  = row_view_2d(c, pp, 2 * q_sz + r_sz, Hq);
+                        K_raw = row_view_2d(c, pp, 2 * q_sz + r_sz + Hq, kv_sz);
+                        V_raw = row_view_2d(c, pp, 2 * q_sz + r_sz + Hq + kv_sz, kv_sz);
+                    } else {
+                        if (qgrs_all) {
+                            ggml_tensor * pq = slice_s(qgrs_all, si);
+                            Q_raw = row_view_2d(c, pq, 0, q_sz);
+                            Gate  = row_view_2d(c, pq, q_sz, q_sz);
+                            R_raw = row_view_2d(c, pq, 2 * q_sz, r_sz);
+                            Sink  = row_view_2d(c, pq, 2 * q_sz + r_sz, Hq);
+                        } else {
+                            Q_raw = slice_s(q_sep, si);
+                            Gate  = slice_s(g_sep, si);
+                            R_raw = slice_s(r_sep, si);
+                            Sink  = slice_s(s_sep, si);
+                        }
+                        ggml_tensor * pk = slice_s(k_all, si);
+                        ggml_tensor * pv = slice_s(v_all, si);
+                        K_raw = use_kv_dyn ? row_view_2d(c, pk, 0, kv_sz) : pk;
+                        k_dyn = use_kv_dyn ? row_view_2d(c, pk, kv_sz, (int64_t) w.sconv_kernel * Hk)
+                                           : (kd_sep ? slice_s(kd_sep, si) : nullptr);
+                        V_raw = use_kv_dyn ? row_view_2d(c, pv, 0, kv_sz) : pv;
+                        v_dyn = use_kv_dyn ? row_view_2d(c, pv, kv_sz, (int64_t) w.sconv_kernel * Hk)
+                                           : (vd_sep ? slice_s(vd_sep, si) : nullptr);
+                    }
+
+                    ggml_tensor * Q = nullptr, * rt = nullptr;
+                    make_clip_qr_rel_table(
+                        c, Q_raw, L.attn_q_clip, R_raw, L.attn_rel_clip,
+                        L.is_swa ? nullptr : c_pos[si], L.attn_rel_bias, Sink,
+                        D, w.d_rel, Hq, w.qk_clip, w.rel_clip, w.rms_eps,
+                        L.is_swa ? 0 : w.log_scale_floor, L.is_swa ? 0.0f : w.log_scale_alpha,
+                        &Q, &rt);
+                    ggml_tensor * kd_dep = ggml_inkling2_sconv_kv_write(
+                        c, K_raw, L.attn_k_conv, st, st, k_dyn, k_p, c_pos[si],
+                        0, D, Hk, 0, swa, w.qk_clip, w.rms_eps, 1);
+                    ggml_tensor * vd_dep = ggml_inkling2_sconv_kv_write(
+                        c, V_raw, L.attn_v_conv, st, st, v_dyn, v_p, c_pos[si],
+                        kv_sz, D, Hk, 1, swa, w.qk_clip, w.rms_eps, 1);
+                    ao_s[si] = ggml_inkling2_attn_rel(
+                        c, Q, k_p, v_p, rt, c_meta[si], kd_dep, vd_dep, Gate, swa, w.rel_extent, 0, 1);
+                }
+
+                // ONE FUSED O-PROJ GEMM ACROSS ALL 3 CODA DEPTHS!
+                ggml_tensor * wo_all = ggml_mul_mat(c, L.wo, concat_s(ao_s));
+
+                ggml_tensor * ffn_inp[3]  = {};
+                ggml_tensor * ffn_in_s[3] = {};
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+                    ggml_tensor * x  = nullptr;
+                    if (ip % w.attn_res_block == 0) {
+                        x = ggml_inkling2_sconv(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, 2 * kv_sz, 0, 1);
+                        c_blocks[si].push_back(inpSA[si]);
+                    } else {
+                        x = ggml_inkling2_sconv_add(c, slice_s(wo_all, si), L.attn_post_conv, st, st, nullptr, inpSA[si], 2 * kv_sz, 0, 1);
+                    }
+                    ffn_inp[si]  = x;
+                    ffn_in_s[si] = ggml_inkling2_attn_res_mix(
+                        c, x, L.ffn_res_query, L.ffn_norm,
+                        c_blocks[si].empty() ? nullptr : c_blocks[si].data(), (int) c_blocks[si].size(), w.rms_eps);
+                }
+
+                // ONE FUSED ROUTER + 128-EXPERT MoE PASS ACROSS ALL 3 CODA DEPTHS!
+                ggml_tensor * ffn_cat = concat_s(ffn_in_s);
+                ggml_tensor * rl   = ggml_mul_mat(c, L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp, ffn_cat);
+                ggml_tensor * sel  = ggml_inkling2_sigmoid_topk_ids(c, rl, L.ffn_exp_probs_b, w.n_expert_used);
+                ggml_tensor * wsel = ggml_inkling2_sigmoid_topk_wts(c, rl, sel, w.route_scale, 1e-20f);
+                ggml_tensor * x3   = ggml_reshape_3d(c, ffn_cat, w.n_embd, 1, T_tot);
+                ggml_tensor * gu   = ggml_mul_mat_id(c, L.ffn_gate_up_exps, x3, sel);
+                ggml_tensor * act  = ggml_inkling2_situ(c, gu, w.situ_beta, w.situ_linear_beta);
+                ggml_tensor * dn   = ggml_mul_mat_id(c, L.ffn_down_exps, act, sel);
+                ggml_tensor * moe_all = ggml_ds4_moe_fused_combine_shared(c, dn, wsel, nullptr);
+
+                for (int si = 0; si < n_s; ++si) {
+                    const auto & sd = streams[si];
+                    ggml_tensor * st = plane_view_conv(c, tc.prefix_conv[ip], sd.pass);
+                    c_cur[si] = ggml_inkling2_sconv_add(
+                        c, slice_s(moe_all, si), L.ffn_post_conv, st, st, nullptr, ffn_inp[si], 2 * kv_sz + w.n_embd, 0, 1);
+                }
+            }
+
+            for (int si = 0; si < n_s; ++si) {
+                ggml_build_forward_expand(gf, c_cur[si]);
+            }
+
+            ggml_tensor * feats_out = nullptr;
+            ggml_tensor * greedy_t  = nullptr;
+            const bool is_last_pass2 = (pass2_si >= 0 && streams[pass2_si].chunk_idx == M - 1);
+            if (pass2_si >= 0) {
+                const auto & sd2 = streams[pass2_si];
+                const auto & cs2 = ring[sd2.ring_slot];
+                ggml_tensor * f01 = ggml_concat(c, cs2.tap_l2, cs2.core_taps[0], 0);
+                ggml_tensor * f23 = ggml_concat(c, cs2.core_taps[1], cs2.core_taps[2], 0);
+                feats_out = ggml_concat(c, ggml_concat(c, f01, f23, 0), tap_l22, 0);
+                ggml_set_output(feats_out);
+                ggml_build_forward_expand(gf, feats_out);
+
+                if (is_last_pass2) {
+                    ggml_tensor * final_out_norm = ggml_inkling2_attn_res_mix(
+                        c, c_cur[pass2_si], w.output_res_query, w.output_norm,
+                        c_blocks[pass2_si].empty() ? nullptr : c_blocks[pass2_si].data(),
+                        (int) c_blocks[pass2_si].size(), w.rms_eps);
+                    ggml_tensor * lm_in = ggml_view_2d(
+                        c, final_out_norm, w.n_embd, 1, final_out_norm->nb[1],
+                        (size_t) (sd2.len - 1) * final_out_norm->nb[1]);
+                    ggml_tensor * raw_l = ggml_mul_mat(c, w.output, lm_in);
+                    ggml_tensor * soft  = ggml_inkling2_softcap_slice(c, raw_l, w.n_vocab_unpadded, w.logit_softcap);
+                    greedy_t = ggml_argmax(c, soft);
+                    ggml_set_output(greedy_t);
+                    ggml_build_forward_expand(gf, greedy_t);
+                }
+            }
+
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
+            if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+                if (ga) ggml_gallocr_free(ga);
+                ggml_free(c);
+                free_ring();
+                return false;
+            }
+            for (int si = 0; si < n_s; ++si) {
+                const auto & sd = streams[si];
+                std::vector<int32_t> pos_v(sd.len);
+                for (int i = 0; i < sd.len; ++i) pos_v[i] = sd.pos + i;
+                int32_t meta[4] = { sd.pos, sd.pos + sd.len, 0, sd.pos + sd.len };
+                ggml_backend_tensor_set(c_pos[si],  pos_v.data(), 0, (size_t) sd.len * sizeof(int32_t));
+                ggml_backend_tensor_set(c_meta[si], meta,         0, sizeof(meta));
+            }
+            bool ok = (ggml_backend_graph_compute(target_backend, gf) == GGML_STATUS_SUCCESS);
+            if (ok && pass2_si >= 0 && feats_out) {
+                const auto & sd2 = streams[pass2_si];
+                ok = inkling2_2dsd_commit_prefix_kv_from_feats(target_backend, w, cache, feats_out, sd2.pos, sd2.len);
+                if (ok && is_last_pass2 && greedy_t) {
+                    ggml_backend_tensor_get(greedy_t, &out_greedy_tok, 0, sizeof(int32_t));
+                }
+            }
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            if (!ok) { free_ring(); return false; }
+        }
+    }
+
+    tc.prefix_len = pos0 + n_tokens;
+    cache.cur_pos = pos0 + n_tokens;
+    free_ring();
+    return true;
 }
 
 // ─── Advance Active Tree Nodes by +1 Loop ───────────────────────────────
