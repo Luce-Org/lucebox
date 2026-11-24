@@ -572,7 +572,8 @@ bool copy_feature_ring_range_to_tensor(
     const DraftFeatureMirror & feature_ring,
     ggml_tensor * dst,
     int start_pos,
-    int n_tokens) {
+    int n_tokens,
+    bool sync) {
     if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
     if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
 
@@ -602,8 +603,10 @@ bool copy_feature_ring_range_to_tensor(
             if (!to_f32) return false;
             cudaError_t err = cudaSetDevice(feature_ring.device);
             if (feature_cuda_failed("cudaSetDevice", err)) return false;
+            cudaStream_t stream = luce_copy_stream(feature_ring.device);
+            if (!stream) return false;
             to_f32(src_base, (float *)dst_base,
-                   (int64_t)run * (int64_t)fc_in, nullptr);
+                   (int64_t)run * (int64_t)fc_in, stream);
             err = cudaGetLastError();
             if (feature_cuda_failed("to_fp32_cuda", err)) return false;
         } else {
@@ -620,7 +623,11 @@ bool copy_feature_ring_range_to_tensor(
         }
         done += run;
     }
-    if (!luce_copy_stream_sync(feature_ring.device)) {
+    return !sync || sync_feature_ring_copy_stream(feature_ring.device);
+}
+
+bool sync_feature_ring_copy_stream(int device) {
+    if (!luce_copy_stream_sync(device)) {
         std::fprintf(stderr, "[dflash-feature] copy stream sync failed\n");
         return false;
     }

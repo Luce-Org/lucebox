@@ -137,11 +137,17 @@ bool copy_host_capture_slice_to_draft_ring(
 
 // Copy n_tokens rows from the DraftFeatureMirror ring buffer into a
 // destination tensor (typically the draft graph's target_hidden_cat input).
+// When `sync` is false, the copy stream is left unsynchronized so a batched
+// caller can issue multiple lane copies and call sync_feature_ring_copy_stream()
+// once afterwards.
 bool copy_feature_ring_range_to_tensor(
     const DraftFeatureMirror & feature_ring,
     ggml_tensor * dst,
     int start_pos,
-    int n_tokens);
+    int n_tokens,
+    bool sync = true);
+
+bool sync_feature_ring_copy_stream(int device);
 
 bool copy_feature_ring_range_to_host_f32(
     const DraftFeatureMirror & feature_ring,

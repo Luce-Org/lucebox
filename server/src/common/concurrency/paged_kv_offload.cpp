@@ -109,7 +109,7 @@ PagedKvOffload::PagedKvOffload(SeqSlotManager & slots, PagedKvPool & pool,
 SeqEngine::KvOffloadState PagedKvOffload::state(int slot) const {
     if (!slots_.is_active(slot)) return {};
     const SeqSlot & s = slots_.slot(slot);
-    return {s.parked(), s.recomputing(), saved_[(size_t)slot].size()};
+    return {s.parked(), s.recomputing(), saved_[(size_t)slot].size};
 }
 
 bool PagedKvOffload::payload_size(size_t blocks, size_t & bytes,
@@ -157,23 +157,30 @@ bool PagedKvOffload::suspend(int slot, size_t available_bytes,
             error = "insufficient current host memory for decode KV offload";
             return false;
         }
-        std::vector<uint8_t> saved(bytes);
+        // Uninitialized host buffer avoids zero-filling hundreds of MB before
+        // overwriting every byte from device memory.
+        std::unique_ptr<uint8_t[]> saved(bytes > 0 ? new uint8_t[bytes] : nullptr);
+        const std::vector<uint32_t> & table = sequence.block_table;
         ggml_backend_synchronize(backend_);
+        transfer_.begin(backend_);
         size_t offset = 0;
         for (const auto & plane : tensors_) {
-            for (uint32_t block : sequence.block_table) {
-                ggml_backend_tensor_get_async(backend_, plane.tensor, saved.data() + offset,
-                    plane.offset + static_cast<size_t>(block) * plane.block_bytes,
-                    plane.block_bytes);
-                offset += plane.block_bytes;
+            for (size_t i = 0, run = 0; i < table.size(); i += run) {
+                run = contiguous_block_run(table, i, table.size());
+                const size_t run_bytes = run * plane.block_bytes;
+                transfer_.d2h(
+                    plane.tensor,
+                    plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
+                    saved.get() + offset, run_bytes);
+                offset += run_bytes;
             }
         }
+        transfer_.finish();
         if (!slots_.detach_kv(slot)) {
             error = "could not release preserved KV blocks";
             return false;
         }
-        ggml_backend_synchronize(backend_);
-        saved_[(size_t)slot] = std::move(saved);
+        saved_[(size_t)slot] = {std::move(saved), bytes};
         return true;
     } catch (const std::bad_alloc &) {
         error = "could not allocate decode KV offload RAM";
@@ -195,7 +202,7 @@ bool PagedKvOffload::restore(int slot, std::vector<int32_t> & blocks,
                           pool_.block_size() - 1) / pool_.block_size();
     size_t bytes = 0;
     if (!payload_size(count, bytes, error)) return false;
-    if (bytes != saved_[(size_t)slot].size()) {
+    if (bytes != saved_[(size_t)slot].size) {
         error = "saved KV payload size does not match the sequence";
         return false;
     }
@@ -208,18 +215,24 @@ bool PagedKvOffload::restore(int slot, std::vector<int32_t> & blocks,
             error = "restored KV sequence is unavailable";
             return false;
         }
+        const std::vector<uint32_t> & table = sequence.block_table;
         ggml_backend_synchronize(backend_);
+        transfer_.begin(backend_);
         size_t offset = 0;
+        const uint8_t * src_data = saved_[(size_t)slot].data.get();
         for (const auto & plane : tensors_) {
-            for (uint32_t block : sequence.block_table) {
-                ggml_backend_tensor_set_async(backend_, plane.tensor, saved_[(size_t)slot].data() + offset,
-                    plane.offset + static_cast<size_t>(block) * plane.block_bytes,
-                    plane.block_bytes);
-                offset += plane.block_bytes;
+            for (size_t i = 0, run = 0; i < table.size(); i += run) {
+                run = contiguous_block_run(table, i, table.size());
+                const size_t run_bytes = run * plane.block_bytes;
+                transfer_.h2d(
+                    plane.tensor,
+                    plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
+                    src_data + offset, run_bytes);
+                offset += run_bytes;
             }
         }
         for (size_t i = 0; i < count; ++i) blocks[i] = (int32_t)sequence.block_table[i];
-        ggml_backend_synchronize(backend_);
+        transfer_.finish();
         discard(slot);
         return true;
     } catch (const std::bad_alloc &) {
@@ -231,7 +244,8 @@ bool PagedKvOffload::restore(int slot, std::vector<int32_t> & blocks,
 
 void PagedKvOffload::discard(int slot) {
     if (slot >= 0 && static_cast<size_t>(slot) < saved_.size()) {
-        std::vector<uint8_t>().swap(saved_[(size_t)slot]);
+        saved_[(size_t)slot].data.reset();
+        saved_[(size_t)slot].size = 0;
     }
 }
 

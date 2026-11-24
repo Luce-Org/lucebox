@@ -86,8 +86,17 @@ inline uint64_t request_rng_seed(const SamplerCfg & cfg) {
 int sample_logits(const float * logits_in,
                   int vocab,
                   const SamplerCfg & cfg,
-                  const std::vector<int32_t> & history,
+                  const int32_t * history,
+                  size_t history_len,
                   std::mt19937_64 & rng);
+
+inline int sample_logits(const float * logits_in,
+                         int vocab,
+                         const SamplerCfg & cfg,
+                         const std::vector<int32_t> & history,
+                         std::mt19937_64 & rng) {
+    return sample_logits(logits_in, vocab, cfg, history.data(), history.size(), rng);
+}
 
 // True when sample_logits with this config returns the row's argmax, the lowest
 // id on ties, whatever the history and RNG: greedy with no penalty and no
@@ -110,7 +119,12 @@ int sample_logits_top_n(const SamplerCfg & cfg, int vocab);
 // tie reaches the n-th value, or a penalty lowers enough candidates that a token outside them could enter the top_k);
 // the caller then reads the row and calls sample_logits.
 int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab, const SamplerCfg & cfg,
-                      const std::vector<int32_t> & history, std::mt19937_64 & rng);
+                      const int32_t * history, size_t history_len, std::mt19937_64 & rng);
+
+inline int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab, const SamplerCfg & cfg,
+                             const std::vector<int32_t> & history, std::mt19937_64 & rng) {
+    return sample_logits_top(vals, ids, n, vocab, cfg, history.data(), history.size(), rng);
+}
 
 // True when sample_logits with this config runs on the host only. Otherwise
 // it may take a GPU sampler path, which uses the calling thread's current
@@ -125,8 +139,17 @@ bool sample_logits_host_only(const SamplerCfg & cfg, int vocab);
 void sampler_distribution(const float * logits_in,
                           int vocab,
                           const SamplerCfg & cfg,
-                          const std::vector<int32_t> & history,
+                          const int32_t * history,
+                          size_t history_len,
                           std::vector<std::pair<float, int>> & out);
+
+inline void sampler_distribution(const float * logits_in,
+                                 int vocab,
+                                 const SamplerCfg & cfg,
+                                 const std::vector<int32_t> & history,
+                                 std::vector<std::pair<float, int>> & out) {
+    sampler_distribution(logits_in, vocab, cfg, history.data(), history.size(), out);
+}
 
 // Inverse-CDF draw over (weight, token) pairs; weights need not be normalized.
 int sampler_draw(const std::vector<std::pair<float, int>> & cand, double r_uniform);

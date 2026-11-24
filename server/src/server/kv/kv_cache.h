@@ -147,6 +147,9 @@ struct KvPlanQuery {
     // the least it must add to be captured instead of the request's own cut.
     std::function<int()> queued_shared_prefix;
     int shared_prefix_min_tokens = 0;
+    // Optional precomputed chat boundaries for `*prompt` (avoids rescanning
+    // the prompt in lookup_candidate and reserve_inline_snap).
+    const std::vector<int> * precomputed_boundaries = nullptr;
 };
 
 class KvCache {

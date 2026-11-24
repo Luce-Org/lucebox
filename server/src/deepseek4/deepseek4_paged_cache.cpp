@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <limits>
@@ -277,9 +278,7 @@ void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot) {
     auto clear_slot = [slot](ggml_tensor * tensor) {
         if (!tensor || tensor->ne[2] <= (int64_t) slot) return;
         const size_t bytes = tensor->nb[2];
-        std::vector<uint8_t> zeros(bytes, 0);
-        ggml_backend_tensor_set(tensor, zeros.data(), (size_t) slot * bytes,
-                                bytes);
+        ggml_backend_tensor_memset(tensor, 0, (size_t) slot * bytes, bytes);
     };
     // A new sequence starts with no n-gram context.
     if (slot < c.engram_tokens.size()) c.engram_tokens[slot].reset();
@@ -307,22 +306,77 @@ bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
     const auto same_rows = [](const ggml_tensor * a, const ggml_tensor * b) {
         return a && b && a->type == b->type && a->ne[0] == b->ne[0] && a->nb[1] == b->nb[1];
     };
+    const auto tensor_buf = [](const ggml_tensor * t) -> ggml_backend_buffer_t {
+        return t ? (t->view_src ? t->view_src->buffer : t->buffer) : nullptr;
+    };
+    const auto can_direct_row_copy = [&](const ggml_tensor * from, const ggml_tensor * to) {
+        const ggml_backend_buffer_t sb = tensor_buf(from);
+        const ggml_backend_buffer_t db = tensor_buf(to);
+        if (!sb || !db || !from->data || !to->data) return false;
+        if (from->nb[0] != to->nb[0] || from->nb[1] != ggml_row_size(from->type, from->ne[0])) {
+            return false;
+        }
+        const bool src_host = ggml_backend_buffer_is_host(sb);
+        const bool dst_host = ggml_backend_buffer_is_host(db);
+        if (src_host && dst_host) return true;
+        return !src_host && !dst_host &&
+               ggml_backend_buffer_get_type(sb) == ggml_backend_buffer_get_type(db);
+    };
+    const auto direct_copy_rows = [&](const ggml_tensor * from, size_t src_off,
+                                      ggml_tensor * to, size_t dst_off, int64_t n_rows) {
+        const ggml_backend_buffer_t sb = tensor_buf(from);
+        const ggml_backend_buffer_t db = tensor_buf(to);
+        const size_t bytes = (size_t) n_rows * from->nb[1];
+        if (ggml_backend_buffer_is_host(sb) && ggml_backend_buffer_is_host(db)) {
+            std::memcpy(static_cast<char *>(to->data) + dst_off,
+                        static_cast<const char *>(from->data) + src_off, bytes);
+            return;
+        }
+        ggml_tensor v_src{};
+        v_src.type = from->type;
+        v_src.buffer = sb;
+        v_src.ne[0] = from->ne[0];
+        v_src.ne[1] = n_rows;
+        v_src.ne[2] = 1;
+        v_src.ne[3] = 1;
+        v_src.nb[0] = from->nb[0];
+        v_src.nb[1] = from->nb[1];
+        v_src.nb[2] = bytes;
+        v_src.nb[3] = bytes;
+        v_src.data = static_cast<char *>(from->data) + src_off;
+
+        ggml_tensor v_dst = v_src;
+        v_dst.buffer = db;
+        v_dst.data = static_cast<char *>(to->data) + dst_off;
+        ggml_backend_tensor_copy(&v_src, &v_dst);
+    };
+    std::vector<uint8_t> host_scratch;
     // One whole slot plane of a [width, rows, slots] tensor from a [width, rows] one.
     const auto copy_plane = [&](const ggml_tensor * from, ggml_tensor * to) {
         if (!from && !to) return true;
         if (!same_rows(from, to) || from->ne[1] != to->ne[1] || ggml_nbytes(from) != to->nb[2]) return false;
-        std::vector<uint8_t> host(ggml_nbytes(from));
-        ggml_backend_tensor_get(from, host.data(), 0, host.size());
-        ggml_backend_tensor_set(to, host.data(), size_t(slot) * to->nb[2], host.size());
+        const size_t bytes = ggml_nbytes(from);
+        if (can_direct_row_copy(from, to) && ggml_is_contiguous(from)) {
+            direct_copy_rows(from, 0, to, size_t(slot) * to->nb[2], from->ne[1]);
+            return true;
+        }
+        host_scratch.resize(bytes);
+        ggml_backend_tensor_get(from, host_scratch.data(), 0, bytes);
+        ggml_backend_tensor_set(to, host_scratch.data(), size_t(slot) * to->nb[2], bytes);
         return true;
     };
     // Completed compression groups, chronological in src, paged in dst.
-    // Groups inside one logical block land on consecutive rows of its page.
+    // Groups inside one logical block land on consecutive rows of its page,
+    // and contiguous physical blocks coalesce into one transfer.
     const auto copy_groups = [&](const ggml_tensor * from, ggml_tensor * to, uint32_t ratio, int groups) {
         if (!groups) return true;
         if (!same_rows(from, to) || groups > from->ne[1]) return false;
-        std::vector<uint8_t> host(size_t(groups) * from->nb[1]);
-        ggml_backend_tensor_get(from, host.data(), 0, host.size());
+        const bool direct = can_direct_row_copy(from, to);
+        const size_t total_bytes = size_t(groups) * from->nb[1];
+        if (!direct) {
+            host_scratch.resize(total_bytes);
+            ggml_backend_tensor_get(from, host_scratch.data(), 0, total_bytes);
+        }
         const int per_block = int(DS4_PAGE_TOKENS / ratio);
         for (int g = 0; g < groups;) {
             const uint64_t end_token = uint64_t(g) * ratio + ratio - 1;
@@ -330,9 +384,28 @@ bool import_deepseek4_paged_slot(const DeepSeek4Cache & src, int n_tokens,
             uint64_t row = 0; bool emitted = false;
             if (!ds4_compressed_page_row(end_token, uint32_t(block_table[logical]), ratio, row, emitted) ||
                 !emitted || row >= uint64_t(to->ne[1])) return false;
-            const int run = std::min(groups - g, per_block - int((end_token % DS4_PAGE_TOKENS) / ratio));
-            ggml_backend_tensor_set(to, host.data() + size_t(g) * from->nb[1],
-                                    size_t(row) * to->nb[1], size_t(run) * from->nb[1]);
+            int run = std::min(groups - g, per_block - int((end_token % DS4_PAGE_TOKENS) / ratio));
+            // Coalesce subsequent logical blocks whose physical pages are adjacent.
+            uint64_t cur_logical = logical;
+            uint32_t cur_phys = uint32_t(block_table[logical]);
+            while (g + run < groups && cur_logical + 1 < blocks_needed) {
+                const uint32_t next_phys = uint32_t(block_table[cur_logical + 1]);
+                if (next_phys != cur_phys + 1) break;
+                const uint64_t next_end = uint64_t(g + run) * ratio + ratio - 1;
+                uint64_t next_row = 0; bool next_emitted = false;
+                if (!ds4_compressed_page_row(next_end, next_phys, ratio, next_row, next_emitted) ||
+                    !next_emitted || next_row != row + uint64_t(run)) break;
+                run += std::min(groups - (g + run), per_block);
+                ++cur_logical;
+                cur_phys = next_phys;
+            }
+            if (row + uint64_t(run) > uint64_t(to->ne[1])) return false;
+            if (direct) {
+                direct_copy_rows(from, size_t(g) * from->nb[1], to, size_t(row) * to->nb[1], run);
+            } else {
+                ggml_backend_tensor_set(to, host_scratch.data() + size_t(g) * from->nb[1],
+                                        size_t(row) * to->nb[1], size_t(run) * from->nb[1]);
+            }
             g += run;
         }
         return true;

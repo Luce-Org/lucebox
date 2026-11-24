@@ -479,3 +479,158 @@ TEST_CASE(PagedKvPoolFixture, auto_pool_sizing) {
     CHECK(headline >= 32768);
     CHECK(headline < 16LL * 32768);
 }
+
+TEST_CASE(PagedKvPoolFixture, shared_prefix_refcounting) {
+    // 10 physical blocks, 4 sequences, 16 tokens per block. A 3-block
+    // (48-token) prefix shared by 4 requests, plus 1 private suffix block
+    // each, fits in 3 + 4 = 7 blocks.
+    PagedKvPool pool(/*physical_block_count=*/10, /*max_sequences=*/4, /*block_size=*/16);
+
+    const auto s0 = acquire(pool, 1);
+    CHECK(pool.append(s0, 48).status == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 7);
+    CHECK(pool.pinned_only_block_count() == 0);
+
+    std::vector<uint32_t> pinned;
+    CHECK(pool.pin_prefix_blocks(s0, 3, pinned) == PagedKvStatus::Ok);
+    CHECK(equals(pinned, {0, 1, 2}));
+    CHECK(pool.free_block_count() == 7);
+    CHECK(pool.pinned_only_block_count() == 0);  // s0 still active
+    for (uint32_t b : pinned) {
+        CHECK(pool.block_refcount(b) == 2);
+        CHECK(pool.is_block_shared(b));
+    }
+
+    // s0 appends suffix into private block 3 and retires: blocks 0,1,2 stay
+    // pinned on GPU (pinned_only_block_count == 3), block 3 frees immediately.
+    CHECK(pool.append(s0, 5).status == PagedKvStatus::Ok);
+    CHECK(sequence(pool, s0).block_table.back() == 3);
+    CHECK(pool.release(s0) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 7);
+    CHECK(pool.pinned_only_block_count() == 3);
+    for (uint32_t b : pinned) {
+        CHECK(pool.block_refcount(b) == 1);
+        CHECK(!pool.is_block_shared(b));
+    }
+
+    // 4 concurrent requests share those 3 prefix blocks.
+    PagedKvSequenceHandle h[4];
+    for (int i = 0; i < 4; ++i) {
+        CHECK(pool.acquire_reserved(100 + i, /*token_capacity=*/16, h[i]) ==
+              PagedKvStatus::Ok);
+        CHECK(pool.seed_shared_prefix(h[i], pinned.data(), 3, 48) ==
+              PagedKvStatus::Ok);
+        CHECK(pool.append(h[i], 10).status == PagedKvStatus::Ok);
+        const auto snap = sequence(pool, h[i]);
+        CHECK(snap.kv_seq_len == 58);
+        CHECK(snap.block_table.size() == 4);
+        CHECK(snap.block_table[0] == 0);
+        CHECK(snap.block_table[1] == 1);
+        CHECK(snap.block_table[2] == 2);
+        CHECK(snap.block_table[3] == static_cast<uint32_t>(3 + i));
+    }
+    CHECK(pool.pinned_only_block_count() == 0);
+    CHECK(pool.free_block_count() == 3);  // 10 - (3 shared + 4 private)
+    for (uint32_t b : pinned) CHECK(pool.block_refcount(b) == 5);  // 4 seqs + 1 pin
+
+    // Unpinning while the sequences are live leaves the blocks to them.
+    CHECK(pool.unpin_prefix_blocks(pinned) == PagedKvStatus::Ok);
+    CHECK(pool.pinned_only_block_count() == 0);
+    CHECK(pool.free_block_count() == 3);
+    for (uint32_t b : pinned) CHECK(pool.block_refcount(b) == 4);
+
+    // Release 3 of the 4 sequences: private blocks return, shared blocks stay.
+    for (int i = 0; i < 3; ++i) {
+        CHECK(pool.release(h[i]) == PagedKvStatus::Ok);
+    }
+    CHECK(pool.free_block_count() == 6);
+    for (uint32_t b : pinned) CHECK(pool.block_refcount(b) == 1);
+
+    // Release final sequence: all 10 blocks are reclaimed cleanly.
+    CHECK(pool.release(h[3]) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 10);
+    CHECK(pool.pinned_only_block_count() == 0);
+    for (uint32_t b = 0; b < 10; ++b) CHECK(pool.block_refcount(b) == 0);
+}
+
+TEST_CASE(PagedKvPoolFixture, shared_prefix_partial_tail_cow_isolation) {
+    PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/3, /*block_size=*/16);
+    const auto src = acquire(pool, 1);
+    CHECK(pool.append(src, 37).status == PagedKvStatus::Ok);  // 2 full blocks + 5 tail tokens
+
+    // Partial block 2 cannot be pinned; only the 2 full blocks can.
+    std::vector<uint32_t> pinned;
+    CHECK(pool.pin_prefix_blocks(src, 3, pinned) == PagedKvStatus::InvalidArgument);
+    CHECK(pool.pin_prefix_blocks(src, 2, pinned) == PagedKvStatus::Ok);
+    CHECK(equals(pinned, {0, 1}));
+
+    // Two new sequences restore the unaligned 37-token prefix: both share
+    // blocks {0, 1}, and each gets its own private block for logical block 2.
+    // `a` was admitted with that tail block reserved (as the engine admits a
+    // shared-prefix restore); `b` takes it from the free list.
+    PagedKvSequenceHandle a;
+    CHECK(pool.acquire_reserved(2, /*token_capacity=*/16, a) == PagedKvStatus::Ok);
+    CHECK(sequence(pool, a).reserved_block_count == 1);
+    const uint32_t free_before = pool.free_block_count();
+    const auto b = acquire(pool, 3);
+    CHECK(pool.seed_shared_prefix(a, pinned.data(), 2, 37) == PagedKvStatus::Ok);
+    CHECK(sequence(pool, a).reserved_block_count == 0);
+    CHECK(pool.free_block_count() == free_before);
+    CHECK(pool.seed_shared_prefix(b, pinned.data(), 2, 37) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == free_before - 1);
+
+    const auto sa = sequence(pool, a);
+    const auto sb = sequence(pool, b);
+    CHECK(sa.kv_seq_len == 37);
+    CHECK(sb.kv_seq_len == 37);
+    CHECK(sa.block_table[0] == 0 && sb.block_table[0] == 0);
+    CHECK(sa.block_table[1] == 1 && sb.block_table[1] == 1);
+    CHECK(sa.block_table[2] != sb.block_table[2]);
+    CHECK(sa.block_table[2] != sequence(pool, src).block_table[2]);
+    CHECK(pool.block_refcount(sa.block_table[2]) == 1);
+    CHECK(pool.block_refcount(sb.block_table[2]) == 1);
+
+    // Appending tokens to `a` and `b` writes only into their private tail blocks.
+    const auto app_a = pool.append(a, 5);
+    const auto app_b = pool.append(b, 5);
+    CHECK(app_a.status == PagedKvStatus::Ok);
+    CHECK(app_b.status == PagedKvStatus::Ok);
+    CHECK(app_a.write_slots[0].physical_block == sa.block_table[2]);
+    CHECK(app_b.write_slots[0].physical_block == sb.block_table[2]);
+
+    // Rollback of private suffix succeeds, but rolling back into shared block 1 fails.
+    CHECK(pool.rollback_append(a, 5) == PagedKvStatus::Ok);
+    CHECK(pool.rollback_append(a, 5) == PagedKvStatus::Ok);  // lands at exact boundary 32
+    CHECK(sequence(pool, a).kv_seq_len == 32);
+    CHECK(pool.rollback_append(a, 1) == PagedKvStatus::InvalidArgument);
+    CHECK(sequence(pool, a).kv_seq_len == 32);
+
+    CHECK(pool.release(src) == PagedKvStatus::Ok);
+    CHECK(pool.release(a) == PagedKvStatus::Ok);
+    CHECK(pool.release(b) == PagedKvStatus::Ok);
+    CHECK(pool.unpin_prefix_blocks(pinned) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 8);
+}
+
+TEST_CASE(PagedKvPoolFixture, shared_prefix_overlapping_pins) {
+    PagedKvPool pool(/*physical_block_count=*/10, /*max_sequences=*/2, /*block_size=*/16);
+    const auto t1 = acquire(pool, 1);
+    CHECK(pool.append(t1, 64).status == PagedKvStatus::Ok);  // blocks 0..3
+
+    // Turn 1 pins blocks 0..1; turn 2 pins blocks 0..3, overlapping it.
+    std::vector<uint32_t> pin1, pin2;
+    CHECK(pool.pin_prefix_blocks(t1, 2, pin1) == PagedKvStatus::Ok);
+    CHECK(pool.pin_prefix_blocks(t1, 4, pin2) == PagedKvStatus::Ok);
+    CHECK(pool.release(t1) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 6);
+    CHECK(pool.pinned_only_block_count() == 4);
+
+    // Dropping turn 1 leaves turn 2's blocks 0..3 intact.
+    CHECK(pool.unpin_prefix_blocks(pin1) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 6);
+    CHECK(pool.pinned_only_block_count() == 4);
+
+    CHECK(pool.unpin_prefix_blocks(pin2) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 10);
+    CHECK(pool.pinned_only_block_count() == 0);
+}

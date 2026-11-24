@@ -542,7 +542,8 @@ private:
     // LUCE_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
     // EOS suppression); fetches the slot's logits row on demand.
     int32_t apply_min_tokens_floor(int32_t tok, int generated,
-                                   size_t logits_row_offset);
+                                   size_t logits_row_offset,
+                                   const ggml_tensor * logits_override = nullptr);
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
