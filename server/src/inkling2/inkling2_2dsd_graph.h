@@ -40,7 +40,8 @@ bool inkling2_2dsd_prefill_chunk(
     int pos0,
     bool is_last_chunk,
     int32_t & out_greedy_tok,
-    std::vector<float> * out_last_logits = nullptr);
+    std::vector<float> * out_last_logits = nullptr,
+    int capture_q_rows = 0);
 
 // 3-Pass Wavefront 60-Plane Prefill for multi-chunk prompts (`n_tokens > chunk_size`):
 // Fuses all 3 core passes (L6..17) AND all 3 coda depths (L18..23) across up to 3 chunks
@@ -55,7 +56,9 @@ bool inkling2_2dsd_prefill_wavefront(
     int pos0,
     int chunk_size,
     int32_t & out_greedy_tok,
-    std::vector<float> * out_last_logits = nullptr);
+    std::vector<float> * out_last_logits = nullptr,
+    int capture_q_rows = 0,
+    bool is_last_chunk = true);
 
 // Advance `nodes` by +1 loop in up to 3 static-bucketed HIP/CUDA graphs:
 //   - Prelude (L0..5) for nodes with depth == 0
@@ -89,7 +92,8 @@ bool inkling2_2dsd_advance_nodes_batched(
     bool allow_split,
     std::vector<int> & out_readout_rows,
     std::vector<int32_t> & out_readout_argmax,
-    Inkling2TwoDSDAdvanceSampleOut * out_sample = nullptr);
+    Inkling2TwoDSDAdvanceSampleOut * out_sample = nullptr,
+    const Inkling2KvFlash * const * slot_kfs = nullptr);
 
 // Commit accepted path slots [0..n_commit-1] from tree scratch into all 60 committed prefix planes
 // AND commit their loop-3 features into the 5-layer drafter prefix KV cache.

@@ -273,9 +273,10 @@ bool inkling2_2dsd_commit_prefix_kv_from_slots(
     int32_t pos[kInkling2TwoDSDMaxCommit];
     int32_t wpos[kInkling2TwoDSDMaxCommit];
     for (int i = 0; i < n_commit; ++i) {
+        const int rel = std::max(0, (pos0 - tc.draft_pref_start) + i);
         idx[i]  = depth_base + commit_slots[i];
         pos[i]  = pos0 + i;
-        wpos[i] = std::max(0, (pos0 - tc.draft_pref_start) + i);
+        wpos[i] = (tc.draft_ring_cap > 0) ? (rel % tc.draft_ring_cap) : rel;
     }
     ggml_backend_tensor_set(g.feats, idx,  0, (size_t) n_commit * sizeof(int32_t));
     ggml_backend_tensor_set(g.pos,   pos,  0, (size_t) n_commit * sizeof(int32_t));
@@ -326,7 +327,8 @@ bool inkling2_2dsd_draft_batch(
     const int L_b = bucket_leaf(n_req);
     const int S_b = bucket_span(max_span);
     const int pref_len    = tc.prefix_len;
-    const int pref_len_kv = std::max(0, tc.prefix_len - tc.draft_pref_start);
+    const int rel_pref    = std::max(0, tc.prefix_len - tc.draft_pref_start);
+    const int pref_len_kv = (tc.draft_ring_cap > 0) ? std::min(rel_pref, tc.draft_ring_cap) : rel_pref;
     const int kv_used     = pref_len_kv + L_b * S_b + L_b * B;
     if (kv_used + 1 > tc.draft_cap) {
         std::fprintf(stderr, "[inkling2-2dsd] draft KV overflow (used=%d cap=%d)\n", kv_used, tc.draft_cap);

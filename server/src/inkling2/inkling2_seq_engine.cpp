@@ -1,8 +1,11 @@
-// Inkling2SeqEngine — Concurrent N-slot batched 2DSD SeqEngine for Inkling 2 Mini.
+// Inkling2SeqEngine & Inkling2SlotKv — Unified concurrent N-slot SeqEngine
+// (Batched Multi-Slot 2DSD + 1D AR/DSpark + SlotKv v2 + Inkling2SlotStateAdapter + 3-Tier KVFlash 2.0).
 
 #include "inkling2_seq_engine.h"
 #include "inkling2_2dsd_draft.h"
 #include "inkling2_2dsd_graph.h"
+#include "inkling2_graph.h"
+#include "inkling2_kvflash.h"
 
 #include "common/sampler.h"
 
@@ -16,13 +19,6 @@
 
 namespace luce::common {
 namespace {
-
-static uint32_t compute_pool_blocks(int max_ctx, int n_slots) {
-    if (max_ctx <= 0 || n_slots <= 0) return 0;
-    const uint64_t per_slot = (uint64_t(max_ctx) + 255u) / 256u;
-    const uint64_t total = per_slot * (uint64_t) n_slots;
-    return total <= std::numeric_limits<uint32_t>::max() ? (uint32_t) total : 0;
-}
 
 static bool sampler_uses_fast_gpu(const SamplerCfg & s) {
     return s.needs_logit_processing() && s.temp > 0.0f &&
@@ -107,15 +103,121 @@ private:
 
 } // namespace
 
+// ─── Inkling2SlotKv (SlotKv v2) ──────────────────────────────────────────
+
+uint32_t Inkling2SlotKv::compute_pool_blocks_(int max_ctx, size_t n_slots, uint32_t bs) {
+    if (max_ctx <= 0 || n_slots == 0 || bs == 0) return 0;
+    const uint64_t per_slot = ((uint64_t) max_ctx + bs - 1) / bs;
+    const uint64_t total    = per_slot * (uint64_t) n_slots;
+    return total <= std::numeric_limits<uint32_t>::max() ? (uint32_t) total : 0;
+}
+
+Inkling2SlotKv::Inkling2SlotKv(int max_ctx,
+                               const std::vector<Inkling2Cache *> & caches,
+                               uint32_t block_size)
+    : pool_(compute_pool_blocks_(max_ctx, caches.size(), block_size),
+            (uint32_t) caches.size(),
+            block_size),
+      caches_(caches) {}
+
+SlotKvCaps Inkling2SlotKv::caps() const {
+    SlotKvCaps c;
+    c.parkable_offload        = true;
+    c.sticky_sessions         = false;
+    c.supports_prefix_store   = false;
+    c.mutates_existing_blocks = false;
+    c.dual_tier_tables        = false;
+    for (const Inkling2Cache * cache : caches_) {
+        if (cache && cache->kvflash && cache->kvflash->active()) {
+            c.mutates_existing_blocks = true;
+            if (cache->kvflash->tier15_active()) c.dual_tier_tables = true;
+        }
+    }
+    return c;
+}
+
+PagedKvStatus Inkling2SlotKv::acquire_reserved(PagedKvRequestId id, uint32_t cap,
+                                               PagedKvSequenceHandle & h) {
+    return pool_.acquire_reserved(id, cap, h);
+}
+
+PagedKvStatus Inkling2SlotKv::acquire_reserved(PagedKvRequestId id, uint32_t cap,
+                                               const SlotAcquireOpts & opts,
+                                               PagedKvSequenceHandle & h) {
+    (void) opts;
+    return pool_.acquire_reserved(id, cap, h);
+}
+
+PagedKvStatus Inkling2SlotKv::reserve_capacity(PagedKvSequenceHandle h, uint32_t cap) {
+    return pool_.reserve_capacity(h, cap);
+}
+
+PagedKvAppendResult Inkling2SlotKv::append(PagedKvSequenceHandle h, uint32_t n, bool first_last) {
+    return pool_.append(h, n, first_last);
+}
+
+PagedKvStatus Inkling2SlotKv::rollback_append(PagedKvSequenceHandle h, uint32_t n) {
+    return pool_.rollback_append(h, n);
+}
+
+PagedKvStatus Inkling2SlotKv::clear(PagedKvSequenceHandle h) {
+    return pool_.clear(h);
+}
+
+PagedKvStatus Inkling2SlotKv::release(PagedKvSequenceHandle h) {
+    return pool_.release(h);
+}
+
+PagedKvStatus Inkling2SlotKv::owned_block_count(PagedKvSequenceHandle h, uint32_t & n) const {
+    return pool_.owned_block_count(h, n);
+}
+
+bool Inkling2SlotKv::build_table_patch(PagedKvSequenceHandle h, uint32_t token_extent,
+                                       uint32_t max_attn_blocks, SlotTablePatch & out,
+                                       bool remote) const {
+    out = {};
+    PagedKvSequenceSnapshot snap;
+    if (pool_.sequence(h, snap) != PagedKvStatus::Ok) return false;
+    const uint32_t slot_id = h.slot;
+    const uint32_t bs = std::max<uint32_t>(1, pool_.block_size());
+    const uint32_t need = (token_extent + bs - 1) / bs;
+    if (need > max_attn_blocks) return false;
+
+    if (slot_id < caches_.size() && caches_[slot_id] &&
+        caches_[slot_id]->kvflash && caches_[slot_id]->kvflash->active()) {
+        const auto & kf = *caches_[slot_id]->kvflash;
+        if (remote && !kf.tier15_active()) return false;
+        const auto & bt = remote ? kf.bt_remote() : kf.bt_local();
+        const uint32_t n_copy = std::min<uint32_t>(need, (uint32_t) bt.size());
+        out.first_block = 0;
+        out.blocks.assign(bt.begin(), bt.begin() + (ptrdiff_t) n_copy);
+        return true;
+    }
+
+    if (remote) return false;
+    if (need > snap.block_table.size()) return false;
+    out.first_block = 0;
+    out.blocks.resize(need);
+    for (uint32_t i = 0; i < need; ++i) out.blocks[i] = (int32_t) snap.block_table[i];
+    return true;
+}
+
+// ─── Inkling2SeqEngine ───────────────────────────────────────────────────
+
 struct Inkling2SeqEngine::SlotState {
     std::vector<int32_t> prompt;
     int prefill_pos = 0;
+    int rewind_pos  = -1;
+    int q_cap_start = 0;
+    bool rewind_done = false;
+    SlotStateSlab parked_slab;
+
+    // 2DSD per-slot session & sampling bridge
     std::unique_ptr<SlotCommitRunner> runner;
     std::unique_ptr<Inkling2TwoDSDSession> session;
     Inkling2TwoDSDStats stats;
     long long last_reported_draft_slots = 0;
 
-    // Transient per-micro-step sampling bridge (valid only during apply_step_and_verify)
     const Inkling2TwoDSDAdvanceSampleOut * cur_batch_sample = nullptr;
     const std::vector<int> * cur_global_readout_idx = nullptr;
     bool cur_fast_gpu_active = false;
@@ -132,17 +234,47 @@ Inkling2SeqEngine::Inkling2SeqEngine(
         int prefill_chunk)
     : backend_(target_backend),
       weights_(weights),
-      multi_cache_(multi_cache),
+      multi_cache_(&multi_cache),
+      batched_2dsd_(true),
       n_slots_(std::max(1, std::min(max_concurrency, multi_cache.tree.n_seq_slots))),
       prefill_chunk_(std::max(64, prefill_chunk)),
-      pool_(compute_pool_blocks(multi_cache.max_ctx, n_slots_), (uint32_t) n_slots_, 256),
-      slots_(pool_, multi_cache.max_ctx),
-      slot_caches_((size_t) n_slots_),
+      owned_slot_views_((size_t) n_slots_),
+      caches_((size_t) n_slots_, nullptr),
+      slot_state_((size_t) n_slots_) {
+    for (int s = 0; s < n_slots_; ++s) {
+        caches_[(size_t) s] = &owned_slot_views_[(size_t) s];
+        slot_state_[(size_t) s] = std::make_unique<SlotState>();
+    }
+    init_slot_views();
+    slot_kv_ = std::make_unique<Inkling2SlotKv>(multi_cache.max_ctx, caches_, (uint32_t) kInkling2KvFlashChunk);
+    slots_   = std::make_unique<SeqSlotManager>(*slot_kv_, multi_cache.max_ctx);
+    state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
+}
+
+Inkling2SeqEngine::Inkling2SeqEngine(
+        ggml_backend_t backend,
+        const Inkling2Weights & weights,
+        std::vector<Inkling2Cache *> caches,
+        int max_ctx,
+        int prefill_chunk,
+        int verify_width,
+        Inkling2SeqForwardFn custom_forward)
+    : backend_(backend),
+      weights_(weights),
+      multi_cache_(nullptr),
+      batched_2dsd_(false),
+      n_slots_(std::max(1, (int) caches.size())),
+      prefill_chunk_(std::max(1, prefill_chunk)),
+      verify_width_(verify_width),
+      custom_forward_(std::move(custom_forward)),
+      caches_(std::move(caches)),
       slot_state_((size_t) n_slots_) {
     for (int s = 0; s < n_slots_; ++s) {
         slot_state_[(size_t) s] = std::make_unique<SlotState>();
     }
-    init_slot_views();
+    slot_kv_ = std::make_unique<Inkling2SlotKv>(max_ctx, caches_, (uint32_t) kInkling2KvFlashChunk);
+    slots_   = std::make_unique<SeqSlotManager>(*slot_kv_, max_ctx);
+    state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
 }
 
 Inkling2SeqEngine::~Inkling2SeqEngine() {
@@ -150,22 +282,34 @@ Inkling2SeqEngine::~Inkling2SeqEngine() {
 }
 
 bool Inkling2SeqEngine::init_slot_views() {
+    if (!batched_2dsd_ || !multi_cache_) return true;
     for (int s = 0; s < n_slots_; ++s) {
-        if (!make_inkling2_slot_view(multi_cache_, weights_, s, slot_caches_[(size_t) s])) {
+        if (!make_inkling2_slot_view(*multi_cache_, weights_, s, owned_slot_views_[(size_t) s])) {
             return false;
         }
+        caches_[(size_t) s] = &owned_slot_views_[(size_t) s];
         slot_state_[(size_t) s]->runner =
-            std::make_unique<SlotCommitRunner>(backend_, weights_, slot_caches_[(size_t) s]);
+            std::make_unique<SlotCommitRunner>(backend_, weights_, owned_slot_views_[(size_t) s]);
+    }
+    if (slot_kv_) slot_kv_->set_caches(caches_);
+    if (state_adapter_) {
+        state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
     }
     return true;
 }
 
 void Inkling2SeqEngine::release_device_state() {
     if (backend_) ggml_backend_synchronize(backend_);
-    for (int s = 0; s < n_slots_; ++s) {
-        slot_state_[(size_t) s]->session.reset();
-        slot_state_[(size_t) s]->runner.reset();
-        free_inkling2_cache(slot_caches_[(size_t) s]);
+    if (batched_2dsd_) {
+        for (int s = 0; s < n_slots_; ++s) {
+            if (slot_state_[(size_t) s]) {
+                slot_state_[(size_t) s]->session.reset();
+                slot_state_[(size_t) s]->runner.reset();
+            }
+            if ((size_t) s < owned_slot_views_.size()) {
+                free_inkling2_cache(owned_slot_views_[(size_t) s]);
+            }
+        }
     }
 }
 
@@ -176,6 +320,13 @@ bool Inkling2SeqEngine::reinstate_device_state(int prefill_chunk) {
 
 bool Inkling2SeqEngine::token_is_eos(int32_t token) const {
     return token == weights_.eos_id || token == weights_.eos_chat_id;
+}
+
+int Inkling2SeqEngine::max_decode_tokens() const {
+    if (batched_2dsd_) return kInkling2TwoDSDMaxCommit;
+    if (verify_width_ == 1 || !weights_.dspark.loaded) return 1;
+    const int cap = std::min(kInkling2MaxVerify, weights_.dspark.block_size);
+    return (verify_width_ >= 2 && verify_width_ <= cap) ? verify_width_ : cap;
 }
 
 void Inkling2SeqEngine::reset_slot_session(int slot) {
@@ -191,48 +342,91 @@ SeqEngine::AdmitResult Inkling2SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
+    return admit_bounded(request_id, prompt, sampler, 0, {});
+}
+
+SeqEngine::AdmitResult Inkling2SeqEngine::admit_bounded(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        int max_new_tokens,
+        const AdmitMeta & meta) {
+    (void) max_new_tokens; (void) meta;
+    if (prompt.empty()) {
+        AdmitResult inv;
+        inv.status = AdmitResult::Status::failed;
+        inv.error  = "inkling2 prompt is empty";
+        return inv;
+    }
+    const int vocab = weights_.n_vocab_unpadded;
     for (int32_t tok : prompt) {
-        if (tok < 0 || tok >= weights_.n_vocab_unpadded) {
+        if (tok < 0 || (vocab > 0 && tok >= vocab)) {
             AdmitResult inv;
             inv.status = AdmitResult::Status::failed;
-            inv.error = "inkling2 prompt contains an invalid token id";
+            inv.error  = "inkling2 prompt contains an invalid token id";
             return inv;
         }
     }
-    AdmitResult res = slots_.admit(request_id, prompt, sampler);
+
+    AdmitResult res = slots_->admit(request_id, prompt, sampler);
     if (res.status != AdmitResult::Status::admitted) return res;
-    if (res.slot < 0 || res.slot >= n_slots_ || !slot_caches_[(size_t) res.slot].tree.active) {
-        slots_.retire(res.slot);
+
+    const int s = res.slot;
+    if (s < 0 || s >= n_slots_ || !caches_[(size_t) s] ||
+        (batched_2dsd_ && !caches_[(size_t) s]->tree.active)) {
+        slots_->retire(s);
         res.status = AdmitResult::Status::failed;
-        res.error = "inkling2 slot view not initialized";
+        res.error  = "inkling2 slot cache not initialized";
         return res;
     }
-    if (pool_.reserve_capacity(slots_.slot(res.slot).handle, (uint32_t) max_context()) != PagedKvStatus::Ok) {
-        slots_.retire(res.slot);
+    if (slot_kv_->reserve_capacity(slots_->slot(s).handle, (uint32_t) max_context()) != PagedKvStatus::Ok) {
+        slots_->retire(s);
         res.status = AdmitResult::Status::busy;
-        res.error = "inkling2 full-context reservation unavailable";
+        res.error  = "inkling2 full-context reservation unavailable";
         return res;
     }
 
-    reset_inkling2_cache(slot_caches_[(size_t) res.slot]);
-    auto & st = *slot_state_[(size_t) res.slot];
-    reset_slot_session(res.slot);
+    Inkling2Cache & cache = *caches_[(size_t) s];
+    if (!custom_forward_) {
+        reset_inkling2_cache(cache);
+    }
+
+    auto & st = *slot_state_[(size_t) s];
+    reset_slot_session(s);
     st.prompt = prompt;
     st.prefill_pos = 0;
+    st.rewind_pos  = -1;
+    st.q_cap_start = (int) prompt.size();
+    st.rewind_done = false;
+    st.parked_slab.clear();
     st.stats = {};
     st.last_reported_draft_slots = 0;
+
+    if (cache.kvflash && cache.kvflash->active()) {
+        st.rewind_pos = cache.kvflash->plan_mode4_rewind(prompt, -1);
+        st.q_cap_start = (st.rewind_pos >= 0)
+            ? std::max(st.rewind_pos, (int) prompt.size() - cache.kvflash->select_queries())
+            : (int) prompt.size();
+        cache.kvflash->clear_queries();
+    }
     return res;
 }
 
 StepPlanLimits Inkling2SeqEngine::step_plan_limits(int decode_rows) const {
-    (void) decode_rows;
     StepPlanLimits lim;
-    lim.max_prefill_sequences = 1;
-    lim.max_prefill_tokens_per_sequence = prefill_chunk_;
-    lim.max_prefill_tokens_total = prefill_chunk_;
-    lim.prefill_allocation_quantum = prefill_chunk_;
-    lim.prefill_time_share = 1.0;
-    lim.time_share_prompt_tokens = 0;
+    if (batched_2dsd_) {
+        lim.max_prefill_sequences = 1;
+        lim.max_prefill_tokens_per_sequence = prefill_chunk_;
+        lim.max_prefill_tokens_total = prefill_chunk_;
+        lim.prefill_allocation_quantum = prefill_chunk_;
+        lim.prefill_time_share = 1.0;
+        lim.time_share_prompt_tokens = 0;
+    } else {
+        lim.max_prefill_sequences           = std::min(slot_count(), (decode_rows > 0) ? 1 : 2);
+        lim.max_prefill_tokens_per_sequence = prefill_chunk_;
+        lim.max_prefill_tokens_total        = prefill_chunk_ * lim.max_prefill_sequences;
+        lim.prefill_allocation_quantum      = std::min(64, prefill_chunk_);
+    }
     return lim;
 }
 
@@ -240,80 +434,87 @@ bool Inkling2SeqEngine::reserve_decode(const StepPlan & plan) {
     std::vector<int> growth((size_t) n_slots_, 0);
     for (const StepInput & in : plan.decode) {
         if (in.slot < 0 || in.slot >= n_slots_) return false;
-        const int rem = std::max(0, max_context() - slots_.slot(in.slot).cur_pos);
+        const int rem = std::max(0, max_context() - slots_->slot(in.slot).cur_pos);
         if (rem <= 0) return false;
-        growth[(size_t) in.slot] = std::min(rem, in.allow_speculation ? max_decode_tokens() : 1);
+        growth[(size_t) in.slot] = batched_2dsd_
+            ? std::min(rem, in.allow_speculation ? max_decode_tokens() : 1)
+            : 1;
     }
-    return slots_.reserve_decode(growth);
+    return slots_->reserve_decode(growth);
 }
 
-void Inkling2SeqEngine::retire(int slot) {
-    if (slot >= 0 && slot < n_slots_) {
-        reset_slot_session(slot);
-        slot_state_[(size_t) slot]->prompt.clear();
-        slot_state_[(size_t) slot]->prefill_pos = 0;
+std::string Inkling2SeqEngine::validate_plan_(const StepPlan & plan) const {
+    const int n = slot_count();
+    std::vector<uint8_t> seen_dec((size_t) n, 0);
+    std::vector<uint8_t> seen_pre((size_t) n, 0);
+
+    for (const StepInput & in : plan.decode) {
+        if (in.slot < 0 || in.slot >= n) return "decode slot out of range";
+        if (in.token < 0 || (weights_.n_vocab_unpadded > 0 && in.token >= weights_.n_vocab_unpadded)) {
+            return "decode input token out of range";
+        }
+        if (seen_dec[(size_t) in.slot]) return "duplicate decode slot";
+        if (!slots_->slot(in.slot).decoding()) return "decode slot is not in decode phase";
+        seen_dec[(size_t) in.slot] = 1;
     }
-    slots_.retire(slot);
+    for (int s = 0; s < n; ++s) {
+        if (slots_->slot(s).decoding() && !seen_dec[(size_t) s]) {
+            return "plan omitted an active decoding slot";
+        }
+    }
+
+    const StepPlanLimits lim = step_plan_limits((int) plan.decode.size());
+    if (!batched_2dsd_ && (int) plan.prefills.size() > lim.max_prefill_sequences) {
+        return "prefill cohort exceeds max_prefill_sequences";
+    }
+    int total_pre = 0;
+    for (const PrefillSlice & sl : plan.prefills) {
+        if (sl.slot < 0 || sl.slot >= n) return "prefill slot out of range";
+        if (sl.max_tokens <= 0 || (!batched_2dsd_ && sl.max_tokens > lim.max_prefill_tokens_per_sequence)) {
+            return "prefill slice exceeds per-sequence token limit";
+        }
+        if (seen_pre[(size_t) sl.slot] || seen_dec[(size_t) sl.slot]) {
+            return "duplicate or decoding slot in prefill plan";
+        }
+        if (!slots_->slot(sl.slot).prefilling()) return "prefill slot is not in prefill phase";
+        seen_pre[(size_t) sl.slot] = 1;
+        total_pre += sl.max_tokens;
+    }
+    if (!batched_2dsd_ && total_pre > lim.max_prefill_tokens_total) {
+        return "prefill slices exceed max_prefill_tokens_total";
+    }
+    return {};
 }
 
 SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
+    if (plan.decode.empty() && plan.prefills.empty()) {
+        return {};
+    }
+    const std::string val_err = validate_plan_(plan);
+    if (!val_err.empty()) {
+        StepResult res;
+        res.error = val_err;
+        return res;
+    }
+    return batched_2dsd_ ? step_batched_2dsd_(plan) : step_1d_(plan);
+}
+
+// ─── Batched Multi-Slot 2DSD Step (Shares all 128 MoE Experts + KVFlash!) ─
+
+SeqEngine::StepResult Inkling2SeqEngine::step_batched_2dsd_(const StepPlan & plan) {
     StepResult result;
-
-    // ── 0. Pre-mutation validation ───────────────────────────────────────
-    std::vector<uint8_t> seen_dec((size_t) n_slots_, 0);
-    std::vector<uint8_t> seen_pre((size_t) n_slots_, 0);
-    for (const StepInput & in : plan.decode) {
-        if (in.slot < 0 || in.slot >= n_slots_) {
-            result.error = "inkling2 step: decode slot out of range";
-            return result;
-        }
-        if (in.token < 0 || in.token >= weights_.n_vocab_unpadded) {
-            result.error = "inkling2 step: decode token out of range";
-            return result;
-        }
-        if (seen_dec[(size_t) in.slot]) {
-            result.error = "inkling2 step: duplicate decode slot";
-            return result;
-        }
-        if (!slots_.slot(in.slot).decoding()) {
-            result.error = "inkling2 step: decode slot is not in decode phase";
-            return result;
-        }
-        seen_dec[(size_t) in.slot] = 1;
-    }
-    for (const PrefillSlice & sl : plan.prefills) {
-        if (sl.slot < 0 || sl.slot >= n_slots_ || sl.max_tokens <= 0) {
-            result.error = "inkling2 step: invalid prefill slice";
-            return result;
-        }
-        if (seen_dec[(size_t) sl.slot] || seen_pre[(size_t) sl.slot]) {
-            result.error = "inkling2 step: slot assigned more than once";
-            return result;
-        }
-        if (!slots_.slot(sl.slot).prefilling()) {
-            result.error = "inkling2 step: prefill slot is not in prefill phase";
-            return result;
-        }
-        seen_pre[(size_t) sl.slot] = 1;
-    }
-    for (int s = 0; s < n_slots_; ++s) {
-        if (slots_.slot(s).decoding() && !seen_dec[(size_t) s]) {
-            result.error = "inkling2 step: plan omits a decoding slot";
-            return result;
-        }
-    }
-
     const int n_vocab = weights_.n_vocab_unpadded;
 
-    // ── 1. Prefill selected prompt slices (zero-copy per-slot cache views) ──
+    // 1. Prefill selected prompt slices (zero-copy per-slot cache views + per-slot Mode-4!)
     for (const PrefillSlice & slice : plan.prefills) {
         const int s = slice.slot;
-        SeqSlot & sl = slots_.slot(s);
+        SeqSlot & sl = slots_->slot(s);
         SlotState & st = *slot_state_[(size_t) s];
-        Inkling2Cache & sc = slot_caches_[(size_t) s];
+        Inkling2Cache & sc = *caches_[(size_t) s];
+        auto * kf = (sc.kvflash && sc.kvflash->active()) ? sc.kvflash.get() : nullptr;
 
         const int rem = sl.prompt_len - st.prefill_pos;
-        const int take = std::min(rem, slice.max_tokens);
+        int take = std::min(rem, slice.max_tokens);
         if (take <= 0) {
             PrefillOutput po;
             po.slot = s;
@@ -322,19 +523,29 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             result.prefills.push_back(std::move(po));
             continue;
         }
+        if (st.rewind_pos > st.prefill_pos && st.rewind_pos < st.prefill_pos + take) {
+            take = st.rewind_pos - st.prefill_pos;
+        }
         if (st.prefill_pos == 0) {
             const int win = resolve_draft_window();
             sc.tree.draft_pref_start = (win > 0 && sl.prompt_len > win) ? (sl.prompt_len - win) : 0;
         }
 
-        const bool is_last = (st.prefill_pos + take >= sl.prompt_len);
+        const int end = st.prefill_pos + take;
+        const bool is_last = (end >= sl.prompt_len);
         const bool is_greedy = !sl.sampler.needs_logit_processing();
+        const int cap_q = (kf && st.rewind_pos >= 0 && !st.rewind_done && end > st.q_cap_start)
+            ? std::min(take, end - st.q_cap_start) : 0;
+
         int32_t first_tok = -1;
         std::vector<float> last_logits;
-        const bool ok = inkling2_2dsd_prefill_chunk(
-            backend_, weights_, sc,
-            st.prompt.data() + st.prefill_pos, take, st.prefill_pos,
-            is_last, first_tok, (is_last && !is_greedy) ? &last_logits : nullptr);
+        const bool ok = (take > prefill_chunk_ && weights_.is_loop && weights_.n_passes == 3)
+            ? inkling2_2dsd_prefill_wavefront(
+                backend_, weights_, sc, st.prompt.data() + st.prefill_pos, take, st.prefill_pos,
+                prefill_chunk_, first_tok, (is_last && !is_greedy) ? &last_logits : nullptr, cap_q, is_last)
+            : inkling2_2dsd_prefill_chunk(
+                backend_, weights_, sc, st.prompt.data() + st.prefill_pos, take, st.prefill_pos,
+                is_last, first_tok, (is_last && !is_greedy) ? &last_logits : nullptr, cap_q);
         if (!ok) {
             result.decode.clear();
             result.prefills.clear();
@@ -342,7 +553,7 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             return result;
         }
 
-        auto chunk_res = slots_.append_prefill(s, take);
+        auto chunk_res = slots_->append_prefill(s, take);
         if (!chunk_res.ok) {
             result.decode.clear();
             result.prefills.clear();
@@ -351,6 +562,33 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
         }
         st.prefill_pos += take;
 
+        if (kf && st.rewind_pos > 0 && st.prefill_pos == st.rewind_pos && !st.rewind_done) {
+            kf->save_rewind_snap(sc, weights_, st.rewind_pos);
+        }
+        if (is_last && kf && st.rewind_pos > 0 && !st.rewind_done && kf->has_rewind_snap()) {
+            st.rewind_done = true;
+            if (kf->mode4_score_and_recall(st.rewind_pos, sl.prompt_len)) {
+                kf->restore_rewind_snap(sc, weights_);
+                int rpos = st.rewind_pos;
+                while (rpos < sl.prompt_len) {
+                    const int rend = std::min(sl.prompt_len, rpos + prefill_chunk_);
+                    const int rn = rend - rpos;
+                    const bool rlast = (rend == sl.prompt_len);
+                    if (!inkling2_2dsd_prefill_chunk(
+                            backend_, weights_, sc, st.prompt.data() + rpos, rn, rpos, rlast,
+                            first_tok, (rlast && !is_greedy) ? &last_logits : nullptr, 0)) {
+                        kf->clear_rewind_snap();
+                        result.decode.clear();
+                        result.prefills.clear();
+                        result.error = "inkling2 2dsd Mode-4 rewind prefill failed";
+                        return result;
+                    }
+                    rpos = rend;
+                }
+            }
+            kf->clear_rewind_snap();
+        }
+
         PrefillOutput po;
         po.slot = s;
         if (is_last) {
@@ -358,7 +596,7 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
                 auto ph = sl.penalty_history();
                 first_tok = sample_logits(last_logits.data(), n_vocab, sl.sampler, ph, sl.rng);
             }
-            slots_.commit_prefill(s);
+            slots_->commit_prefill(s);
             po.status = PrefillOutput::Status::completed;
             po.token = first_tok;
         } else {
@@ -369,22 +607,22 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
 
     if (plan.decode.empty()) return result;
 
-    // ── 2. Prepare decoding sessions for this cohort ─────────────────────
+    // 2. Prepare decoding sessions for this cohort
     const int n_dec = (int) plan.decode.size();
     const Inkling2TwoDSDConfig base_cfg = inkling2_2dsd_config_for_concurrency(
         weights_.n_passes, weights_.twodsd.block_size, n_dec);
     const bool allow_split = (weights_.expert_backend != nullptr && weights_.split_exp > 0);
 
     std::vector<DecodeOutput> dec_outs((size_t) n_dec);
-    std::vector<int> pending_idx; // indices into plan.decode still awaiting commit this step
+    std::vector<int> pending_idx;
     pending_idx.reserve((size_t) n_dec);
 
     for (int i = 0; i < n_dec; ++i) {
         const StepInput & in = plan.decode[(size_t) i];
         const int s = in.slot;
-        SeqSlot & sl = slots_.slot(s);
+        SeqSlot & sl = slots_->slot(s);
         SlotState & st = *slot_state_[(size_t) s];
-        Inkling2Cache & sc = slot_caches_[(size_t) s];
+        Inkling2Cache & sc = *caches_[(size_t) s];
 
         dec_outs[(size_t) i].slot = s;
         if (sc.tree.prefix_len >= max_context()) {
@@ -476,10 +714,10 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
         pending_idx.push_back(i);
     }
 
-    // ── 3. Batched micro-step loop (1 GPU call in steady state, <= R on cold start) ─
+    // 3. Batched micro-step loop (1 GPU call in steady state, <= R on cold start)
     std::vector<int> prefix_lens((size_t) n_slots_, 0);
+    std::vector<const Inkling2KvFlash *> slot_kfs((size_t) n_slots_, nullptr);
     for (int guard = 0; !pending_idx.empty() && guard < weights_.n_passes + 2; ++guard) {
-        // 3a. Run per-slot drafter batches for any pending anchor events
         for (int idx : pending_idx) {
             const int s = plan.decode[(size_t) idx].slot;
             SlotState & st = *slot_state_[(size_t) s];
@@ -488,7 +726,7 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             st.session->collect_draft_reqs(reqs, plan_heads, plan_widths);
             if (!reqs.empty()) {
                 std::vector<Inkling2TwoDSDDraftOut> outs;
-                if (!inkling2_2dsd_draft_batch(backend_, weights_, slot_caches_[(size_t) s], reqs, outs) ||
+                if (!inkling2_2dsd_draft_batch(backend_, weights_, *caches_[(size_t) s], reqs, outs) ||
                     outs.size() != reqs.size()) {
                     result.decode.clear();
                     result.prefills.clear();
@@ -501,10 +739,9 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             }
         }
 
-        // 3b. Pack active nodes from ALL pending slots into ONE batched target step
         std::vector<Inkling2TwoDSDNodeDesc> combined_descs;
-        std::vector<int> desc_owner_idx;      // index into plan.decode
-        std::vector<int> desc_local_pos;      // index into slot's active_ids
+        std::vector<int> desc_owner_idx;
+        std::vector<int> desc_local_pos;
         std::vector<std::vector<int>> slot_active_ids((size_t) n_dec);
         uint32_t combined_mask = 0u;
 
@@ -514,7 +751,7 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
 
         for (int idx : pending_idx) {
             const int s = plan.decode[(size_t) idx].slot;
-            const SeqSlot & sl = slots_.slot(s);
+            const SeqSlot & sl = slots_->slot(s);
             SlotState & st = *slot_state_[(size_t) s];
 
             std::vector<Inkling2TwoDSDNodeDesc> descs;
@@ -544,8 +781,12 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             }
         }
 
+        bool any_kf = false;
         for (int s = 0; s < n_slots_; ++s) {
-            prefix_lens[(size_t) s] = slot_caches_[(size_t) s].tree.prefix_len;
+            prefix_lens[(size_t) s] = caches_[(size_t) s]->tree.prefix_len;
+            slot_kfs[(size_t) s] = (caches_[(size_t) s]->kvflash && caches_[(size_t) s]->kvflash->active())
+                ? caches_[(size_t) s]->kvflash.get() : nullptr;
+            if (slot_kfs[(size_t) s]) any_kf = true;
         }
 
         Inkling2TwoDSDAdvanceSampleOut batch_sample;
@@ -554,17 +795,17 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
         std::vector<int> global_readout_rows;
         std::vector<int32_t> global_readout_argmax;
         if (!inkling2_2dsd_advance_nodes_batched(
-                backend_, weights_, multi_cache_, combined_descs,
+                backend_, weights_, *multi_cache_, combined_descs,
                 prefix_lens.data(), n_slots_, combined_mask, allow_split,
                 global_readout_rows, global_readout_argmax,
-                any_stochastic ? &batch_sample : nullptr)) {
+                any_stochastic ? &batch_sample : nullptr,
+                any_kf ? slot_kfs.data() : nullptr)) {
             result.decode.clear();
             result.prefills.clear();
             result.error = "inkling2_2dsd_advance_nodes_batched failed";
             return result;
         }
 
-        // 3c. Demultiplex readouts back to each pending slot
         std::vector<std::vector<int>> per_slot_rrows((size_t) n_dec);
         std::vector<std::vector<int32_t>> per_slot_rargmax((size_t) n_dec);
         std::vector<std::vector<int>> per_slot_gidx((size_t) n_dec);
@@ -576,16 +817,15 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             per_slot_gidx[(size_t) idx].push_back(g);
         }
 
-        // 3d. Verify each pending slot and collect outputs for slots that committed >= 1 token
         std::vector<int> next_pending;
         next_pending.reserve(pending_idx.size());
 
         for (int idx : pending_idx) {
             const StepInput & in = plan.decode[(size_t) idx];
             const int s = in.slot;
-            SeqSlot & sl = slots_.slot(s);
+            SeqSlot & sl = slots_->slot(s);
             SlotState & st = *slot_state_[(size_t) s];
-            Inkling2Cache & sc = slot_caches_[(size_t) s];
+            Inkling2Cache & sc = *caches_[(size_t) s];
 
             ++st.stats.target_calls;
             st.stats.target_cells += (long long) slot_active_ids[(size_t) idx].size();
@@ -594,7 +834,6 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             st.cur_global_readout_idx = &per_slot_gidx[(size_t) idx];
             st.cur_fast_gpu_active = (batch_sample.fast_temp > 0.0f) && sampler_uses_fast_gpu(sl.sampler);
 
-            // Prepare live penalty history (generated tokens so far + fed token `in.token`)
             st.cur_penalty_hist.clear();
             if (sl.sampler.needs_logit_processing()) {
                 st.cur_penalty_hist = sl.penalty_history();
@@ -634,21 +873,20 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
             }
 
             if (!emitted.empty()) {
-                // Commit fed token + any accepted speculative children to SeqSlotManager
                 std::vector<int32_t> kv_tokens;
                 kv_tokens.reserve(emitted.size());
                 kv_tokens.push_back(in.token);
                 for (size_t j = 0; j + 1 < emitted.size(); ++j) {
                     kv_tokens.push_back(emitted[j]);
                 }
-                auto app = slots_.append_tokens(s, kv_tokens.data(), (int) kv_tokens.size());
+                auto app = slots_->append_tokens(s, kv_tokens.data(), (int) kv_tokens.size());
                 if (!app.ok) {
                     result.decode.clear();
                     result.prefills.clear();
                     result.error = "inkling2 slot manager append_tokens failed";
                     return result;
                 }
-                slots_.commit_step(s);
+                slots_->commit_step(s);
 
                 DecodeOutput & out = dec_outs[(size_t) idx];
                 out.token = emitted.back();
@@ -677,6 +915,316 @@ SeqEngine::StepResult Inkling2SeqEngine::step(const StepPlan & plan) {
 
     result.decode = std::move(dec_outs);
     return result;
+}
+
+// ─── 1D / DSpark / Custom-Forward Step ───────────────────────────────────
+
+Inkling2SeqStepResult Inkling2SeqEngine::run_forward_1d_(
+        int slot, const int32_t * tokens, int n_tokens, int pos0,
+        bool need_logits, int capture_q_rows) {
+    if (custom_forward_) {
+        return custom_forward_(slot, tokens, n_tokens, pos0, need_logits, capture_q_rows);
+    }
+    Inkling2SeqStepResult out;
+    Inkling2Cache & cache = *caches_[(size_t) slot];
+    Inkling2ForwardOut r = inkling2_forward(
+        backend_, weights_, cache, tokens, n_tokens, pos0,
+        /*verify=*/false, /*need_logits=*/need_logits,
+        /*capture_taps_for_dspark=*/weights_.dspark.loaded,
+        /*allow_split=*/true, /*fast_sample_temp=*/0.0f,
+        /*capture_q_rows=*/capture_q_rows);
+    if (!r.ok) {
+        out.error = "inkling2_forward failed";
+        return out;
+    }
+    out.ok = true;
+    if (!r.greedy.empty()) out.greedy_token = r.greedy.back();
+    if (need_logits && !r.logits.empty()) {
+        const int nv = weights_.n_vocab_unpadded;
+        out.logits.assign(r.logits.end() - nv, r.logits.end());
+    }
+    return out;
+}
+
+int32_t Inkling2SeqEngine::sample_slot_1d_(SeqSlot & seq, const Inkling2SeqStepResult & r, bool is_greedy) {
+    if (is_greedy && r.greedy_token >= 0) return r.greedy_token;
+    if (!r.logits.empty()) {
+        const auto pen_hist = seq.penalty_history();
+        return (int32_t) sample_logits(r.logits.data(), (int) r.logits.size(), seq.sampler, pen_hist, seq.rng);
+    }
+    return r.greedy_token;
+}
+
+bool Inkling2SeqEngine::try_solo_dspark_step_(const StepInput & in, DecodeOutput & out) {
+    if (custom_forward_ || !weights_.dspark.loaded || verify_width_ == 1 || !in.allow_speculation) {
+        return false;
+    }
+    SeqSlot & seq = slots_->slot(in.slot);
+    if (!sample_logits_is_argmax(seq.sampler)) return false;
+
+    Inkling2Cache & cache = *caches_[(size_t) in.slot];
+    const int pos = seq.cur_pos;
+    const int rem_ctx = max_context() - pos - 1;
+    const int max_vw = std::min(kInkling2MaxVerify, weights_.dspark.block_size);
+    const int vw = (verify_width_ >= 2 && verify_width_ <= max_vw) ? verify_width_ : max_vw;
+    const int k_draft = std::min(vw - 1, rem_ctx);
+    if (k_draft < 1) return false;
+
+    std::vector<int32_t> drafts;
+    if (!inkling2_dspark_draft(backend_, weights_, cache, in.token, pos, k_draft, drafts, 0) || drafts.empty()) {
+        return false;
+    }
+    const int n_d = (int) drafts.size();
+    std::vector<int32_t> verify_ids(1 + (size_t) n_d);
+    verify_ids[0] = in.token;
+    for (int i = 0; i < n_d; ++i) verify_ids[1 + (size_t) i] = drafts[(size_t) i];
+
+    Inkling2ForwardOut vr = inkling2_forward(
+        backend_, weights_, cache, verify_ids.data(), 1 + n_d, pos,
+        /*verify=*/true, /*need_logits=*/false, /*capture_taps=*/true,
+        /*allow_split=*/(weights_.expert_backend && weights_.split_exp > 0));
+    if (!vr.ok || (int) vr.greedy.size() < 1 + n_d) return false;
+
+    int n_acc = 0;
+    int32_t final_tok = vr.greedy[0];
+    std::vector<int32_t> committed;
+    for (int i = 0; i < n_d; ++i) {
+        const int32_t tgt = vr.greedy[(size_t) i];
+        if (tgt == drafts[(size_t) i] && !token_is_eos(tgt)) {
+            committed.push_back(tgt);
+            ++n_acc;
+            final_tok = vr.greedy[(size_t) (i + 1)];
+        } else {
+            final_tok = tgt;
+            break;
+        }
+    }
+    const int retained = n_acc + 1;
+    if (!inkling2_verify_rollback(backend_, weights_, cache, pos, retained)) return false;
+    if (ggml_tensor * taps = cache.verify_ws[1 + n_d].taps_out) {
+        inkling2_dspark_commit_taps(backend_, weights_, cache, taps, pos, retained);
+    }
+
+    auto app = slots_->append_tokens(in.slot, verify_ids.data(), retained);
+    if (!app.ok) return false;
+    slots_->commit_step(in.slot);
+
+    out.slot             = in.slot;
+    out.committed_tokens = std::move(committed);
+    out.token            = final_tok;
+    out.spec_offered     = n_d;
+    out.spec_accepted    = n_acc;
+    out.failed           = false;
+    return true;
+}
+
+SeqEngine::StepResult Inkling2SeqEngine::step_1d_(const StepPlan & plan) {
+    StepResult res;
+
+    for (const PrefillSlice & sl : plan.prefills) {
+        const int s = sl.slot;
+        SeqSlot & seq = slots_->slot(s);
+        SlotState & sr = *slot_state_[(size_t) s];
+        Inkling2Cache & cache = *caches_[(size_t) s];
+        auto * kf = (cache.kvflash && cache.kvflash->active()) ? cache.kvflash.get() : nullptr;
+
+        const int prompt_len = seq.prompt_len;
+        const int pos0 = seq.cur_pos;
+        int n = std::min(sl.max_tokens, prompt_len - pos0);
+        if (sr.rewind_pos > pos0 && sr.rewind_pos < pos0 + n) {
+            n = sr.rewind_pos - pos0;
+        }
+        const int end = pos0 + n;
+        const bool is_last = (end == prompt_len);
+        const bool is_greedy = sample_logits_is_argmax(seq.sampler);
+        const int cap_q = (kf && sr.rewind_pos >= 0 && !sr.rewind_done && end > sr.q_cap_start)
+            ? std::min(n, end - sr.q_cap_start) : 0;
+
+        auto pc = slots_->append_prefill(s, n);
+        if (!pc.ok) {
+            res.error = "inkling2 append_prefill failed";
+            res.decode.clear();
+            res.prefills.clear();
+            return res;
+        }
+
+        Inkling2SeqStepResult fr = run_forward_1d_(
+            s, sr.prompt.data() + pos0, n, pos0,
+            /*need_logits=*/is_last && !is_greedy, cap_q);
+        if (!fr.ok) {
+            res.error = fr.error.empty() ? "inkling2 prefill forward failed" : fr.error;
+            res.decode.clear();
+            res.prefills.clear();
+            return res;
+        }
+
+        if (kf && sr.rewind_pos > 0 && end == sr.rewind_pos && !sr.rewind_done && !custom_forward_) {
+            kf->save_rewind_snap(cache, weights_, sr.rewind_pos);
+        }
+
+        if (is_last && kf && sr.rewind_pos > 0 && !sr.rewind_done && kf->has_rewind_snap() && !custom_forward_) {
+            sr.rewind_done = true;
+            if (kf->mode4_score_and_recall(sr.rewind_pos, prompt_len)) {
+                kf->restore_rewind_snap(cache, weights_);
+                int rpos = sr.rewind_pos;
+                while (rpos < prompt_len) {
+                    const int rend = std::min(prompt_len, rpos + prefill_chunk_);
+                    const int rn = rend - rpos;
+                    const bool rlast = (rend == prompt_len);
+                    fr = run_forward_1d_(s, sr.prompt.data() + rpos, rn, rpos, rlast && !is_greedy, 0);
+                    if (!fr.ok) {
+                        kf->clear_rewind_snap();
+                        res.error = "inkling2 Mode-4 rewind prefill failed";
+                        res.decode.clear();
+                        res.prefills.clear();
+                        return res;
+                    }
+                    rpos = rend;
+                }
+            }
+            kf->clear_rewind_snap();
+        }
+
+        PrefillOutput po;
+        po.slot = s;
+        if (is_last) {
+            slots_->commit_prefill(s);
+            po.status = PrefillOutput::Status::completed;
+            po.token  = sample_slot_1d_(seq, fr, is_greedy);
+        } else {
+            po.status = PrefillOutput::Status::advanced;
+        }
+        res.prefills.push_back(std::move(po));
+    }
+
+    const bool solo_spec_eligible = plan.prefills.empty() && plan.decode.size() == 1;
+    for (const StepInput & in : plan.decode) {
+        DecodeOutput dout;
+        dout.slot = in.slot;
+
+        if (solo_spec_eligible && try_solo_dspark_step_(in, dout)) {
+            res.decode.push_back(std::move(dout));
+            continue;
+        }
+
+        SeqSlot & seq = slots_->slot(in.slot);
+        const int pos = seq.cur_pos;
+        const bool is_greedy = sample_logits_is_argmax(seq.sampler);
+
+        auto app = slots_->append_token(in.slot, in.token);
+        if (!app.ok) {
+            res.error = "inkling2 decode append_token failed";
+            res.decode.clear();
+            res.prefills.clear();
+            return res;
+        }
+
+        Inkling2SeqStepResult fr = run_forward_1d_(
+            in.slot, &in.token, 1, pos, /*need_logits=*/!is_greedy, /*capture_q_rows=*/0);
+        if (!fr.ok) {
+            slots_->rollback_step(in.slot);
+            res.error = fr.error.empty() ? "inkling2 decode forward failed" : fr.error;
+            res.decode.clear();
+            res.prefills.clear();
+            return res;
+        }
+
+        slots_->commit_step(in.slot);
+        dout.token  = sample_slot_1d_(seq, fr, is_greedy);
+        dout.failed = false;
+        res.decode.push_back(std::move(dout));
+    }
+
+    return res;
+}
+
+// ─── Slot Offload / Restore / Evict / Retire ─────────────────────────────
+
+size_t Inkling2SeqEngine::kv_offload_capacity() const {
+    return state_adapter_->slab_bytes() * (size_t) std::max(0, slot_count() - 1);
+}
+
+SeqEngine::KvOffloadState Inkling2SeqEngine::kv_offload_state(int slot) const {
+    KvOffloadState st;
+    if (slot < 0 || slot >= slot_count()) return st;
+    const SeqSlot & seq = slots_->slot(slot);
+    st.parked    = seq.parked();
+    st.recompute = seq.recomputing();
+    st.bytes     = slot_state_[(size_t) slot]->parked_slab.size();
+    return st;
+}
+
+bool Inkling2SeqEngine::offload_kv(int slot, size_t max_bytes, std::string & error) {
+    if (slot < 0 || slot >= slot_count()) { error = "invalid slot"; return false; }
+    const size_t need = state_adapter_->slab_bytes();
+    if (max_bytes > 0 && need > max_bytes) { error = "slab exceeds budget"; return false; }
+    SlotStateSlab slab;
+    if (!state_adapter_->save_slot_state(slot, slab)) {
+        error = "failed to save Inkling2 slot state slab";
+        return false;
+    }
+    if (!slots_->detach_kv(slot)) {
+        error = "SeqSlotManager::detach_kv failed";
+        return false;
+    }
+    reset_slot_session(slot);
+    slot_state_[(size_t) slot]->parked_slab = std::move(slab);
+    return true;
+}
+
+bool Inkling2SeqEngine::restore_kv(int slot, std::string & error) {
+    if (slot < 0 || slot >= slot_count()) { error = "invalid slot"; return false; }
+    SeqSlot & seq = slots_->slot(slot);
+    auto & st = *slot_state_[(size_t) slot];
+    if (seq.recomputing()) {
+        if (!slots_->resume_recompute(slot)) return false;
+        reset_slot_session(slot);
+        if (!custom_forward_) state_adapter_->reset_slot_state(slot);
+        st.prompt = seq.sample_history;
+        st.prefill_pos = 0;
+        st.rewind_done = false;
+        return true;
+    }
+    if (!slots_->attach_kv(slot)) return false;
+    if (!st.parked_slab.empty()) {
+        if (!state_adapter_->restore_slot_state(slot, st.parked_slab)) {
+            error = "failed to restore Inkling2 slot state slab";
+            return false;
+        }
+        st.parked_slab.clear();
+    }
+    return true;
+}
+
+bool Inkling2SeqEngine::evict_kv(int slot, int32_t pending_token, std::string & error) {
+    if (slot < 0 || slot >= slot_count()) { error = "invalid slot"; return false; }
+    if (!slots_->evict_for_recompute(slot, pending_token)) {
+        error = "SeqSlotManager::evict_for_recompute failed";
+        return false;
+    }
+    reset_slot_session(slot);
+    slot_state_[(size_t) slot]->parked_slab.clear();
+    return true;
+}
+
+bool Inkling2SeqEngine::kv_restore_feasible(int slot) const {
+    return slot >= 0 && slot < slot_count() && slots_->kv_restore_feasible(slot);
+}
+
+void Inkling2SeqEngine::retire(int slot) {
+    if (slot >= 0 && slot < n_slots_) {
+        reset_slot_session(slot);
+        auto & st = *slot_state_[(size_t) slot];
+        st.prompt.clear();
+        st.prefill_pos = 0;
+        st.rewind_pos  = -1;
+        st.rewind_done = false;
+        st.parked_slab.clear();
+        if (!custom_forward_ && caches_[(size_t) slot]) {
+            reset_inkling2_cache(*caches_[(size_t) slot]);
+        }
+    }
+    slots_->retire(slot);
 }
 
 } // namespace luce::common

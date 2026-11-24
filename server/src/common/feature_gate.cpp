@@ -331,17 +331,18 @@ std::string check_feature_compatibility(
                    "supported only for dense Qwen3.5 (use --max-concurrency 1)";
         }
         if (!args.paged_attention) {
-            if (arch != "qwen4exp")
+            const bool per_slot_engine = (arch == "qwen4exp" || arch_is_inkling2_family(arch));
+            if (!per_slot_engine)
                 return "--max-concurrency requires --paged-attention";
             if (args.max_concurrency > 4)
-                return "qwen4exp full-cache concurrency supports at most 4 slots";
+                return arch + " full-cache concurrency supports at most 4 slots";
             if (args.kv_pool_tokens != 0)
-                return "qwen4exp full-cache concurrency does not use --kv-pool-tokens";
+                return arch + " full-cache concurrency does not use --kv-pool-tokens";
             if (args.device.max_ctx <= 0)
-                return "qwen4exp full-cache concurrency requires a positive --max-ctx";
+                return arch + " full-cache concurrency requires a positive --max-ctx";
             if (args.device.is_layer_split() || args.device.is_tensor_parallel() ||
                 args.remote_target_shard.enabled())
-                return "qwen4exp full-cache concurrency requires one local target device";
+                return arch + " full-cache concurrency requires one local target device";
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
         // whole-model graph has a smaller, separately qualified ceiling.

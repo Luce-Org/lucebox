@@ -5,6 +5,7 @@
 #pragma once
 
 #include "inkling2_internal.h"
+#include "inkling2_kvflash.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -13,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -34,18 +36,25 @@ struct Inkling2GraphWorkspace {
     bool                 verify  = false;
     bool                 split   = false;
     bool                 split_kv = false;
+    bool                 paged_kv = false;
     bool                 capture_taps = false;
+    bool                 capture_q = false;
+    int                  q_cap_n = 0;
 
     // Runtime input tensors (updated via fast async H2D before each replay)
-    ggml_tensor * inp_tokens = nullptr; // I32 [T]
-    ggml_tensor * inp_pos    = nullptr; // I32 [T]
-    ggml_tensor * inp_meta   = nullptr; // I32 [4]: {pos0, kv_len, kv_start, kv_end}
-    ggml_tensor * inp_meta_r = nullptr; // I32 [4]: remote Split-KV slice {pos0, kv_len, 0, split_pos}
+    ggml_tensor * inp_tokens    = nullptr; // I32 [T]
+    ggml_tensor * inp_pos       = nullptr; // I32 [T]
+    ggml_tensor * inp_meta      = nullptr; // I32 [4]: {pos0, kv_len, kv_start, kv_end}
+    ggml_tensor * inp_meta_r    = nullptr; // I32 [4]: remote Split-KV slice {pos0, kv_len, 0, split_pos}
+    ggml_tensor * inp_bt_local  = nullptr; // I32 [max_blocks] when KVFlash paged global KV active
+    ggml_tensor * inp_bt_remote = nullptr; // I32 [max_blocks] when Dual-GPU KVFlash Tier 1.5 active
+    uint64_t      bt_epoch      = 0;       // cached block table epoch uploaded to inp_bt_*
 
     // Outputs
     ggml_tensor * logits     = nullptr; // F32 [n_vocab_unpadded, T] (or [n_vocab_unpadded, 1] for prefill)
     ggml_tensor * greedy     = nullptr; // I32 [T]
     ggml_tensor * taps_out   = nullptr; // F32 [n_embd, 4, T] when capture_taps==true
+    ggml_tensor * q_cap_out  = nullptr; // F32 [D, Hq, L_global, q_cap_n] when capture_q==true
 
     // Cached 1-node GPU top-candidate extractor for ultra-fast exact stochastic sampling (temp > 0)
     ggml_context * sample_ctx    = nullptr;
@@ -101,9 +110,10 @@ struct Inkling2TwoDSDPhaseGraph {
     ggml_cgraph *        gf    = nullptr;
     bool                 built = false;
 
-    ggml_tensor * inp_meta       = nullptr; // I32 [m_stride, T]
-    ggml_tensor * inp_prefix_len = nullptr; // I32 [1]
-    ggml_tensor * inp_pos        = nullptr; // I32 [T]
+    ggml_tensor * inp_meta         = nullptr; // I32 [m_stride, T]
+    ggml_tensor * inp_prefix_len   = nullptr; // contiguous: I32 [1] or [P]; paged: I32 [2 + max_blocks, n_seq_slots]
+    ggml_tensor * inp_prefix_len_r = nullptr; // paged Tier 1.5: I32 [2 + max_blocks, n_seq_slots] on expert_backend
+    ggml_tensor * inp_pos          = nullptr; // I32 [T]
     ggml_tensor * inp_flags      = nullptr; // I32 [T]
     ggml_tensor * inp_tokens     = nullptr; // I32 [T] (prelude only)
     ggml_tensor * inp_slot       = nullptr; // I32 [T] (0..S-1)
@@ -140,12 +150,13 @@ struct Inkling2TwoDSDDraftGraph {
 };
 
 struct Inkling2TwoDSDCommitGraph {
-    ggml_context * ctx   = nullptr;
-    ggml_gallocr_t alloc = nullptr;
-    ggml_cgraph *  gf    = nullptr;
-    ggml_tensor *  slots = nullptr; // I32 [kInkling2TwoDSDMaxCommit]
-    ggml_tensor *  meta  = nullptr; // I32 [2]: {prefix_len, n_commit}
-    bool           built = false;
+    ggml_context * ctx         = nullptr;
+    ggml_gallocr_t alloc       = nullptr;
+    ggml_cgraph *  gf          = nullptr;
+    ggml_tensor *  slots       = nullptr; // I32 [kInkling2TwoDSDMaxCommit]
+    ggml_tensor *  meta        = nullptr; // I32 [2]: {prefix_len, n_commit}
+    ggml_tensor *  block_table = nullptr; // I32 [max_blocks] when KVFlash paged global KV active
+    bool           built       = false;
 };
 
 struct Inkling2TwoDSDPrefixStoreGraph {
@@ -165,18 +176,24 @@ struct Inkling2TreeCache {
     int  n_seq_slots  = 1;     // >1 when backing multi-stream Inkling2SeqEngine
     int  max_nodes    = kInkling2TwoDSDMaxNodes; // live slots [0..max_nodes-1]; scratch = max_nodes
     int  n_depths     = 3;                       // coda planes for readout depths {1, 2, 3}
-    int  prefix_len   = 0;
+    int  prefix_len       = 0;
     int  draft_pref_start = 0;                   // tail-only drafter prefix start (0 = full prefix)
+    int  global_pool_cap  = 0;                   // global prefix_k/v resident token pool (max_ctx or tier0_pool)
+    int  shared_kv_window = 0;                   // >0 enables Last-Loop Shared-KV (4 cold global planes)
+    int  shared_tail_cap  = 0;                   // ring capacity per early plane packed at prefix_k/v tail
+    int  draft_ring_cap   = 0;                   // >0 enables sliding ctx-KV ring [0..draft_ring_cap-1] for O(1) VRAM
 
     // Flat 4D per-physical-layer tensors (24 physical layers):
     //   planes[ip]: 1 for prelude (0..5), 3 for core (6..17), 3 for coda (18..23) -> 60 planes total
-    std::vector<int>           planes;      // size 24
-    std::vector<ggml_tensor *> prefix_k;    // [D, cap, Hk, P] (Q8_0 or F16)
-    std::vector<ggml_tensor *> prefix_v;    // [D, cap, Hk, P]
-    std::vector<ggml_tensor *> tree_k;      // [D, S, Hk, P]
-    std::vector<ggml_tensor *> tree_v;      // [D, S, Hk, P]
-    std::vector<ggml_tensor *> prefix_conv; // [3, sconv_channels, P] F32
-    std::vector<ggml_tensor *> tree_conv;   // [sconv_channels, S, P] F32
+    std::vector<int>           planes;          // size 24
+    std::vector<ggml_tensor *> prefix_k;        // [D, cap, Hk, P_storage] (Q8_0 or F16)
+    std::vector<ggml_tensor *> prefix_v;        // [D, cap, Hk, P_storage]
+    std::vector<ggml_tensor *> remote_prefix_k; // Dual-GPU Tier 1.5 warm prefix [D, remote_cap, Hk, P_storage] (global layers only)
+    std::vector<ggml_tensor *> remote_prefix_v; // Dual-GPU Tier 1.5 warm prefix [D, remote_cap, Hk, P_storage] (global layers only)
+    std::vector<ggml_tensor *> tree_k;          // [D, S, Hk, P_tot]
+    std::vector<ggml_tensor *> tree_v;          // [D, S, Hk, P_tot]
+    std::vector<ggml_tensor *> prefix_conv;     // [3, sconv_channels, P_tot] F32
+    std::vector<ggml_tensor *> tree_conv;       // [sconv_channels, S, P_tot] F32
 
     // Per-node recurrent & feature pools (S = max_nodes + 1):
     std::vector<ggml_tensor *> pre_blocks;   // [H, S] F32 each (1 block for prelude L0..5)
@@ -247,6 +264,13 @@ struct Inkling2Cache {
 
     // Persistent device buffer holding the last committed token's 4 target taps [n_embd, 4, 1]
     ggml_tensor * last_taps_dev = nullptr;
+
+    // Optional 3-Tier Dual-GPU KVFlash 2.0 manager (active when LUCE_KVFLASH > 0)
+    ggml_context *                   kvflash_alias_ctx = nullptr;
+    std::unique_ptr<Inkling2KvFlash> kvflash;
+    // Cached KVFlash config used at cache creation so multi-slot views can attach per-slot managers
+    Inkling2KvFlashConfig            kvflash_cfg;
+    ggml_backend_t                   target_backend_ref = nullptr;
 
     // Cached HIP-graph workspaces
     Inkling2GraphWorkspace decode_ws;

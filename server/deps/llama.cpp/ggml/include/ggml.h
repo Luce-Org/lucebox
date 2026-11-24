@@ -3312,6 +3312,21 @@ extern "C" {
             float                 threshold,
             float                 eps);
 
+    // Paged global-layer variant of ggml_inkling2_kv_write: maps logical pos_buf[t] via
+    // block_table[pos / block_size] * block_size + (pos % block_size); entries < 0 are skipped.
+    GGML_API struct ggml_tensor * ggml_inkling2_kv_write_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * pos_buf,
+            struct ggml_tensor  * block_table,
+            int                   block_size,
+            int                   head_dim,
+            int                   n_head_kv,
+            int                   is_v,
+            float                 threshold,
+            float                 eps);
+
     // Compute rel_table [rel_extent+1, n_head, T] = (rel_bias @ Rcur) - sink.
     GGML_API struct ggml_tensor * ggml_inkling2_rel_table(
             struct ggml_context * ctx,
@@ -3336,6 +3351,24 @@ extern "C" {
             struct ggml_tensor  * v_dep,
             struct ggml_tensor  * gate_proj,
             int                   swa_window,
+            int                   rel_extent,
+            int                   partial,
+            int                   include_sink);
+
+    // Paged global-layer variant of ggml_inkling2_attn_rel (KVFlash 2.0 + disjoint Dual-GPU Split-KV).
+    // block_table: I32 [max_blocks] on device; entries < 0 mark evicted or peer-GPU holes and are skipped in O(1).
+    GGML_API struct ggml_tensor * ggml_inkling2_attn_rel_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_cache,
+            struct ggml_tensor  * v_cache,
+            struct ggml_tensor  * rel_table,
+            struct ggml_tensor  * kv_meta,
+            struct ggml_tensor  * k_dep,
+            struct ggml_tensor  * v_dep,
+            struct ggml_tensor  * gate_proj,
+            struct ggml_tensor  * block_table,
+            int                   block_size,
             int                   rel_extent,
             int                   partial,
             int                   include_sink);
@@ -3465,6 +3498,27 @@ extern "C" {
             int                   n_head_kv,
             int                   is_v,
             int                   swa_window,
+            float                 threshold,
+            float                 eps,
+            int                   write_mode);
+
+    // Paged global-layer variant of ggml_inkling2_sconv_kv_write: always advances ShortConv state,
+    // and writes K/V to block_table[pos / block_size] * block_size + (pos % block_size) when >= 0.
+    GGML_API struct ggml_tensor * ggml_inkling2_sconv_kv_write_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_static,
+            struct ggml_tensor  * state_in,
+            struct ggml_tensor  * state_out,
+            struct ggml_tensor  * dyn_taps,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * pos_buf,
+            struct ggml_tensor  * block_table,
+            int                   block_size,
+            int                   state_chan_offset,
+            int                   head_dim,
+            int                   n_head_kv,
+            int                   is_v,
             float                 threshold,
             float                 eps,
             int                   write_mode);

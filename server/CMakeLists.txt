@@ -593,6 +593,8 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_hot.cpp
     src/inkling2/inkling2_loader.cpp
     src/inkling2/inkling2_cache.cpp
+    src/inkling2/inkling2_kvflash.cpp
+    src/inkling2/inkling2_slot_state.cpp
     src/inkling2/inkling2_graph.cpp
     src/inkling2/inkling2_2dsd_draft.cpp
     src/inkling2/inkling2_2dsd_graph.cpp
@@ -2344,6 +2346,20 @@ if(LUCE_TESTS)
         target_link_libraries(test_inkling2_ops PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
         add_test(NAME inkling2_ops COMMAND test_inkling2_ops)
         set_tests_properties(inkling2_ops PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_kvflash.cpp")
+        add_executable(test_inkling2_kvflash test/unit/test_inkling2_kvflash.cpp)
+        target_include_directories(test_inkling2_kvflash PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_inkling2_kvflash PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME inkling2_kvflash COMMAND test_inkling2_kvflash)
+        set_tests_properties(inkling2_kvflash PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_seq_engine.cpp")
+        add_executable(test_inkling2_seq_engine test/unit/test_inkling2_seq_engine.cpp)
+        target_include_directories(test_inkling2_seq_engine PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(test_inkling2_seq_engine PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME inkling2_seq_engine COMMAND test_inkling2_seq_engine)
+        set_tests_properties(inkling2_seq_engine PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_inkling2_forward.cpp")
         add_executable(smoke_inkling2_forward test/smoke/smoke_inkling2_forward.cpp)

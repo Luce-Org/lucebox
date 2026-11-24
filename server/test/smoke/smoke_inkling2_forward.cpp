@@ -1,8 +1,9 @@
-// End-to-end smoke + parity + benchmark tool for Inkling 2 Mini (`inkling2_loop`).
+// End-to-end smoke + parity + needle + concurrent benchmark tool for Inkling 2 Mini (`inkling2_loop`).
 //
 // Usage:
-//   smoke_inkling2_forward <model.gguf> [--gpu 0] [--expert-gpu -1] [--dspark <mtp.safetensors|off>]
-//       [--n-gen 128] [--ctx 8192] [--kv q8_0|f16] [--prompt "text"] [--prompt-len N] [--parity]
+//   smoke_inkling2_forward <model.gguf> [--gpu 0] [--expert-gpu -1] [--dspark <path|off>]
+//       [--n-gen 128] [--ctx 8192] [--kv q8_0|f16] [--prompt "text"] [--prompt-len N]
+//       [--parity] [--ar] [--needle-test] [--needle-pos N] [--concurrency N] [--concurrent] [--contract]
 
 #include "inkling2_backend.h"
 #include "inkling2_cache.h"
@@ -23,9 +24,45 @@
 
 using namespace luce::common;
 
+static std::vector<int32_t> build_needle_prompt(
+        const Tokenizer & tok,
+        int target_len,
+        int needle_pos_tok,
+        const char * array_id,
+        const char * proj_name,
+        const char * passcode) {
+    const std::string hdr = "<|message_user|><|content_text|>Read the following technical log carefully and answer the question at the very end.\n\n";
+    const std::string filler =
+        std::string("LOG ENTRY: Routine subsystem heartbeat verified across sensor array ") + array_id + ". "
+        "Thermal readings remained within nominal bounds (34.2 C to 36.8 C), power rails stable at 12.01 V, "
+        "memory scrubbing completed with zero correctable ECC events, and network ring buffers flushed cleanly.\n";
+    const std::string needle =
+        std::string("\nCRITICAL VAULT RECORD: The secret launch passcode for ") + proj_name + " is " + passcode + ". "
+        "Store this exact passcode " + passcode + " for verification.\n\n";
+    const std::string question =
+        std::string("\nQuestion: What is the exact secret launch passcode for ") + proj_name +
+        " mentioned in the CRITICAL VAULT RECORD above? Reply with the passcode clearly.<|end_message|><|message_model|><|content_text|>";
+    auto ids_hdr    = tok.encode(hdr, true);
+    auto ids_filler = tok.encode(filler, false);
+    auto ids_needle = tok.encode(needle, false);
+    auto ids_q      = tok.encode(question, false);
+    std::vector<int32_t> out = ids_hdr;
+    bool inserted = false;
+    while ((int) (out.size() + ids_q.size()) < target_len) {
+        if (!inserted && (int) out.size() >= needle_pos_tok) {
+            out.insert(out.end(), ids_needle.begin(), ids_needle.end());
+            inserted = true;
+        }
+        out.insert(out.end(), ids_filler.begin(), ids_filler.end());
+    }
+    if (!inserted) out.insert(out.end(), ids_needle.begin(), ids_needle.end());
+    out.insert(out.end(), ids_q.begin(), ids_q.end());
+    return out;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "Usage: %s <model.gguf> [--gpu 0] [--expert-gpu -1] [--dspark path|off] [--n-gen 128] [--ctx 8192] [--kv q8_0|f16] [--prompt text] [--prompt-len N] [--parity]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <model.gguf> [--gpu 0] [--expert-gpu -1] [--dspark path|off] [--n-gen 128] [--ctx 8192] [--kv q8_0|f16] [--prompt text] [--prompt-len N] [--parity] [--ar] [--needle-test] [--needle-pos N] [--concurrency N] [--contract]\n", argv[0]);
         return 1;
     }
     std::string model_path = argv[1];
@@ -39,6 +76,9 @@ int main(int argc, char ** argv) {
     int prompt_len = 0;
     int concurrency = 1;
     bool parity = false;
+    bool force_ar_cli = false;
+    bool needle_test = false;
+    int needle_pos_tok = 1500;
     bool run_contract = false;
     float temp = 0.0f;
     int top_k = 0;
@@ -57,9 +97,15 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) reps = std::max(1, std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--prompt-len") == 0 && i + 1 < argc) prompt_len = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt_text = argv[++i];
-        else if (std::strcmp(argv[i], "--concurrency") == 0 && i + 1 < argc) concurrency = std::max(1, std::atoi(argv[++i]));
-        else if (std::strcmp(argv[i], "--contract") == 0) run_contract = true;
+        else if ((std::strcmp(argv[i], "--concurrency") == 0 || std::strcmp(argv[i], "--max-concurrency") == 0) && i + 1 < argc) {
+            concurrency = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--concurrent") == 0) {
+            if (concurrency < 2) concurrency = 2;
+        } else if (std::strcmp(argv[i], "--contract") == 0) run_contract = true;
         else if (std::strcmp(argv[i], "--parity") == 0) parity = true;
+        else if (std::strcmp(argv[i], "--ar") == 0) force_ar_cli = true;
+        else if (std::strcmp(argv[i], "--needle-test") == 0) needle_test = true;
+        else if (std::strcmp(argv[i], "--needle-pos") == 0 && i + 1 < argc) needle_pos_tok = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) temp = std::strtof(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) top_k = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) top_p = std::strtof(argv[++i], nullptr);
@@ -76,16 +122,22 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<int32_t> prompt_ids = tok.encode(prompt_text, true);
-    if (prompt_len > 0) {
-        std::vector<int32_t> rep;
-        rep.reserve(prompt_len);
-        while ((int) rep.size() < prompt_len) {
-            for (int32_t id : prompt_ids) {
-                if ((int) rep.size() < prompt_len) rep.push_back(id);
+    std::vector<int32_t> prompt_ids;
+    if (needle_test) {
+        const int target_len = prompt_len > 0 ? prompt_len : 12000;
+        prompt_ids = build_needle_prompt(tok, target_len, needle_pos_tok, "4B", "Project Cobalt-9", "AURORA-7392-QUARTZ");
+    } else {
+        prompt_ids = tok.encode(prompt_text, true);
+        if (prompt_len > 0) {
+            std::vector<int32_t> rep;
+            rep.reserve(prompt_len);
+            while ((int) rep.size() < prompt_len) {
+                for (int32_t id : prompt_ids) {
+                    if ((int) rep.size() < prompt_len) rep.push_back(id);
+                }
             }
+            prompt_ids = std::move(rep);
         }
-        prompt_ids = std::move(rep);
     }
     std::printf("[smoke] prompt_tokens=%zu n_gen=%d gpu=%d expert_gpu=%d kv=%s\n",
                 prompt_ids.size(), n_gen, gpu, expert_gpu, ggml_type_name(kv_type));
@@ -130,7 +182,7 @@ int main(int argc, char ** argv) {
     if (concurrency > 1) {
         SeqEngine * eng = backend.seq_engine();
         if (!eng) {
-            std::fprintf(stderr, "[CONC] FAIL: seq_engine() returned null (needs 2DSD drafter)\n");
+            std::fprintf(stderr, "[CONC] FAIL: seq_engine() returned null\n");
             return 1;
         }
         const int N = std::min(concurrency, eng->slot_count());
@@ -140,18 +192,28 @@ int main(int argc, char ** argv) {
             "Implement binary search in C++ with clean loop invariants and show an example call.",
             "Summarize the difference between TCP and QUIC connection establishment and head-of-line blocking."
         };
+        const char * kArrays[4]    = { "4B", "7C", "2A", "9F" };
+        const char * kProjects[4]  = { "Project Cobalt-9", "Project Obsidian-4", "Project Helios-7", "Project Zenith-2" };
+        const char * kPasscodes[4] = { "AURORA-7392-QUARTZ", "TITAN-4819-SAPPHIRE", "SOLARIS-6104-BERYL", "VORTEX-2951-TOPAZ" };
+
         std::vector<std::vector<int32_t>> prompts((size_t) N);
         for (int s = 0; s < N; ++s) {
-            prompts[(size_t) s] = tok.encode(kPrompts[s % 4], true);
-            if (prompt_len > 0) {
-                std::vector<int32_t> rep;
-                rep.reserve((size_t) prompt_len);
-                while ((int) rep.size() < prompt_len) {
-                    for (int32_t id : prompts[(size_t) s]) {
-                        if ((int) rep.size() < prompt_len) rep.push_back(id);
+            if (needle_test) {
+                const int target_len = prompt_len > 0 ? prompt_len : 12000;
+                prompts[(size_t) s] = build_needle_prompt(
+                    tok, target_len, needle_pos_tok, kArrays[s % 4], kProjects[s % 4], kPasscodes[s % 4]);
+            } else {
+                prompts[(size_t) s] = tok.encode(kPrompts[s % 4], true);
+                if (prompt_len > 0) {
+                    std::vector<int32_t> rep;
+                    rep.reserve((size_t) prompt_len);
+                    while ((int) rep.size() < prompt_len) {
+                        for (int32_t id : prompts[(size_t) s]) {
+                            if ((int) rep.size() < prompt_len) rep.push_back(id);
+                        }
                     }
+                    prompts[(size_t) s] = std::move(rep);
                 }
-                prompts[(size_t) s] = std::move(rep);
             }
         }
         SamplerCfg samp;
@@ -185,9 +247,14 @@ int main(int argc, char ** argv) {
             long long pure_toks = 0;
             while (true) {
                 SeqEngine::StepPlan plan;
+                for (int s = 0; s < N; ++s) {
+                    if (decoding[(size_t) s] && !done[(size_t) s]) {
+                        plan.decode.push_back({ slots[(size_t) s], pending_tok[(size_t) s], !force_ar_cli });
+                    }
+                }
                 int next_pre = -1;
                 for (int s = 0; s < N; ++s) {
-                    if (!decoding[(size_t) s]) { next_pre = s; break; }
+                    if (!decoding[(size_t) s] && !done[(size_t) s]) { next_pre = s; break; }
                 }
                 if (next_pre >= 0) {
                     auto lim = eng->step_plan_limits((int) plan.decode.size());
@@ -195,11 +262,6 @@ int main(int argc, char ** argv) {
                 } else if (!all_prefilled) {
                     all_prefilled = true;
                     t_pure_dec0 = std::chrono::steady_clock::now();
-                }
-                for (int s = 0; s < N; ++s) {
-                    if (decoding[(size_t) s] && !done[(size_t) s]) {
-                        plan.decode.push_back({ slots[(size_t) s], pending_tok[(size_t) s], true });
-                    }
                 }
                 if (plan.prefills.empty() && plan.decode.empty()) break;
 
@@ -247,7 +309,6 @@ int main(int argc, char ** argv) {
                     push_tok(d.token);
                     pending_tok[(size_t) s] = d.token;
                 }
-                // Retire finished slots immediately so step() won't require them on next iteration
                 for (int s = 0; s < N; ++s) {
                     if (done[(size_t) s] && slots[(size_t) s] >= 0) {
                         eng->retire(slots[(size_t) s]);
@@ -269,7 +330,7 @@ int main(int argc, char ** argv) {
             if (rep == reps - 1) {
                 for (int s = 0; s < N; ++s) {
                     std::string txt = tok.decode(out_toks[(size_t) s]);
-                    std::printf("[CONC stream %d (%zu tok)] %.180s\n", s, out_toks[(size_t) s].size(), txt.c_str());
+                    std::printf("[CONC stream %d (%zu tok)] %.400s\n---\n", s, out_toks[(size_t) s].size(), txt.c_str());
                 }
             }
         }
@@ -316,7 +377,7 @@ int main(int argc, char ** argv) {
         for (int rep = 0; rep < reps; ++rep) {
             char lbl[32];
             std::snprintf(lbl, sizeof(lbl), reps > 1 ? "RUN%d" : "RUN", rep);
-            r = run_one(false, lbl);
+            r = run_one(force_ar_cli, lbl);
             if (!r.ok()) return 1;
         }
         return 0;

@@ -10373,6 +10373,27 @@ struct ggml_tensor * ggml_inkling2_kv_write(
     ggml_set_op_params_i32(result, 4, swa_window);
     ggml_set_op_params_f32(result, 5, threshold);
     ggml_set_op_params_f32(result, 6, eps);
+    ggml_set_op_params_i32(result, 7, 0);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_kv_write_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * pos_buf,
+        struct ggml_tensor  * block_table,
+        int                   block_size,
+        int                   head_dim,
+        int                   n_head_kv,
+        int                   is_v,
+        float                 threshold,
+        float                 eps) {
+    GGML_ASSERT(block_table && block_table->type == GGML_TYPE_I32 && block_size > 0);
+    struct ggml_tensor * result = ggml_inkling2_kv_write(
+        ctx, x, kv_cache, pos_buf, head_dim, n_head_kv, is_v, /*swa_window=*/0, threshold, eps);
+    result->src[3] = block_table;
+    ggml_set_op_params_i32(result, 7, block_size);
     return result;
 }
 
@@ -10429,6 +10450,31 @@ struct ggml_tensor * ggml_inkling2_attn_rel(
     ggml_set_op_params_i32(result, 2, rel_extent);
     ggml_set_op_params_i32(result, 3, partial);
     ggml_set_op_params_i32(result, 4, include_sink);
+    ggml_set_op_params_i32(result, 5, 0);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_attn_rel_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_cache,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * rel_table,
+        struct ggml_tensor  * kv_meta,
+        struct ggml_tensor  * k_dep,
+        struct ggml_tensor  * v_dep,
+        struct ggml_tensor  * gate_proj,
+        struct ggml_tensor  * block_table,
+        int                   block_size,
+        int                   rel_extent,
+        int                   partial,
+        int                   include_sink) {
+    GGML_ASSERT(block_table && block_table->type == GGML_TYPE_I32 && block_size > 0);
+    struct ggml_tensor * result = ggml_inkling2_attn_rel(
+        ctx, q, k_cache, v_cache, rel_table, kv_meta, k_dep, v_dep, gate_proj,
+        /*swa_window=*/0, rel_extent, partial, include_sink);
+    result->src[8] = block_table;
+    ggml_set_op_params_i32(result, 5, block_size);
     return result;
 }
 
@@ -10706,6 +10752,34 @@ struct ggml_tensor * ggml_inkling2_sconv_kv_write(
     ggml_set_op_params_f32(result, 6, threshold);
     ggml_set_op_params_f32(result, 7, eps);
     ggml_set_op_params_i32(result, 8, write_mode);
+    ggml_set_op_params_i32(result, 9, 0);
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_sconv_kv_write_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_static,
+        struct ggml_tensor  * state_in,
+        struct ggml_tensor  * state_out,
+        struct ggml_tensor  * dyn_taps,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * pos_buf,
+        struct ggml_tensor  * block_table,
+        int                   block_size,
+        int                   state_chan_offset,
+        int                   head_dim,
+        int                   n_head_kv,
+        int                   is_v,
+        float                 threshold,
+        float                 eps,
+        int                   write_mode) {
+    GGML_ASSERT(block_table && block_table->type == GGML_TYPE_I32 && block_size > 0);
+    struct ggml_tensor * result = ggml_inkling2_sconv_kv_write(
+        ctx, x, w_static, state_in, state_out, dyn_taps, kv_cache, pos_buf,
+        state_chan_offset, head_dim, n_head_kv, is_v, /*swa_window=*/0, threshold, eps, write_mode);
+    result->src[7] = block_table;
+    ggml_set_op_params_i32(result, 9, block_size);
     return result;
 }
 

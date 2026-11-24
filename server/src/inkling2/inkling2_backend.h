@@ -110,6 +110,7 @@ private:
     ggml_backend_t        snap_backend_   = nullptr;
     Inkling2Weights       weights_;
     Inkling2Cache         cache_;
+    std::vector<std::unique_ptr<Inkling2Cache>> extra_caches_;
     std::unique_ptr<SeqEngine> seq_engine_;
     int                   chunk_          = 512;
     int                   fitted_max_ctx_ = 0;

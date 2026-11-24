@@ -12,6 +12,7 @@
 //     transformer + exact-n_spec fused F16 RNN Markov chain + on-device masks in ONE HIP graph!
 
 #include "inkling2_graph.h"
+#include "inkling2_kvflash.h"
 
 #include "ggml-cuda.h"
 
@@ -262,13 +263,22 @@ static bool build_inkling2_target_graph(
         bool verify,
         bool use_split,
         bool use_split_kv,
-        bool capture_taps) {
+        bool use_paged_kv,
+        bool capture_taps,
+        int capture_q_rows) {
     free_inkling2_workspace(ws);
     ws.n_tokens     = n_tokens;
     ws.verify       = verify;
     ws.split        = use_split;
     ws.split_kv     = use_split_kv;
+    ws.paged_kv     = use_paged_kv;
     ws.capture_taps = capture_taps;
+    ws.q_cap_n      = (use_paged_kv && capture_q_rows > 0) ? std::min(capture_q_rows, n_tokens) : 0;
+    ws.capture_q    = (ws.q_cap_n > 0);
+    ws.bt_epoch     = 0;
+    ws.inp_bt_local = nullptr;
+    ws.inp_bt_remote = nullptr;
+    ws.q_cap_out    = nullptr;
 
     const size_t max_nodes = 16384;
     const size_t ctx_bytes = max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false) + (16 << 20);
@@ -290,6 +300,15 @@ static bool build_inkling2_target_graph(
         ws.inp_meta_r = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4);
         ggml_set_input(ws.inp_meta_r);
     }
+    const int kf_block_size = use_paged_kv ? cache.kvflash->block_size() : 0;
+    if (use_paged_kv) {
+        ws.inp_bt_local = ggml_new_tensor_1d(c, GGML_TYPE_I32, cache.kvflash->max_blocks());
+        ggml_set_input(ws.inp_bt_local);
+        if (use_split_kv) {
+            ws.inp_bt_remote = ggml_new_tensor_1d(c, GGML_TYPE_I32, cache.kvflash->max_blocks());
+            ggml_set_input(ws.inp_bt_remote);
+        }
+    }
 
     const int write_mode = verify ? 2 : 1; // 2 = write verify conv ring; 1 = update live conv state
     const int Hq = w.n_head;
@@ -298,6 +317,11 @@ static bool build_inkling2_target_graph(
     const int q_sz  = Hq * D;
     const int kv_sz = Hk * D;
     const int r_sz  = w.d_rel * Hq;
+
+    if (ws.capture_q && !w.global_slots.empty()) {
+        ws.q_cap_out = ggml_new_tensor_4d(c, GGML_TYPE_F32, D, Hq, (int64_t) w.global_slots.size(), ws.q_cap_n);
+        ggml_set_output(ws.q_cap_out);
+    }
 
     // Input token embedding + tok_norm
     ggml_tensor * cur = ggml_get_rows(c, w.tok_embd, ws.inp_tokens);
@@ -468,7 +492,43 @@ static bool build_inkling2_target_graph(
         const int gidx = w.slot_to_global_idx[il];
         ggml_tensor * attn_out = nullptr;
 
-        if (!L.is_swa && use_split_kv && gidx >= 0 && cache.remote_backend && cache.remote_k[gidx]) {
+        if (!L.is_swa && ws.q_cap_out && gidx >= 0) {
+            ggml_tensor * q_tail = ggml_view_3d(
+                c, Q, D, Hq, ws.q_cap_n, Q->nb[1], Q->nb[2],
+                (size_t) (n_tokens - ws.q_cap_n) * Q->nb[2]);
+            ggml_tensor * q_dst = ggml_view_3d(
+                c, ws.q_cap_out, D, Hq, ws.q_cap_n, ws.q_cap_out->nb[1], ws.q_cap_out->nb[3],
+                (size_t) gidx * ws.q_cap_out->nb[2]);
+            ggml_build_forward_expand(gf, ggml_cpy(c, q_tail, q_dst));
+        }
+
+        if (!L.is_swa && use_paged_kv) {
+            // KVFlash 2.0 paged global layer: live writes always land in Tier-0 paged pool;
+            // evicted blocks live in Tier 1.5 (disjoint bt_remote) or Tier 2 Host (-1 skipped O(1)).
+            ggml_tensor * k_dep = ggml_inkling2_sconv_kv_write_paged(
+                c, K_raw, L.attn_k_conv, state_live, state_dst, k_dyn, cache.k_cache[il], ws.inp_pos,
+                ws.inp_bt_local, kf_block_size, 0, D, Hk, 0, w.qk_clip, w.rms_eps, write_mode);
+            ggml_tensor * v_dep = ggml_inkling2_sconv_kv_write_paged(
+                c, V_raw, L.attn_v_conv, state_live, state_dst, v_dyn, cache.v_cache[il], ws.inp_pos,
+                ws.inp_bt_local, kf_block_size, kv_sz, D, Hk, 1, w.qk_clip, w.rms_eps, write_mode);
+            if (use_split_kv && gidx >= 0 && cache.remote_backend && cache.remote_k[gidx]) {
+                ggml_tensor * part_r = ggml_inkling2_attn_rel_paged(
+                    c, Q, cache.remote_k[gidx], cache.remote_v[gidx], rel_table, ws.inp_meta_r,
+                    nullptr, nullptr, nullptr, ws.inp_bt_remote, kf_block_size,
+                    w.rel_extent, /*partial=*/1, /*include_sink=*/1);
+                ws.expert_nodes.push_back(part_r);
+                ggml_tensor * part_l = ggml_inkling2_attn_rel_paged(
+                    c, Q, cache.k_cache[il], cache.v_cache[il], rel_table, ws.inp_meta,
+                    k_dep, v_dep, nullptr, ws.inp_bt_local, kf_block_size,
+                    w.rel_extent, /*partial=*/1, /*include_sink=*/0);
+                attn_out = ggml_inkling2_attn_split_combine(c, part_r, part_l, Gate, D, Hq);
+            } else {
+                attn_out = ggml_inkling2_attn_rel_paged(
+                    c, Q, cache.k_cache[il], cache.v_cache[il], rel_table, ws.inp_meta,
+                    k_dep, v_dep, Gate, ws.inp_bt_local, kf_block_size,
+                    w.rel_extent, /*partial=*/0, /*include_sink=*/1);
+            }
+        } else if (!L.is_swa && use_split_kv && gidx >= 0 && cache.remote_backend && cache.remote_k[gidx]) {
             ggml_tensor * K_conv = ggml_inkling2_sconv(
                 c, K_raw, L.attn_k_conv, state_live, state_dst, k_dyn, 0, D, write_mode);
             ggml_tensor * V_conv = ggml_inkling2_sconv(
@@ -722,7 +782,9 @@ static bool build_inkling2_target_graph(
                 for (ggml_tensor * src : node->src) {
                     for (ggml_tensor * t = src; t; t = t->view_src) {
                         if ((t->flags & GGML_TENSOR_FLAG_INPUT) && !t->buffer) {
-                            ggml_backend_sched_set_tensor_backend(ws.sched, t, target_backend);
+                            ggml_backend_t pin_be = (t == ws.inp_meta_r || t == ws.inp_bt_remote)
+                                ? w.expert_backend : target_backend;
+                            ggml_backend_sched_set_tensor_backend(ws.sched, t, pin_be);
                         }
                     }
                 }
@@ -734,6 +796,12 @@ static bool build_inkling2_target_graph(
                 } else if (!is_view && ggml_backend_supports_op(target_backend, node)) {
                     ggml_backend_sched_set_tensor_backend(ws.sched, node, target_backend);
                 }
+            }
+            if (ws.q_cap_out && !ws.q_cap_out->buffer) {
+                ggml_backend_sched_set_tensor_backend(ws.sched, ws.q_cap_out, target_backend);
+            }
+            if (ws.taps_out && !ws.taps_out->buffer) {
+                ggml_backend_sched_set_tensor_backend(ws.sched, ws.taps_out, target_backend);
             }
         }
         if (!ggml_backend_sched_alloc_graph(ws.sched, gf)) {
@@ -767,12 +835,22 @@ Inkling2ForwardOut inkling2_forward(
         bool need_logits,
         bool capture_taps_for_dspark,
         bool allow_split,
-        float fast_sample_temp) {
+        float fast_sample_temp,
+        int capture_q_rows) {
     Inkling2ForwardOut out;
     if (n_tokens <= 0 || pos0 < 0 || pos0 + n_tokens > cache.max_ctx) return out;
 
     const bool can_capture = capture_taps_for_dspark && w.dspark.loaded;
-    const bool use_split_kv = (cache.remote_backend != nullptr && cache.remote_split_pos > 0);
+    const bool use_paged_kv = (cache.kvflash && cache.kvflash->active());
+    const bool use_split_kv = use_paged_kv
+        ? cache.kvflash->tier15_active()
+        : (cache.remote_backend != nullptr && cache.remote_split_pos > 0);
+    const int eff_capture_q = (use_paged_kv && !verify && capture_q_rows > 0)
+        ? std::min(capture_q_rows, n_tokens) : 0;
+
+    if (use_paged_kv) {
+        if (!cache.kvflash->prepare_span(pos0, n_tokens)) return out;
+    }
 
     // Choose single-GPU vs Dual-GPU split:
     //   - T=1 decode: single-GPU on R9700 (zero PCIe hops) unless LUCE_INKLING2_SPLIT_T1=1
@@ -785,7 +863,7 @@ Inkling2ForwardOut inkling2_forward(
 
     Inkling2GraphWorkspace temp_ws;
     Inkling2GraphWorkspace * ws = nullptr;
-    if (!verify && n_tokens == 1) {
+    if (!verify && n_tokens == 1 && eff_capture_q == 0) {
         ws = &cache.decode_ws;
     } else if (verify && n_tokens >= 2 && n_tokens <= kInkling2MaxVerify) {
         ws = &cache.verify_ws[n_tokens];
@@ -795,25 +873,38 @@ Inkling2ForwardOut inkling2_forward(
 
     if (!ws->built || ws->n_tokens != n_tokens || ws->verify != verify ||
         ws->split != use_split || ws->split_kv != use_split_kv ||
-        ws->capture_taps != can_capture) {
+        ws->paged_kv != use_paged_kv || ws->capture_taps != can_capture ||
+        ws->q_cap_n != eff_capture_q) {
         if (!build_inkling2_target_graph(
-                target_backend, w, cache, *ws, n_tokens, verify, use_split, use_split_kv, can_capture)) {
+                target_backend, w, cache, *ws, n_tokens, verify, use_split,
+                use_split_kv, use_paged_kv, can_capture, eff_capture_q)) {
             return out;
         }
     }
 
-    // Upload tiny runtime inputs (tokens, positions, kv_meta)
+    // Upload tiny runtime inputs (tokens, positions, kv_meta, optional KVFlash block tables)
     std::vector<int32_t> pos(n_tokens);
     for (int i = 0; i < n_tokens; ++i) pos[i] = pos0 + i;
 
     const int kv_len = pos0 + n_tokens;
-    int32_t meta[4] = { pos0, kv_len, use_split_kv ? cache.remote_split_pos : 0, kv_len };
+    int32_t meta[4] = { pos0, kv_len, (use_split_kv && !use_paged_kv) ? cache.remote_split_pos : 0, kv_len };
     ggml_backend_tensor_set(ws->inp_tokens, tokens, 0, (size_t) n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(ws->inp_pos, pos.data(), 0, (size_t) n_tokens * sizeof(int32_t));
     ggml_backend_tensor_set(ws->inp_meta, meta, 0, sizeof(meta));
     if (use_split_kv && ws->inp_meta_r) {
-        int32_t meta_r[4] = { pos0, kv_len, 0, std::min(kv_len, cache.remote_split_pos) };
+        int32_t meta_r[4] = { pos0, kv_len, 0, use_paged_kv ? kv_len : std::min(kv_len, cache.remote_split_pos) };
         ggml_backend_tensor_set(ws->inp_meta_r, meta_r, 0, sizeof(meta_r));
+    }
+    if (use_paged_kv && ws->inp_bt_local) {
+        // Always upload block tables: ggml_gallocr reuses input tensor memory for
+        // downstream scratch tensors (e.g. LM-head logits) after the last attention consumer.
+        const auto & btl = cache.kvflash->bt_local();
+        ggml_backend_tensor_set(ws->inp_bt_local, btl.data(), 0, btl.size() * sizeof(int32_t));
+        if (use_split_kv && ws->inp_bt_remote) {
+            const auto & btr = cache.kvflash->bt_remote();
+            ggml_backend_tensor_set(ws->inp_bt_remote, btr.data(), 0, btr.size() * sizeof(int32_t));
+        }
+        ws->bt_epoch = cache.kvflash->tables_epoch();
     }
 
     ggml_status st = GGML_STATUS_SUCCESS;
@@ -879,6 +970,13 @@ Inkling2ForwardOut inkling2_forward(
     } else if (need_logits) {
         out.logits.resize((size_t) w.n_vocab_unpadded * n_out);
         ggml_backend_tensor_get(ws->logits, out.logits.data(), 0, out.logits.size() * sizeof(float));
+    }
+
+    // Capture global queries for Mode-4 exact chunk scoring when requested
+    if (use_paged_kv && ws->q_cap_out && ws->q_cap_n > 0) {
+        std::vector<float> q_host((size_t) ggml_nelements(ws->q_cap_out));
+        ggml_backend_tensor_get(ws->q_cap_out, q_host.data(), 0, ggml_nbytes(ws->q_cap_out));
+        cache.kvflash->append_queries(q_host.data(), ws->q_cap_n);
     }
 
     // For non-verify forwards (prefill / T=1 decode), immediately commit captured taps to DSpark KV cache

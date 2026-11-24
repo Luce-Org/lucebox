@@ -40,7 +40,8 @@ Inkling2ForwardOut inkling2_forward(
     bool need_logits,
     bool capture_taps_for_dspark,
     bool allow_split = true,
-    float fast_sample_temp = 0.0f);
+    float fast_sample_temp = 0.0f,
+    int capture_q_rows = 0);
 
 // 3-Pass Wavefront Loop-Fused Prefill (bit-exact):
 // Pipelines consecutive prompt chunks across Pass 2 / Pass 1 / Pass 0 simultaneously so every

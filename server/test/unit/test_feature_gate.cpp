@@ -905,7 +905,7 @@ void test_feature_gate_kvflash_requires_reading_arch() {
     // The refusal lists the architectures that do read it, from the table.
     const std::string refusal =
         gate_result(args, "deepseek41", PlacementBackend::Cuda, fixed);
-    CHECK(refusal.find("(supported: qwen35, qwen35moe, qwen4exp, laguna, gemma4)") !=
+    CHECK(refusal.find("(supported: qwen35, qwen35moe, qwen4exp, laguna, gemma4, inkling2_loop, inkling2)") !=
           std::string::npos);
 }
 
@@ -929,7 +929,12 @@ void test_inkling2_hip_only_and_verify_width() {
 
         BackendAdmissionContext kvflash;
         kvflash.kvflash = KvFlashRequest::Fixed;
-        CHECK(!gate_result(args, arch, PlacementBackend::Hip, kvflash).empty());
+        CHECK(gate_result(args, arch, PlacementBackend::Hip, kvflash).empty());
+
+        BackendArgs par_ok = args;
+        par_ok.max_concurrency = 2;
+        par_ok.device.max_ctx = 8192;
+        CHECK(gate_result(par_ok, arch, PlacementBackend::Hip, kvflash).empty());
     }
 }
 
