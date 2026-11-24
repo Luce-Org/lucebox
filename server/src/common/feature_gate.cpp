@@ -74,6 +74,10 @@ std::string check_feature_compatibility(
     if (arch == "deepseek41" && args.remote_target_shard.enabled()) {
         return "--target-shard-ipc-bin is not implemented for DeepSeek V4.1 (see server/docs/DS41.md)";
     }
+    // GLM-5.3-Flash splits layers in-process only; it has no remote shard path.
+    if (arch == "glm5-next" && args.remote_target_shard.enabled()) {
+        return "--target-shard-ipc-bin is not implemented for GLM-5.3-Flash (see server/docs/GLM53.md)";
+    }
 
     // ── vision projector × architecture / placement
     // DeepSeek V4 Vision and DeepSeek V4.1 Flash share the DeepSeek4 image

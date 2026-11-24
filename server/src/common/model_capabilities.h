@@ -47,7 +47,7 @@ struct ArchCapabilities {
     const char * arch;
 
     // Placement-independent.
-    bool layer_split;         // has a LayerSplitAdapter (--target-devices)
+    bool layer_split;         // --target-devices: a LayerSplitAdapter, or in-process (glm5-next)
     bool remote_draft;        // draft over IPC (--draft-ipc-bin)
     bool pflash_compression;  // PFlash prefill compression (--pflash on)
     bool expert_offload;      // hot/cold MoE expert residency (--spark, --freq,
@@ -84,6 +84,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"gemma4",     true,  false, false, false,  true,    kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
     {"deepseek4",  true,  false, true,  false,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
     {"deepseek41", false, false, true,  false,  false,   kMono,  kNever, kNever, kNever, kNever,kNever, kMono},
+    {"glm5-next",  true,  false, false, false,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
     {"inkling2_loop", false, false, false, false, false, kMono,  kNever, kMono,  kNever, kNever,kNever, kNever},
     {"inkling2",   false, false, false, false,  false,   kMono,  kNever, kMono,  kNever, kNever,kNever, kNever},
 };

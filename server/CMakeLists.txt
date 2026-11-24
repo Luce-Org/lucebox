@@ -573,6 +573,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/glm5
     ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
@@ -640,6 +641,10 @@ add_library(luce_common STATIC
     src/deepseek4/deepseek4_dspark_spec.cpp
     src/deepseek4/deepseek4_cluster.cpp
     src/deepseek4/deepseek4_vision.cpp
+    # GLM-5.3-Flash (glm5-next)
+    src/glm5/glm5_loader.cpp
+    src/glm5/glm5_graph.cpp
+    src/glm5/glm5_backend.cpp
     src/common/gpu_page_pool.cpp
     src/common/host_stream_flag.cpp
     src/common/vision/image_decode.cpp
@@ -1169,6 +1174,7 @@ if(LUCE_TESTS)
     # script tests) set the label at their add_test site.
     set(_luce_cpu_ctest_names
         deepseek4_unit
+        test_glm5_unit
         test_seq_slot_manager
         test_seq_engine_contract
         test_seq_batch_plan
@@ -1927,6 +1933,19 @@ if(LUCE_TESTS)
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_glm5_unit.cpp")
+        # GLM-5.3-Flash (glm5-next): tiny synthetic models on CPU.
+        add_executable(test_glm5_unit test/unit/test_glm5_unit.cpp)
+        target_include_directories(test_glm5_unit PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(test_glm5_unit PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        if(LUCE_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_glm5_unit PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_glm5_unit PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_glm5_unit)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds41v_vision.cpp")
         # DeepSeek V4.1 vision encoder: blocked attention, projector metadata.
