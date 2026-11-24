@@ -41,6 +41,11 @@ static void free_dspark_workspace(Inkling2DSparkWorkspace & ws) {
 static void free_tree_cache(Inkling2TreeCache & tc) {
     for (auto & kv : tc.phase_graphs) {
         auto & g = kv.second;
+        if (g.sample_alloc) { ggml_gallocr_free(g.sample_alloc); g.sample_alloc = nullptr; }
+        if (g.sample_ctx)   { ggml_free(g.sample_ctx); g.sample_ctx = nullptr; }
+        g.sample_gf = nullptr;
+        g.sample_logits = nullptr;
+        g.sample_cands = nullptr;
         if (g.sched) { ggml_backend_sched_free(g.sched); g.sched = nullptr; }
         if (g.alloc) { ggml_gallocr_free(g.alloc); g.alloc = nullptr; }
         if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
@@ -81,6 +86,8 @@ static void free_tree_cache(Inkling2TreeCache & tc) {
     tc.draft_v.clear();
     tc.draft_cap = 0;
     tc.prefix_len = 0;
+    tc.n_seq_slots = 1;
+    tc.is_slot_view = false;
     tc.active = false;
 }
 
@@ -92,8 +99,10 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
                            ggml_type kv_type,
                            Inkling2Cache & out,
                            std::string & error,
-                           int fixed_remote_split_pos) {
+                           int fixed_remote_split_pos,
+                           int n_seq_slots) {
     free_inkling2_cache(out);
+    n_seq_slots = std::max(1, n_seq_slots);
     out.max_ctx = std::max(2048, max_ctx);
     out.kv_type = (kv_type == GGML_TYPE_F16 || kv_type == GGML_TYPE_Q8_0) ? kv_type : GGML_TYPE_Q8_0;
     // SWA ring capacity: must hold at least swa_window + max_chunk + verify slack without overwrite
@@ -151,9 +160,13 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
 
     if (is_2dsd) {
         // 60-plane contiguous target prefix + tree scratch + per-node pools (ZERO duplicate KV!).
-        // Legacy 48-slot k_cache/v_cache/conv_state alias straight into tree.prefix_* for AR fallback.
+        // When n_seq_slots > 1, each tensor's outermost dimension scales by n_seq_slots so every
+        // sequence slot `s` is a 100% contiguous slice (for zero-copy prefill/commit/draft views)
+        // AND all slots share ONE batched Prelude/Core/Coda target pass via plane_eff = s*P + p.
         auto & tc = out.tree;
         tc.active = true;
+        tc.is_slot_view = false;
+        tc.n_seq_slots = n_seq_slots;
         tc.max_nodes = kInkling2TwoDSDMaxNodes;
         tc.n_depths = w.n_passes; // 3 readout depths {1, 2, 3}
         tc.prefix_len = 0;
@@ -186,33 +199,34 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
 
         for (int ip = 0; ip < w.n_layer_phys; ++ip) {
             const int P = (ip < w.core_start) ? 1 : (ip < w.core_end ? w.n_passes : tc.n_depths);
+            const int P_tot = P * n_seq_slots;
             tc.planes[ip] = P;
             const bool is_swa = w.layers[ip].is_swa;
             const int cap = is_swa ? out.swa_cap : out.max_ctx;
-            tc.prefix_k[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P);
-            tc.prefix_v[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P);
-            tc.tree_k[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P);
-            tc.tree_v[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P);
-            tc.prefix_conv[ip] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels, P);
-            tc.tree_conv[ip]   = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_channels, S, P);
+            tc.prefix_k[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P_tot);
+            tc.prefix_v[ip]    = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, cap, w.n_head_kv, P_tot);
+            tc.tree_k[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P_tot);
+            tc.tree_v[ip]      = ggml_new_tensor_4d(out.ctx, out.kv_type, w.head_dim, S,   w.n_head_kv, P_tot);
+            tc.prefix_conv[ip] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels, P_tot);
+            tc.tree_conv[ip]   = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.sconv_channels, S, P_tot);
         }
 
         tc.pre_blocks.resize(pre_n_blk, nullptr);
         for (int b = 0; b < pre_n_blk; ++b) {
-            tc.pre_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
+            tc.pre_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * n_seq_slots);
         }
-        tc.pre_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
-        tc.pre_tap     = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S);
+        tc.pre_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * n_seq_slots);
+        tc.pre_tap     = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * n_seq_slots);
 
         tc.core_blocks.resize(core_n_blk, nullptr);
         for (int b = 0; b < core_n_blk; ++b) {
-            tc.core_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+            tc.core_blocks[b] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * w.n_passes * n_seq_slots);
         }
-        tc.core_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+        tc.core_partial = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * w.n_passes * n_seq_slots);
         for (int ti = 0; ti < 3; ++ti) {
-            tc.core_taps[ti] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, S * w.n_passes);
+            tc.core_taps[ti] = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, w.n_embd, (int64_t) S * w.n_passes * n_seq_slots);
         }
-        tc.node_features = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, 5 * w.n_embd, S * tc.n_depths);
+        tc.node_features = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, 5 * w.n_embd, (int64_t) S * tc.n_depths * n_seq_slots);
         out.last_taps_dev = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, w.n_embd, 4, 1);
 
         out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, target_backend);
@@ -228,30 +242,32 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
         out.remote_cap = 0;
         out.global_local_cap = out.max_ctx;
 
-        // Zero-copy alias legacy 48-slot k_cache/v_cache/conv_state into tree.prefix_* so AR fallback
-        // (force_ar_decode / non-greedy temp > 0) uses the exact same physical buffer with 0 extra VRAM!
-        struct ggml_init_params agp = { ((size_t) n_slots * 3 + 8) * ggml_tensor_overhead() + 4096, nullptr, true };
-        tc.alias_ctx = ggml_init(agp);
-        out.k_cache.resize(n_slots, nullptr);
-        out.v_cache.resize(n_slots, nullptr);
-        out.conv_state.resize(n_slots, nullptr);
-        out.conv_ring.assign(n_slots, nullptr);
-        for (const auto & vi : w.schedule) {
-            const int il = vi.slot;
-            const int ip = vi.phys;
-            const int plane = (ip < w.core_start) ? 0 : (ip < w.core_end ? vi.pass : (tc.n_depths - 1));
-            ggml_tensor * pk = tc.prefix_k[ip];
-            ggml_tensor * pv = tc.prefix_v[ip];
-            ggml_tensor * pc = tc.prefix_conv[ip];
-            out.k_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pk->ne[1], w.n_head_kv);
-            out.k_cache[il]->data   = (char *) pk->data + (size_t) plane * pk->nb[3];
-            out.k_cache[il]->buffer = pk->buffer;
-            out.v_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pv->ne[1], w.n_head_kv);
-            out.v_cache[il]->data   = (char *) pv->data + (size_t) plane * pv->nb[3];
-            out.v_cache[il]->buffer = pv->buffer;
-            out.conv_state[il] = ggml_new_tensor_2d(tc.alias_ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
-            out.conv_state[il]->data   = (char *) pc->data + (size_t) plane * pc->nb[2];
-            out.conv_state[il]->buffer = pc->buffer;
+        // Zero-copy alias legacy 48-slot k_cache/v_cache/conv_state into tree.prefix_* (slot 0)
+        // so single-slot AR fallback uses the exact same physical buffer with 0 extra VRAM!
+        if (n_seq_slots == 1) {
+            struct ggml_init_params agp = { ((size_t) n_slots * 3 + 8) * ggml_tensor_overhead() + 4096, nullptr, true };
+            tc.alias_ctx = ggml_init(agp);
+            out.k_cache.resize(n_slots, nullptr);
+            out.v_cache.resize(n_slots, nullptr);
+            out.conv_state.resize(n_slots, nullptr);
+            out.conv_ring.assign(n_slots, nullptr);
+            for (const auto & vi : w.schedule) {
+                const int il = vi.slot;
+                const int ip = vi.phys;
+                const int plane = (ip < w.core_start) ? 0 : (ip < w.core_end ? vi.pass : (tc.n_depths - 1));
+                ggml_tensor * pk = tc.prefix_k[ip];
+                ggml_tensor * pv = tc.prefix_v[ip];
+                ggml_tensor * pc = tc.prefix_conv[ip];
+                out.k_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pk->ne[1], w.n_head_kv);
+                out.k_cache[il]->data   = (char *) pk->data + (size_t) plane * pk->nb[3];
+                out.k_cache[il]->buffer = pk->buffer;
+                out.v_cache[il] = ggml_new_tensor_3d(tc.alias_ctx, out.kv_type, w.head_dim, pv->ne[1], w.n_head_kv);
+                out.v_cache[il]->data   = (char *) pv->data + (size_t) plane * pv->nb[3];
+                out.v_cache[il]->buffer = pv->buffer;
+                out.conv_state[il] = ggml_new_tensor_2d(tc.alias_ctx, GGML_TYPE_F32, w.sconv_kernel - 1, w.sconv_channels);
+                out.conv_state[il]->data   = (char *) pc->data + (size_t) plane * pc->nb[2];
+                out.conv_state[il]->buffer = pc->buffer;
+            }
         }
 
         // Allocate 5-layer loop-context drafter prefix KV cache (slack = 256 for multi-leaf span + block)
@@ -262,8 +278,13 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
         tc.draft_k.resize(d_layers, nullptr);
         tc.draft_v.resize(d_layers, nullptr);
         for (int i = 0; i < d_layers; ++i) {
-            tc.draft_k[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
-            tc.draft_v[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
+            if (n_seq_slots > 1) {
+                tc.draft_k[i] = ggml_new_tensor_4d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv, n_seq_slots);
+                tc.draft_v[i] = ggml_new_tensor_4d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv, n_seq_slots);
+            } else {
+                tc.draft_k[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
+                tc.draft_v[i] = ggml_new_tensor_3d(out.dspark_kv_ctx, GGML_TYPE_F16, w.twodsd.head_dim, tc.draft_cap, w.twodsd.n_head_kv);
+            }
         }
         out.dspark_kv_buf = ggml_backend_alloc_ctx_tensors(out.dspark_kv_ctx, target_backend);
         if (!out.dspark_kv_buf) {
@@ -350,12 +371,112 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
     return true;
 }
 
+bool make_inkling2_slot_view(Inkling2Cache & multi,
+                             const Inkling2Weights & w,
+                             int seq_slot,
+                             Inkling2Cache & view_out) {
+    free_inkling2_cache(view_out);
+    const auto & mtc = multi.tree;
+    if (!mtc.active || seq_slot < 0 || seq_slot >= mtc.n_seq_slots) return false;
+
+    view_out.kv_type          = multi.kv_type;
+    view_out.max_ctx          = multi.max_ctx;
+    view_out.swa_cap          = multi.swa_cap;
+    view_out.global_local_cap = multi.global_local_cap;
+    view_out.cur_pos          = 0;
+    view_out.dspark_ctx_pos   = 0;
+
+    auto & tc = view_out.tree;
+    tc.active        = true;
+    tc.is_slot_view  = true;
+    tc.n_seq_slots   = 1;
+    tc.max_nodes     = mtc.max_nodes;
+    tc.n_depths      = mtc.n_depths;
+    tc.prefix_len    = 0;
+    tc.draft_pref_start = 0;
+    tc.draft_cap     = mtc.draft_cap;
+    tc.planes        = mtc.planes;
+
+    const int S = tc.max_nodes + 1;
+    const size_t n_tensors = (size_t) w.n_layer_phys * 6 + mtc.pre_blocks.size() + mtc.core_blocks.size()
+                           + mtc.draft_k.size() * 2 + 16;
+    struct ggml_init_params gp = { n_tensors * ggml_tensor_overhead() + 8192, nullptr, true };
+    view_out.ctx = ggml_init(gp);
+    if (!view_out.ctx) return false;
+
+    auto alias_4d = [&](ggml_tensor * src, int64_t ne3, size_t off) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_4d(view_out.ctx, src->type, src->ne[0], src->ne[1], src->ne[2], ne3);
+        t->data   = (char *) src->data + off;
+        t->buffer = src->buffer;
+        return t;
+    };
+    auto alias_3d = [&](ggml_tensor * src, int64_t ne2, size_t off) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_3d(view_out.ctx, src->type, src->ne[0], src->ne[1], ne2);
+        t->data   = (char *) src->data + off;
+        t->buffer = src->buffer;
+        return t;
+    };
+    auto alias_2d = [&](ggml_tensor * src, int64_t ne1, size_t off) -> ggml_tensor * {
+        ggml_tensor * t = ggml_new_tensor_2d(view_out.ctx, src->type, src->ne[0], ne1);
+        t->data   = (char *) src->data + off;
+        t->buffer = src->buffer;
+        return t;
+    };
+
+    tc.prefix_k.resize(w.n_layer_phys, nullptr);
+    tc.prefix_v.resize(w.n_layer_phys, nullptr);
+    tc.tree_k.resize(w.n_layer_phys, nullptr);
+    tc.tree_v.resize(w.n_layer_phys, nullptr);
+    tc.prefix_conv.resize(w.n_layer_phys, nullptr);
+    tc.tree_conv.resize(w.n_layer_phys, nullptr);
+    for (int ip = 0; ip < w.n_layer_phys; ++ip) {
+        const int P = mtc.planes[ip];
+        const size_t p_off = (size_t) seq_slot * P;
+        tc.prefix_k[ip]    = alias_4d(mtc.prefix_k[ip],    P, p_off * mtc.prefix_k[ip]->nb[3]);
+        tc.prefix_v[ip]    = alias_4d(mtc.prefix_v[ip],    P, p_off * mtc.prefix_v[ip]->nb[3]);
+        tc.tree_k[ip]      = alias_4d(mtc.tree_k[ip],      P, p_off * mtc.tree_k[ip]->nb[3]);
+        tc.tree_v[ip]      = alias_4d(mtc.tree_v[ip],      P, p_off * mtc.tree_v[ip]->nb[3]);
+        tc.prefix_conv[ip] = alias_3d(mtc.prefix_conv[ip], P, p_off * mtc.prefix_conv[ip]->nb[2]);
+        tc.tree_conv[ip]   = alias_3d(mtc.tree_conv[ip],   P, p_off * mtc.tree_conv[ip]->nb[2]);
+    }
+
+    tc.pre_blocks.resize(mtc.pre_blocks.size(), nullptr);
+    for (size_t b = 0; b < mtc.pre_blocks.size(); ++b) {
+        tc.pre_blocks[b] = alias_2d(mtc.pre_blocks[b], S, (size_t) seq_slot * S * mtc.pre_blocks[b]->nb[1]);
+    }
+    tc.pre_partial = alias_2d(mtc.pre_partial, S, (size_t) seq_slot * S * mtc.pre_partial->nb[1]);
+    tc.pre_tap     = alias_2d(mtc.pre_tap,     S, (size_t) seq_slot * S * mtc.pre_tap->nb[1]);
+
+    const int S3 = S * w.n_passes;
+    tc.core_blocks.resize(mtc.core_blocks.size(), nullptr);
+    for (size_t b = 0; b < mtc.core_blocks.size(); ++b) {
+        tc.core_blocks[b] = alias_2d(mtc.core_blocks[b], S3, (size_t) seq_slot * S3 * mtc.core_blocks[b]->nb[1]);
+    }
+    tc.core_partial = alias_2d(mtc.core_partial, S3, (size_t) seq_slot * S3 * mtc.core_partial->nb[1]);
+    for (int ti = 0; ti < 3; ++ti) {
+        tc.core_taps[ti] = alias_2d(mtc.core_taps[ti], S3, (size_t) seq_slot * S3 * mtc.core_taps[ti]->nb[1]);
+    }
+    tc.node_features = alias_2d(mtc.node_features, S * tc.n_depths,
+                                (size_t) seq_slot * S * tc.n_depths * mtc.node_features->nb[1]);
+
+    const size_t d_layers = mtc.draft_k.size();
+    tc.draft_k.resize(d_layers, nullptr);
+    tc.draft_v.resize(d_layers, nullptr);
+    for (size_t i = 0; i < d_layers; ++i) {
+        const size_t dk_off = (mtc.n_seq_slots > 1) ? ((size_t) seq_slot * mtc.draft_k[i]->nb[3]) : 0;
+        const size_t dv_off = (mtc.n_seq_slots > 1) ? ((size_t) seq_slot * mtc.draft_v[i]->nb[3]) : 0;
+        tc.draft_k[i] = alias_3d(mtc.draft_k[i], mtc.draft_k[i]->ne[2], dk_off);
+        tc.draft_v[i] = alias_3d(mtc.draft_v[i], mtc.draft_v[i]->ne[2], dv_off);
+    }
+    return true;
+}
+
 void reset_inkling2_cache(Inkling2Cache & cache) {
     cache.cur_pos = 0;
     cache.dspark_ctx_pos = 0;
     cache.tree.prefix_len = 0;
     cache.tree.draft_pref_start = 0;
-    if (cache.buf) {
+    if (cache.buf || cache.tree.is_slot_view) {
         if (cache.tree.active) {
             for (ggml_tensor * pc : cache.tree.prefix_conv) {
                 if (pc) ggml_backend_tensor_memset(pc, 0, 0, ggml_nbytes(pc));

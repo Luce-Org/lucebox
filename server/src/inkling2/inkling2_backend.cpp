@@ -4,6 +4,7 @@
 #include "inkling2_2dsd_draft.h"
 #include "inkling2_2dsd_executor.h"
 #include "inkling2_2dsd_graph.h"
+#include "inkling2_seq_engine.h"
 
 #include "common/peer_access.h"
 #include "common/sampler.h"
@@ -44,6 +45,46 @@ static void free_snapshot(Inkling2Snapshot & s) {
     s.cur_pos = 0;
     s.dspark_ctx_pos = 0;
     s.used = false;
+}
+
+static bool try_build_exact_cands_2dsd(const int32_t * rc,
+                                       const SamplerCfg & sampler,
+                                       std::vector<std::pair<int32_t, float>> & out_probs,
+                                       double & out_cum) {
+    const int cnt = rc[0];
+    if (cnt <= 0 || cnt > 256) return false;
+    float gmax = 0.0f, Z = 0.0f;
+    std::memcpy(&gmax, &rc[1], sizeof(float));
+    std::memcpy(&Z,    &rc[2], sizeof(float));
+    if (!(Z > 0.0f) || !std::isfinite(Z)) return false;
+    struct Cand { float v; int32_t id; };
+    Cand cands[256];
+    for (int j = 0; j < cnt; ++j) {
+        std::memcpy(&cands[j].v, &rc[4 + 2 * j], sizeof(float));
+        cands[j].id = rc[4 + 2 * j + 1];
+        if (!std::isfinite(cands[j].v)) return false;
+    }
+    std::sort(cands, cands + cnt, [](const Cand & a, const Cand & b) {
+        return a.v > b.v || (a.v == b.v && a.id < b.id);
+    });
+    const int k_lim = (sampler.top_k > 0 && sampler.top_k < cnt) ? sampler.top_k : cnt;
+    const float inv_t = 1.0f / std::max(sampler.temp, 1e-6f);
+    out_probs.clear();
+    out_probs.reserve((size_t) k_lim);
+    out_cum = 0.0;
+    for (int j = 0; j < k_lim; ++j) {
+        const float p = std::exp((cands[j].v - gmax) * inv_t) / Z;
+        out_probs.push_back({ cands[j].id, p });
+        out_cum += p;
+        if (sampler.top_p > 0.0f && sampler.top_p < 1.0f && out_cum >= sampler.top_p) {
+            break;
+        }
+    }
+    const bool exact_ok =
+        (sampler.top_k > 0 && cnt >= sampler.top_k) ||
+        (sampler.top_p > 0.0f && sampler.top_p < 1.0f && out_cum >= sampler.top_p) ||
+        (out_cum >= 0.9995);
+    return exact_ok && !out_probs.empty() && out_cum > 0.0;
 }
 
 } // namespace
@@ -121,6 +162,10 @@ bool Inkling2Backend::load_all() {
         if (std::strcmp(env_kv, "f16") == 0 || std::strcmp(env_kv, "F16") == 0) kv_type = GGML_TYPE_F16;
     }
 
+    const int n_seq_slots = (cfg_.max_concurrency > 1 && weights_.draft_mode == Inkling2DraftMode::TwoDSD && weights_.twodsd.loaded)
+        ? std::min(cfg_.max_concurrency, 8)
+        : 1;
+
     // Determine max_ctx (reuse frozen first-load layout on reinstate so host-RAM
     // prefix snapshots remain valid; otherwise auto-fit when <= 0 or fit_ctx).
     int max_ctx = fitted_max_ctx_;
@@ -144,7 +189,7 @@ bool Inkling2Backend::load_all() {
             const size_t draft_kv_b = (weights_.draft_mode == Inkling2DraftMode::TwoDSD)
                 ? ((size_t) weights_.twodsd.n_layer * 2 * weights_.twodsd.n_head_kv * weights_.twodsd.head_dim * 2)
                 : (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
-            const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b + draft_kv_b;
+            const size_t bytes_per_tok = (n_global * 2 * weights_.n_head_kv * kv_row_b + draft_kv_b) * (size_t) n_seq_slots;
             const size_t reserve = (size_t) 4 << 30;
             const size_t usable = (tfree > reserve ? tfree - reserve : 0)
                                 + (expert_backend_ && efree > reserve ? efree - reserve : 0);
@@ -157,7 +202,7 @@ bool Inkling2Backend::load_all() {
     }
 
     if (!create_inkling2_cache(backend_, expert_backend_, weights_, max_ctx, chunk_, kv_type, cache_, err,
-                               fitted_remote_split_pos_)) {
+                               fitted_remote_split_pos_, n_seq_slots)) {
         std::fprintf(stderr, "[inkling2] %s\n", err.c_str());
         return false;
     }
@@ -165,10 +210,22 @@ bool Inkling2Backend::load_all() {
         fitted_remote_split_pos_ = cache_.remote_split_pos;
     }
 
+    if (n_seq_slots > 1) {
+        if (!seq_engine_) {
+            seq_engine_ = std::make_unique<Inkling2SeqEngine>(
+                backend_, weights_, cache_, n_seq_slots, chunk_);
+        } else {
+            static_cast<Inkling2SeqEngine *>(seq_engine_.get())->reinstate_device_state(chunk_);
+        }
+    }
+
     return true;
 }
 
 void Inkling2Backend::release_device_state() {
+    if (seq_engine_) {
+        static_cast<Inkling2SeqEngine *>(seq_engine_.get())->release_device_state();
+    }
     last_logits_.clear();
     free_inkling2_cache(cache_);
     free_inkling2_weights(weights_);
@@ -191,6 +248,7 @@ bool Inkling2Backend::init() {
 
 void Inkling2Backend::shutdown() {
     release_all();
+    seq_engine_.reset();
     if (snap_backend_)   { ggml_backend_free(snap_backend_); snap_backend_ = nullptr; }
     if (expert_backend_) { ggml_backend_free(expert_backend_); expert_backend_ = nullptr; }
     if (backend_)        { ggml_backend_free(backend_); backend_ = nullptr; }
@@ -203,8 +261,9 @@ void Inkling2Backend::print_ready_banner() const {
         const auto tdcfg = inkling2_2dsd_config_from_env(w.n_passes, w.twodsd.block_size);
         const char * sname = (tdcfg.stage == Inkling2TwoDSDStage::Stage1) ? "stage1"
                            : (tdcfg.stage == Inkling2TwoDSDStage::Stage2a) ? "stage2a" : "stage2b";
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "2dsd(%s,k=%d,conf=%.2f)", sname, tdcfg.k, tdcfg.draft_confidence);
+        char buf[112];
+        std::snprintf(buf, sizeof(buf), "2dsd(%s,k=%d,conf=%.2f,slots=%d)",
+                      sname, tdcfg.k, tdcfg.draft_confidence, cache_.tree.n_seq_slots);
         spec_str = buf;
     } else if (w.dspark.loaded) {
         spec_str = "on(block=8)";
@@ -503,14 +562,16 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     }
 
     const bool is_greedy = sample_logits_is_argmax(req.sampler);
-    // ─── 2DSD Greedy Path (Stage 2b default with static draft_confidence pruning) ──
+    // ─── 2DSD Path (Greedy & Lossless Stochastic temp > 0 via GPU subop 32) ──
     const bool use_2dsd = (weights_.draft_mode == Inkling2DraftMode::TwoDSD) &&
                           weights_.twodsd.loaded && cache_.tree.active &&
-                          !req.force_ar_decode && vw != 1 && is_greedy && req.n_gen > 2 && restored == 0;
+                          !req.force_ar_decode && vw != 1 && req.n_gen > 2 && restored == 0;
     if (use_2dsd) {
         const auto t_pre0 = std::chrono::steady_clock::now();
         int pos_2d = 0;
         int32_t first_tok = -1;
+        std::vector<float> first_logits;
+        std::vector<float> * first_logits_ptr = is_greedy ? nullptr : &first_logits;
         const int n_prompt_2d = (int) req.prompt.size();
         // Tail-only drafter prefix KV window (default 2048 tokens; 0 = full prefix):
         // skips drafter K/V projection on early prompt chunks and keeps drafter FlashAttention O(1).
@@ -537,7 +598,7 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
                 return result;
             }
             if (!inkling2_2dsd_prefill_wavefront(backend_, weights_, cache_, req.prompt.data(),
-                                                 n_prompt_2d, 0, wf_chunk_2d, first_tok)) {
+                                                 n_prompt_2d, 0, wf_chunk_2d, first_tok, first_logits_ptr)) {
                 result.fail(GenerateErrorCode::PrefillFailed, "inkling2 2dsd wavefront prefill failed");
                 return result;
             }
@@ -552,7 +613,8 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             const int end = std::min(n_prompt_2d, pos_2d + chunk_);
             const int n   = end - pos_2d;
             const bool is_last = (end == n_prompt_2d);
-            if (!inkling2_2dsd_prefill_chunk(backend_, weights_, cache_, req.prompt.data() + pos_2d, n, pos_2d, is_last, first_tok)) {
+            if (!inkling2_2dsd_prefill_chunk(backend_, weights_, cache_, req.prompt.data() + pos_2d, n, pos_2d, is_last,
+                                             first_tok, is_last ? first_logits_ptr : nullptr)) {
                 result.fail(GenerateErrorCode::PrefillFailed, "inkling2 2dsd prefill failed");
                 return result;
             }
@@ -567,12 +629,31 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             return result;
         }
 
+        // Exact stochastic sampling state (used only when !is_greedy; zero overhead for greedy!)
+        const bool use_fast_gpu_2d = !is_greedy && req.sampler.temp > 0.0f &&
+            req.sampler.rep_pen <= 1.0f && req.sampler.freq_pen == 0.0f &&
+            req.sampler.pres_pen == 0.0f && req.sampler.constraint == nullptr;
+        const float fast_temp_2d = use_fast_gpu_2d ? req.sampler.temp : 0.0f;
+        const int n_vocab_2d = weights_.n_vocab_unpadded;
+        std::mt19937_64 rng_2d(request_rng_seed(req.sampler));
+        std::vector<int32_t> history_2d;
+        std::vector<float> scratch_2d;
+        if (!is_greedy) {
+            history_2d = req.prompt;
+            scratch_2d.resize((size_t) n_vocab_2d);
+            if (!first_logits.empty()) {
+                std::memcpy(scratch_2d.data(), first_logits.data(), (size_t) n_vocab_2d * sizeof(float));
+                first_tok = sample_logits(scratch_2d.data(), n_vocab_2d, req.sampler, history_2d, rng_2d);
+            }
+        }
+
         ThinkingBudget budget(req.budget_hook, req.n_gen);
         bool cancelled = false;
         auto commit_2d = [&](int32_t & tok) -> bool {
             tok = budget.apply(tok).token;
             result.budget_forced_close = budget.forced_close();
             result.tokens.push_back(tok);
+            if (!is_greedy) history_2d.push_back(tok);
             io.emit(tok);
             if (io.is_cancelled()) {
                 cancelled = true;
@@ -581,10 +662,14 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             return tok != weights_.eos_id && tok != weights_.eos_chat_id && (int) result.tokens.size() < req.n_gen;
         };
 
+        Inkling2TwoDSDAdvanceSampleOut last_sample;
+        last_sample.fast_temp = fast_temp_2d;
+
         class GpuTwoDSDRunner final : public Inkling2TwoDSDRunner {
         public:
-            GpuTwoDSDRunner(ggml_backend_t b, const Inkling2Weights & w, Inkling2Cache & c, bool split)
-                : b_(b), w_(w), c_(c), split_(split) {}
+            GpuTwoDSDRunner(ggml_backend_t b, const Inkling2Weights & w, Inkling2Cache & c, bool split,
+                            Inkling2TwoDSDAdvanceSampleOut * sample_out)
+                : b_(b), w_(w), c_(c), split_(split), sample_out_(sample_out) {}
             int prefix_length() const override { return c_.tree.prefix_len; }
             int max_nodes() const override { return c_.tree.max_nodes; }
             int max_ctx() const override { return c_.max_ctx; }
@@ -592,7 +677,8 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
                                uint32_t readout_mask,
                                std::vector<int> & out_rows,
                                std::vector<int32_t> & out_argmax) override {
-                return inkling2_2dsd_advance_nodes(b_, w_, c_, nodes, readout_mask, split_, out_rows, out_argmax);
+                return inkling2_2dsd_advance_nodes(b_, w_, c_, nodes, readout_mask, split_,
+                                                   out_rows, out_argmax, sample_out_);
             }
             bool commit_nodes(const int * slots, int n) override {
                 return inkling2_2dsd_commit_nodes(b_, w_, c_, slots, n);
@@ -606,15 +692,60 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             const Inkling2Weights & w_;
             Inkling2Cache & c_;
             bool split_;
+            Inkling2TwoDSDAdvanceSampleOut * sample_out_;
         };
 
+        Inkling2TwoDSDSamplerHooks sample_hooks;
+        if (!is_greedy) {
+            sample_hooks.capture = [&](int row_idx, Inkling2TwoDSDDepthRSample & out) {
+                out.top_cands.clear();
+                out.logits.clear();
+                if (use_fast_gpu_2d && (size_t) (row_idx + 1) * 516 <= last_sample.top_cands.size()) {
+                    const int32_t * rc = last_sample.top_cands.data() + (size_t) row_idx * 516;
+                    std::vector<std::pair<int32_t, float>> tmp_probs;
+                    double tmp_cum = 0.0;
+                    if (try_build_exact_cands_2dsd(rc, req.sampler, tmp_probs, tmp_cum)) {
+                        out.top_cands.assign(rc, rc + 516);
+                        return;
+                    }
+                }
+                // Rare flat high-temperature row or active penalties/grammar: fetch only this 1 row
+                if (last_sample.logits_dev) {
+                    out.logits.resize((size_t) n_vocab_2d);
+                    ggml_backend_tensor_get(last_sample.logits_dev, out.logits.data(),
+                        (size_t) row_idx * n_vocab_2d * sizeof(float), (size_t) n_vocab_2d * sizeof(float));
+                }
+            };
+            sample_hooks.sample = [&](const Inkling2TwoDSDDepthRSample & payload, int32_t greedy_tok) -> int32_t {
+                if (payload.top_cands.size() >= 516) {
+                    std::vector<std::pair<int32_t, float>> probs;
+                    double cum = 0.0;
+                    if (try_build_exact_cands_2dsd(payload.top_cands.data(), req.sampler, probs, cum)) {
+                        std::uniform_real_distribution<double> u01(0.0, cum);
+                        const double r = u01(rng_2d);
+                        double acc = 0.0;
+                        for (size_t j = 0; j < probs.size(); ++j) {
+                            acc += probs[j].second;
+                            if (r <= acc || j + 1 == probs.size()) return probs[j].first;
+                        }
+                    }
+                }
+                if (!payload.logits.empty()) {
+                    std::memcpy(scratch_2d.data(), payload.logits.data(), (size_t) n_vocab_2d * sizeof(float));
+                    return sample_logits(scratch_2d.data(), n_vocab_2d, req.sampler, history_2d, rng_2d);
+                }
+                return greedy_tok;
+            };
+        }
+
         const auto td_cfg = inkling2_2dsd_config_from_env(weights_.n_passes, weights_.twodsd.block_size);
-        GpuTwoDSDRunner runner(backend_, weights_, cache_, is_dual);
+        GpuTwoDSDRunner runner(backend_, weights_, cache_, is_dual, is_greedy ? nullptr : &last_sample);
         Inkling2TwoDSDStats td_stats;
         std::string td_err;
 
         const auto t_dec0 = std::chrono::steady_clock::now();
-        const bool ok_2d = inkling2_2dsd_run_greedy(runner, td_cfg, first_tok, req.n_gen, commit_2d, td_stats, td_err);
+        const bool ok_2d = inkling2_2dsd_run(runner, td_cfg, first_tok, req.n_gen, commit_2d,
+                                             is_greedy ? nullptr : &sample_hooks, td_stats, td_err);
         const auto t_dec1 = std::chrono::steady_clock::now();
 
         if (!ok_2d) {

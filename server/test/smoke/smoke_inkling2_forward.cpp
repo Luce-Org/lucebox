@@ -8,6 +8,8 @@
 #include "inkling2_cache.h"
 #include "inkling2_graph.h"
 #include "inkling2_internal.h"
+#include "common/concurrency/seq_engine.h"
+#include "seq_engine_contract.h"
 #include "server/tokenizer.h"
 
 #include "ggml-cuda.h"
@@ -35,7 +37,13 @@ int main(int argc, char ** argv) {
     int chunk = 0;
     int reps = 1;
     int prompt_len = 0;
+    int concurrency = 1;
     bool parity = false;
+    bool run_contract = false;
+    float temp = 0.0f;
+    int top_k = 0;
+    float top_p = 1.0f;
+    uint32_t seed = 0;
     ggml_type kv_type = GGML_TYPE_Q8_0;
     std::string prompt_text = "Write a concise Python function to compute the nth Fibonacci number using dynamic programming, and explain its time complexity.";
 
@@ -49,7 +57,13 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) reps = std::max(1, std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--prompt-len") == 0 && i + 1 < argc) prompt_len = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt_text = argv[++i];
+        else if (std::strcmp(argv[i], "--concurrency") == 0 && i + 1 < argc) concurrency = std::max(1, std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--contract") == 0) run_contract = true;
         else if (std::strcmp(argv[i], "--parity") == 0) parity = true;
+        else if (std::strcmp(argv[i], "--temp") == 0 && i + 1 < argc) temp = std::strtof(argv[++i], nullptr);
+        else if (std::strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) top_k = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) top_p = std::strtof(argv[++i], nullptr);
+        else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = (uint32_t) std::strtoul(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--kv") == 0 && i + 1 < argc) {
             ++i;
             kv_type = (std::strcmp(argv[i], "f16") == 0) ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
@@ -81,6 +95,7 @@ int main(int argc, char ** argv) {
     cfg.draft_path = dspark_path;
     cfg.device.gpu = gpu;
     cfg.device.max_ctx = max_ctx;
+    cfg.max_concurrency = (run_contract && concurrency < 2) ? 2 : concurrency;
     if (chunk > 0) cfg.chunk = chunk;
     cfg.cache_type_k = kv_type;
     cfg.cache_type_v = kv_type;
@@ -97,11 +112,178 @@ int main(int argc, char ** argv) {
     }
     backend.print_ready_banner();
 
+    if (run_contract) {
+        SeqEngine * eng = backend.seq_engine();
+        if (!eng) {
+            std::fprintf(stderr, "[CONTRACT] FAIL: seq_engine() returned null\n");
+            return 1;
+        }
+        auto violations = check_seq_engine_contract(*eng);
+        std::printf("[CONTRACT] violations=%zu\n", violations.size());
+        for (const auto & v : violations) {
+            std::printf("[CONTRACT]   - %s\n", v.c_str());
+        }
+        if (!violations.empty()) return 1;
+        if (concurrency <= 1) return 0;
+    }
+
+    if (concurrency > 1) {
+        SeqEngine * eng = backend.seq_engine();
+        if (!eng) {
+            std::fprintf(stderr, "[CONC] FAIL: seq_engine() returned null (needs 2DSD drafter)\n");
+            return 1;
+        }
+        const int N = std::min(concurrency, eng->slot_count());
+        const char * kPrompts[4] = {
+            "Write a concise Python function to compute the nth Fibonacci number using dynamic programming, and explain its time complexity.",
+            "Explain how a B-tree differs from an LSM-tree for write-heavy database workloads in three short bullet points.",
+            "Implement binary search in C++ with clean loop invariants and show an example call.",
+            "Summarize the difference between TCP and QUIC connection establishment and head-of-line blocking."
+        };
+        std::vector<std::vector<int32_t>> prompts((size_t) N);
+        for (int s = 0; s < N; ++s) {
+            prompts[(size_t) s] = tok.encode(kPrompts[s % 4], true);
+            if (prompt_len > 0) {
+                std::vector<int32_t> rep;
+                rep.reserve((size_t) prompt_len);
+                while ((int) rep.size() < prompt_len) {
+                    for (int32_t id : prompts[(size_t) s]) {
+                        if ((int) rep.size() < prompt_len) rep.push_back(id);
+                    }
+                }
+                prompts[(size_t) s] = std::move(rep);
+            }
+        }
+        SamplerCfg samp;
+        samp.temp = temp;
+        samp.top_k = top_k;
+        samp.top_p = top_p;
+        samp.seed = seed;
+
+        for (int rep = 0; rep < reps; ++rep) {
+            std::vector<int> slots((size_t) N, -1);
+            std::vector<bool> decoding((size_t) N, false);
+            std::vector<bool> done((size_t) N, false);
+            std::vector<int32_t> pending_tok((size_t) N, -1);
+            std::vector<std::vector<int32_t>> out_toks((size_t) N);
+
+            for (int s = 0; s < N; ++s) {
+                auto adm = eng->admit((uint64_t) (rep * 100 + s + 1), prompts[(size_t) s], samp);
+                if (adm.status != SeqEngine::AdmitResult::Status::admitted) {
+                    std::fprintf(stderr, "[CONC] admit failed for stream %d: %s\n", s, adm.error.c_str());
+                    return 1;
+                }
+                slots[(size_t) s] = adm.slot;
+            }
+
+            const auto t_all0 = std::chrono::steady_clock::now();
+            auto t_pure_dec0 = t_all0;
+            bool all_prefilled = false;
+            int steps = 0;
+            int pure_steps = 0;
+            long long total_toks = 0;
+            long long pure_toks = 0;
+            while (true) {
+                SeqEngine::StepPlan plan;
+                int next_pre = -1;
+                for (int s = 0; s < N; ++s) {
+                    if (!decoding[(size_t) s]) { next_pre = s; break; }
+                }
+                if (next_pre >= 0) {
+                    auto lim = eng->step_plan_limits((int) plan.decode.size());
+                    plan.prefills.push_back({ slots[(size_t) next_pre], lim.max_prefill_tokens_per_sequence });
+                } else if (!all_prefilled) {
+                    all_prefilled = true;
+                    t_pure_dec0 = std::chrono::steady_clock::now();
+                }
+                for (int s = 0; s < N; ++s) {
+                    if (decoding[(size_t) s] && !done[(size_t) s]) {
+                        plan.decode.push_back({ slots[(size_t) s], pending_tok[(size_t) s], true });
+                    }
+                }
+                if (plan.prefills.empty() && plan.decode.empty()) break;
+
+                auto sr = eng->step(plan);
+                std::string val_err = validate_step_result(plan, sr, eng->slot_count());
+                if (!sr.ok() || !val_err.empty()) {
+                    std::fprintf(stderr, "[CONC] step failed: err=%s val=%s\n",
+                                 sr.error.c_str(), val_err.c_str());
+                    return 1;
+                }
+                for (const auto & po : sr.prefills) {
+                    int s = -1;
+                    for (int i = 0; i < N; ++i) if (slots[(size_t) i] == po.slot) { s = i; break; }
+                    if (s >= 0 && po.status == SeqEngine::PrefillOutput::Status::completed) {
+                        decoding[(size_t) s] = true;
+                        pending_tok[(size_t) s] = po.token;
+                        out_toks[(size_t) s].push_back(po.token);
+                        ++total_toks;
+                        if (eng->token_is_eos(po.token) || (int) out_toks[(size_t) s].size() >= n_gen) {
+                            done[(size_t) s] = true;
+                        }
+                    }
+                }
+                if (!plan.decode.empty()) {
+                    ++steps;
+                    if (all_prefilled) ++pure_steps;
+                }
+                for (const auto & d : sr.decode) {
+                    int s = -1;
+                    for (int i = 0; i < N; ++i) if (slots[(size_t) i] == d.slot) { s = i; break; }
+                    if (s < 0 || d.failed) {
+                        std::fprintf(stderr, "[CONC] slot %d decode failed: %s\n", d.slot, d.error.c_str());
+                        return 1;
+                    }
+                    auto push_tok = [&](int32_t tk) {
+                        if (done[(size_t) s]) return;
+                        out_toks[(size_t) s].push_back(tk);
+                        ++total_toks;
+                        if (all_prefilled) ++pure_toks;
+                        if (eng->token_is_eos(tk) || (int) out_toks[(size_t) s].size() >= n_gen) {
+                            done[(size_t) s] = true;
+                        }
+                    };
+                    for (int32_t tk : d.committed_tokens) push_tok(tk);
+                    push_tok(d.token);
+                    pending_tok[(size_t) s] = d.token;
+                }
+                // Retire finished slots immediately so step() won't require them on next iteration
+                for (int s = 0; s < N; ++s) {
+                    if (done[(size_t) s] && slots[(size_t) s] >= 0) {
+                        eng->retire(slots[(size_t) s]);
+                        slots[(size_t) s] = -1;
+                    }
+                }
+            }
+            const auto t_dec1 = std::chrono::steady_clock::now();
+            const double wall_s = std::chrono::duration<double>(t_dec1 - t_all0).count();
+            const double pure_s = all_prefilled ? std::chrono::duration<double>(t_dec1 - t_pure_dec0).count() : wall_s;
+            for (int s = 0; s < N; ++s) {
+                if (slots[(size_t) s] >= 0) eng->retire(slots[(size_t) s]);
+            }
+
+            std::printf("[CONC N=%d rep=%d] total_toks=%lld (pure=%lld in %d steps, %.3fs) wall=%.3fs | pure_agg=%.1f tok/s (%.1f tok/s/stream)\n",
+                        N, rep, total_toks, pure_toks, pure_steps, pure_s, wall_s,
+                        pure_s > 0 ? pure_toks / pure_s : 0.0,
+                        pure_s > 0 ? (pure_toks / pure_s) / N : 0.0);
+            if (rep == reps - 1) {
+                for (int s = 0; s < N; ++s) {
+                    std::string txt = tok.decode(out_toks[(size_t) s]);
+                    std::printf("[CONC stream %d (%zu tok)] %.180s\n", s, out_toks[(size_t) s].size(), txt.c_str());
+                }
+            }
+        }
+        return 0;
+    }
+
     auto run_one = [&](bool force_ar, const char * label) -> GenerateResult {
         GenerateRequest req;
         req.prompt = prompt_ids;
         req.n_gen = n_gen;
-        req.sampler.temp = 0.0f; // greedy
+        req.sampler.temp = temp;
+        req.sampler.top_k = top_k;
+        req.sampler.top_p = top_p;
+        req.sampler.seed = seed;
         req.force_ar_decode = force_ar;
         DaemonIO io;
         GenerateResult r = backend.generate(req, io);

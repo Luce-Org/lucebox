@@ -597,6 +597,7 @@ add_library(luce_common STATIC
     src/inkling2/inkling2_2dsd_draft.cpp
     src/inkling2/inkling2_2dsd_graph.cpp
     src/inkling2/inkling2_2dsd_executor.cpp
+    src/inkling2/inkling2_seq_engine.cpp
     src/inkling2/inkling2_backend.cpp
     src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
@@ -2346,7 +2347,7 @@ if(LUCE_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_inkling2_forward.cpp")
         add_executable(smoke_inkling2_forward test/smoke/smoke_inkling2_forward.cpp)
-        target_include_directories(smoke_inkling2_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_include_directories(smoke_inkling2_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(smoke_inkling2_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_batched.cpp")

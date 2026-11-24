@@ -3,6 +3,7 @@
 
 #include "inkling2_2dsd_graph.h"
 #include "inkling2_2dsd_draft.h"
+#include "common/cuda_graph_overrides.h"
 
 #include "ggml-cuda.h"
 
@@ -257,6 +258,20 @@ static bool twodsd_profile_enabled() {
     return on;
 }
 
+static bool batch_invariant_2dsd_enabled() {
+    const char * e = std::getenv("LUCE_BATCH_INVARIANT");
+    return (e != nullptr && std::atoi(e) != 0);
+}
+
+static ggml_tensor * make_exact_gpu_top_cands(ggml_context * c, ggml_tensor * logits, float temp) {
+    ggml_tensor * res = ggml_new_tensor_2d(c, GGML_TYPE_I32, 516, logits->ne[1]);
+    res->op = GGML_OP_INKLING2_OP;
+    res->src[0] = logits;
+    set_op_i32(res, 0, 32);
+    set_op_f32(res, 1, temp);
+    return res;
+}
+
 static ggml_tensor * make_tree_commit(
         ggml_context * c,
         ggml_tensor * prefix_k, ggml_tensor * prefix_v,
@@ -387,7 +402,7 @@ static void prefetch_next_tree_layer(
 }
 
 static int bucket_rows(int n) {
-    static constexpr int kBuckets[] = { 1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64 };
+    static constexpr int kBuckets[] = { 1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 40, 48, 64 };
     for (int b : kBuckets) if (n <= b) return b;
     return ((n + 31) / 32) * 32;
 }
@@ -728,8 +743,11 @@ static bool build_phase_graph(
     ggml_context * c = g.ctx;
     g.expert_nodes.clear();
 
+    const int n_planes_phase = (phase_id == 0) ? 1 : w.n_passes;
+    const int pref_len_elems = (tc.n_seq_slots > 1) ? (n_planes_phase * tc.n_seq_slots) : 1;
+
     g.inp_meta       = ggml_new_tensor_2d(c, GGML_TYPE_I32, m_stride, row_b);
-    g.inp_prefix_len = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+    g.inp_prefix_len = ggml_new_tensor_1d(c, GGML_TYPE_I32, pref_len_elems);
     g.inp_pos        = ggml_new_tensor_1d(c, GGML_TYPE_I32, row_b);
     g.inp_flags      = ggml_new_tensor_1d(c, GGML_TYPE_I32, row_b);
     g.inp_slot       = ggml_new_tensor_1d(c, GGML_TYPE_I32, row_b);
@@ -856,6 +874,8 @@ static bool build_phase_graph(
             raw_logits = ggml_mul_mat(c, w.output, out_norm);
         }
         ggml_tensor * logits = ggml_inkling2_softcap_slice(c, raw_logits, w.n_vocab_unpadded, w.logit_softcap);
+        g.out_logits = logits;
+        ggml_set_output(g.out_logits);
         g.out_greedy = ggml_argmax(c, logits);
         ggml_set_output(g.out_greedy);
         ggml_build_forward_expand(g.gf, g.out_greedy);
@@ -890,7 +910,9 @@ static StagedPhaseInputs stage_phase_rows(
         const std::vector<int> & flags_in,
         const std::vector<int> & extra_in,
         int max_nodes,
-        int prefix_len) {
+        const int * prefix_lens,
+        int n_seq_slots,
+        int n_planes_phase) {
     const int n = (int) rows.size();
     int max_path = 1;
     for (const auto * nd : rows) {
@@ -901,28 +923,32 @@ static StagedPhaseInputs stage_phase_rows(
     const int m_stride = 11 + path_b;
     const int S = max_nodes + 1;
     const int scratch = max_nodes;
+    const int pad_prefix_len = (prefix_lens && n_seq_slots > 0) ? prefix_lens[0] : 0;
 
     StagedPhaseInputs st;
     st.row_b  = row_b;
     st.path_b = path_b;
     st.meta.assign((size_t) row_b * m_stride, -1);
-    st.pos.assign(row_b, prefix_len);
+    st.pos.assign(row_b, pad_prefix_len);
     st.flags.assign(row_b, kInkling2TwoDSDFlagsPadding);
     st.tokens.assign(row_b, rows[0]->token);
     st.slot.assign(row_b, scratch);
     st.flat_cur.assign(row_b, scratch);
     st.flat_prev.assign(row_b, scratch);
 
-    // Map (slot -> row index in this call) for same-call ShortConv hist_row resolution
-    std::unordered_map<int, int> row_of;
+    // Map ((seq_slot, slot) -> row index in this call) for same-call ShortConv hist_row resolution
+    std::unordered_map<int64_t, int> row_of;
     row_of.reserve((size_t) n * 2);
-    for (int r = 0; r < n; ++r) row_of[rows[r]->slot] = r;
+    for (int r = 0; r < n; ++r) {
+        const int64_t key = (int64_t) rows[r]->seq_slot * S + rows[r]->slot;
+        row_of[key] = r;
+    }
 
     // Initialize padding rows safely: scratch slot, plane 0, prefix history (-1,-2,-3), self in path[0]
     for (int r = n; r < row_b; ++r) {
         int32_t * mt = st.meta.data() + (size_t) r * m_stride;
         mt[0] = scratch;
-        mt[1] = prefix_len;
+        mt[1] = pad_prefix_len;
         mt[2] = 0;
         mt[3] = kInkling2TwoDSDFlagsPadding;
         mt[4] = 0;
@@ -933,14 +959,16 @@ static StagedPhaseInputs stage_phase_rows(
 
     for (int r = 0; r < n; ++r) {
         const auto & nd = *rows[r];
-        const int plane = planes[r];
-        const int flg   = flags_in[r];
-        const int ext   = extra_in[r];
+        const int ss        = (n_seq_slots > 1) ? nd.seq_slot : 0;
+        const int plane     = planes[r];
+        const int plane_eff = ss * n_planes_phase + plane;
+        const int flg       = flags_in[r];
+        const int ext       = extra_in[r];
         int32_t * mt = st.meta.data() + (size_t) r * m_stride;
 
         mt[0] = nd.slot;
         mt[1] = nd.pos;
-        mt[2] = plane;
+        mt[2] = plane_eff;
         mt[3] = flg;
         mt[4] = ext;
 
@@ -949,13 +977,14 @@ static StagedPhaseInputs stage_phase_rows(
             const int behind = n_anc - 3 + j;
             if (behind >= 0) {
                 const int anc_slot = nd.ancestors[behind];
-                auto it = row_of.find(anc_slot);
+                const int64_t anc_key = (int64_t) ss * S + anc_slot;
+                auto it = row_of.find(anc_key);
                 if (it != row_of.end() && planes[it->second] == plane) {
-                    mt[5 + j] = it->second; // same-call input row
+                    mt[5 + j] = it->second; // same-call input row (same sequence & plane)
                     mt[8 + j] = anc_slot;
                 } else {
                     mt[5 + j] = -1;
-                    mt[8 + j] = anc_slot;   // tree_conv[plane, anc_slot]
+                    mt[8 + j] = anc_slot;   // tree_conv[plane_eff, anc_slot]
                 }
             } else {
                 mt[5 + j] = -1;
@@ -970,9 +999,9 @@ static StagedPhaseInputs stage_phase_rows(
         st.pos[r]       = nd.pos;
         st.flags[r]     = flg;
         st.tokens[r]    = nd.token;
-        st.slot[r]      = nd.slot;
-        st.flat_cur[r]  = plane * S + nd.slot;
-        st.flat_prev[r] = std::max(0, plane - 1) * S + nd.slot;
+        st.slot[r]      = ss * S + nd.slot;
+        st.flat_cur[r]  = (ss * 3 + plane) * S + nd.slot;
+        st.flat_prev[r] = (ss * 3 + std::max(0, plane - 1)) * S + nd.slot;
     }
     return st;
 }
@@ -983,13 +1012,18 @@ static bool run_phase(
         Inkling2Cache & cache,
         int phase_id,
         const StagedPhaseInputs & st,
+        const int * prefix_lens,
+        int n_seq_slots,
+        int n_real,
         bool has_later,
         bool allow_split,
-        std::vector<int32_t> * out_greedy = nullptr) {
+        std::vector<int32_t> * out_greedy = nullptr,
+        Inkling2TwoDSDAdvanceSampleOut * out_sample = nullptr) {
     auto & tc = cache.tree;
+    const bool batch_inv = batch_invariant_2dsd_enabled();
     const int min_dual = dual_2dsd_min_rows();
     const bool phase_split_ok = ((dual_2dsd_phases_mask() & (1 << phase_id)) != 0);
-    const bool use_split = allow_split && phase_split_ok && w.expert_backend && w.split_exp > 0 &&
+    const bool use_split = !batch_inv && allow_split && phase_split_ok && w.expert_backend && w.split_exp > 0 &&
                            st.row_b >= min_dual && st.row_b <= 64;
     const auto key = std::make_tuple(phase_id, st.row_b, st.path_b, has_later ? 1 : 0, use_split ? 1 : 0);
     auto & g = tc.phase_graphs[key];
@@ -1002,9 +1036,21 @@ static bool run_phase(
     const bool prof = twodsd_profile_enabled();
     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-    const int32_t pref_len = tc.prefix_len;
-    ggml_backend_tensor_set(g.inp_meta,       st.meta.data(),  0, st.meta.size()  * sizeof(int32_t));
-    ggml_backend_tensor_set(g.inp_prefix_len, &pref_len,       0, sizeof(pref_len));
+    const int n_planes_phase = (phase_id == 0) ? 1 : w.n_passes;
+    ggml_backend_tensor_set(g.inp_meta, st.meta.data(), 0, st.meta.size() * sizeof(int32_t));
+    if (tc.n_seq_slots > 1) {
+        std::vector<int32_t> pl_buf((size_t) n_planes_phase * tc.n_seq_slots, 0);
+        for (int s = 0; s < tc.n_seq_slots; ++s) {
+            const int32_t pl = (prefix_lens && s < n_seq_slots) ? prefix_lens[s] : 0;
+            for (int p = 0; p < n_planes_phase; ++p) {
+                pl_buf[(size_t) s * n_planes_phase + p] = pl;
+            }
+        }
+        ggml_backend_tensor_set(g.inp_prefix_len, pl_buf.data(), 0, pl_buf.size() * sizeof(int32_t));
+    } else {
+        const int32_t pref_len = (prefix_lens && n_seq_slots > 0) ? prefix_lens[0] : tc.prefix_len;
+        ggml_backend_tensor_set(g.inp_prefix_len, &pref_len, 0, sizeof(pref_len));
+    }
     ggml_backend_tensor_set(g.inp_pos,        st.pos.data(),   0, st.pos.size()   * sizeof(int32_t));
     ggml_backend_tensor_set(g.inp_flags,      st.flags.data(), 0, st.flags.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.inp_slot,       st.slot.data(),  0, st.slot.size()  * sizeof(int32_t));
@@ -1013,28 +1059,79 @@ static bool run_phase(
     if (g.inp_flat_prev) ggml_backend_tensor_set(g.inp_flat_prev, st.flat_prev.data(), 0, st.flat_prev.size() * sizeof(int32_t));
 
     ggml_status status = GGML_STATUS_SUCCESS;
-    if (g.sched) {
-        status = ggml_backend_sched_graph_compute_async(g.sched, g.gf);
-        // Only issue Strix idle hold on Coda (or when explicitly synced) to keep Strix warm across
-        // the ~2.6 ms drafter window without injecting a hold barrier between Prelude -> Core -> Coda!
-        if (status == GGML_STATUS_SUCCESS && w.expert_backend && out_greedy) {
-            ggml_backend_cuda_hold(w.expert_backend, 8000);
+    {
+        const ScopedCudaGraphOverrides inv_guard(false, 0, false, 0, /*mmvq_batch_invariant=*/batch_inv);
+        if (g.sched) {
+            status = ggml_backend_sched_graph_compute_async(g.sched, g.gf);
+            // Only issue Strix idle hold on Coda (or when explicitly synced) to keep Strix warm across
+            // the ~2.6 ms drafter window without injecting a hold barrier between Prelude -> Core -> Coda!
+            if (status == GGML_STATUS_SUCCESS && w.expert_backend && out_greedy) {
+                ggml_backend_cuda_hold(w.expert_backend, 8000);
+            }
+            if (status == GGML_STATUS_SUCCESS && (out_greedy || out_sample || prof)) {
+                ggml_backend_sched_synchronize(g.sched);
+            }
+        } else {
+            // Chain Prelude/Core asynchronously on the same GPU stream when no host readback is requested;
+            // Coda (with out_greedy) performs the single end-of-step sync!
+            status = (out_greedy || out_sample || prof)
+                ? ggml_backend_graph_compute(target_backend, g.gf)
+                : ggml_backend_graph_compute_async(target_backend, g.gf);
         }
-        if (status == GGML_STATUS_SUCCESS && (out_greedy || prof)) {
-            ggml_backend_sched_synchronize(g.sched);
-        }
-    } else {
-        // Chain Prelude/Core asynchronously on the same GPU stream when no host readback is requested;
-        // Coda (with out_greedy) performs the single end-of-step sync!
-        status = (out_greedy || prof)
-            ? ggml_backend_graph_compute(target_backend, g.gf)
-            : ggml_backend_graph_compute_async(target_backend, g.gf);
     }
     if (status != GGML_STATUS_SUCCESS) return false;
 
+    const int n_out = std::min(std::max(n_real, 0), st.row_b);
     if (out_greedy && g.out_greedy) {
-        out_greedy->resize((size_t) st.row_b);
-        ggml_backend_tensor_get(g.out_greedy, out_greedy->data(), 0, (size_t) st.row_b * sizeof(int32_t));
+        out_greedy->resize((size_t) n_out);
+        if (n_out > 0) {
+            ggml_backend_tensor_get(g.out_greedy, out_greedy->data(), 0, (size_t) n_out * sizeof(int32_t));
+        }
+    }
+    if (out_sample && g.out_logits && n_out > 0) {
+        out_sample->logits_dev = g.out_logits;
+        out_sample->n_vocab    = w.n_vocab_unpadded;
+        out_sample->top_cands.clear();
+        if (out_sample->fast_temp > 0.0f) {
+            // Rebuild cached 1-node top-cand extractor if temp or active row count changed
+            const bool need_build = !g.sample_gf || !g.sample_cands ||
+                                    g.sample_cands->ne[1] != n_out ||
+                                    g.sample_temp != out_sample->fast_temp;
+            if (need_build) {
+                if (g.sample_alloc) { ggml_gallocr_free(g.sample_alloc); g.sample_alloc = nullptr; }
+                if (g.sample_ctx)   { ggml_free(g.sample_ctx); g.sample_ctx = nullptr; }
+                g.sample_gf = nullptr;
+                g.sample_logits = nullptr;
+                g.sample_cands = nullptr;
+                struct ggml_init_params sgp = { 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false) + 4096, nullptr, true };
+                g.sample_ctx = ggml_init(sgp);
+                if (!g.sample_ctx) return false;
+                g.sample_gf = ggml_new_graph_custom(g.sample_ctx, 16, false);
+                // Leaf alias spanning ONLY the `n_out` active Coda rows (skips padding rows!)
+                g.sample_logits = ggml_new_tensor_2d(g.sample_ctx, GGML_TYPE_F32, w.n_vocab_unpadded, n_out);
+                g.sample_logits->data   = g.out_logits->data;
+                g.sample_logits->buffer = g.out_logits->buffer;
+                g.sample_cands = make_exact_gpu_top_cands(g.sample_ctx, g.sample_logits, out_sample->fast_temp);
+                ggml_set_output(g.sample_cands);
+                ggml_build_forward_expand(g.sample_gf, g.sample_cands);
+                g.sample_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
+                if (!g.sample_alloc || !ggml_gallocr_alloc_graph(g.sample_alloc, g.sample_gf)) {
+                    if (g.sample_alloc) { ggml_gallocr_free(g.sample_alloc); g.sample_alloc = nullptr; }
+                    ggml_free(g.sample_ctx); g.sample_ctx = nullptr;
+                    g.sample_gf = nullptr; g.sample_logits = nullptr; g.sample_cands = nullptr;
+                    return false;
+                }
+                g.sample_temp = out_sample->fast_temp;
+            }
+            g.sample_logits->data   = g.out_logits->data;
+            g.sample_logits->buffer = g.out_logits->buffer;
+            if (ggml_backend_graph_compute(target_backend, g.sample_gf) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            out_sample->top_cands.resize((size_t) 516 * n_out);
+            ggml_backend_tensor_get(g.sample_cands, out_sample->top_cands.data(), 0,
+                                    out_sample->top_cands.size() * sizeof(int32_t));
+        }
     }
     if (prof) {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1056,7 +1153,8 @@ bool inkling2_2dsd_prefill_chunk(
         int n_tokens,
         int pos0,
         bool is_last_chunk,
-        int32_t & out_greedy_tok) {
+        int32_t & out_greedy_tok,
+        std::vector<float> * out_last_logits) {
     if (!w.twodsd.loaded || !cache.tree.active || n_tokens <= 0) return false;
     auto & tc = cache.tree;
     const int Hq = w.n_head, Hk = w.n_head_kv, D = w.head_dim;
@@ -1313,12 +1411,14 @@ bool inkling2_2dsd_prefill_chunk(
     }
 
     ggml_tensor * greedy_t = nullptr;
+    ggml_tensor * soft_t   = nullptr;
     if (is_last_chunk) {
         ggml_tensor * lm_in = ggml_view_2d(c, final_out_norm, w.n_embd, 1, final_out_norm->nb[1],
                                            (size_t) (n_tokens - 1) * final_out_norm->nb[1]);
         ggml_tensor * raw_l = ggml_mul_mat(c, w.output, lm_in);
-        ggml_tensor * soft  = ggml_inkling2_softcap_slice(c, raw_l, w.n_vocab_unpadded, w.logit_softcap);
-        greedy_t = ggml_argmax(c, soft);
+        soft_t  = ggml_inkling2_softcap_slice(c, raw_l, w.n_vocab_unpadded, w.logit_softcap);
+        if (out_last_logits) ggml_set_output(soft_t);
+        greedy_t = ggml_argmax(c, soft_t);
         ggml_set_output(greedy_t);
         ggml_build_forward_expand(gf, greedy_t);
     } else {
@@ -1353,6 +1453,10 @@ bool inkling2_2dsd_prefill_chunk(
         if (is_last_chunk && greedy_t) {
             ggml_backend_tensor_get(greedy_t, &out_greedy_tok, 0, sizeof(int32_t));
         }
+        if (is_last_chunk && out_last_logits && soft_t) {
+            out_last_logits->resize((size_t) w.n_vocab_unpadded);
+            ggml_backend_tensor_get(soft_t, out_last_logits->data(), 0, (size_t) w.n_vocab_unpadded * sizeof(float));
+        }
         tc.prefix_len = pos0 + n_tokens;
         cache.cur_pos = pos0 + n_tokens;
         if (tail_n > 0) cache.dspark_ctx_pos = pos0 + n_tokens;
@@ -1371,10 +1475,11 @@ bool inkling2_2dsd_prefill_wavefront(
         int n_tokens,
         int pos0,
         int chunk_size,
-        int32_t & out_greedy_tok) {
+        int32_t & out_greedy_tok,
+        std::vector<float> * out_last_logits) {
     if (!w.twodsd.loaded || !cache.tree.active || n_tokens <= 0) return false;
     if (n_tokens <= chunk_size || !w.is_loop || w.n_passes != 3) {
-        return inkling2_2dsd_prefill_chunk(target_backend, w, cache, tokens, n_tokens, pos0, true, out_greedy_tok);
+        return inkling2_2dsd_prefill_chunk(target_backend, w, cache, tokens, n_tokens, pos0, true, out_greedy_tok, out_last_logits);
     }
 
     auto & tc = cache.tree;
@@ -2082,6 +2187,7 @@ bool inkling2_2dsd_prefill_wavefront(
             }
 
             ggml_tensor * greedy_t    = nullptr;
+            ggml_tensor * soft_t      = nullptr;
             ggml_tensor * inp_dr_pos  = nullptr;
             ggml_tensor * inp_dr_wpos = nullptr;
             int tail_beg = 0, tail_n = 0;
@@ -2115,8 +2221,9 @@ bool inkling2_2dsd_prefill_wavefront(
                         c, final_out_norm, w.n_embd, 1, final_out_norm->nb[1],
                         (size_t) (sd2.len - 1) * final_out_norm->nb[1]);
                     ggml_tensor * raw_l = ggml_mul_mat(c, w.output, lm_in);
-                    ggml_tensor * soft  = ggml_inkling2_softcap_slice(c, raw_l, w.n_vocab_unpadded, w.logit_softcap);
-                    greedy_t = ggml_argmax(c, soft);
+                    soft_t = ggml_inkling2_softcap_slice(c, raw_l, w.n_vocab_unpadded, w.logit_softcap);
+                    if (out_last_logits) ggml_set_output(soft_t);
+                    greedy_t = ggml_argmax(c, soft_t);
                     ggml_set_output(greedy_t);
                     ggml_build_forward_expand(gf, greedy_t);
                 }
@@ -2154,6 +2261,10 @@ bool inkling2_2dsd_prefill_wavefront(
                 if (is_last_pass2 && greedy_t) {
                     ggml_backend_tensor_get(greedy_t, &out_greedy_tok, 0, sizeof(int32_t));
                 }
+                if (is_last_pass2 && out_last_logits && soft_t) {
+                    out_last_logits->resize((size_t) w.n_vocab_unpadded);
+                    ggml_backend_tensor_get(soft_t, out_last_logits->data(), 0, (size_t) w.n_vocab_unpadded * sizeof(float));
+                }
             }
             ggml_gallocr_free(ga);
             ggml_free(c);
@@ -2167,20 +2278,28 @@ bool inkling2_2dsd_prefill_wavefront(
     return true;
 }
 
-// ─── Advance Active Tree Nodes by +1 Loop ───────────────────────────────
-bool inkling2_2dsd_advance_nodes(
+// ─── Advance Active Tree Nodes by +1 Loop (Single-Slot & Multi-Slot Batched) ─
+bool inkling2_2dsd_advance_nodes_batched(
         ggml_backend_t target_backend,
         const Inkling2Weights & w,
-        Inkling2Cache & cache,
+        Inkling2Cache & multi_cache,
         const std::vector<Inkling2TwoDSDNodeDesc> & nodes,
+        const int * prefix_lens,
+        int n_seq_slots,
         uint32_t readout_mask,
         bool allow_split,
         std::vector<int> & out_readout_rows,
-        std::vector<int32_t> & out_readout_argmax) {
+        std::vector<int32_t> & out_readout_argmax,
+        Inkling2TwoDSDAdvanceSampleOut * out_sample) {
     out_readout_rows.clear();
     out_readout_argmax.clear();
-    if (!cache.tree.active || nodes.empty()) return false;
-    auto & tc = cache.tree;
+    if (out_sample) {
+        out_sample->top_cands.clear();
+        out_sample->logits_dev = nullptr;
+        out_sample->n_vocab = w.n_vocab_unpadded;
+    }
+    if (!multi_cache.tree.active || nodes.empty() || n_seq_slots <= 0) return false;
+    auto & tc = multi_cache.tree;
 
     // 1. Prelude for fresh nodes (depth == 0)
     std::vector<const Inkling2TwoDSDNodeDesc *> fresh_rows;
@@ -2194,8 +2313,10 @@ bool inkling2_2dsd_advance_nodes(
         }
     }
     if (!fresh_rows.empty()) {
-        auto st = stage_phase_rows(fresh_rows, fresh_planes, fresh_flags, fresh_extra, tc.max_nodes, tc.prefix_len);
-        if (!run_phase(target_backend, w, cache, /*phase_id=*/0, st, /*has_later=*/false, allow_split)) {
+        auto st = stage_phase_rows(fresh_rows, fresh_planes, fresh_flags, fresh_extra,
+                                   tc.max_nodes, prefix_lens, n_seq_slots, /*n_planes_phase=*/1);
+        if (!run_phase(target_backend, w, multi_cache, /*phase_id=*/0, st,
+                       prefix_lens, n_seq_slots, (int) fresh_rows.size(), /*has_later=*/false, allow_split)) {
             return false;
         }
     }
@@ -2217,8 +2338,10 @@ bool inkling2_2dsd_advance_nodes(
         all_extra.push_back(std::max(0, nd.depth - 1));
     }
     {
-        auto st = stage_phase_rows(all_rows, all_planes, all_flags, all_extra, tc.max_nodes, tc.prefix_len);
-        if (!run_phase(target_backend, w, cache, /*phase_id=*/1, st, any_later, allow_split)) {
+        auto st = stage_phase_rows(all_rows, all_planes, all_flags, all_extra,
+                                   tc.max_nodes, prefix_lens, n_seq_slots, /*n_planes_phase=*/w.n_passes);
+        if (!run_phase(target_backend, w, multi_cache, /*phase_id=*/1, st,
+                       prefix_lens, n_seq_slots, (int) all_rows.size(), any_later, allow_split)) {
             return false;
         }
     }
@@ -2237,14 +2360,33 @@ bool inkling2_2dsd_advance_nodes(
         }
     }
     if (!read_rows.empty()) {
-        auto st = stage_phase_rows(read_rows, read_planes, read_flags, read_extra, tc.max_nodes, tc.prefix_len);
-        std::vector<int32_t> greedy_padded;
-        if (!run_phase(target_backend, w, cache, /*phase_id=*/2, st, /*has_later=*/false, allow_split, &greedy_padded)) {
+        auto st = stage_phase_rows(read_rows, read_planes, read_flags, read_extra,
+                                   tc.max_nodes, prefix_lens, n_seq_slots, /*n_planes_phase=*/tc.n_depths);
+        std::vector<int32_t> greedy_out;
+        if (!run_phase(target_backend, w, multi_cache, /*phase_id=*/2, st,
+                       prefix_lens, n_seq_slots, (int) read_rows.size(),
+                       /*has_later=*/false, allow_split, &greedy_out, out_sample)) {
             return false;
         }
-        out_readout_argmax.assign(greedy_padded.begin(), greedy_padded.begin() + (ptrdiff_t) read_rows.size());
+        out_readout_argmax.assign(greedy_out.begin(), greedy_out.end());
     }
     return true;
+}
+
+bool inkling2_2dsd_advance_nodes(
+        ggml_backend_t target_backend,
+        const Inkling2Weights & w,
+        Inkling2Cache & cache,
+        const std::vector<Inkling2TwoDSDNodeDesc> & nodes,
+        uint32_t readout_mask,
+        bool allow_split,
+        std::vector<int> & out_readout_rows,
+        std::vector<int32_t> & out_readout_argmax,
+        Inkling2TwoDSDAdvanceSampleOut * out_sample) {
+    const int pref_len = cache.tree.prefix_len;
+    return inkling2_2dsd_advance_nodes_batched(
+        target_backend, w, cache, nodes, &pref_len, 1, readout_mask, allow_split,
+        out_readout_rows, out_readout_argmax, out_sample);
 }
 
 // ─── Commit Verified Path from Tree -> 60-Plane Prefix & 5-Layer Drafter KV ──

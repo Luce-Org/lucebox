@@ -1714,12 +1714,374 @@ static bool test_2dsd_p0_fused_ops(ggml_backend_t backend) {
     return ok_40 && ok_41 && max_err_42 < 1e-5f && ok_43;
 }
 
+// ─── Test: Multi-Slot TREE_ATTN_REL (subop 35) per-plane prefix_len_buf[plane] ─
+static bool test_2dsd_multislot_tree_attn_rel(ggml_backend_t backend) {
+    const int D = 128, Hk = 2, GQA = 3, Hq = Hk * GQA;
+    const int cap = 32, S = 8, P = 4, T = 4, rel_ext = 64, path_w = 8, m_stride = 11 + path_w;
+    const int32_t pref_lens[P] = { 3, 9, 5, 14 };
+    const int32_t q_planes[T]  = { 0, 1, 2, 3 };
+    const int32_t q_extra[T]   = { 2, 1, 3, 2 }; // uncommitted tree ancestors + self
+
+    std::mt19937 rng(3535);
+    std::uniform_real_distribution<float> dist(-0.6f, 0.6f);
+
+    std::vector<float> q((size_t) D * Hq * T);
+    std::vector<ggml_fp16_t> pk((size_t) D * cap * Hk * P), pv((size_t) D * cap * Hk * P);
+    std::vector<ggml_fp16_t> tk((size_t) D * S   * Hk * P), tv((size_t) D * S   * Hk * P);
+    std::vector<float> rt((size_t) (rel_ext + 1) * Hq * T), gate((size_t) D * Hq * T);
+    for (float & v : q)    v = dist(rng);
+    for (float & v : rt)   v = dist(rng) * 0.3f;
+    for (float & v : gate) v = dist(rng);
+    for (auto & v : pk) v = ggml_fp32_to_fp16(dist(rng));
+    for (auto & v : pv) v = ggml_fp32_to_fp16(dist(rng));
+    for (auto & v : tk) v = ggml_fp32_to_fp16(dist(rng));
+    for (auto & v : tv) v = ggml_fp32_to_fp16(dist(rng));
+
+    std::vector<int32_t> meta((size_t) T * m_stride, -1);
+    for (int t = 0; t < T; ++t) {
+        int32_t * mt = meta.data() + (size_t) t * m_stride;
+        const int p = q_planes[t];
+        mt[0] = q_extra[t] - 1;
+        mt[1] = pref_lens[p] + q_extra[t] - 1;
+        mt[2] = p;
+        mt[3] = 0;
+        mt[4] = 0;
+        for (int e = 0; e < q_extra[t]; ++e) mt[11 + e] = e;
+    }
+
+    auto run_one = [&](const int32_t * pl_ptr, int pl_n, int single_row) -> std::vector<float> {
+        const int rows = (single_row >= 0) ? 1 : T;
+        struct ggml_init_params gp = { 32 * ggml_tensor_overhead() + ggml_graph_overhead() + (2 << 20), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * t_q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hq, rows);
+        ggml_tensor * t_pk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, cap, Hk, P);
+        ggml_tensor * t_pv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, cap, Hk, P);
+        ggml_tensor * t_tk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S,   Hk, P);
+        ggml_tensor * t_tv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, S,   Hk, P);
+        ggml_tensor * t_rt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rel_ext + 1, Hq, rows);
+        ggml_tensor * t_mt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m_stride, rows);
+        ggml_tensor * t_pl = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, pl_n);
+        ggml_tensor * t_gt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D * Hq, rows);
+        ggml_set_input(t_q); ggml_set_input(t_pk); ggml_set_input(t_pv);
+        ggml_set_input(t_tk); ggml_set_input(t_tv); ggml_set_input(t_rt);
+        ggml_set_input(t_mt); ggml_set_input(t_pl); ggml_set_input(t_gt);
+
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D * Hq, rows);
+        dst->op = GGML_OP_INKLING2_OP;
+        dst->src[0] = t_q;  dst->src[1] = t_pk; dst->src[2] = t_pv;
+        dst->src[3] = t_tk; dst->src[4] = t_tv; dst->src[5] = t_rt;
+        dst->src[6] = t_mt; dst->src[7] = t_pl; dst->src[8] = t_gt;
+        test_set_op_i32(dst, 0, 35);
+        test_set_op_i32(dst, 1, 0);
+        test_set_op_i32(dst, 2, rel_ext);
+        test_set_op_i32(dst, 3, m_stride);
+        test_set_op_i32(dst, 4, path_w);
+        ggml_set_output(dst);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, dst);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+
+        const int r0 = (single_row >= 0) ? single_row : 0;
+        ggml_backend_tensor_set(t_q,  q.data()    + (size_t) r0 * D * Hq,           0, (size_t) rows * D * Hq * sizeof(float));
+        ggml_backend_tensor_set(t_pk, pk.data(),                                    0, pk.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_pv, pv.data(),                                    0, pv.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_tk, tk.data(),                                    0, tk.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_tv, tv.data(),                                    0, tv.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_rt, rt.data()   + (size_t) r0 * (rel_ext + 1) * Hq, 0, (size_t) rows * (rel_ext + 1) * Hq * sizeof(float));
+        ggml_backend_tensor_set(t_mt, meta.data() + (size_t) r0 * m_stride,         0, (size_t) rows * m_stride * sizeof(int32_t));
+        ggml_backend_tensor_set(t_pl, pl_ptr,                                       0, (size_t) pl_n * sizeof(int32_t));
+        ggml_backend_tensor_set(t_gt, gate.data() + (size_t) r0 * D * Hq,           0, (size_t) rows * D * Hq * sizeof(float));
+
+        ggml_backend_graph_compute(backend, gf);
+        std::vector<float> out((size_t) D * Hq * rows);
+        ggml_backend_tensor_get(dst, out.data(), 0, out.size() * sizeof(float));
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return out;
+    };
+
+    const std::vector<float> batched = run_one(pref_lens, P, -1);
+    float max_err = 0.0f;
+    for (int t = 0; t < T; ++t) {
+        const int32_t pl1 = pref_lens[q_planes[t]];
+        const std::vector<float> ref = run_one(&pl1, 1, t);
+        std::vector<float> got(batched.begin() + (ptrdiff_t) t * D * Hq,
+                               batched.begin() + (ptrdiff_t) (t + 1) * D * Hq);
+        max_err = std::max(max_err, max_abs_diff(ref, got));
+    }
+    std::printf("[test_inkling2_ops] 2dsd_multislot_attn_rel: max_err=%.3e\n", max_err);
+    return max_err < 1e-6f;
+}
+
+// ─── Test: Non-greedy Seeded Parity & N=4 Concurrent Batched 2DSD Sessions ──
+static bool test_2dsd_nongreedy_and_multislot_session() {
+    using namespace luce::common;
+    auto synth_logits = [](uint32_t h, int depth) -> std::array<float, 8> {
+        std::array<float, 8> lg{};
+        for (int v = 0; v < 8; ++v) {
+            uint32_t x = h * 2654435761u + (uint32_t) (v * 97 + depth * 31);
+            x ^= x >> 13; x *= 1274126177u; x ^= x >> 16;
+            lg[(size_t) v] = ((float) (x & 1023u) / 1024.0f) * 3.0f - 1.5f;
+        }
+        return lg;
+    };
+    auto argmax8 = [](const std::array<float, 8> & lg) -> int32_t {
+        int32_t best = 0;
+        for (int i = 1; i < 8; ++i) if (lg[(size_t) i] > lg[(size_t) best]) best = i;
+        return best;
+    };
+    auto sample8 = [](const float * lg, std::mt19937 & rng, float temp) -> int32_t {
+        float mx = lg[0];
+        for (int i = 1; i < 8; ++i) mx = std::max(mx, lg[i]);
+        double probs[8], Z = 0.0;
+        for (int i = 0; i < 8; ++i) { probs[i] = std::exp((lg[i] - mx) / temp); Z += probs[i]; }
+        std::uniform_real_distribution<double> u01(0.0, Z);
+        const double r = u01(rng);
+        double acc = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            acc += probs[i];
+            if (r <= acc || i == 7) return i;
+        }
+        return 7;
+    };
+    auto seq_hash = [](const std::vector<int32_t> & seq) -> uint32_t {
+        uint32_t h = 2166136261u;
+        for (int32_t t : seq) { h ^= (uint32_t) t; h *= 16777619u; }
+        return h;
+    };
+
+    // 1. Non-greedy seeded parity: 2DSD stage2b with stochastic hooks MUST match AR bit-for-bit!
+    const float temp = 0.8f;
+    const uint32_t seed = 424242u;
+    const int n_gen = 32;
+    const std::vector<int32_t> prompt = { 1, 5, 2, 7 };
+
+    std::vector<int32_t> ar_toks;
+    {
+        std::mt19937 rng(seed);
+        std::vector<int32_t> ctx = prompt;
+        auto lg0 = synth_logits(seq_hash(ctx), 3);
+        int32_t tok = sample8(lg0.data(), rng, temp);
+        ar_toks.push_back(tok);
+        for (int i = 1; i < n_gen; ++i) {
+            ctx.push_back(tok);
+            auto lg = synth_logits(seq_hash(ctx), 3);
+            tok = sample8(lg.data(), rng, temp);
+            ar_toks.push_back(tok);
+        }
+    }
+
+    struct MockStochRunner final : public Inkling2TwoDSDRunner {
+        std::vector<int32_t> committed;
+        std::vector<int32_t> slot_tok;
+        std::vector<std::array<float, 8>> last_readout_logits;
+        decltype(synth_logits) & fn_lg;
+        decltype(argmax8) & fn_am;
+        decltype(seq_hash) & fn_sh;
+        MockStochRunner(std::vector<int32_t> p, decltype(synth_logits) & fl, decltype(argmax8) & fa, decltype(seq_hash) & fs)
+            : committed(std::move(p)), slot_tok(129, 0), fn_lg(fl), fn_am(fa), fn_sh(fs) {}
+        int prefix_length() const override { return (int) committed.size(); }
+        int max_nodes() const override { return 128; }
+        int max_ctx() const override { return 256; }
+        bool advance_nodes(const std::vector<Inkling2TwoDSDNodeDesc> & nodes, uint32_t readout_mask,
+                           std::vector<int> & out_rows, std::vector<int32_t> & out_argmax) override {
+            out_rows.clear(); out_argmax.clear(); last_readout_logits.clear();
+            for (int i = 0; i < (int) nodes.size(); ++i) {
+                const auto & nd = nodes[(size_t) i];
+                slot_tok[(size_t) nd.slot] = nd.token;
+                const int new_d = nd.depth + 1;
+                if ((readout_mask & (1u << new_d)) != 0u) {
+                    std::vector<int32_t> path = committed;
+                    for (int anc : nd.ancestors) path.push_back(slot_tok[(size_t) anc]);
+                    path.push_back(nd.token);
+                    auto lg = fn_lg(fn_sh(path), new_d);
+                    out_rows.push_back(i);
+                    out_argmax.push_back(fn_am(lg));
+                    last_readout_logits.push_back(lg);
+                }
+            }
+            return true;
+        }
+        bool commit_nodes(const int * slots, int n) override {
+            for (int i = 0; i < n; ++i) committed.push_back(slot_tok[(size_t) slots[i]]);
+            return true;
+        }
+        bool draft_batch(const std::vector<Inkling2TwoDSDDraftReq> & reqs,
+                         std::vector<Inkling2TwoDSDDraftOut> & out) override {
+            out.clear();
+            for (const auto & r : reqs) {
+                Inkling2TwoDSDDraftOut o;
+                std::vector<int32_t> path = committed;
+                for (int anc : r.span_slots) path.push_back(slot_tok[(size_t) anc]);
+                path.push_back(r.head_token);
+                for (int s = 0; s < 5; ++s) {
+                    auto lg = fn_lg(fn_sh(path), 3);
+                    int32_t tk = fn_am(lg);
+                    o.tokens.push_back(tk);
+                    o.confidence.push_back(0.9f);
+                    path.push_back(tk);
+                }
+                out.push_back(std::move(o));
+            }
+            return true;
+        }
+    };
+
+    std::vector<int32_t> td_toks;
+    {
+        std::mt19937 rng(seed);
+        MockStochRunner runner(prompt, synth_logits, argmax8, seq_hash);
+        auto lg0 = synth_logits(seq_hash(prompt), 3);
+        int32_t first_tok = sample8(lg0.data(), rng, temp);
+
+        Inkling2TwoDSDSamplerHooks hooks;
+        hooks.capture = [&](int r_idx, Inkling2TwoDSDDepthRSample & out) {
+            const auto & lg = runner.last_readout_logits[(size_t) r_idx];
+            out.logits.assign(lg.begin(), lg.end());
+        };
+        hooks.sample = [&](const Inkling2TwoDSDDepthRSample & payload, int32_t greedy_tok) -> int32_t {
+            if (payload.logits.size() == 8) return sample8(payload.logits.data(), rng, temp);
+            return greedy_tok;
+        };
+
+        Inkling2TwoDSDConfig cfg;
+        cfg.stage = Inkling2TwoDSDStage::Stage2b;
+        cfg.k = 6;
+        Inkling2TwoDSDStats st;
+        std::string err;
+        auto on_commit = [&](int32_t & tok) -> bool {
+            td_toks.push_back(tok);
+            return (int) td_toks.size() < n_gen;
+        };
+        if (!inkling2_2dsd_run(runner, cfg, first_tok, n_gen, on_commit, &hooks, st, err)) {
+            std::fprintf(stderr, "[test_inkling2_ops] non-greedy 2dsd failed: %s\n", err.c_str());
+            return false;
+        }
+    }
+    const bool ok_nongreedy = (ar_toks == td_toks);
+
+    // 2. N=4 concurrent batched Inkling2TwoDSDSession parity vs independent AR
+    constexpr int N = 4;
+    std::vector<std::vector<int32_t>> prompts_n = {
+        { 1, 2, 3 }, { 4, 5, 6, 7, 0 }, { 2, 2, 1, 6 }, { 7, 3, 5, 1, 4, 2 }
+    };
+    std::vector<std::vector<int32_t>> ref_n(N), got_n(N);
+    for (int s = 0; s < N; ++s) {
+        std::vector<int32_t> ctx = prompts_n[(size_t) s];
+        int32_t tok = argmax8(synth_logits(seq_hash(ctx), 3));
+        ref_n[(size_t) s].push_back(tok);
+        for (int i = 1; i < 20; ++i) {
+            ctx.push_back(tok);
+            tok = argmax8(synth_logits(seq_hash(ctx), 3));
+            ref_n[(size_t) s].push_back(tok);
+        }
+    }
+
+    std::vector<std::unique_ptr<MockStochRunner>> runners(N);
+    std::vector<Inkling2TwoDSDStats> stats_n(N);
+    std::vector<std::unique_ptr<Inkling2TwoDSDSession>> sessions(N);
+    Inkling2TwoDSDConfig conc_cfg = inkling2_2dsd_config_for_concurrency(3, 6, N);
+    for (int s = 0; s < N; ++s) {
+        runners[(size_t) s] = std::make_unique<MockStochRunner>(prompts_n[(size_t) s], synth_logits, argmax8, seq_hash);
+        sessions[(size_t) s] = std::make_unique<Inkling2TwoDSDSession>(*runners[(size_t) s], conc_cfg, stats_n[(size_t) s], 256);
+        int32_t first_tok = argmax8(synth_logits(seq_hash(prompts_n[(size_t) s]), 3));
+        got_n[(size_t) s].push_back(first_tok);
+        std::string err;
+        if (!sessions[(size_t) s]->seed_cursor(first_tok, (int) prompts_n[(size_t) s].size(), err)) return false;
+    }
+
+    std::vector<bool> done_n(N, false);
+    for (int iter = 0; iter < 100; ++iter) {
+        bool any = false;
+        for (int s = 0; s < N; ++s) if (!done_n[(size_t) s]) any = true;
+        if (!any) break;
+
+        std::vector<Inkling2TwoDSDNodeDesc> combined;
+        std::vector<int> owner, local_pos;
+        std::vector<std::vector<int>> active_ids(N);
+        uint32_t mask = 0u;
+        for (int s = 0; s < N; ++s) {
+            if (done_n[(size_t) s]) continue;
+            std::vector<Inkling2TwoDSDDraftReq> reqs;
+            std::vector<int> ph, pw;
+            sessions[(size_t) s]->collect_draft_reqs(reqs, ph, pw);
+            if (!reqs.empty()) {
+                std::vector<Inkling2TwoDSDDraftOut> outs;
+                runners[(size_t) s]->draft_batch(reqs, outs);
+                sessions[(size_t) s]->apply_draft_outs(ph, pw, outs);
+            }
+            std::vector<Inkling2TwoDSDNodeDesc> ds;
+            std::string err;
+            if (!sessions[(size_t) s]->collect_active(active_ids[(size_t) s], ds, err)) return false;
+            mask |= sessions[(size_t) s]->readout_mask();
+            for (int r = 0; r < (int) ds.size(); ++r) {
+                ds[(size_t) r].seq_slot = s;
+                combined.push_back(std::move(ds[(size_t) r]));
+                owner.push_back(s);
+                local_pos.push_back(r);
+            }
+        }
+
+        // Batched target advance across all N slots together
+        std::vector<std::vector<int>> per_r(N);
+        std::vector<std::vector<int32_t>> per_am(N);
+        for (int i = 0; i < (int) combined.size(); ++i) {
+            const auto & nd = combined[(size_t) i];
+            const int s = owner[(size_t) i];
+            runners[(size_t) s]->slot_tok[(size_t) nd.slot] = nd.token;
+            const int new_d = nd.depth + 1;
+            if ((mask & (1u << new_d)) != 0u) {
+                std::vector<int32_t> path = runners[(size_t) s]->committed;
+                for (int anc : nd.ancestors) path.push_back(runners[(size_t) s]->slot_tok[(size_t) anc]);
+                path.push_back(nd.token);
+                per_r[(size_t) s].push_back(local_pos[(size_t) i]);
+                per_am[(size_t) s].push_back(argmax8(synth_logits(seq_hash(path), new_d)));
+            }
+        }
+        for (int s = 0; s < N; ++s) {
+            if (done_n[(size_t) s]) continue;
+            bool stopped = false;
+            std::string err;
+            auto on_commit = [&](int32_t & tok) -> bool {
+                got_n[(size_t) s].push_back(tok);
+                return (int) got_n[(size_t) s].size() < 20;
+            };
+            if (!sessions[(size_t) s]->apply_step_and_verify(active_ids[(size_t) s], per_r[(size_t) s], per_am[(size_t) s], on_commit, stopped, err)) {
+                return false;
+            }
+            if (stopped || (int) got_n[(size_t) s].size() >= 20) done_n[(size_t) s] = true;
+        }
+    }
+    bool ok_conc = true;
+    for (int s = 0; s < N; ++s) {
+        if (got_n[(size_t) s] != ref_n[(size_t) s]) ok_conc = false;
+    }
+
+    std::printf("[test_inkling2_ops] 2dsd_nongreedy_and_conc: nongreedy_parity=%d conc_n4_parity=%d\n",
+                ok_nongreedy ? 1 : 0, ok_conc ? 1 : 0);
+    return ok_nongreedy && ok_conc;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
+    bool cpu_only = false;
     int gpu = 0;
     if (const char * e = std::getenv("LUCE_TEST_GPU")) gpu = std::atoi(e);
-    if (argc > 1) gpu = std::atoi(argv[1]);
+    if (argc > 1) {
+        if (std::strcmp(argv[1], "--cpu-only") == 0) cpu_only = true;
+        else gpu = std::atoi(argv[1]);
+    }
+    if (cpu_only) {
+        bool ok = true;
+        ok &= test_2dsd_mask_embedding_pt();
+        ok &= test_2dsd_executor();
+        ok &= test_2dsd_nongreedy_and_multislot_session();
+        std::printf("[test_inkling2_ops] (cpu-only) %s\n", ok ? "ALL PASSED" : "FAILED");
+        return ok ? 0 : 1;
+    }
 
     ggml_backend_t backend = ggml_backend_cuda_init(gpu);
     if (!backend) {
@@ -1747,6 +2109,8 @@ int main(int argc, char ** argv) {
     ok &= test_2dsd_mask_embedding_pt();
     ok &= test_2dsd_executor();
     ok &= test_2dsd_p0_fused_ops(backend);
+    ok &= test_2dsd_multislot_tree_attn_rel(backend);
+    ok &= test_2dsd_nongreedy_and_multislot_session();
 
     ggml_backend_free(backend);
     std::printf("[test_inkling2_ops] %s\n", ok ? "ALL PASSED" : "FAILED");

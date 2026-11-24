@@ -109,7 +109,15 @@ struct Inkling2TwoDSDPhaseGraph {
     ggml_tensor * inp_slot       = nullptr; // I32 [T] (0..S-1)
     ggml_tensor * inp_flat_cur   = nullptr; // I32 [T] (plane*S + slot)
     ggml_tensor * inp_flat_prev  = nullptr; // I32 [T] (max(0,plane-1)*S + slot)
+    ggml_tensor * out_logits     = nullptr; // F32 [n_vocab_unpadded, T] (coda only)
     ggml_tensor * out_greedy     = nullptr; // I32 [T] (coda only)
+    // Lazy cached 1-node GPU top-candidate extractor for fast non-greedy sampling (subop 32)
+    ggml_context * sample_ctx    = nullptr;
+    ggml_gallocr_t sample_alloc  = nullptr;
+    ggml_cgraph *  sample_gf     = nullptr;
+    ggml_tensor *  sample_logits = nullptr; // leaf alias to out_logits->data
+    ggml_tensor *  sample_cands  = nullptr; // I32 [516, T]
+    float          sample_temp   = 0.0f;
     std::vector<ggml_tensor *> expert_nodes;
 };
 
@@ -152,11 +160,13 @@ struct Inkling2TwoDSDPrefixStoreGraph {
 
 // 60-plane contiguous target cache + tree scratch + 5-layer drafter KV + graph caches.
 struct Inkling2TreeCache {
-    bool active    = false;
-    int  max_nodes = kInkling2TwoDSDMaxNodes; // live slots [0..max_nodes-1]; scratch = max_nodes
-    int  n_depths  = 3;                       // coda planes for readout depths {1, 2, 3}
-    int  prefix_len = 0;
-    int  draft_pref_start = 0;                // tail-only drafter prefix start (0 = full prefix)
+    bool active       = false;
+    bool is_slot_view = false; // true for zero-copy per-slot views aliasing a multi-slot cache
+    int  n_seq_slots  = 1;     // >1 when backing multi-stream Inkling2SeqEngine
+    int  max_nodes    = kInkling2TwoDSDMaxNodes; // live slots [0..max_nodes-1]; scratch = max_nodes
+    int  n_depths     = 3;                       // coda planes for readout depths {1, 2, 3}
+    int  prefix_len   = 0;
+    int  draft_pref_start = 0;                   // tail-only drafter prefix start (0 = full prefix)
 
     // Flat 4D per-physical-layer tensors (24 physical layers):
     //   planes[ip]: 1 for prelude (0..5), 3 for core (6..17), 3 for coda (18..23) -> 60 planes total
@@ -253,7 +263,16 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
                            ggml_type kv_type,
                            Inkling2Cache & out,
                            std::string & error,
-                           int fixed_remote_split_pos = -1);
+                           int fixed_remote_split_pos = -1,
+                           int n_seq_slots = 1);
+
+// Create a zero-copy single-slot Inkling2Cache view into slot `seq_slot` of a multi-slot 2DSD cache.
+// The view shares device memory with `multi` (does not own buffers) and owns its own single-slot
+// commit/draft/prefix-store graph caches so existing prefill/commit/draft routines run unchanged.
+bool make_inkling2_slot_view(Inkling2Cache & multi,
+                             const Inkling2Weights & w,
+                             int seq_slot,
+                             Inkling2Cache & view_out);
 
 void reset_inkling2_cache(Inkling2Cache & cache);
 void free_inkling2_cache(Inkling2Cache & cache);

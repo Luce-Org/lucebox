@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,21 @@ struct Inkling2TwoDSDStats {
     double    draft_s           = 0.0;
 };
 
+// Optional per-node depth-R sampling payload captured when running non-greedy 2DSD.
+// Stores either compact subop-32 GPU top-candidates (516 i32 = 2 KB) or a full logits row fallback.
+struct Inkling2TwoDSDDepthRSample {
+    std::vector<int32_t> top_cands; // 516 ints from EXACT_GPU_TOP_CANDS when fast path active
+    std::vector<float>   logits;    // full row fallback (only populated if top_cands empty or flat)
+};
+
+// Callbacks for lossless non-greedy 2DSD:
+//   - capture(readout_idx, out): called when a node reaches depth==R during advance_nodes (before verify).
+//   - sample(payload, greedy_tok): called inside verify ONLY along the committed path (exact AR RNG order!).
+struct Inkling2TwoDSDSamplerHooks {
+    std::function<void(int readout_idx, Inkling2TwoDSDDepthRSample & out)> capture;
+    std::function<int32_t(const Inkling2TwoDSDDepthRSample & payload, int32_t greedy_tok)> sample;
+};
+
 // Abstract target+drafter runner interface (implemented by GPU backend and unit-test mocks).
 class Inkling2TwoDSDRunner {
 public:
@@ -67,6 +83,62 @@ public:
                              std::vector<Inkling2TwoDSDDraftOut> & out) = 0;
 };
 
+// Step-wise 2DSD Trie Session (used by both single-stream decode and multi-stream Inkling2SeqEngine).
+// Separates trie state transitions from batched GPU target/drafter execution so N concurrent slots
+// can pack their active nodes and draft requests into one shared GPU step.
+class Inkling2TwoDSDSession {
+public:
+    Inkling2TwoDSDSession(Inkling2TwoDSDRunner & runner,
+                          const Inkling2TwoDSDConfig & cfg,
+                          Inkling2TwoDSDStats & stats,
+                          int output_limit,
+                          const Inkling2TwoDSDSamplerHooks * sampler = nullptr);
+    ~Inkling2TwoDSDSession();
+
+    Inkling2TwoDSDSession(const Inkling2TwoDSDSession &) = delete;
+    Inkling2TwoDSDSession & operator=(const Inkling2TwoDSDSession &) = delete;
+
+    uint32_t readout_mask() const;
+
+    // Seed the initial cursor at `first_token` (already committed at prefix_len - 1) and queue its anchor.
+    bool seed_cursor(int32_t first_token, int prefix_len_before_first, std::string & error);
+
+    // Phase A: collect pending draft requests (without running the drafter) and apply returned drafts.
+    void collect_draft_reqs(std::vector<Inkling2TwoDSDDraftReq> & out_reqs,
+                            std::vector<int> & out_plan_heads,
+                            std::vector<int> & out_plan_widths);
+    void apply_draft_outs(const std::vector<int> & plan_heads,
+                          const std::vector<int> & plan_widths,
+                          const std::vector<Inkling2TwoDSDDraftOut> & outs);
+
+    // Phase B: collect all active nodes (depth < R) to advance by +1 loop.
+    bool collect_active(std::vector<int> & out_active_ids,
+                        std::vector<Inkling2TwoDSDNodeDesc> & out_descs,
+                        std::string & error) const;
+
+    // Phase C: apply target readouts, verify committed path, and run Stage 2 / Stage 1 transitions.
+    // Returns false on fatal error; sets `stopped = true` when `on_commit` returns false.
+    bool apply_step_and_verify(const std::vector<int> & active_ids,
+                               const std::vector<int> & readout_rows,
+                               const std::vector<int32_t> & readout_argmax,
+                               const std::function<bool(int32_t &)> & on_commit,
+                               bool & stopped,
+                               std::string & error);
+
+    // Update effective config (e.g. concurrency-adaptive draft_confidence / stage when N changes).
+    void update_config(const Inkling2TwoDSDConfig & cfg);
+
+    int live_node_count() const;
+    int32_t cursor_token() const;
+    int cursor_pos() const;
+    int cursor_depth() const;
+    void clear_cursor_children();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // Run greedy 2DSD decode starting from `first_token` (already sampled from prompt prefill at
 // `prefix_len - 1`). Invokes `on_commit(tok)` for each emitted token (including `first_token`),
 // stopping when `on_commit` returns false (EOS, max_new, or cancellation).
@@ -79,7 +151,22 @@ bool inkling2_2dsd_run_greedy(
     Inkling2TwoDSDStats & stats,
     std::string & error);
 
+// Run 2DSD decode with optional lossless stochastic sampling hooks (`sampler == nullptr` => greedy).
+bool inkling2_2dsd_run(
+    Inkling2TwoDSDRunner & runner,
+    const Inkling2TwoDSDConfig & cfg,
+    int32_t first_token,
+    int max_new,
+    const std::function<bool(int32_t &)> & on_commit,
+    const Inkling2TwoDSDSamplerHooks * sampler,
+    Inkling2TwoDSDStats & stats,
+    std::string & error);
+
 // Parse stage string ("stage1", "stage2a", "stage2b") and env overrides.
 Inkling2TwoDSDConfig inkling2_2dsd_config_from_env(int R, int block_size);
+
+// Concurrency-adaptive 2DSD config scaling confidence & block width with active slot count `N`
+// to keep combined MoE batch width in the optimal 24..48 cell sweet spot.
+Inkling2TwoDSDConfig inkling2_2dsd_config_for_concurrency(int R, int block_size, int active_slots);
 
 } // namespace luce::common

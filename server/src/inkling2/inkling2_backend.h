@@ -34,6 +34,7 @@ struct Inkling2BackendConfig {
     DevicePlacement             device;
     std::optional<DevicePlacement> expert_device;
     int                         chunk = 512;
+    int                         max_concurrency = 1; // >1 enables batched multi-stream Inkling2SeqEngine (2DSD)
     ggml_type                   cache_type_k = GGML_TYPE_COUNT; // COUNT -> Q8_0 default (or F16 via --cache-type-k f16)
     ggml_type                   cache_type_v = GGML_TYPE_COUNT;
 };
@@ -92,6 +93,8 @@ public:
     bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
     void free_drafter() override {}
 
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
+
     void shutdown() override;
 
 private:
@@ -107,6 +110,7 @@ private:
     ggml_backend_t        snap_backend_   = nullptr;
     Inkling2Weights       weights_;
     Inkling2Cache         cache_;
+    std::unique_ptr<SeqEngine> seq_engine_;
     int                   chunk_          = 512;
     int                   fitted_max_ctx_ = 0;
     int                   fitted_remote_split_pos_ = -1;

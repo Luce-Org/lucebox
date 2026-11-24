@@ -3643,11 +3643,11 @@ static __global__ void inkling2_tree_attn_rel_kernel(
         size_t tv_nb1, size_t tv_nb2, size_t tv_nb3,
         const float   * __restrict__ rel_table,      // [rel_extent+1, Hq, T]
         const int32_t * __restrict__ meta,           // [m_stride, T]
-        const int32_t * __restrict__ prefix_len_buf, // [1]
+        const int32_t * __restrict__ prefix_len_buf, // [1] or [P] (per-plane for multi-slot batching)
         const float   * __restrict__ gate_ptr, size_t gate_stride,
         float         * __restrict__ dst,            // [128*Hq, T]
         int Hq, int prefix_cap, int swa_window, int rel_extent,
-        int m_stride, int path_w) {
+        int m_stride, int path_w, int prefix_len_n) {
     const int lane    = threadIdx.x; // 0..31
     const int warp    = threadIdx.y; // 0..NWARPS-1
     const int kv_head = blockIdx.x;
@@ -3656,7 +3656,7 @@ static __global__ void inkling2_tree_attn_rel_kernel(
     const int32_t * mt  = meta + (size_t) q_tok * m_stride;
     const int q_pos     = mt[1];
     const int plane     = mt[2];
-    const int pref_len  = prefix_len_buf[0];
+    const int pref_len  = (prefix_len_n > 1) ? prefix_len_buf[plane] : prefix_len_buf[0];
     const int eff_end   = q_pos + 1;
     const int eff_start = (swa_window > 0) ? max(0, q_pos - swa_window + 1) : 0;
 
@@ -5379,7 +5379,8 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     gate ? (const float *) gate->data : nullptr,
                     gate ? (gate->nb[1] / sizeof(float)) : 0,
                     (float *) dst->data,
-                    Hq, prefix_cap, swa_window, rel_extent, m_stride, path_w);
+                    Hq, prefix_cap, swa_window, rel_extent, m_stride, path_w,
+                    (int) prefix_len_buf->ne[0]);
             };
             if (prefix_k->type == GGML_TYPE_Q8_0) {
                 if      (gqa == 3) launch_tree_attn(std::true_type{}, std::integral_constant<int, 3>{});

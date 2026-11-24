@@ -48,6 +48,27 @@ Inkling2TwoDSDConfig inkling2_2dsd_config_from_env(int R, int block_size) {
     return cfg;
 }
 
+Inkling2TwoDSDConfig inkling2_2dsd_config_for_concurrency(int R, int block_size, int active_slots) {
+    Inkling2TwoDSDConfig cfg = inkling2_2dsd_config_from_env(R, block_size);
+    const bool explicit_conf  = (std::getenv("LUCE_INKLING2_2DSD_CONF") != nullptr);
+    const bool explicit_k     = (std::getenv("LUCE_INKLING2_2DSD_K") != nullptr);
+    const bool explicit_stage = (std::getenv("LUCE_INKLING2_2DSD_STAGE") != nullptr);
+    if (active_slots <= 1) {
+        return cfg;
+    }
+    if (active_slots >= 8) {
+        if (!explicit_stage) cfg.stage = Inkling2TwoDSDStage::Stage1;
+        if (!explicit_k)     cfg.k = 1; // depth-only pipelining: ~3 cells/slot -> 24+ cells across 8 slots, 0 draft cost!
+        if (!explicit_conf)  cfg.draft_confidence = 0.0f;
+    } else if (active_slots >= 4) {
+        if (!explicit_k)    cfg.k = std::min(cfg.k, 6);
+        if (!explicit_conf) cfg.draft_confidence = std::max(cfg.draft_confidence, 0.75f);
+    } else { // 2..3 active slots
+        if (!explicit_conf) cfg.draft_confidence = std::max(cfg.draft_confidence, 0.65f);
+    }
+    return cfg;
+}
+
 namespace {
 
 enum class NodeRole { Main = 0, Frozen = 1, Fork = 2 };
@@ -68,6 +89,8 @@ struct TreeNode {
 
     int32_t  readouts[5]    = { -1, -1, -1, -1, -1 }; // indexed by depth 1..R
     bool     has_readout[5] = {};
+    bool     has_sample_r   = false;
+    Inkling2TwoDSDDepthRSample sample_r;
     std::unordered_map<int32_t, int> children; // token -> child node id
     std::vector<int> frozen_suffix;            // node ids starting at this frozen head
 };
@@ -80,9 +103,10 @@ struct DraftEvent {
 
 struct TrieState {
     Inkling2TwoDSDRunner & runner;
-    const Inkling2TwoDSDConfig & cfg;
+    Inkling2TwoDSDConfig cfg;
     Inkling2TwoDSDStats & stats;
     int output_limit = 0;
+    const Inkling2TwoDSDSamplerHooks * sampler = nullptr;
 
     int next_id = 0;
     int cursor_id = -1;
@@ -91,8 +115,9 @@ struct TrieState {
     std::unordered_map<int, std::vector<int>> blocks; // head_id -> [head_id, s1, ...]
     std::vector<DraftEvent> events;
 
-    TrieState(Inkling2TwoDSDRunner & r, const Inkling2TwoDSDConfig & c, Inkling2TwoDSDStats & st, int out_lim)
-        : runner(r), cfg(c), stats(st), output_limit(out_lim) {
+    TrieState(Inkling2TwoDSDRunner & r, const Inkling2TwoDSDConfig & c, Inkling2TwoDSDStats & st,
+              int out_lim, const Inkling2TwoDSDSamplerHooks * samp = nullptr)
+        : runner(r), cfg(c), stats(st), output_limit(out_lim), sampler(samp) {
         const int cap = runner.max_nodes();
         free_slots.reserve(cap);
         for (int s = cap - 1; s >= 0; --s) free_slots.push_back(s);
@@ -320,7 +345,9 @@ struct TrieState {
         while (nodes.at(cursor_id).depth == cfg.R) {
             const int cur_id = cursor_id;
             const auto & cur = nodes.at(cur_id);
-            int32_t emit_tok = cur.readouts[cfg.R];
+            int32_t emit_tok = (sampler && sampler->sample && cur.has_sample_r)
+                ? sampler->sample(cur.sample_r, cur.readouts[cfg.R])
+                : cur.readouts[cfg.R];
             const bool more = on_commit(emit_tok);
 
             int chosen_id = -1;
@@ -399,16 +426,18 @@ struct TrieState {
         return true;
     }
 
-    bool run_draft_events(std::string & error) {
+    void collect_draft_reqs(
+            std::vector<Inkling2TwoDSDDraftReq> & reqs,
+            std::vector<int> & plan_heads,
+            std::vector<int> & plan_widths) {
+        reqs.clear();
+        plan_heads.clear();
+        plan_widths.clear();
         std::vector<DraftEvent> evs;
         evs.swap(events);
-        if (evs.empty()) return true;
+        if (evs.empty()) return;
 
         std::unordered_set<int> seen;
-        std::vector<int> plan_heads;
-        std::vector<int> plan_widths;
-        std::vector<Inkling2TwoDSDDraftReq> reqs;
-
         for (const auto & ev : evs) {
             auto it = nodes.find(ev.head_id);
             if (it == nodes.end() || !it->second.growing) continue;
@@ -438,22 +467,15 @@ struct TrieState {
             plan_heads.push_back(head.id);
             plan_widths.push_back(width);
         }
+    }
 
-        if (reqs.empty()) return true;
-
-        const auto td0 = std::chrono::steady_clock::now();
-        std::vector<Inkling2TwoDSDDraftOut> outs;
-        if (!runner.draft_batch(reqs, outs) || outs.size() != reqs.size()) {
-            error = "inkling2_2dsd: draft_batch failed";
-            return false;
-        }
-        const auto td1 = std::chrono::steady_clock::now();
-        stats.draft_s += std::chrono::duration<double>(td1 - td0).count();
-        ++stats.drafter_batches;
-        stats.drafter_calls += (long long) reqs.size();
-
-        for (size_t i = 0; i < reqs.size(); ++i) {
+    void apply_draft_outs(
+            const std::vector<int> & plan_heads,
+            const std::vector<int> & plan_widths,
+            const std::vector<Inkling2TwoDSDDraftOut> & outs) {
+        for (size_t i = 0; i < plan_heads.size() && i < outs.size(); ++i) {
             const int head_id = plan_heads[i];
+            if (!nodes.count(head_id)) continue;
             const int n_want  = std::min(plan_widths[i] - 1, (int) outs[i].tokens.size());
             int n_keep = n_want;
             // Static draft_confidence pruning: truncate before first slot below threshold!
@@ -477,18 +499,196 @@ struct TrieState {
                 parent_id = cid;
             }
         }
+    }
+
+    bool run_draft_events(std::string & error) {
+        std::vector<Inkling2TwoDSDDraftReq> reqs;
+        std::vector<int> plan_heads;
+        std::vector<int> plan_widths;
+        collect_draft_reqs(reqs, plan_heads, plan_widths);
+        if (reqs.empty()) return true;
+
+        const auto td0 = std::chrono::steady_clock::now();
+        std::vector<Inkling2TwoDSDDraftOut> outs;
+        if (!runner.draft_batch(reqs, outs) || outs.size() != reqs.size()) {
+            error = "inkling2_2dsd: draft_batch failed";
+            return false;
+        }
+        const auto td1 = std::chrono::steady_clock::now();
+        stats.draft_s += std::chrono::duration<double>(td1 - td0).count();
+        ++stats.drafter_batches;
+        stats.drafter_calls += (long long) reqs.size();
+
+        apply_draft_outs(plan_heads, plan_widths, outs);
         return true;
     }
 };
 
 } // namespace
 
-bool inkling2_2dsd_run_greedy(
+struct Inkling2TwoDSDSession::Impl {
+    TrieState trie;
+    Impl(Inkling2TwoDSDRunner & r, const Inkling2TwoDSDConfig & c, Inkling2TwoDSDStats & st,
+         int out_lim, const Inkling2TwoDSDSamplerHooks * samp)
+        : trie(r, c, st, out_lim, samp) {}
+};
+
+Inkling2TwoDSDSession::Inkling2TwoDSDSession(
+        Inkling2TwoDSDRunner & runner,
+        const Inkling2TwoDSDConfig & cfg,
+        Inkling2TwoDSDStats & stats,
+        int output_limit,
+        const Inkling2TwoDSDSamplerHooks * sampler)
+    : impl_(std::make_unique<Impl>(runner, cfg, stats, output_limit, sampler)) {}
+
+Inkling2TwoDSDSession::~Inkling2TwoDSDSession() = default;
+
+uint32_t Inkling2TwoDSDSession::readout_mask() const {
+    uint32_t mask = (1u << impl_->trie.cfg.d1) | (1u << impl_->trie.cfg.R);
+    if (impl_->trie.cfg.stage != Inkling2TwoDSDStage::Stage1) {
+        mask |= (1u << impl_->trie.cfg.d2);
+    }
+    return mask;
+}
+
+bool Inkling2TwoDSDSession::seed_cursor(int32_t first_token, int prefix_len_before_first, std::string & error) {
+    auto & trie = impl_->trie;
+    trie.cursor_id = trie.add_child(-1, first_token, NodeRole::Main, trie.cfg.R);
+    if (trie.cursor_id < 0) {
+        error = "inkling2_2dsd: failed to allocate initial cursor node";
+        return false;
+    }
+    trie.queue_anchor(trie.cursor_id, prefix_len_before_first, trie.cfg.R);
+    return true;
+}
+
+void Inkling2TwoDSDSession::collect_draft_reqs(
+        std::vector<Inkling2TwoDSDDraftReq> & out_reqs,
+        std::vector<int> & out_plan_heads,
+        std::vector<int> & out_plan_widths) {
+    impl_->trie.collect_draft_reqs(out_reqs, out_plan_heads, out_plan_widths);
+}
+
+void Inkling2TwoDSDSession::apply_draft_outs(
+        const std::vector<int> & plan_heads,
+        const std::vector<int> & plan_widths,
+        const std::vector<Inkling2TwoDSDDraftOut> & outs) {
+    impl_->trie.apply_draft_outs(plan_heads, plan_widths, outs);
+}
+
+bool Inkling2TwoDSDSession::collect_active(
+        std::vector<int> & out_active_ids,
+        std::vector<Inkling2TwoDSDNodeDesc> & out_descs,
+        std::string & error) const {
+    const auto & trie = impl_->trie;
+    out_active_ids.clear();
+    out_descs.clear();
+    out_active_ids.reserve(trie.nodes.size());
+    for (const auto & kv : trie.nodes) {
+        if (kv.second.depth < trie.cfg.R) out_active_ids.push_back(kv.first);
+    }
+    if (out_active_ids.empty()) {
+        error = "inkling2_2dsd: finalized trie has no active nodes";
+        return false;
+    }
+    std::sort(out_active_ids.begin(), out_active_ids.end(), [&](int a, int b) {
+        const auto & na = trie.nodes.at(a);
+        const auto & nb = trie.nodes.at(b);
+        return na.position < nb.position || (na.position == nb.position && na.id < nb.id);
+    });
+    out_descs.reserve(out_active_ids.size());
+    for (int nid : out_active_ids) {
+        const auto & nd = trie.nodes.at(nid);
+        Inkling2TwoDSDNodeDesc d;
+        d.token     = nd.token;
+        d.slot      = nd.slot;
+        d.pos       = nd.position;
+        d.depth     = nd.depth;
+        d.ancestors = trie.ancestor_slots(nid);
+        out_descs.push_back(std::move(d));
+    }
+    return true;
+}
+
+bool Inkling2TwoDSDSession::apply_step_and_verify(
+        const std::vector<int> & active_ids,
+        const std::vector<int> & readout_rows,
+        const std::vector<int32_t> & readout_argmax,
+        const std::function<bool(int32_t &)> & on_commit,
+        bool & stopped,
+        std::string & error) {
+    auto & trie = impl_->trie;
+    for (int nid : active_ids) {
+        trie.nodes.at(nid).depth += 1;
+    }
+    for (size_t i = 0; i < readout_rows.size(); ++i) {
+        const int nid = active_ids[readout_rows[i]];
+        auto & nd = trie.nodes.at(nid);
+        nd.readouts[nd.depth]    = readout_argmax[i];
+        nd.has_readout[nd.depth] = true;
+        if (nd.depth == trie.cfg.R && trie.sampler && trie.sampler->capture) {
+            trie.sampler->capture((int) i, nd.sample_r);
+            nd.has_sample_r = true;
+        }
+    }
+    if (!trie.run_verify(on_commit, stopped, error)) return false;
+    if (!stopped) {
+        trie.run_stage2(active_ids);
+        trie.run_stage1();
+    }
+    return true;
+}
+
+void Inkling2TwoDSDSession::update_config(const Inkling2TwoDSDConfig & cfg) {
+    impl_->trie.cfg = cfg;
+}
+
+int Inkling2TwoDSDSession::live_node_count() const {
+    return (int) impl_->trie.nodes.size();
+}
+
+int32_t Inkling2TwoDSDSession::cursor_token() const {
+    const auto & trie = impl_->trie;
+    auto it = trie.nodes.find(trie.cursor_id);
+    return (it != trie.nodes.end()) ? it->second.token : -1;
+}
+
+int Inkling2TwoDSDSession::cursor_pos() const {
+    const auto & trie = impl_->trie;
+    auto it = trie.nodes.find(trie.cursor_id);
+    return (it != trie.nodes.end()) ? it->second.position : -1;
+}
+
+int Inkling2TwoDSDSession::cursor_depth() const {
+    const auto & trie = impl_->trie;
+    auto it = trie.nodes.find(trie.cursor_id);
+    return (it != trie.nodes.end()) ? it->second.depth : -1;
+}
+
+void Inkling2TwoDSDSession::clear_cursor_children() {
+    auto & trie = impl_->trie;
+    auto it = trie.nodes.find(trie.cursor_id);
+    if (it == trie.nodes.end()) return;
+    std::vector<int> drop;
+    for (const auto & kv : it->second.children) {
+        trie.collect_descendants(kv.second, drop);
+    }
+    if (!drop.empty()) {
+        trie.drop_subtrees(drop);
+    }
+    it->second.children.clear();
+    trie.events.clear();
+    trie.blocks.clear();
+    trie.blocks[trie.cursor_id] = { trie.cursor_id };
+}
+
+bool inkling2_2dsd_run(
         Inkling2TwoDSDRunner & runner,
         const Inkling2TwoDSDConfig & cfg,
         int32_t first_token,
         int max_new,
         const std::function<bool(int32_t &)> & on_commit,
+        const Inkling2TwoDSDSamplerHooks * sampler,
         Inkling2TwoDSDStats & stats,
         std::string & error) {
     stats = {};
@@ -502,78 +702,63 @@ bool inkling2_2dsd_run_greedy(
     const int output_limit = std::min(pref0 + max_new, runner.max_ctx());
     if (pref0 >= output_limit) return true;
 
-    uint32_t readout_mask = (1u << cfg.d1) | (1u << cfg.R);
-    if (cfg.stage != Inkling2TwoDSDStage::Stage1) {
-        readout_mask |= (1u << cfg.d2);
-    }
+    Inkling2TwoDSDSession session(runner, cfg, stats, output_limit, sampler);
+    if (!session.seed_cursor(first, pref0 - 1, error)) return false;
 
-    TrieState trie(runner, cfg, stats, output_limit);
-    trie.cursor_id = trie.add_child(-1, first, NodeRole::Main, cfg.R);
-    if (trie.cursor_id < 0) {
-        error = "inkling2_2dsd: failed to allocate initial cursor node";
-        return false;
-    }
-    trie.queue_anchor(trie.cursor_id, pref0 - 1, cfg.R);
-    if (!trie.run_draft_events(error)) return false;
-
-    bool stopped = false;
-    while (!stopped) {
-        // Gather all active nodes (depth < R) sorted by (position, node_id)
-        std::vector<int> active_ids;
-        active_ids.reserve(trie.nodes.size());
-        for (const auto & kv : trie.nodes) {
-            if (kv.second.depth < cfg.R) active_ids.push_back(kv.first);
-        }
-        if (active_ids.empty()) {
-            error = "inkling2_2dsd: finalized trie has no active nodes";
+    auto run_pending_drafts = [&]() -> bool {
+        std::vector<Inkling2TwoDSDDraftReq> reqs;
+        std::vector<int> heads, widths;
+        session.collect_draft_reqs(reqs, heads, widths);
+        if (reqs.empty()) return true;
+        const auto td0 = std::chrono::steady_clock::now();
+        std::vector<Inkling2TwoDSDDraftOut> outs;
+        if (!runner.draft_batch(reqs, outs) || outs.size() != reqs.size()) {
+            error = "inkling2_2dsd: draft_batch failed";
             return false;
         }
-        std::sort(active_ids.begin(), active_ids.end(), [&](int a, int b) {
-            const auto & na = trie.nodes.at(a);
-            const auto & nb = trie.nodes.at(b);
-            return na.position < nb.position || (na.position == nb.position && na.id < nb.id);
-        });
+        const auto td1 = std::chrono::steady_clock::now();
+        stats.draft_s += std::chrono::duration<double>(td1 - td0).count();
+        ++stats.drafter_batches;
+        stats.drafter_calls += (long long) reqs.size();
+        session.apply_draft_outs(heads, widths, outs);
+        return true;
+    };
 
+    if (!run_pending_drafts()) return false;
+
+    const uint32_t rmask = session.readout_mask();
+    bool stopped = false;
+    while (!stopped) {
+        std::vector<int> active_ids;
         std::vector<Inkling2TwoDSDNodeDesc> descs;
-        descs.reserve(active_ids.size());
-        for (int nid : active_ids) {
-            const auto & nd = trie.nodes.at(nid);
-            Inkling2TwoDSDNodeDesc d;
-            d.token     = nd.token;
-            d.slot      = nd.slot;
-            d.pos       = nd.position;
-            d.depth     = nd.depth;
-            d.ancestors = trie.ancestor_slots(nid);
-            descs.push_back(std::move(d));
-        }
+        if (!session.collect_active(active_ids, descs, error)) return false;
 
         std::vector<int> readout_rows;
         std::vector<int32_t> readout_argmax;
-        if (!runner.advance_nodes(descs, readout_mask, readout_rows, readout_argmax)) {
+        if (!runner.advance_nodes(descs, rmask, readout_rows, readout_argmax)) {
             error = "inkling2_2dsd: advance_nodes failed";
             return false;
         }
         ++stats.target_calls;
         stats.target_cells += (long long) active_ids.size();
 
-        for (int nid : active_ids) {
-            trie.nodes.at(nid).depth += 1;
+        if (!session.apply_step_and_verify(active_ids, readout_rows, readout_argmax, on_commit, stopped, error)) {
+            return false;
         }
-        for (size_t i = 0; i < readout_rows.size(); ++i) {
-            const int nid = active_ids[readout_rows[i]];
-            auto & nd = trie.nodes.at(nid);
-            nd.readouts[nd.depth]    = readout_argmax[i];
-            nd.has_readout[nd.depth] = true;
-        }
-
-        if (!trie.run_verify(on_commit, stopped, error)) return false;
-        if (!stopped) {
-            trie.run_stage2(active_ids);
-            trie.run_stage1();
-            if (!trie.run_draft_events(error)) return false;
-        }
+        if (!stopped && !run_pending_drafts()) return false;
     }
     return true;
+}
+
+bool inkling2_2dsd_run_greedy(
+        Inkling2TwoDSDRunner & runner,
+        const Inkling2TwoDSDConfig & cfg,
+        int32_t first_token,
+        int max_new,
+        const std::function<bool(int32_t &)> & on_commit,
+        Inkling2TwoDSDStats & stats,
+        std::string & error) {
+    return inkling2_2dsd_run(runner, cfg, first_token, max_new, on_commit, nullptr, stats, error);
 }
 
 } // namespace luce::common

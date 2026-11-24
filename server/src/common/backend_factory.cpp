@@ -309,6 +309,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.device        = placement.target;
         cfg.expert_device = placement.expert;
         cfg.chunk         = execution.chunk;
+        cfg.max_concurrency = execution.max_concurrency;
         cfg.cache_type_k  = cache.cache_type_k;
         cfg.cache_type_v  = cache.cache_type_v;
 
