@@ -22,9 +22,14 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded PR runs (opened/synchronize/reopened, attempt 1) so pushes
+# don't pile up on the same PR, while giving main pushes, merge_group, manual
+# dispatches, and reruns their own workflow group. Sharing one workflow group
+# across main pushes blocked hosted sccache-seeding builds for 8-24h whenever
+# lucebox3 had a queue backlog or went offline.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) && format('pr-latest-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
 jobs:
   plan:
@@ -458,7 +463,12 @@ jobs:
       # itself runs only across both GPUs; serve-smoke-amd below serves it).
       LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
+    # Collapse queued main pushes per arch (at most one active + one pending) so
+    # rapid merges don't pile redundant lucebox3 builds, while keeping each PR
+    # run in its own group so PRs never cancel one another on lucebox3.
+    concurrency:
+      group: ${{ github.event_name == 'push' && format('lucebox3-main-{0}', matrix.arch) || format('lucebox3-run-{0}-{1}', github.run_id, matrix.arch) }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -683,7 +693,8 @@ jobs:
       LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
       LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
+    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs
+    # (and gpu-tests-amd above already collapses queued main pushes).
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
