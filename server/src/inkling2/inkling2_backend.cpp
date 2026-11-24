@@ -1,6 +1,7 @@
 // Inkling2Backend — ModelBackend implementation for Inkling 2 / Inkling 2 Mini.
 
 #include "inkling2_backend.h"
+#include "inkling2_top_cands.h"
 
 #include "common/peer_access.h"
 #include "common/sampler.h"
@@ -572,49 +573,19 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
     };
     // Exact fast sampler over GPU-extracted top-256 candidates + exact full-vocab Z (auto-fallback to full row if needed!)
     std::vector<float> fallback_row;
+    std::vector<std::pair<double, int32_t>> fast_cands;
     auto sample_row_fast = [&](const Inkling2ForwardOut & fr, int row_idx) -> int32_t {
         if (!fr.top_cands.empty()) {
-            const int32_t * rc = fr.top_cands.data() + (size_t) row_idx * 516;
-            const int cnt = rc[0];
-            float gmax = 0.0f, Z = 0.0f;
-            std::memcpy(&gmax, &rc[1], sizeof(float));
-            std::memcpy(&Z,    &rc[2], sizeof(float));
-            if (cnt > 0 && cnt <= 256 && Z > 0.0f && std::isfinite(Z)) {
-                struct Cand { float v; int32_t id; };
-                Cand cands[256];
-                for (int j = 0; j < cnt; ++j) {
-                    std::memcpy(&cands[j].v, &rc[4 + 2 * j], sizeof(float));
-                    cands[j].id = rc[4 + 2 * j + 1];
-                }
-                std::sort(cands, cands + cnt, [](const Cand & a, const Cand & b) {
-                    return a.v > b.v || (a.v == b.v && a.id < b.id);
-                });
-                const int k_lim = (req.sampler.top_k > 0 && req.sampler.top_k < cnt) ? req.sampler.top_k : cnt;
-                const float inv_t = 1.0f / std::max(req.sampler.temp, 1e-6f);
-                float probs[256];
+            const int32_t * rc = fr.top_cands.data() + (size_t) row_idx * kInkling2TopCandsRow;
+            if (inkling2_top_cands_weights(rc, n_vocab, req.sampler, fast_cands)) {
                 double cum = 0.0;
-                int keep = 0;
-                for (int j = 0; j < k_lim; ++j) {
-                    const float p = std::exp((cands[j].v - gmax) * inv_t) / Z;
-                    probs[j] = p;
-                    cum += p;
-                    keep = j + 1;
-                    if (req.sampler.top_p > 0.0f && req.sampler.top_p < 1.0f && cum >= req.sampler.top_p) {
-                        break;
-                    }
-                }
-                const bool exact_ok =
-                    (req.sampler.top_k > 0 && cnt >= req.sampler.top_k) ||
-                    (req.sampler.top_p > 0.0f && req.sampler.top_p < 1.0f && cum >= req.sampler.top_p) ||
-                    (cum >= 0.9995);
-                if (exact_ok && keep > 0 && cum > 0.0) {
-                    std::uniform_real_distribution<double> u01(0.0, cum);
-                    double r = u01(rng);
-                    double acc = 0.0;
-                    for (int j = 0; j < keep; ++j) {
-                        acc += probs[j];
-                        if (r <= acc || j == keep - 1) return cands[j].id;
-                    }
+                for (const auto & c : fast_cands) cum += c.first;
+                std::uniform_real_distribution<double> u01(0.0, cum);
+                double r = u01(rng);
+                double acc = 0.0;
+                for (size_t j = 0; j < fast_cands.size(); ++j) {
+                    acc += fast_cands[j].first;
+                    if (r <= acc || j + 1 == fast_cands.size()) return fast_cands[j].second;
                 }
             }
             // Rare fallback (flat high-temperature distribution): fetch only this single row
