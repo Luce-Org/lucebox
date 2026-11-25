@@ -223,7 +223,10 @@ static bool parse_and_validate_reranker_header(
     const uint64_t data_offset = (uint64_t) gguf_get_data_offset(g);
     const auto check_tensor = [&](const RerankerTensorSpec & r) -> bool {
         ggml_tensor * src = ggml_get_tensor(data_ctx, r.name.c_str());
-        if (!src || src->type != GGML_TYPE_F32 ||
+        // 2D tensors only feed ggml_mul_mat as src0, so they may be F16; 1D norms and biases
+        // feed ggml_add/ggml_mul and stay F32.
+        if (!src ||
+            !(src->type == GGML_TYPE_F32 || (r.n_dims == 2 && src->type == GGML_TYPE_F16)) ||
             src->ne[0] != r.ne0 || src->ne[1] != r.ne1 ||
             src->ne[2] != 1 || src->ne[3] != 1) {
             error = "seg reranker tensor mismatch: " + r.name;
@@ -446,16 +449,22 @@ bool load_pflash_seg_reranker(
     out.ctx = ggml_init(ip);
     if (!out.ctx) return fail("seg reranker context alloc failed");
 
+    int n_matmul = 0;
+    int n_matmul_f16 = 0;
     for (size_t idx = 0; idx < specs.size(); ++idx) {
         const auto & r = specs[idx];
         ggml_tensor * src = ggml_get_tensor(data_ctx, r.name.c_str());
         *dsts[idx] = r.n_dims == 1
-            ? ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, r.ne0)
-            : ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, r.ne0, r.ne1);
+            ? ggml_new_tensor_1d(out.ctx, src->type, r.ne0)
+            : ggml_new_tensor_2d(out.ctx, src->type, r.ne0, r.ne1);
         if (ggml_nbytes(src) != ggml_nbytes(*dsts[idx])) {
             return fail("seg reranker tensor byte size mismatch: " + r.name);
         }
         ggml_set_name(*dsts[idx], r.name.c_str());
+        if (r.n_dims == 2) {
+            ++n_matmul;
+            if (src->type == GGML_TYPE_F16) ++n_matmul_f16;
+        }
     }
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) return fail("seg reranker backend buffer alloc failed");
@@ -481,14 +490,15 @@ bool load_pflash_seg_reranker(
     out.loaded = true;
     if (out.delta_min > -1e8f || out.delta_max < 1e8f) {
         std::fprintf(stderr,
-            "[pflash-reranker] loaded %s (mode=%s in=%d d=%d H=%d L=%d ff=%d delta=[%.3g,%.3g])\n",
+            "[pflash-reranker] loaded %s (mode=%s in=%d d=%d H=%d L=%d ff=%d f16_weights=%d/%d delta=[%.3g,%.3g])\n",
             path.c_str(), out.feature_mode.c_str(), out.in_dim, out.d_model,
-            out.n_heads, out.n_layers, out.d_ff, out.delta_min, out.delta_max);
+            out.n_heads, out.n_layers, out.d_ff, n_matmul_f16, n_matmul,
+            out.delta_min, out.delta_max);
     } else {
         std::fprintf(stderr,
-            "[pflash-reranker] loaded %s (mode=%s in=%d d=%d H=%d L=%d ff=%d)\n",
+            "[pflash-reranker] loaded %s (mode=%s in=%d d=%d H=%d L=%d ff=%d f16_weights=%d/%d)\n",
             path.c_str(), out.feature_mode.c_str(), out.in_dim, out.d_model,
-            out.n_heads, out.n_layers, out.d_ff);
+            out.n_heads, out.n_layers, out.d_ff, n_matmul_f16, n_matmul);
     }
     std::fflush(stderr);
     return true;

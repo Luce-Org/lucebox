@@ -79,6 +79,7 @@ bool validate_pflash_seg_reranker_gguf(
     std::string & error);
 
 // Load a `pflash_seg_reranker_v1` GGUF onto `backend`.
+// 2D matmul weight tensors may be F32 or F16; 1D norms and biases must be F32.
 // If `expected_drafter_sha256` is non-empty, enforces exact drafter binding; if
 // `expected_head_sha256` is non-empty and the GGUF names its scoring head
 // (`reranker.scoring_head_sha256`), enforces exact head binding.

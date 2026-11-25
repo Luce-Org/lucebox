@@ -252,16 +252,25 @@ static bool load_qwen35_scoring_head(const std::string & path,
     head_params.no_alloc = true;
     st.head_ctx = ggml_init(head_params);
     if (!st.head_ctx) return fail("scoring head context allocation failed");
+    int n_f16 = 0;
     for (const auto & contract : contracts) {
         ggml_tensor * source = data_ctx ? ggml_get_tensor(data_ctx, contract.name) : nullptr;
-        if (!source || source->type != GGML_TYPE_F32 || ggml_n_dims(source) != 2 ||
+        // Both matrices only feed ggml_mul_mat as src0, so they may be F16 or F32.
+        if (!source ||
+            (source->type != GGML_TYPE_F32 && source->type != GGML_TYPE_F16) ||
+            ggml_n_dims(source) != 2 ||
             source->ne[0] != contract.ne0 || source->ne[1] != contract.ne1) {
             return fail(std::string("scoring head tensor contract mismatch: ") +
                         contract.name);
         }
         *contract.destination =
-            ggml_new_tensor_2d(st.head_ctx, GGML_TYPE_F32, contract.ne0, contract.ne1);
+            ggml_new_tensor_2d(st.head_ctx, source->type, contract.ne0, contract.ne1);
+        if (ggml_nbytes(source) != ggml_nbytes(*contract.destination)) {
+            return fail(std::string("scoring head tensor byte size mismatch: ") +
+                        contract.name);
+        }
         ggml_set_name(*contract.destination, contract.name);
+        if (source->type == GGML_TYPE_F16) ++n_f16;
     }
     st.head_buf = ggml_backend_alloc_ctx_tensors(st.head_ctx, w.backend);
     if (!st.head_buf) return fail("scoring head buffer allocation failed");
@@ -274,7 +283,8 @@ static bool load_qwen35_scoring_head(const std::string & path,
     st.head_file_id = head_fd_id;
     st.head_sha256 = head_sha;
     st.head_loaded = true;
-    std::fprintf(stderr, "[qwen35-drafter] loaded scoring head: %s\n", path.c_str());
+    std::fprintf(stderr, "[qwen35-drafter] loaded scoring head: %s (f16_weights=%d/2)\n",
+                 path.c_str(), n_f16);
     std::fflush(stderr);
     return true;
 }
@@ -920,7 +930,9 @@ static bool validate_head_gguf_header(
     };
     for (const auto & r : reqs) {
         ggml_tensor * t = ggml_get_tensor(data_ctx, r.name);
-        if (!t || t->type != GGML_TYPE_F32 || ggml_n_dims(t) != 2 ||
+        if (!t ||
+            (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) ||
+            ggml_n_dims(t) != 2 ||
             t->ne[0] != r.ne0 || t->ne[1] != r.ne1) {
             return fail(std::string("scoring head tensor contract mismatch: ") + r.name);
         }
