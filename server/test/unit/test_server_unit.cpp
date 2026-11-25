@@ -7753,11 +7753,13 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_qsa_batch_boundary) {
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, true, true));
     TEST_ASSERT(!qwen4exp_can_batch(w, spans, 2, false));
     spans[0].n_tokens = 1;
-    Qwen4ExpForwardSegment rows[5] = {spans[0], spans[1], spans[0], spans[1], spans[0]};
+    Qwen4ExpForwardSegment rows[17];
+    for (int i = 0; i < 17; ++i) rows[i] = (i % 2 == 0) ? spans[0] : spans[1];
     TEST_ASSERT(qwen4exp_can_batch(w, rows, 4, true));
     TEST_ASSERT(qwen4exp_can_batch(w, rows, 3, true));
-    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 5, true)); // batch-invariant MMID ceiling
-    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 5, false));
+    TEST_ASSERT(qwen4exp_can_batch(w, rows, 16, true));
+    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 17, true)); // multi-slot decode ceiling (kQwen4ExpMaxBatchedSlots)
+    TEST_ASSERT(!qwen4exp_can_batch(w, rows, 17, false));
     w.indexer_top_k = 1024;
     spans[0].pos0 = 1026;
     spans[0].n_tokens = 1;

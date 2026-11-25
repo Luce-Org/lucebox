@@ -168,6 +168,7 @@ private:
     int remote_layers_ = 0;   // split mode: full-attention layers whose cache rows and attention run on the expert device
     int kvflash_pool_ = 0;    // --kvflash: the full-attention rows each slot's cache pools (0: one per position)
     int recall_mode_ = 0;      // LUCE_Q4_INDEXER_RECALL after refusals (0 off, 1 score only, 2 recall)
+    int recall_pinned_width_from_ = -1; // original cfg_.verify_width when recall_mode_=2 pinned it (-1: not pinned)
     int recall_queries_ = 64;  // LUCE_Q4_RECALL_QUERIES
     bool pool_qsa_ = true;     // LUCE_Q4_POOL_QSA (Qwen4ExpCache::pool_qsa where supported)
     int recall_tail_ = kQ4RecallTailDefault;   // LUCE_Q4_RECALL_TAIL (mode 2 only)

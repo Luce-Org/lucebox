@@ -151,8 +151,9 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
             w.n_embd_head_v, attn_rows, w.n_head_kv);
         const int il = out.full_layer_ids[i];
         const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
-        // QSA selects blocks of positions laid out in order, which pool slots are not: a pooled cache attends densely.
-        // ponytail: recall keeps the indexer at full max_ctx (F32 raw keys, ~max_ctx * 512 B per full-attention layer).
+        // QSA selects blocks of positions laid out in order, which pool slots are not: a pooled cache attends densely
+        // unless pool_qsa is active. Pooled KVFlash recall stores indexer_raw in F16 (~max_ctx * 256 B per full-attn
+        // layer) to cut VRAM across concurrent slots; unpooled full-context QSA keeps F32 (~max_ctx * 512 B).
         if (w.indexer_head_size > 0 && ratio > 0 && (kvflash_pool == 0 || recall_queries > 0)) {
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,

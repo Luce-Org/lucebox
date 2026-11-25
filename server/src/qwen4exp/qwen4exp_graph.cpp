@@ -792,6 +792,7 @@ static ggml_tensor * qsa_pooled_keys_stable(ggml_context * c, const Qwen4ExpLaye
         ggml_tensor * row = ggml_view_1d(c, ws.qsa_params, 1, o + 5 * sizeof(int32_t));
         ggml_tensor * pos = ggml_view_1d(c, ws.qsa_params, 4, o + 6 * sizeof(int32_t));
         ggml_tensor * span = ggml_get_rows(c, raw_written, rows);
+        if (span->type != GGML_TYPE_F32) span = ggml_cast(c, span, GGML_TYPE_F32);
         ggml_tensor * fresh = qsa_pool_norm_rope(c, L, w, qwen4exp_pool_blocks(c, span, 4), pos);
         written = ggml_set_rows(c, written, fresh, row);
     }

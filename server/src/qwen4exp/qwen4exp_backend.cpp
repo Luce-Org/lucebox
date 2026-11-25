@@ -673,24 +673,33 @@ bool Qwen4ExpBackend::create_main_cache() {
 // memory). It holds the full-attention layers' F16 K/V; the MTP draft layer keeps one row per position.
 void Qwen4ExpBackend::size_kvflash_pool() {
     const Qwen4ExpWeights & w = weights_;
-    int64_t n_full = 0, recall_bytes = 0;
+    int64_t n_full = 0, recall_bytes_f16 = 0, recall_bytes_f32 = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         n_full += w.layers[il].is_full_attention;
-        if (recall_mode_ > 0 && w.layers[il].is_full_attention)
-            recall_bytes += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size,
-                                                  il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                                  /*f16_raw=*/true);
+        if (recall_mode_ > 0 && w.layers[il].is_full_attention) {
+            const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
+            recall_bytes_f16 += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size, ratio, /*f16_raw=*/true);
+            recall_bytes_f32 += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size, ratio, /*f16_raw=*/false);
+        }
     }
-    recall_bytes *= cfg_.max_concurrency;
+    recall_bytes_f16 *= cfg_.max_concurrency;
+    recall_bytes_f32 *= cfg_.max_concurrency;
     KvFlashAutoBudget budget;
     budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
     // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
     // No cache yet: the drafter's per-token room is counted at the configured context. recall_bytes: the indexer rows
     // a recall mode keeps at the full context beside the pool (settling may still drop them; the pool then just stays smaller).
-    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx) + recall_bytes;
+    const int64_t base_reserve = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
+    budget.reserve_bytes = base_reserve + recall_bytes_f16;
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+    // If auto sized up to full context under F16 raw-key savings, kvflash_pool_for() disables paging and allocates
+    // F32 raw keys; re-size with F32 reserve so auto does not overcommit when full context only fits with F16.
+    if (kvflash_pool_ >= cfg_.device.max_ctx && recall_bytes_f32 > recall_bytes_f16) {
+        budget.reserve_bytes = base_reserve + recall_bytes_f32;
+        kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+    }
 }
 
 // LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall), LUCE_Q4_RECALL_QUERIES and LUCE_Q4_RECALL_TAIL. An invalid value
@@ -713,8 +722,10 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
                      recall_mode_);
         recall_mode_ = 0;
     }
-    // Before the cache is sized, so the pin equals --verify-width 5. ponytail: a later settle to score only keeps the pin.
+    // Before the cache is sized, so the pin equals --verify-width 5; restored if settling drops recall to 0.
+    recall_pinned_width_from_ = -1;
     if (const int w = q4_recall_verify_width(recall_mode_, cfg_.verify_width); w != cfg_.verify_width) {
+        recall_pinned_width_from_ = cfg_.verify_width;
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=2 pins the MTP verify width to %d (the adaptive width "
                      "varies with step timings, which changes recall's picks run to run; --verify-width overrides)\n", w);
         cfg_.verify_width = w;
@@ -728,6 +739,10 @@ void Qwen4ExpBackend::settle_indexer_recall() {
     if (s.why)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
     recall_mode_ = s.mode;
+    if (recall_mode_ == 0 && recall_pinned_width_from_ >= 0) {
+        cfg_.verify_width = recall_pinned_width_from_;
+        recall_pinned_width_from_ = -1;
+    }
     if (cache_.pool_qsa)
         std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; the "
                      "replayed tail densely; LUCE_Q4_POOL_QSA=0: dense over the pool)\n");

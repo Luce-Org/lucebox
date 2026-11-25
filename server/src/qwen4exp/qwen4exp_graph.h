@@ -47,7 +47,7 @@ constexpr int64_t kQwen4ExpStableQsaMaxCtx = 262144;
 // kQwen4ExpStableQsaMaxCtx).
 int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
 
-// The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
+// The multi-slot decode graph's row ceiling (supports up to 16 concurrent slots).
 constexpr int kQwen4ExpMaxBatchedSlots = 16;
 // The rows per slot of a batched verify (qwen4exp_verify_batched): a pending token and three drafts. Two slots fill one
 // batch-invariant product (8 rows).
