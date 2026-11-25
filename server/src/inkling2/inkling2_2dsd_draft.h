@@ -23,6 +23,7 @@ struct Inkling2TwoDSDDraftReq {
 
 struct Inkling2TwoDSDDraftOut {
     std::vector<int32_t> tokens;     // size = block_size - 1 (7)
+    std::vector<int32_t> alt_tokens; // optional 2nd-best Markov token per slot (for confidence-guided branching)
     std::vector<float>   confidence; // size = block_size - 1 (7), probabilities in [0, 1]
 };
 

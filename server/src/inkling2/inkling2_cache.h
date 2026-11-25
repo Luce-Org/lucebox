@@ -23,8 +23,9 @@ namespace luce::common {
 constexpr int kInkling2MaxVerify     = 8;   // 1 anchor + up to 7 DSpark drafts
 constexpr int kInkling2TwoDSDMaxNodes = 128; // live tree slots (slot 128 = scratch padding)
 constexpr int kInkling2TwoDSDMaxCommit = 16; // max committed path length per step
-constexpr int kInkling2TwoDSDFlagsLater   = 1;
-constexpr int kInkling2TwoDSDFlagsPadding = 2;
+constexpr int kInkling2TwoDSDFlagsLater     = 1;
+constexpr int kInkling2TwoDSDFlagsPadding   = 2;
+constexpr int kInkling2TwoDSDFlagsEarlyCoda = 4; // Coda d1/d2 early readout row (piggybacks on depth-3 experts!)
 
 struct Inkling2GraphWorkspace {
     ggml_context *       ctx     = nullptr;
@@ -147,6 +148,7 @@ struct Inkling2TwoDSDDraftGraph {
     ggml_tensor * inp_span_wpos  = nullptr; // I32 [S_b * L_b]
     ggml_tensor * inp_draft_meta = nullptr; // I32 [3 + L_b]
     ggml_tensor * out_tokens     = nullptr; // I32 [L_b, 7] (7 steps x L_b leaves)
+    ggml_tensor * out_alt_tokens = nullptr; // I32 [L_b, 7] (2nd-best Markov token per slot for tree branching!)
     ggml_tensor * out_conf       = nullptr; // F32 [7 * L_b]
 };
 

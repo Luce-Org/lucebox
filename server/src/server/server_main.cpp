@@ -1304,10 +1304,12 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name.c_str());
         return 2;
     }
-    // qwen4exp owns full per-slot caches; other concurrent engines use paging.
-    if (bargs.max_concurrency > 1 &&
-        inspect_gguf_model_info(bargs.model_path.c_str()).arch != "qwen4exp")
-        bargs.paged_attention = true;
+    // qwen4exp and inkling2 own per-slot caches; other concurrent engines use paged decode.
+    if (bargs.max_concurrency > 1) {
+        const std::string conc_arch = inspect_gguf_model_info(bargs.model_path.c_str()).arch;
+        if (conc_arch != "qwen4exp" && !luce::common::arch_is_inkling2_family(conc_arch))
+            bargs.paged_attention = true;
+    }
     // --max-ctx auto starts from the trained context; the backend lowers it to what its devices hold.
     if (bargs.device.fit_ctx) {
         const GgufMetadata meta = read_gguf_metadata(bargs.model_path, false);

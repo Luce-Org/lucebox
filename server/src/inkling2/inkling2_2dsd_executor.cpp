@@ -3,6 +3,7 @@
 #include "inkling2_2dsd_executor.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,23 @@ Inkling2TwoDSDConfig inkling2_2dsd_config_from_env(int R, int block_size) {
     if (const char * ec = std::getenv("LUCE_INKLING2_2DSD_CONF")) {
         const float v = std::strtof(ec, nullptr);
         if (v >= 0.0f && v <= 1.0f) cfg.draft_confidence = v;
+    }
+    if (const char * eb = std::getenv("LUCE_INKLING2_3DSD_TREE_BRANCH")) {
+        cfg.tree_branch = (std::atoi(eb) != 0);
+    }
+    if (const char * el = std::getenv("LUCE_INKLING2_3DSD_LOOKUP")) {
+        cfg.prompt_lookup = (std::atoi(el) != 0);
+    }
+    if (const char * elk = std::getenv("LUCE_INKLING2_3DSD_LOOKUP_K")) {
+        const int v = std::atoi(elk);
+        if (v >= 2 && v <= 32) cfg.lookup_max_k = v;
+    }
+    if (const char * bi = std::getenv("LUCE_BATCH_INVARIANT")) {
+        if (std::atoi(bi) != 0) cfg.lookup_max_k = std::min(cfg.lookup_max_k, 7);
+    }
+    if (const char * ee = std::getenv("LUCE_INKLING2_2DSD_EARLY_EXIT_P")) {
+        const float v = std::strtof(ee, nullptr);
+        if (v >= 0.0f && v <= 1.0f) cfg.early_exit_p = v;
     }
     if (cfg.stage != Inkling2TwoDSDStage::Stage1 && !(cfg.d1 < cfg.d2 && cfg.d2 < cfg.R)) {
         cfg.stage = Inkling2TwoDSDStage::Stage1;
@@ -87,12 +105,89 @@ struct TreeNode {
     bool     from_draft     = false;
     int      proposal_depth = 0;
 
-    int32_t  readouts[5]    = { -1, -1, -1, -1, -1 }; // indexed by depth 1..R
-    bool     has_readout[5] = {};
-    bool     has_sample_r   = false;
+    int32_t  readouts[5]     = { -1, -1, -1, -1, -1 }; // indexed by depth 1..R
+    bool     has_readout[5]  = {};
+    float    readout_pmax[5] = {};
+    bool     early_exited_d2 = false;
+    bool     has_sample_r    = false;
     Inkling2TwoDSDDepthRSample sample_r;
     std::unordered_map<int32_t, int> children; // token -> child node id
     std::vector<int> frozen_suffix;            // node ids starting at this frozen head
+};
+
+// Lightweight O(1) trigram prompt-lookup matcher supporting in-flight ancestor suffixes.
+struct TwoDSDSuffixLookup {
+    static constexpr int kWays = 4;
+    static constexpr int kMinMatch = 4;
+    static constexpr int kMaxMatch = 32;
+
+    std::vector<int32_t> hist;
+    std::unordered_map<uint64_t, std::array<int32_t, kWays>> index;
+
+    static uint64_t key3(int32_t a, int32_t b, int32_t c) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        h = (h ^ (uint32_t) a) * 0x100000001b3ull;
+        h = (h ^ (uint32_t) b) * 0x100000001b3ull;
+        h = (h ^ (uint32_t) c) * 0x100000001b3ull;
+        return h;
+    }
+
+    void reset(const std::vector<int32_t> & tokens) {
+        hist.clear();
+        index.clear();
+        hist.reserve(tokens.size() + 256);
+        append(tokens.data(), tokens.size());
+    }
+
+    void append(const int32_t * tokens, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            hist.push_back(tokens[i]);
+            const size_t end = hist.size() - 1;
+            if (end < 2) continue;
+            auto it = index.find(key3(hist[end - 2], hist[end - 1], hist[end]));
+            if (it == index.end()) {
+                std::array<int32_t, kWays> ways;
+                ways.fill(-1);
+                ways[0] = (int32_t) end;
+                index.emplace(key3(hist[end - 2], hist[end - 1], hist[end]), ways);
+            } else {
+                auto & ways = it->second;
+                for (int j = kWays - 1; j > 0; --j) ways[j] = ways[j - 1];
+                ways[0] = (int32_t) end;
+            }
+        }
+    }
+
+    // Match `suffix` (representing committed_tail + in-flight ancestors + head.token) against `hist`.
+    // `live_len` is the total logical sequence length (hist.size() + in_flight_len); excludes matching self.
+    int propose(const std::vector<int32_t> & suffix, int max_k, std::vector<int32_t> & out) const {
+        out.clear();
+        const int slen = (int) suffix.size();
+        const int hlen = (int) hist.size();
+        if (max_k <= 0 || slen < kMinMatch || hlen < kMinMatch + 2) return 0;
+        const auto it = index.find(key3(suffix[(size_t) slen - 3], suffix[(size_t) slen - 2], suffix[(size_t) slen - 1]));
+        if (it == index.end()) return 0;
+        int best_len = 0;
+        int best_end = -1;
+        for (int e : it->second) {
+            if (e < kMinMatch - 1 || e + 1 >= hlen) continue;
+            // Avoid matching the exact same tail when suffix came solely from hist
+            if (e == hlen - 1) continue;
+            int len = 0;
+            const int lim = std::min({ kMaxMatch, e + 1, slen });
+            while (len < lim && hist[(size_t) (e - len)] == suffix[(size_t) (slen - 1 - len)]) ++len;
+            if (len > best_len) {
+                best_len = len;
+                best_end = e;
+            }
+        }
+        if (best_len < kMinMatch) return 0;
+        out.reserve((size_t) max_k);
+        for (int p = best_end + 1; p < hlen && (int) out.size() < max_k; ++p) {
+            out.push_back(hist[(size_t) p]);
+        }
+        return (int) out.size();
+    }
 };
 
 struct DraftEvent {
@@ -114,6 +209,8 @@ struct TrieState {
     std::unordered_map<int, TreeNode> nodes;
     std::unordered_map<int, std::vector<int>> blocks; // head_id -> [head_id, s1, ...]
     std::vector<DraftEvent> events;
+    TwoDSDSuffixLookup lookup;
+    std::vector<float> last_pmax;
 
     TrieState(Inkling2TwoDSDRunner & r, const Inkling2TwoDSDConfig & c, Inkling2TwoDSDStats & st,
               int out_lim, const Inkling2TwoDSDSamplerHooks * samp = nullptr)
@@ -246,6 +343,8 @@ struct TrieState {
             const auto & parent = nodes.at(parent_id);
             const auto & child  = nodes.at(cid);
             if (parent.readouts[depth] != child.token) {
+                const int32_t pred_tok = parent.readouts[depth];
+                const int ppos = parent.position;
                 if (cfg.frozen_suffix) {
                     freeze_suffix(suffix, idx);
                 } else {
@@ -253,7 +352,27 @@ struct TrieState {
                     collect_descendants(cid, rem);
                     drop_subtrees(rem);
                 }
-                new_anchor(parent_id, depth, NodeRole::Main);
+                auto pit = nodes.at(parent_id).children.find(pred_tok);
+                if (pit != nodes.at(parent_id).children.end()) {
+                    // Pre-branched top-2 sibling HIT at d1/d2! Promote to Main (already +1 depth ahead!).
+                    // If it already has a readout at `depth`, immediately anchor its predicted child so
+                    // the entire drafted block stays 100% depth-aligned (0 freeze/promote desync!).
+                    const int alt_id = pit->second;
+                    auto & alt = nodes.at(alt_id);
+                    alt.role           = NodeRole::Main;
+                    alt.growing        = true;
+                    alt.proposal_depth = depth;
+                    if (alt.children.empty() && !blocks.count(alt_id) && alt.position + 1 < output_limit) {
+                        if (alt.depth >= depth && alt.has_readout[depth]) {
+                            new_anchor(alt_id, depth, NodeRole::Main);
+                        } else {
+                            queue_anchor(alt_id, ppos, depth);
+                        }
+                    }
+                    ++stats.promotions;
+                } else {
+                    new_anchor(parent_id, depth, NodeRole::Main);
+                }
                 return;
             }
             auto & cmut = nodes.at(cid);
@@ -328,10 +447,26 @@ struct TrieState {
                 }
             } else if (cfg.stage == Inkling2TwoDSDStage::Stage2b &&
                        parent.position + 1 < output_limit &&
-                       !parent.children.count(pred) &&
                        (int) free_slots.size() > cfg.k) {
-                if (new_anchor(pid, cfg.d2, NodeRole::Fork) >= 0) {
-                    ++stats.forks;
+                auto cit = parent.children.find(pred);
+                if (cit == parent.children.end()) {
+                    if (new_anchor(pid, cfg.d2, NodeRole::Fork) >= 0) {
+                        ++stats.forks;
+                    }
+                } else {
+                    const int cid = cit->second;
+                    auto & ch = nodes.at(cid);
+                    if (ch.role == NodeRole::Fork && ch.children.empty() && !blocks.count(cid)) {
+                        ch.growing = true;
+                        if (ch.depth >= cfg.d2 && ch.has_readout[cfg.d2] && ch.position + 1 < output_limit) {
+                            new_anchor(cid, cfg.d2, NodeRole::Main);
+                        } else if (ch.depth >= cfg.d1 && ch.has_readout[cfg.d1] && ch.position + 1 < output_limit) {
+                            new_anchor(cid, cfg.d1, NodeRole::Main);
+                        } else {
+                            queue_anchor(cid, parent.position, cfg.d2);
+                        }
+                        ++stats.promotions;
+                    }
                 }
             }
         }
@@ -396,6 +531,9 @@ struct TrieState {
             }
             if (is_bonus) {
                 queue_anchor(chosen_id, cur_pos, cfg.R);
+            } else if (nodes.at(chosen_id).children.empty() && !blocks.count(chosen_id) &&
+                       nodes.at(chosen_id).position + 1 < output_limit) {
+                queue_anchor(chosen_id, cur_pos, cfg.R);
             }
         }
 
@@ -405,7 +543,11 @@ struct TrieState {
             std::vector<int> commit_slots;
             commit_slots.reserve(accepted_ids.size());
             for (int nid : accepted_ids) {
-                commit_slots.push_back(nodes.at(nid).slot);
+                const auto & nd = nodes.at(nid);
+                commit_slots.push_back(nd.early_exited_d2 ? -(nd.slot + 1) : nd.slot);
+                if (cfg.prompt_lookup) {
+                    lookup.append(&nd.token, 1);
+                }
             }
             if (!runner.commit_nodes(commit_slots.data(), (int) commit_slots.size())) {
                 error = "inkling2_2dsd: commit_nodes failed";
@@ -415,10 +557,19 @@ struct TrieState {
                 nodes.at(cursor_id).parent_id = -1;
             }
             for (int nid : accepted_ids) {
+                auto bit = blocks.find(nid);
+                if (bit != blocks.end()) {
+                    // If a pre-branched head reached R and committed before its newly drafted
+                    // suffix was scanned at d1, re-root the surviving suffix at cursor_id.
+                    if (cursor_id >= 0 && bit->second.size() >= 2 && bit->second[1] == cursor_id &&
+                        nodes.count(cursor_id) && !blocks.count(cursor_id)) {
+                        blocks[cursor_id].assign(bit->second.begin() + 1, bit->second.end());
+                    }
+                    blocks.erase(bit);
+                }
                 auto it = nodes.find(nid);
                 if (it != nodes.end()) {
                     release_slot(it->second.slot);
-                    blocks.erase(nid);
                     nodes.erase(it);
                 }
             }
@@ -447,6 +598,45 @@ struct TrieState {
             const auto & head = it->second;
             const int max_by_limit = output_limit - head.position;
             const int max_by_slots = (int) free_slots.size() + 1;
+
+            // 3DSD Lever 3: 0.01 ms CPU Prompt-Lookup Trie Injection (skips GPU drafter on match!)
+            if (cfg.prompt_lookup && lookup.hist.size() >= 8 && max_by_limit > 2 && max_by_slots > 2) {
+                std::vector<int32_t> suffix;
+                suffix.reserve(40);
+                // Reconstruct in-flight token chain [cursor .. head]
+                std::vector<int32_t> inflight;
+                for (int cur_id = head.id; cur_id >= 0;) {
+                    const auto & nd = nodes.at(cur_id);
+                    inflight.push_back(nd.token);
+                    cur_id = nd.parent_id;
+                }
+                std::reverse(inflight.begin(), inflight.end());
+                const int need_hist = std::max(0, 32 - (int) inflight.size());
+                const int h0 = std::max(0, (int) lookup.hist.size() - need_hist);
+                for (int hi = h0; hi < (int) lookup.hist.size(); ++hi) {
+                    suffix.push_back(lookup.hist[(size_t) hi]);
+                }
+                for (int32_t tk : inflight) suffix.push_back(tk);
+
+                const int look_cap = std::min({ cfg.lookup_max_k, max_by_limit - 1, max_by_slots - 1 });
+                std::vector<int32_t> proposed;
+                if (look_cap >= 2 && lookup.propose(suffix, look_cap, proposed) >= 2) {
+                    blocks[head.id] = { head.id };
+                    int parent_id = head.id;
+                    for (int32_t tk : proposed) {
+                        const int cid = add_child(parent_id, tk, NodeRole::Main, 0);
+                        if (cid < 0) break;
+                        nodes.at(cid).from_draft = true;
+                        blocks[head.id].push_back(cid);
+                        parent_id = cid;
+                    }
+                    ++stats.lookup_hits;
+                    stats.lookup_slots += (long long) proposed.size();
+                    stats.draft_slots  += (long long) proposed.size();
+                    continue;
+                }
+            }
+
             const int width = std::min({ cfg.k, max_by_limit, max_by_slots });
             blocks[head.id] = { head.id };
             if (width <= 1) continue;
@@ -491,11 +681,27 @@ struct TrieState {
             stats.draft_slots_cut += (n_want - n_keep);
 
             int parent_id = head_id;
+            bool branched = false;
+            const bool can_branch = cfg.tree_branch &&
+                                    outs[i].alt_tokens.size() >= (size_t) n_keep &&
+                                    outs[i].confidence.size() >= (size_t) n_keep;
             for (int s = 0; s < n_keep; ++s) {
                 const int cid = add_child(parent_id, outs[i].tokens[s], NodeRole::Main, 0);
                 if (cid < 0) break;
                 nodes.at(cid).from_draft = true;
                 blocks[head_id].push_back(cid);
+                // 3DSD Lever 2: Confidence-guided top-2 tree branch at the first uncertain slot!
+                if (can_branch && !branched && free_slots.size() > 8 &&
+                    outs[i].confidence[s] >= cfg.branch_conf_low &&
+                    outs[i].confidence[s] <= cfg.branch_conf_high &&
+                    outs[i].alt_tokens[s] != outs[i].tokens[s]) {
+                    const int alt_id = add_child(parent_id, outs[i].alt_tokens[s], NodeRole::Fork, 0);
+                    if (alt_id >= 0) {
+                        nodes.at(alt_id).from_draft = true;
+                        ++stats.draft_branches;
+                        branched = true;
+                    }
+                }
                 parent_id = cid;
             }
         }
@@ -562,6 +768,14 @@ bool Inkling2TwoDSDSession::seed_cursor(int32_t first_token, int prefix_len_befo
     return true;
 }
 
+void Inkling2TwoDSDSession::set_prompt_history(const std::vector<int32_t> & prompt_tokens) {
+    impl_->trie.lookup.reset(prompt_tokens);
+}
+
+void Inkling2TwoDSDSession::set_last_readout_pmax(const std::vector<float> & pmax) {
+    impl_->trie.last_pmax = pmax;
+}
+
 void Inkling2TwoDSDSession::collect_draft_reqs(
         std::vector<Inkling2TwoDSDDraftReq> & out_reqs,
         std::vector<int> & out_plan_heads,
@@ -626,9 +840,38 @@ bool Inkling2TwoDSDSession::apply_step_and_verify(
         auto & nd = trie.nodes.at(nid);
         nd.readouts[nd.depth]    = readout_argmax[i];
         nd.has_readout[nd.depth] = true;
+        if (i < trie.last_pmax.size()) {
+            nd.readout_pmax[nd.depth] = trie.last_pmax[i];
+        }
         if (nd.depth == trie.cfg.R && trie.sampler && trie.sampler->capture) {
             trie.sampler->capture((int) i, nd.sample_r);
             nd.has_sample_r = true;
+        }
+    }
+    trie.last_pmax.clear();
+    // 3DSD Lever 4 (Opt-In): Native varloop d2 early exit when argmax(d1)==argmax(d2) and p_max >= threshold.
+    // Walk strictly from cursor_id along matching depth-R parents so every promoted node is
+    // guaranteed to be committed immediately by run_verify() (copying plane 1 -> plane 2).
+    if (trie.cfg.early_exit_p > 0.0f && trie.cfg.R == 3 && !trie.sampler) {
+        int cur = trie.cursor_id;
+        while (cur >= 0) {
+            auto it = trie.nodes.find(cur);
+            if (it == trie.nodes.end()) break;
+            auto & nd = it->second;
+            if (nd.depth == 2 && nd.position < trie.output_limit &&
+                nd.has_readout[1] && nd.has_readout[2] &&
+                nd.readouts[2] == nd.readouts[1] &&
+                nd.readout_pmax[2] >= trie.cfg.early_exit_p) {
+                nd.depth = trie.cfg.R;
+                nd.readouts[trie.cfg.R]    = nd.readouts[2];
+                nd.has_readout[trie.cfg.R] = true;
+                nd.early_exited_d2 = true;
+                ++trie.stats.early_exits;
+            }
+            if (nd.depth < trie.cfg.R || !nd.has_readout[trie.cfg.R]) break;
+            auto cit = nd.children.find(nd.readouts[trie.cfg.R]);
+            if (cit == nd.children.end()) break;
+            cur = cit->second;
         }
     }
     if (!trie.run_verify(on_commit, stopped, error)) return false;
@@ -690,7 +933,9 @@ bool inkling2_2dsd_run(
         const std::function<bool(int32_t &)> & on_commit,
         const Inkling2TwoDSDSamplerHooks * sampler,
         Inkling2TwoDSDStats & stats,
-        std::string & error) {
+        std::string & error,
+        const std::vector<int32_t> * prompt_history,
+        const std::vector<float> * last_pmax) {
     stats = {};
     if (max_new <= 0) return true;
 
@@ -703,6 +948,9 @@ bool inkling2_2dsd_run(
     if (pref0 >= output_limit) return true;
 
     Inkling2TwoDSDSession session(runner, cfg, stats, output_limit, sampler);
+    if (prompt_history && !prompt_history->empty()) {
+        session.set_prompt_history(*prompt_history);
+    }
     if (!session.seed_cursor(first, pref0 - 1, error)) return false;
 
     auto run_pending_drafts = [&]() -> bool {
@@ -742,6 +990,9 @@ bool inkling2_2dsd_run(
         ++stats.target_calls;
         stats.target_cells += (long long) active_ids.size();
 
+        if (last_pmax && !last_pmax->empty()) {
+            session.set_last_readout_pmax(*last_pmax);
+        }
         if (!session.apply_step_and_verify(active_ids, readout_rows, readout_argmax, on_commit, stopped, error)) {
             return false;
         }

@@ -42,7 +42,8 @@ static ggml_tensor * inkling2_2dsd_markov_step(
     return res;
 }
 
-// Subop 40: single-launch batched top-1024 candidate vanilla DSpark Markov argmax across L_b leaves.
+// Subop 40: single-launch batched top-1024 candidate vanilla DSpark Markov Top-2 argmax across L_b leaves.
+// Returns I32 [L_b, 2]: row 0 = best1 tokens, row 1 = best2 tokens (0 extra VRAM reads!).
 static ggml_tensor * inkling2_2dsd_markov_topk_step(
         ggml_context * c,
         ggml_tensor * cand_ids,    // I32 [1024, L_b]
@@ -51,7 +52,7 @@ static ggml_tensor * inkling2_2dsd_markov_topk_step(
         ggml_tensor * markov_w1,   // F16 [R, V]
         ggml_tensor * markov_w2,   // Q8_0/F16 [R, V]
         int n_vocab) {
-    ggml_tensor * res = ggml_new_tensor_1d(c, GGML_TYPE_I32, prev_tok->ne[0]);
+    ggml_tensor * res = ggml_new_tensor_2d(c, GGML_TYPE_I32, prev_tok->ne[0], 2);
     res->op = GGML_OP_INKLING2_OP;
     res->src[0] = cand_ids;
     res->src[1] = base_logits;
@@ -267,14 +268,19 @@ bool inkling2_2dsd_commit_prefix_kv_from_slots(
         g.built = true;
     }
 
-    // Depth-R (depth_idx = n_depths - 1 = 2) features sit at rows [2*S .. 3*S - 1]
-    const int depth_base = (tc.n_depths - 1) * S;
+    // Depth-R (depth_idx = n_depths - 1 = 2) features sit at rows [2*S .. 3*S - 1].
+    // Negative commit_slots[i] encodes a varloop early-exited d2 slot (depth_idx = 1, actual_slot = -(s+1)).
+    const int depth_r_base  = (tc.n_depths - 1) * S;
+    const int depth_d2_base = std::min(1, tc.n_depths - 1) * S;
     int32_t idx[kInkling2TwoDSDMaxCommit];
     int32_t pos[kInkling2TwoDSDMaxCommit];
     int32_t wpos[kInkling2TwoDSDMaxCommit];
     for (int i = 0; i < n_commit; ++i) {
-        const int rel = std::max(0, (pos0 - tc.draft_pref_start) + i);
-        idx[i]  = depth_base + commit_slots[i];
+        const int rel    = std::max(0, (pos0 - tc.draft_pref_start) + i);
+        const int raw    = commit_slots[i];
+        const bool from_d2 = (raw < 0);
+        const int actual = from_d2 ? -(raw + 1) : raw;
+        idx[i]  = (from_d2 ? depth_d2_base : depth_r_base) + actual;
         pos[i]  = pos0 + i;
         wpos[i] = (tc.draft_ring_cap > 0) ? (rel % tc.draft_ring_cap) : rel;
     }
@@ -449,28 +455,37 @@ bool inkling2_2dsd_draft_batch(
         ggml_tensor * prev = g.inp_heads; // I32 [L_b]
         ggml_tensor * before_all = nullptr;
         ggml_tensor * tokens_all = nullptr;
+        ggml_tensor * alts_all   = nullptr;
         for (int s = 0; s < n_spec; ++s) {
             before_all = (s == 0) ? prev : ggml_concat(c, before_all, prev, 0); // I32 [L_b * 7]
             ggml_tensor * base_s = ggml_view_2d(
                 c, base_logits, td.vocab_size, L_b, base_logits->nb[1],
                 (size_t) (s * L_b) * base_logits->nb[1]);
+            ggml_tensor * alt_s = nullptr;
             if (topk_cands) {
                 ggml_tensor * cands_s = ggml_view_2d(
                     c, topk_cands, 1024, L_b, topk_cands->nb[1],
                     (size_t) (s * L_b) * topk_cands->nb[1]);
-                prev = inkling2_2dsd_markov_topk_step(c, cands_s, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+                ggml_tensor * top2 = inkling2_2dsd_markov_topk_step(c, cands_s, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+                prev  = ggml_view_1d(c, top2, L_b, 0);
+                alt_s = ggml_view_1d(c, top2, L_b, top2->nb[1]);
             } else {
-                prev = inkling2_2dsd_markov_step(c, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+                prev  = inkling2_2dsd_markov_step(c, base_s, prev, td.markov_w1, td.markov_w2, td.vocab_size);
+                alt_s = prev;
             }
-            tokens_all = (s == 0) ? prev : ggml_concat(c, tokens_all, prev, 0); // I32 [L_b * 7]
+            tokens_all = (s == 0) ? prev  : ggml_concat(c, tokens_all, prev,  0); // I32 [L_b * 7]
+            alts_all   = (s == 0) ? alt_s : ggml_concat(c, alts_all,   alt_s, 0); // I32 [L_b * 7]
         }
 
         // Vectorized confidence head over all 7 * L_b slots in ONE kernel!
-        g.out_tokens = tokens_all;
-        g.out_conf   = inkling2_2dsd_conf_head(c, h_slot_major, before_all, td.markov_w1, td.conf_w, td.conf_b);
+        g.out_tokens     = tokens_all;
+        g.out_alt_tokens = alts_all;
+        g.out_conf       = inkling2_2dsd_conf_head(c, h_slot_major, before_all, td.markov_w1, td.conf_w, td.conf_b);
         ggml_set_output(g.out_tokens);
+        ggml_set_output(g.out_alt_tokens);
         ggml_set_output(g.out_conf);
         ggml_build_forward_expand(g.gf, g.out_tokens);
+        ggml_build_forward_expand(g.gf, g.out_alt_tokens);
         ggml_build_forward_expand(g.gf, g.out_conf);
 
         g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
@@ -538,16 +553,20 @@ bool inkling2_2dsd_draft_batch(
     }
 
     std::vector<int32_t> all_toks((size_t) n_spec * L_b);
+    std::vector<int32_t> all_alts((size_t) n_spec * L_b);
     std::vector<float>   all_conf((size_t) n_spec * L_b);
-    ggml_backend_tensor_get(g.out_tokens, all_toks.data(), 0, all_toks.size() * sizeof(int32_t));
-    ggml_backend_tensor_get(g.out_conf,   all_conf.data(), 0, all_conf.size() * sizeof(float));
+    ggml_backend_tensor_get(g.out_tokens,     all_toks.data(), 0, all_toks.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(g.out_alt_tokens, all_alts.data(), 0, all_alts.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(g.out_conf,       all_conf.data(), 0, all_conf.size() * sizeof(float));
 
     out.resize(n_req);
     for (int l = 0; l < n_req; ++l) {
         out[l].tokens.resize(n_spec);
+        out[l].alt_tokens.resize(n_spec);
         out[l].confidence.resize(n_spec);
         for (int s = 0; s < n_spec; ++s) {
             out[l].tokens[s]     = all_toks[(size_t) s * L_b + l];
+            out[l].alt_tokens[s] = all_alts[(size_t) s * L_b + l];
             out[l].confidence[s] = all_conf[(size_t) s * L_b + l];
         }
     }

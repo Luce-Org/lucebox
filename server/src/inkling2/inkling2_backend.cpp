@@ -165,7 +165,7 @@ bool Inkling2Backend::load_all() {
 
     const bool is_2dsd = (weights_.draft_mode == Inkling2DraftMode::TwoDSD && weights_.twodsd.loaded);
     const int n_seq_slots = (cfg_.max_concurrency > 1 && is_2dsd)
-        ? std::min(cfg_.max_concurrency, 8)
+        ? std::min(cfg_.max_concurrency, 16)
         : 1;
 
     // Determine max_ctx (reuse frozen first-load layout on reinstate so host-RAM
@@ -221,7 +221,7 @@ bool Inkling2Backend::load_all() {
             static_cast<Inkling2SeqEngine *>(seq_engine_.get())->reinstate_device_state(chunk_);
         }
     } else if (cfg_.max_concurrency > 1 && !is_2dsd) {
-        const int n_1d_slots = std::min(cfg_.max_concurrency, 8);
+        const int n_1d_slots = std::min(cfg_.max_concurrency, 16);
         extra_caches_.clear();
         extra_caches_.reserve((size_t) (n_1d_slots - 1));
         std::vector<Inkling2Cache *> caches;
@@ -832,13 +832,17 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         }
 
         const auto td_cfg = inkling2_2dsd_config_from_env(weights_.n_passes, weights_.twodsd.block_size);
-        GpuTwoDSDRunner runner(backend_, weights_, cache_, is_dual, is_greedy ? nullptr : &last_sample);
+        const bool need_pmax_2d = is_greedy && (td_cfg.early_exit_p > 0.0f);
+        last_sample.need_pmax = need_pmax_2d;
+        GpuTwoDSDRunner runner(backend_, weights_, cache_, is_dual,
+                               (!is_greedy || need_pmax_2d) ? &last_sample : nullptr);
         Inkling2TwoDSDStats td_stats;
         std::string td_err;
 
         const auto t_dec0 = std::chrono::steady_clock::now();
         const bool ok_2d = inkling2_2dsd_run(runner, td_cfg, first_tok, req.n_gen, commit_2d,
-                                             is_greedy ? nullptr : &sample_hooks, td_stats, td_err);
+                                             is_greedy ? nullptr : &sample_hooks, td_stats, td_err,
+                                             &req.prompt, need_pmax_2d ? &last_sample.pmax : nullptr);
         const auto t_dec1 = std::chrono::steady_clock::now();
 
         if (!ok_2d) {
@@ -858,7 +862,7 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
         std::fprintf(stderr,
             "[inkling2-2dsd] decode: %zu tok in %.3f s (%.1f tok/s) | calls=%lld S_count=%.2f avg_cells=%.1f max_live=%d | "
             "commits(main=%lld frozen=%lld fork=%lld bonus=%lld) promo=%lld forks=%lld | "
-            "draft=%.3f s batches=%lld slots=%lld cut=%lld (conf=%.2f)\n",
+            "draft=%.3f s batches=%lld slots=%lld cut=%lld br=%lld lookup=%lld/%lld exit=%lld (conf=%.2f)\n",
             result.tokens.size(), result.decode_s,
             result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0,
             td_stats.target_calls, s_count,
@@ -867,6 +871,7 @@ GenerateResult Inkling2Backend::run(const GenerateRequest & req, const DaemonIO 
             td_stats.commit_main, td_stats.commit_frozen, td_stats.commit_fork, td_stats.commit_bonus,
             td_stats.promotions, td_stats.forks,
             td_stats.draft_s, td_stats.drafter_batches, td_stats.draft_slots, td_stats.draft_slots_cut,
+            td_stats.draft_branches, td_stats.lookup_hits, td_stats.lookup_slots, td_stats.early_exits,
             td_cfg.draft_confidence);
         result.succeed();
         return result;

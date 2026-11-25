@@ -17,6 +17,7 @@
 #include <fstream>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -3331,6 +3332,315 @@ static bool test_2dsd_paged_clone_and_multislot_paged(ggml_backend_t backend) {
     return clone_ok && ms_err < 2e-3f && swa_2d_diff < 1e-6f;
 }
 
+// ─── Test: 3DSD GPU Ops (Coda d1/d2 Expert Piggybacking + Subop 40 Top-2 Markov) ─
+static bool test_3dsd_gpu_ops(ggml_backend_t backend) {
+    // 1. Coda d1/d2 Expert Piggybacking (case 24 with op_params[5]=1, flags bit 2 = EARLY_CODA)
+    bool ok_piggy = true;
+    {
+        const int E = 128, K = 8, T = 12;
+        std::mt19937 rng(3030);
+        std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+        std::vector<float> logits((size_t) E * T), bias(E);
+        for (float & v : logits) v = dist(rng);
+        for (float & v : bias)   v = dist(rng) * 0.02f;
+        // Rows 0..7: depth==3 (flags=0, >=32 unique experts); Rows 8..9: early Coda (flags=4); Rows 10..11: padding (flags=2)
+        int32_t flags[T] = { 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 2, 2 };
+
+        auto run_router = [&](int target_pct, int piggy) -> std::vector<int32_t> {
+            const int slices = (target_pct > 0) ? 3 : 2;
+            struct ggml_init_params gp = { 16 * ggml_tensor_overhead() + ggml_graph_overhead() + (1 << 20), nullptr, true };
+            ggml_context * ctx = ggml_init(gp);
+            ggml_tensor * t_lg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+            ggml_tensor * t_bi = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
+            ggml_tensor * t_fl = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            ggml_set_input(t_lg); ggml_set_input(t_bi); ggml_set_input(t_fl);
+
+            ggml_tensor * dst = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, K, T, slices);
+            dst->op = GGML_OP_INKLING2_OP;
+            dst->src[0] = t_lg; dst->src[1] = nullptr; dst->src[2] = t_bi; dst->src[3] = t_fl;
+            test_set_op_i32(dst, 0, 24);
+            test_set_op_i32(dst, 1, K);
+            test_set_op_f32(dst, 2, 1.0f);
+            test_set_op_f32(dst, 3, 1e-20f);
+            test_set_op_i32(dst, 4, target_pct);
+            test_set_op_i32(dst, 5, piggy);
+            ggml_set_output(dst);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, dst);
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            ggml_gallocr_alloc_graph(ga, gf);
+            ggml_backend_tensor_set(t_lg, logits.data(), 0, logits.size() * sizeof(float));
+            ggml_backend_tensor_set(t_bi, bias.data(),   0, bias.size()   * sizeof(float));
+            ggml_backend_tensor_set(t_fl, flags,         0, sizeof(flags));
+            ggml_backend_graph_compute(backend, gf);
+
+            std::vector<int32_t> out((size_t) K * T * slices);
+            ggml_backend_tensor_get(dst, out.data(), 0, out.size() * sizeof(int32_t));
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return out;
+        };
+
+        // Single-GPU (target_pct=0): depth-3 rows 0..7 MUST match exact baseline bit-for-bit,
+        // and early-Coda rows 8..11 MUST select strictly from depth-3's union of experts!
+        auto ref_s = run_router(0, 0);
+        auto pig_s = run_router(0, 1);
+        std::unordered_set<int32_t> d3_exps;
+        for (int r = 0; r < 8; ++r) {
+            for (int k = 0; k < K; ++k) {
+                const int idx = r * K + k;
+                if (pig_s[(size_t) idx] != ref_s[(size_t) idx]) ok_piggy = false;
+                if (pig_s[(size_t) (K * T + idx)] != ref_s[(size_t) (K * T + idx)]) ok_piggy = false;
+                d3_exps.insert(pig_s[(size_t) idx]);
+            }
+        }
+        if (d3_exps.size() < 32) ok_piggy = false;
+        for (int r = 8; r < T; ++r) {
+            for (int k = 0; k < K; ++k) {
+                const int32_t e = pig_s[(size_t) (r * K + k)];
+                if (e < 0 || !d3_exps.count(e)) ok_piggy = false;
+            }
+        }
+        // Dual-GPU (target_pct=74): union(hot, cold) for depth-3 rows matches ref_s, and early rows stay inside d3_exps!
+        auto pig_d = run_router(74, 1);
+        for (int r = 0; r < T; ++r) {
+            for (int k = 0; k < K; ++k) {
+                const int32_t eh = pig_d[(size_t) (r * K + k)];
+                const int32_t ec = pig_d[(size_t) (K * T + r * K + k)];
+                if ((eh >= 0) == (ec >= 0)) ok_piggy = false;
+                const int32_t e = (eh >= 0) ? eh : ec;
+                if (!d3_exps.count(e)) ok_piggy = false;
+                if (r < 8 && e != ref_s[(size_t) (r * K + k)]) ok_piggy = false;
+            }
+        }
+    }
+
+    // 2. Subop 40 Top-2 Markov (dst->ne[1] == 2): verify BOTH best1 and best2 match CPU exact oracle!
+    bool ok_top2 = true;
+    {
+        const int V = 2048, R = 256, L = 3, K = 1024;
+        std::mt19937 rng(4042);
+        std::uniform_real_distribution<float> dist(-1.5f, 1.5f);
+        std::vector<float> base((size_t) V * L);
+        std::vector<ggml_fp16_t> w1((size_t) R * V), w2((size_t) R * V);
+        for (float & v : base) v = dist(rng);
+        for (auto & v : w1) v = ggml_fp32_to_fp16(dist(rng) * 0.1f);
+        for (auto & v : w2) v = ggml_fp32_to_fp16(dist(rng) * 0.1f);
+        int32_t prev[L] = { 17, 503, 1999 };
+        std::vector<int32_t> cands((size_t) K * L);
+        for (int l = 0; l < L; ++l) {
+            for (int k = 0; k < K; ++k) cands[(size_t) l * K + k] = (k * 2 + l) % V;
+        }
+
+        // CPU exact top-2 reference
+        int32_t ref1[L] = {}, ref2[L] = {};
+        for (int l = 0; l < L; ++l) {
+            float b1v = -1e30f, b2v = -1e30f;
+            int32_t b1i = 0, b2i = 0;
+            for (int k = 0; k < K; ++k) {
+                const int32_t v = cands[(size_t) l * K + k];
+                float dot = 0.0f;
+                for (int r = 0; r < R; ++r) {
+                    dot += ggml_fp16_to_fp32(w1[(size_t) prev[l] * R + r]) * ggml_fp16_to_fp32(w2[(size_t) v * R + r]);
+                }
+                const float sc = base[(size_t) l * V + v] + dot;
+                if (sc > b1v || (sc == b1v && v < b1i)) {
+                    b2v = b1v; b2i = b1i;
+                    b1v = sc;  b1i = v;
+                } else if (v != b1i && (sc > b2v || (sc == b2v && v < b2i))) {
+                    b2v = sc;  b2i = v;
+                }
+            }
+            ref1[l] = b1i;
+            ref2[l] = b2i;
+        }
+
+        struct ggml_init_params gp = { 16 * ggml_tensor_overhead() + ggml_graph_overhead() + (2 << 20), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * t_cd = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, L);
+        ggml_tensor * t_bs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, V, L);
+        ggml_tensor * t_pv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+        ggml_tensor * t_w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, R, V);
+        ggml_tensor * t_w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, R, V);
+        ggml_set_input(t_cd); ggml_set_input(t_bs); ggml_set_input(t_pv); ggml_set_input(t_w1); ggml_set_input(t_w2);
+
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, L, 2);
+        dst->op = GGML_OP_INKLING2_OP;
+        dst->src[0] = t_cd; dst->src[1] = t_bs; dst->src[2] = t_pv; dst->src[3] = t_w1; dst->src[4] = t_w2;
+        test_set_op_i32(dst, 0, 40);
+        test_set_op_i32(dst, 1, V);
+        ggml_set_output(dst);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, dst);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_tensor_set(t_cd, cands.data(), 0, cands.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(t_bs, base.data(),  0, base.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_pv, prev,         0, sizeof(prev));
+        ggml_backend_tensor_set(t_w1, w1.data(),    0, w1.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_w2, w2.data(),    0, w2.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_graph_compute(backend, gf);
+
+        int32_t got[L * 2] = {};
+        ggml_backend_tensor_get(dst, got, 0, sizeof(got));
+        for (int l = 0; l < L; ++l) {
+            if (got[l] != ref1[l] || got[L + l] != ref2[l]) ok_top2 = false;
+        }
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+    }
+
+    std::printf("[test_inkling2_ops] 3dsd_gpu_ops: coda_piggyback=%d markov_top2=%d\n",
+                ok_piggy ? 1 : 0, ok_top2 ? 1 : 0);
+    return ok_piggy && ok_top2;
+}
+
+// ─── Test: 3DSD Executor CPU (Prompt Lookup, Top-2 Tree Branching, Varloop d2 Early Exit) ─
+static bool test_3dsd_executor_cpu() {
+    using namespace luce::common;
+    // Build a deterministic 96-token target sequence with a repeated 24-token motif in the prompt
+    std::vector<int32_t> prompt;
+    for (int i = 0; i < 32; ++i) prompt.push_back(100 + i);
+    const int n_gen = 64;
+    std::vector<int32_t> seq(n_gen + 1);
+    for (int i = 0; i <= n_gen; ++i) {
+        if (i < 24) seq[i] = 104 + i;                // exact prompt suffix repeat -> triggers lookup!
+        else        seq[i] = 500 + ((i * 7 + 3) % 41); // fresh tokens -> triggers top-2 branch & early exit!
+    }
+
+    struct Mock3DSDRunner : Inkling2TwoDSDRunner {
+        const std::vector<int32_t> * seq = nullptr;
+        int pref = 0;
+        bool alt_wins = false;
+        bool emit_high_pmax = false;
+        int neg_commits = 0;
+        std::vector<float> last_pmax;
+
+        int prefix_length() const override { return pref; }
+        int max_nodes() const override { return 48; }
+        int max_ctx() const override { return 512; }
+        bool advance_nodes(
+                const std::vector<Inkling2TwoDSDNodeDesc> & nodes,
+                uint32_t readout_mask,
+                std::vector<int> & out_readout_rows,
+                std::vector<int32_t> & out_readout_argmax) override {
+            out_readout_rows.clear();
+            out_readout_argmax.clear();
+            last_pmax.clear();
+            for (int i = 0; i < (int) nodes.size(); ++i) {
+                const int nd = nodes[i].depth + 1;
+                if ((readout_mask & (1u << nd)) == 0) continue;
+                out_readout_rows.push_back(i);
+                const int pos = nodes[i].pos;
+                const int32_t true_next = (pos + 1 < (int) seq->size()) ? (*seq)[pos + 1] : 999;
+                // d1 disagrees with d2/d3 on pos%3==1 (must NOT early-exit!); d1==d2==d3 otherwise
+                int32_t pred = true_next;
+                if (nd == 1 && (pos % 3 == 1)) pred = true_next + 77;
+                out_readout_argmax.push_back(pred);
+                const float pmax = (emit_high_pmax && nd == 2 && (pos % 2 == 0)) ? 0.99f : 0.40f;
+                last_pmax.push_back(pmax);
+            }
+            return true;
+        }
+        bool commit_nodes(const int * commit_slots, int n_commit) override {
+            for (int i = 0; i < n_commit; ++i) {
+                if (commit_slots[i] < 0) ++neg_commits;
+            }
+            pref += n_commit;
+            return true;
+        }
+        bool draft_batch(
+                const std::vector<Inkling2TwoDSDDraftReq> & reqs,
+                std::vector<Inkling2TwoDSDDraftOut> & out) override {
+            out.resize(reqs.size());
+            for (size_t i = 0; i < reqs.size(); ++i) {
+                const int n = 7;
+                out[i].tokens.resize(n);
+                out[i].alt_tokens.resize(n);
+                out[i].confidence.resize(n, 0.90f);
+                const int base = reqs[i].anchor_pos;
+                for (int s = 0; s < n; ++s) {
+                    const int idx = base + s + 1;
+                    const int32_t tru = (idx < (int) seq->size()) ? (*seq)[idx] : 999;
+                    if (alt_wins && s == 1) {
+                        // Make top-1 miss at uncertain slot 1 while top-2 hits!
+                        out[i].tokens[s]     = tru + 1234;
+                        out[i].alt_tokens[s] = tru;
+                        out[i].confidence[s] = 0.50f;
+                    } else {
+                        out[i].tokens[s]     = tru;
+                        out[i].alt_tokens[s] = tru + 1;
+                        out[i].confidence[s] = 0.90f;
+                    }
+                }
+            }
+            return true;
+        }
+    };
+
+    const std::vector<int32_t> expected(seq.begin(), seq.begin() + n_gen);
+
+    // 1. Prompt-lookup trie injection
+    bool ok_lookup = false;
+    {
+        Mock3DSDRunner r; r.seq = &seq;
+        Inkling2TwoDSDConfig cfg;
+        cfg.stage = Inkling2TwoDSDStage::Stage2b; cfg.R = 3; cfg.d1 = 1; cfg.d2 = 2; cfg.k = 8;
+        cfg.prompt_lookup = true; cfg.tree_branch = false; cfg.early_exit_p = 0.0f;
+        std::vector<int32_t> got;
+        Inkling2TwoDSDStats st; std::string err;
+        const bool ok = inkling2_2dsd_run(
+            r, cfg, seq[0], n_gen,
+            [&](int32_t & tok) { got.push_back(tok); return (int) got.size() < n_gen; },
+            nullptr, st, err, &prompt, nullptr);
+        ok_lookup = ok && (got == expected) && (st.lookup_hits > 0) && (st.lookup_slots >= 8);
+    }
+
+    // 2. Confidence-guided top-2 tree branching saves target calls when alt_tokens hits
+    bool ok_branch = false;
+    long long calls_nobr = 0, calls_br = 0;
+    {
+        for (int br = 0; br <= 1; ++br) {
+            Mock3DSDRunner r; r.seq = &seq; r.alt_wins = true;
+            Inkling2TwoDSDConfig cfg;
+            cfg.stage = Inkling2TwoDSDStage::Stage2b; cfg.R = 3; cfg.d1 = 1; cfg.d2 = 2; cfg.k = 8;
+            cfg.prompt_lookup = false; cfg.tree_branch = (br != 0); cfg.early_exit_p = 0.0f;
+            std::vector<int32_t> got;
+            Inkling2TwoDSDStats st; std::string err;
+            const bool ok = inkling2_2dsd_run(
+                r, cfg, seq[0], n_gen,
+                [&](int32_t & tok) { got.push_back(tok); return (int) got.size() < n_gen; },
+                nullptr, st, err, nullptr, nullptr);
+            if (!ok || got != expected) { calls_br = 999999; break; }
+            if (br == 0) calls_nobr = st.target_calls;
+            else         { calls_br = st.target_calls; ok_branch = (st.draft_branches > 0) && (calls_br < calls_nobr); }
+        }
+    }
+
+    // 3. Opt-in varloop d2 early exit: exact match + negative commit slots strictly match early_exits!
+    bool ok_exit = false;
+    {
+        Mock3DSDRunner r; r.seq = &seq; r.emit_high_pmax = true;
+        Inkling2TwoDSDConfig cfg;
+        cfg.stage = Inkling2TwoDSDStage::Stage2b; cfg.R = 3; cfg.d1 = 1; cfg.d2 = 2; cfg.k = 8;
+        cfg.prompt_lookup = false; cfg.tree_branch = false; cfg.early_exit_p = 0.95f;
+        std::vector<int32_t> got;
+        Inkling2TwoDSDStats st; std::string err;
+        const bool ok = inkling2_2dsd_run(
+            r, cfg, seq[0], n_gen,
+            [&](int32_t & tok) { got.push_back(tok); return (int) got.size() < n_gen; },
+            nullptr, st, err, nullptr, &r.last_pmax);
+        // Every promoted early-exit node MUST have been committed with a negative slot!
+        ok_exit = ok && (got == expected) && (st.early_exits > 0) && (r.neg_commits == (int) st.early_exits);
+    }
+
+    std::printf("[test_inkling2_ops] 3dsd_exec_cpu: lookup=%d branch=%d (calls %lld->%lld) early_exit=%d\n",
+                ok_lookup ? 1 : 0, ok_branch ? 1 : 0, calls_nobr, calls_br, ok_exit ? 1 : 0);
+    return ok_lookup && ok_branch && ok_exit;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -3346,6 +3656,7 @@ int main(int argc, char ** argv) {
         ok &= test_2dsd_mask_embedding_pt();
         ok &= test_2dsd_executor();
         ok &= test_2dsd_nongreedy_and_multislot_session();
+        ok &= test_3dsd_executor_cpu();
         std::printf("[test_inkling2_ops] (cpu-only) %s\n", ok ? "ALL PASSED" : "FAILED");
         return ok ? 0 : 1;
     }
@@ -3399,6 +3710,8 @@ int main(int argc, char ** argv) {
     ok &= test_2dsd_multislot_tree_attn_rel(backend);
     ok &= test_2dsd_paged_clone_and_multislot_paged(backend);
     ok &= test_2dsd_nongreedy_and_multislot_session();
+    ok &= test_3dsd_executor_cpu();
+    ok &= test_3dsd_gpu_ops(backend);
 
     ggml_backend_free(backend);
     std::printf("[test_inkling2_ops] %s\n", ok ? "ALL PASSED" : "FAILED");

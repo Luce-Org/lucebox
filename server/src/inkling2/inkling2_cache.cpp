@@ -374,10 +374,10 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
         }
 
         // Allocate 5-layer loop-context drafter prefix KV cache.
-        // Under KVFlash (or explicit LUCE_INKLING2_2DSD_DRAFT_KV_CAP / LUCE_INKLING2_2DSD_DRAFT_RING),
-        // bound to an O(1) sliding ring so 262K ctx stays ~85 MiB/slot instead of ~5.5 GiB!
+        // Bound long contexts (>4096) to an O(1) sliding ring by default so 262K ctx stays
+        // ~85 MiB/slot instead of ~5.5 GiB (override via LUCE_INKLING2_2DSD_DRAFT_RING=0).
         const int d_layers = w.twodsd.n_layer;
-        int draft_ring = (kf_cfg.enabled && out.max_ctx > 4096) ? 4096 : 0;
+        int draft_ring = (out.max_ctx > 4096) ? 4096 : 0;
         const char * edr = std::getenv("LUCE_INKLING2_2DSD_DRAFT_KV_CAP");
         if (!edr) edr = std::getenv("LUCE_INKLING2_2DSD_DRAFT_RING");
         if (edr) {

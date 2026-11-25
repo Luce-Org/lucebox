@@ -118,6 +118,14 @@ public:
                               int max_new_tokens,
                               const AdmitMeta & meta = {}) override;
 
+    bool        supports_prefix_store() const override;
+    size_t      estimate_prefix_store_bytes(int tokens) const override;
+    AdmitResult admit_with_prefix(uint64_t request_id,
+                                  const std::vector<int32_t> & prompt,
+                                  const SamplerCfg & sampler,
+                                  const PrefixStorePlan & plan) override;
+    void        discard_prefix_store(PrefixStoreRef checkpoint) override;
+
     StepPlanLimits step_plan_limits(int decode_rows) const override;
     bool           reserve_decode(const StepPlan & plan) override;
     StepResult     step(const StepPlan & plan) override;
@@ -145,11 +153,19 @@ public:
     const Inkling2SlotStateAdapter & state_adapter() const { return *state_adapter_; }
 
 private:
+    static constexpr int kPrefixCheckpoints = 64;
+
     struct SlotState;
+    struct PrefixCheckpoint;
 
     bool init_slot_views();
     void reset_slot_session(int slot);
     std::string validate_plan_(const StepPlan & plan) const;
+    int  checkpoint_index_(PrefixStoreRef checkpoint) const;
+    bool save_global_kv_(int slot, int tokens, std::vector<uint8_t> & out, bool & is_kvflash) const;
+    bool restore_global_kv_(int slot, int tokens, const std::vector<uint8_t> & in, bool is_kvflash);
+    bool restore_prefix_(int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint);
+    PrefixStoreEvent capture_prefix_(int slot, const PrefixCaptureTicket & ticket);
     StepResult step_batched_2dsd_(const StepPlan & plan);
     StepResult step_1d_(const StepPlan & plan);
     Inkling2SeqStepResult run_forward_1d_(int slot, const int32_t * tokens, int n_tokens,
@@ -171,7 +187,9 @@ private:
     std::unique_ptr<Inkling2SlotKv>           slot_kv_;
     std::unique_ptr<SeqSlotManager>           slots_;
     std::unique_ptr<Inkling2SlotStateAdapter> state_adapter_;
+    std::unique_ptr<Inkling2SlotStateAdapter> state_adapter_with_draft_;
     std::vector<std::unique_ptr<SlotState>>   slot_state_;
+    std::vector<PrefixCheckpoint>             prefix_checkpoints_;
 };
 
 } // namespace luce::common

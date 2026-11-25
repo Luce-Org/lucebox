@@ -169,6 +169,11 @@ public:
                              bool * out_used_gpu = nullptr,
                              bool * out_used_fused = nullptr);
 
+    // Host-RAM prefix checkpoint serialization/restoration (KVFLASH3 layout via KvFlashPager).
+    size_t serialized_bytes_estimate(int tokens) const;
+    bool   serialize_state(int tokens, std::vector<uint8_t> & out) const;
+    bool   restore_state(const std::vector<uint8_t> & blob, int tokens);
+
 private:
     void sync_tier15_and_tables_();
     bool upload_chunk_to_tier15_(int c, int rb);

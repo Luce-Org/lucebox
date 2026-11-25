@@ -902,4 +902,47 @@ bool Inkling2KvFlash::mode4_score_and_recall(
     return true;
 }
 
+size_t Inkling2KvFlash::serialized_bytes_estimate(int tokens) const {
+    if (!active_ || !pager_ || tokens <= 0) return 0;
+    const int nc = (std::min(tokens, max_ctx_) + cfg_.chunk_tokens - 1) / cfg_.chunk_tokens;
+    const size_t chunk_bytes = (pager_->k_seg_bytes() + (size_t) cfg_.chunk_tokens * tier0_v_[0]->nb[1])
+                             * (size_t) n_head_kv_ * (size_t) n_global_;
+    return (size_t) nc * (chunk_bytes + 32) + (size_t) pager_->n_pool_blocks() * sizeof(int32_t) + 128;
+}
+
+bool Inkling2KvFlash::serialize_state(int tokens, std::vector<uint8_t> & out) const {
+    out.clear();
+    if (!active_ || !pager_ || tokens <= 0 || tokens > max_ctx_) return false;
+    const int nc = (tokens + cfg_.chunk_tokens - 1) / cfg_.chunk_tokens;
+    if (nc > pager_->n_chunks()) return false;
+    {
+        ScopedGpuDevice guard(target_gpu_);
+        out = pager_->serialize(nc);
+    }
+    return !out.empty();
+}
+
+bool Inkling2KvFlash::restore_state(const std::vector<uint8_t> & blob, int tokens) {
+    if (!active_ || !pager_ || blob.empty() || tokens <= 0 || tokens > max_ctx_) return false;
+    const int nc = (tokens + cfg_.chunk_tokens - 1) / cfg_.chunk_tokens;
+    reset();
+    bool ok = false;
+    {
+        ScopedGpuDevice guard(target_gpu_);
+        ok = pager_->deserialize(blob.data(), blob.size(), nc);
+        if (ok) {
+            if (tokens < nc * cfg_.chunk_tokens) {
+                pager_->truncate(tokens);
+            }
+            pager_->synchronize_paging();
+        }
+    }
+    if (!ok) {
+        reset();
+        return false;
+    }
+    sync_tier15_and_tables_();
+    return true;
+}
+
 } // namespace luce::common

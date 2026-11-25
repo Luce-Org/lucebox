@@ -22,7 +22,9 @@ struct Inkling2TwoDSDNodeDesc {
 
 struct Inkling2TwoDSDAdvanceSampleOut {
     float                fast_temp  = 0.0f; // input: >0 runs subop 32 EXACT_GPU_TOP_CANDS on Coda logits
-    std::vector<int32_t> top_cands;         // output: [516 * n_readout] when fast_temp > 0
+    bool                 need_pmax  = false; // input: true computes p_max[r] = 1/Z(temp=1) for varloop early-exit
+    std::vector<int32_t> top_cands;         // output: [516 * n_readout] when fast_temp > 0 or need_pmax
+    std::vector<float>   pmax;              // output: [n_readout] max softmax prob (temp=1) when need_pmax
     ggml_tensor *        logits_dev = nullptr; // output: device softcapped F32 [n_vocab, row_b] for fallback/penalties
     int                  n_vocab    = 0;
 };

@@ -10,6 +10,7 @@
 #include "common/sampler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -124,7 +125,7 @@ SlotKvCaps Inkling2SlotKv::caps() const {
     SlotKvCaps c;
     c.parkable_offload        = true;
     c.sticky_sessions         = false;
-    c.supports_prefix_store   = false;
+    c.supports_prefix_store   = true;
     c.mutates_existing_blocks = false;
     c.dual_tier_tables        = false;
     for (const Inkling2Cache * cache : caches_) {
@@ -204,6 +205,30 @@ bool Inkling2SlotKv::build_table_patch(PagedKvSequenceHandle h, uint32_t token_e
 
 // ─── Inkling2SeqEngine ───────────────────────────────────────────────────
 
+struct Inkling2SeqEngine::PrefixCheckpoint {
+    bool                 valid = false;
+    int                  tokens = 0;
+    int                  draft_pref_start = 0;
+    bool                 has_draft_kv = false;
+    bool                 is_kvflash = false;
+    std::vector<int32_t> prompt_tokens;
+    SlotStateSlab        state_slab;
+    std::vector<uint8_t> global_kv;
+    size_t               bytes = 0;
+
+    void clear() {
+        valid = false;
+        tokens = 0;
+        draft_pref_start = 0;
+        has_draft_kv = false;
+        is_kvflash = false;
+        std::vector<int32_t>().swap(prompt_tokens);
+        std::vector<uint8_t>().swap(state_slab);
+        std::vector<uint8_t>().swap(global_kv);
+        bytes = 0;
+    }
+};
+
 struct Inkling2SeqEngine::SlotState {
     std::vector<int32_t> prompt;
     int prefill_pos = 0;
@@ -240,7 +265,8 @@ Inkling2SeqEngine::Inkling2SeqEngine(
       prefill_chunk_(std::max(64, prefill_chunk)),
       owned_slot_views_((size_t) n_slots_),
       caches_((size_t) n_slots_, nullptr),
-      slot_state_((size_t) n_slots_) {
+      slot_state_((size_t) n_slots_),
+      prefix_checkpoints_((size_t) kPrefixCheckpoints) {
     for (int s = 0; s < n_slots_; ++s) {
         caches_[(size_t) s] = &owned_slot_views_[(size_t) s];
         slot_state_[(size_t) s] = std::make_unique<SlotState>();
@@ -249,6 +275,7 @@ Inkling2SeqEngine::Inkling2SeqEngine(
     slot_kv_ = std::make_unique<Inkling2SlotKv>(multi_cache.max_ctx, caches_, (uint32_t) kInkling2KvFlashChunk);
     slots_   = std::make_unique<SeqSlotManager>(*slot_kv_, multi_cache.max_ctx);
     state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
+    state_adapter_with_draft_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/true);
 }
 
 Inkling2SeqEngine::Inkling2SeqEngine(
@@ -268,13 +295,15 @@ Inkling2SeqEngine::Inkling2SeqEngine(
       verify_width_(verify_width),
       custom_forward_(std::move(custom_forward)),
       caches_(std::move(caches)),
-      slot_state_((size_t) n_slots_) {
+      slot_state_((size_t) n_slots_),
+      prefix_checkpoints_((size_t) kPrefixCheckpoints) {
     for (int s = 0; s < n_slots_; ++s) {
         slot_state_[(size_t) s] = std::make_unique<SlotState>();
     }
     slot_kv_ = std::make_unique<Inkling2SlotKv>(max_ctx, caches_, (uint32_t) kInkling2KvFlashChunk);
     slots_   = std::make_unique<SeqSlotManager>(*slot_kv_, max_ctx);
     state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
+    state_adapter_with_draft_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/true);
 }
 
 Inkling2SeqEngine::~Inkling2SeqEngine() {
@@ -294,6 +323,9 @@ bool Inkling2SeqEngine::init_slot_views() {
     if (slot_kv_) slot_kv_->set_caches(caches_);
     if (state_adapter_) {
         state_adapter_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/false);
+    }
+    if (state_adapter_with_draft_) {
+        state_adapter_with_draft_ = std::make_unique<Inkling2SlotStateAdapter>(weights_, caches_, /*include_draft_ring=*/true);
     }
     return true;
 }
@@ -393,6 +425,7 @@ SeqEngine::AdmitResult Inkling2SeqEngine::admit_bounded(
 
     auto & st = *slot_state_[(size_t) s];
     reset_slot_session(s);
+    slots_->slot(s).pending_capture = {};
     st.prompt = prompt;
     st.prefill_pos = 0;
     st.rewind_pos  = -1;
@@ -408,6 +441,344 @@ SeqEngine::AdmitResult Inkling2SeqEngine::admit_bounded(
             ? std::max(st.rewind_pos, (int) prompt.size() - cache.kvflash->select_queries())
             : (int) prompt.size();
         cache.kvflash->clear_queries();
+    }
+    return res;
+}
+
+bool Inkling2SeqEngine::supports_prefix_store() const {
+    return !custom_forward_ && !caches_.empty() && caches_[0] != nullptr;
+}
+
+int Inkling2SeqEngine::checkpoint_index_(PrefixStoreRef checkpoint) const {
+    if (!checkpoint.valid() || checkpoint.id > (uint64_t) kPrefixCheckpoints) return -1;
+    return (int) checkpoint.id - 1;
+}
+
+size_t Inkling2SeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    if (!supports_prefix_store() || tokens <= 0) return 0;
+    const Inkling2Cache & c0 = *caches_[0];
+    const int n_tok = std::clamp(tokens, 1, max_context());
+    const bool compact_draft = c0.tree.active && (c0.tree.draft_ring_cap > 0 || c0.tree.draft_cap <= 8192);
+    size_t total = compact_draft ? state_adapter_with_draft_->slab_bytes() : state_adapter_->slab_bytes();
+    if (c0.kvflash && c0.kvflash->active()) {
+        total += c0.kvflash->serialized_bytes_estimate(n_tok);
+    } else if (c0.tree.active) {
+        const auto & tc = c0.tree;
+        for (int ip = 0; ip < weights_.n_layer_phys; ++ip) {
+            if (weights_.layers[ip].is_swa) continue;
+            if (ip < (int) tc.prefix_k.size() && tc.prefix_k[ip] && tc.prefix_v[ip]) {
+                const size_t p_st = (size_t) tc.prefix_k[ip]->ne[3];
+                total += p_st * (size_t) weights_.n_head_kv * (size_t) n_tok
+                       * (tc.prefix_k[ip]->nb[1] + tc.prefix_v[ip]->nb[1]);
+            }
+        }
+    } else {
+        for (int il : weights_.global_slots) {
+            if (il < (int) c0.k_cache.size() && c0.k_cache[il] && c0.v_cache[il]) {
+                total += (size_t) weights_.n_head_kv * (size_t) n_tok
+                       * (c0.k_cache[il]->nb[1] + c0.v_cache[il]->nb[1]);
+            }
+        }
+    }
+    total += (size_t) n_tok * sizeof(int32_t);
+    return total;
+}
+
+void Inkling2SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
+    const int idx = checkpoint_index_(checkpoint);
+    if (idx >= 0 && prefix_checkpoints_[(size_t) idx].valid &&
+        prefix_checkpoints_[(size_t) idx].tokens == checkpoint.tokens) {
+        prefix_checkpoints_[(size_t) idx].clear();
+    }
+}
+
+bool Inkling2SeqEngine::save_global_kv_(
+        int slot, int tokens, std::vector<uint8_t> & out, bool & is_kvflash) const {
+    out.clear();
+    if (slot < 0 || slot >= n_slots_ || !caches_[(size_t) slot] || tokens <= 0) return false;
+    const Inkling2Cache & cache = *caches_[(size_t) slot];
+    if (cache.kvflash && cache.kvflash->active()) {
+        is_kvflash = true;
+        return cache.kvflash->serialize_state(tokens, out);
+    }
+    is_kvflash = false;
+    if (cache.remote_backend && cache.remote_split_pos >= 0 && tokens > cache.remote_split_pos) {
+        return false; // non-KVFlash Split-KV across two GPUs not supported by contiguous prefix store
+    }
+    if (cache.tree.active) {
+        const auto & tc = cache.tree;
+        size_t total = 0;
+        for (int ip = 0; ip < weights_.n_layer_phys; ++ip) {
+            if (weights_.layers[ip].is_swa) continue;
+            ggml_tensor * pk = tc.prefix_k[ip];
+            ggml_tensor * pv = tc.prefix_v[ip];
+            if (!pk || !pv || tokens > pk->ne[1] || tokens > pv->ne[1]) return false;
+            total += (size_t) pk->ne[3] * (size_t) weights_.n_head_kv * (size_t) tokens * (pk->nb[1] + pv->nb[1]);
+        }
+        out.resize(total);
+        uint8_t * dst = out.data();
+        for (int ip = 0; ip < weights_.n_layer_phys; ++ip) {
+            if (weights_.layers[ip].is_swa) continue;
+            ggml_tensor * pk = tc.prefix_k[ip];
+            ggml_tensor * pv = tc.prefix_v[ip];
+            const int p_st = (int) pk->ne[3];
+            const size_t seg_k = (size_t) tokens * pk->nb[1];
+            const size_t seg_v = (size_t) tokens * pv->nb[1];
+            for (int p = 0; p < p_st; ++p) {
+                for (int h = 0; h < weights_.n_head_kv; ++h) {
+                    ggml_backend_tensor_get(pk, dst, (size_t) p * pk->nb[3] + (size_t) h * pk->nb[2], seg_k);
+                    dst += seg_k;
+                }
+                for (int h = 0; h < weights_.n_head_kv; ++h) {
+                    ggml_backend_tensor_get(pv, dst, (size_t) p * pv->nb[3] + (size_t) h * pv->nb[2], seg_v);
+                    dst += seg_v;
+                }
+            }
+        }
+        return (size_t) (dst - out.data()) == total;
+    }
+    size_t total = 0;
+    for (int il : weights_.global_slots) {
+        ggml_tensor * k = cache.k_cache[il];
+        ggml_tensor * v = cache.v_cache[il];
+        if (!k || !v || tokens > k->ne[1] || tokens > v->ne[1]) return false;
+        total += (size_t) weights_.n_head_kv * (size_t) tokens * (k->nb[1] + v->nb[1]);
+    }
+    out.resize(total);
+    uint8_t * dst = out.data();
+    for (int il : weights_.global_slots) {
+        ggml_tensor * k = cache.k_cache[il];
+        ggml_tensor * v = cache.v_cache[il];
+        const size_t seg_k = (size_t) tokens * k->nb[1];
+        const size_t seg_v = (size_t) tokens * v->nb[1];
+        for (int h = 0; h < weights_.n_head_kv; ++h) {
+            ggml_backend_tensor_get(k, dst, (size_t) h * k->nb[2], seg_k);
+            dst += seg_k;
+        }
+        for (int h = 0; h < weights_.n_head_kv; ++h) {
+            ggml_backend_tensor_get(v, dst, (size_t) h * v->nb[2], seg_v);
+            dst += seg_v;
+        }
+    }
+    return (size_t) (dst - out.data()) == total;
+}
+
+bool Inkling2SeqEngine::restore_global_kv_(
+        int slot, int tokens, const std::vector<uint8_t> & in, bool is_kvflash) {
+    if (slot < 0 || slot >= n_slots_ || !caches_[(size_t) slot] || tokens <= 0 || in.empty()) return false;
+    Inkling2Cache & cache = *caches_[(size_t) slot];
+    const bool live_kf = (cache.kvflash && cache.kvflash->active());
+    if (is_kvflash != live_kf) return false;
+    if (live_kf) {
+        return cache.kvflash->restore_state(in, tokens);
+    }
+    if (cache.tree.active) {
+        auto & tc = cache.tree;
+        size_t expected = 0;
+        for (int ip = 0; ip < weights_.n_layer_phys; ++ip) {
+            if (weights_.layers[ip].is_swa) continue;
+            ggml_tensor * pk = tc.prefix_k[ip];
+            ggml_tensor * pv = tc.prefix_v[ip];
+            if (!pk || !pv || tokens > pk->ne[1] || tokens > pv->ne[1]) return false;
+            expected += (size_t) pk->ne[3] * (size_t) weights_.n_head_kv * (size_t) tokens * (pk->nb[1] + pv->nb[1]);
+        }
+        if (in.size() != expected) return false;
+        const uint8_t * src = in.data();
+        for (int ip = 0; ip < weights_.n_layer_phys; ++ip) {
+            if (weights_.layers[ip].is_swa) continue;
+            ggml_tensor * pk = tc.prefix_k[ip];
+            ggml_tensor * pv = tc.prefix_v[ip];
+            const int p_st = (int) pk->ne[3];
+            const size_t seg_k = (size_t) tokens * pk->nb[1];
+            const size_t seg_v = (size_t) tokens * pv->nb[1];
+            for (int p = 0; p < p_st; ++p) {
+                for (int h = 0; h < weights_.n_head_kv; ++h) {
+                    ggml_backend_tensor_set(pk, src, (size_t) p * pk->nb[3] + (size_t) h * pk->nb[2], seg_k);
+                    src += seg_k;
+                }
+                for (int h = 0; h < weights_.n_head_kv; ++h) {
+                    ggml_backend_tensor_set(pv, src, (size_t) p * pv->nb[3] + (size_t) h * pv->nb[2], seg_v);
+                    src += seg_v;
+                }
+            }
+        }
+        if (backend_) ggml_backend_synchronize(backend_);
+        return (size_t) (src - in.data()) == expected;
+    }
+    size_t expected = 0;
+    for (int il : weights_.global_slots) {
+        ggml_tensor * k = cache.k_cache[il];
+        ggml_tensor * v = cache.v_cache[il];
+        if (!k || !v || tokens > k->ne[1] || tokens > v->ne[1]) return false;
+        expected += (size_t) weights_.n_head_kv * (size_t) tokens * (k->nb[1] + v->nb[1]);
+    }
+    if (in.size() != expected) return false;
+    const uint8_t * src = in.data();
+    for (int il : weights_.global_slots) {
+        ggml_tensor * k = cache.k_cache[il];
+        ggml_tensor * v = cache.v_cache[il];
+        const size_t seg_k = (size_t) tokens * k->nb[1];
+        const size_t seg_v = (size_t) tokens * v->nb[1];
+        for (int h = 0; h < weights_.n_head_kv; ++h) {
+            ggml_backend_tensor_set(k, src, (size_t) h * k->nb[2], seg_k);
+            src += seg_k;
+        }
+        for (int h = 0; h < weights_.n_head_kv; ++h) {
+            ggml_backend_tensor_set(v, src, (size_t) h * v->nb[2], seg_v);
+            src += seg_v;
+        }
+    }
+    if (backend_) ggml_backend_synchronize(backend_);
+    return (size_t) (src - in.data()) == expected;
+}
+
+bool Inkling2SeqEngine::restore_prefix_(
+        int slot, const std::vector<int32_t> & prompt, PrefixStoreRef checkpoint) {
+    const int idx = checkpoint_index_(checkpoint);
+    if (idx < 0 || checkpoint.tokens >= (int) prompt.size()) return false;
+    const PrefixCheckpoint & cp = prefix_checkpoints_[(size_t) idx];
+    if (!cp.valid || cp.tokens != checkpoint.tokens ||
+        cp.prompt_tokens.size() != (size_t) checkpoint.tokens ||
+        !std::equal(cp.prompt_tokens.begin(), cp.prompt_tokens.end(), prompt.begin())) {
+        return false;
+    }
+    Inkling2Cache & cache = *caches_[(size_t) slot];
+    if (!state_adapter_->restore_slot_state(slot, cp.state_slab) ||
+        !restore_global_kv_(slot, cp.tokens, cp.global_kv, cp.is_kvflash)) {
+        reset_inkling2_cache(cache);
+        return false;
+    }
+    if (!slots_->seed_restored_prefix(slot, cp.tokens).ok) {
+        reset_inkling2_cache(cache);
+        return false;
+    }
+    auto & st = *slot_state_[(size_t) slot];
+    st.prefill_pos = cp.tokens;
+    if (cache.tree.active) {
+        cache.tree.prefix_len = cp.tokens;
+        if (cp.has_draft_kv) {
+            cache.tree.draft_pref_start = cp.draft_pref_start;
+        } else {
+            const int win = resolve_draft_window();
+            cache.tree.draft_pref_start = (win > 0 && (int) prompt.size() > win)
+                ? std::max(cp.tokens, (int) prompt.size() - win)
+                : cp.tokens;
+        }
+    }
+    cache.cur_pos = cp.tokens;
+    if (cache.kvflash && cache.kvflash->active()) {
+        const int ct = cache.kvflash->block_size();
+        st.rewind_pos = cache.kvflash->plan_mode4_rewind(prompt, -1);
+        if (st.rewind_pos >= 0 && st.rewind_pos < st.prefill_pos) {
+            // Rewind cannot precede the restored prefix; align up to next chunk boundary inside the new suffix.
+            const int aligned = ((st.prefill_pos + ct - 1) / ct) * ct;
+            if (aligned < (int) prompt.size()) {
+                st.rewind_pos = aligned;
+                if (aligned == st.prefill_pos) {
+                    cache.kvflash->save_rewind_snap(cache, weights_, st.rewind_pos);
+                }
+            } else {
+                st.rewind_pos = -1;
+            }
+        }
+        st.q_cap_start = (st.rewind_pos >= 0)
+            ? std::max(st.rewind_pos, (int) prompt.size() - cache.kvflash->select_queries())
+            : (int) prompt.size();
+        cache.kvflash->clear_queries();
+    }
+    return true;
+}
+
+PrefixStoreEvent Inkling2SeqEngine::capture_prefix_(int slot, const PrefixCaptureTicket & ticket) {
+    PrefixStoreEvent event;
+    event.ticket = ticket;
+    event.status = PrefixStoreEvent::Status::failed;
+    const int idx = checkpoint_index_(ticket.checkpoint);
+    const SeqSlot & sl = slots_->slot(slot);
+    if (!supports_prefix_store() || idx < 0 || !ticket.valid() ||
+        ticket.checkpoint.tokens != sl.cur_pos ||
+        ticket.checkpoint.tokens > (int) sl.sample_history.size()) {
+        event.error = "inkling2 invalid prefix capture boundary";
+        return event;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto elapsed_us = [&t0] {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+
+    const Inkling2Cache & cache = *caches_[(size_t) slot];
+    const bool save_draft = cache.tree.active &&
+                            ticket.checkpoint.tokens > cache.tree.draft_pref_start &&
+                            (cache.tree.draft_ring_cap > 0 || cache.tree.draft_cap <= 8192);
+    PrefixCheckpoint next;
+    next.tokens = ticket.checkpoint.tokens;
+    next.draft_pref_start = cache.tree.active ? cache.tree.draft_pref_start : 0;
+    next.has_draft_kv = save_draft;
+    next.prompt_tokens.assign(sl.sample_history.begin(), sl.sample_history.begin() + next.tokens);
+
+    if (backend_) ggml_backend_synchronize(backend_);
+    const bool state_ok = save_draft
+        ? state_adapter_with_draft_->save_slot_state(slot, next.state_slab)
+        : state_adapter_->save_slot_state(slot, next.state_slab);
+    if (!state_ok || !save_global_kv_(slot, next.tokens, next.global_kv, next.is_kvflash)) {
+        event.elapsed_us = elapsed_us();
+        event.error = "inkling2 prefix capture failed";
+        return event;
+    }
+    next.bytes = next.state_slab.size() + next.global_kv.size() + next.prompt_tokens.size() * sizeof(int32_t);
+    next.valid = true;
+    prefix_checkpoints_[(size_t) idx] = std::move(next);
+
+    event.status = PrefixStoreEvent::Status::saved;
+    event.bytes = prefix_checkpoints_[(size_t) idx].bytes;
+    event.elapsed_us = elapsed_us();
+    std::fprintf(stderr,
+        "[inkling2-seq] saved checkpoint=%llu slot=%d tokens=%d bytes=%.1f MiB kvflash=%d draft=%d time_ms=%.1f\n",
+        (unsigned long long) ticket.checkpoint.id, slot, ticket.checkpoint.tokens,
+        (double) event.bytes / 1048576.0,
+        prefix_checkpoints_[(size_t) idx].is_kvflash ? 1 : 0,
+        prefix_checkpoints_[(size_t) idx].has_draft_kv ? 1 : 0,
+        (double) event.elapsed_us / 1000.0);
+    return event;
+}
+
+SeqEngine::AdmitResult Inkling2SeqEngine::admit_with_prefix(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        const PrefixStorePlan & plan) {
+    AdmitResult res = admit_bounded(request_id, prompt, sampler, 0, {});
+    if (res.status != AdmitResult::Status::admitted) return res;
+    const int s = res.slot;
+    slots_->slot(s).pending_capture = {};
+
+    if (plan.restore.valid()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool restored = restore_prefix_(s, prompt, plan.restore);
+        const uint64_t elapsed_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (restored) {
+            res.prefix_store.restored = plan.restore;
+            std::fprintf(stderr,
+                "[inkling2-seq] restored checkpoint=%llu slot=%d tokens=%d/%zu time_ms=%.1f\n",
+                (unsigned long long) plan.restore.id, s, plan.restore.tokens, prompt.size(),
+                (double) elapsed_us / 1000.0);
+        } else {
+            discard_prefix_store(plan.restore);
+            res.prefix_store.invalidated = plan.restore;
+        }
+        res.prefix_store.restore_attempted = true;
+        res.prefix_store.restore_elapsed_us = elapsed_us;
+    }
+
+    const SeqSlot & seq = slots_->slot(s);
+    if (!res.prefix_store.invalidated.valid() && plan.capture.valid() &&
+        checkpoint_index_(plan.capture.checkpoint) >= 0 &&
+        plan.capture.checkpoint.tokens > seq.cur_pos &&
+        plan.capture.checkpoint.tokens <= seq.prompt_len) {
+        slots_->slot(s).pending_capture = plan.capture;
+        res.prefix_store.capture = plan.capture;
     }
     return res;
 }
@@ -526,6 +897,11 @@ SeqEngine::StepResult Inkling2SeqEngine::step_batched_2dsd_(const StepPlan & pla
         if (st.rewind_pos > st.prefill_pos && st.rewind_pos < st.prefill_pos + take) {
             take = st.rewind_pos - st.prefill_pos;
         }
+        if (sl.pending_capture.valid() &&
+            sl.pending_capture.checkpoint.tokens > st.prefill_pos &&
+            sl.pending_capture.checkpoint.tokens < st.prefill_pos + take) {
+            take = sl.pending_capture.checkpoint.tokens - st.prefill_pos;
+        }
         if (st.prefill_pos == 0) {
             const int win = resolve_draft_window();
             sc.tree.draft_pref_start = (win > 0 && sl.prompt_len > win) ? (sl.prompt_len - win) : 0;
@@ -593,6 +969,11 @@ SeqEngine::StepResult Inkling2SeqEngine::step_batched_2dsd_(const StepPlan & pla
 
         PrefillOutput po;
         po.slot = s;
+        if (sl.pending_capture.valid() && st.prefill_pos == sl.pending_capture.checkpoint.tokens) {
+            const PrefixCaptureTicket ticket = sl.pending_capture;
+            sl.pending_capture = {};
+            po.prefix_store = capture_prefix_(s, ticket);
+        }
         if (is_last) {
             if (!is_greedy && !last_logits.empty()) {
                 auto ph = sl.penalty_history();
@@ -705,6 +1086,11 @@ SeqEngine::StepResult Inkling2SeqEngine::step_batched_2dsd_(const StepPlan & pla
             st.session = std::make_unique<Inkling2TwoDSDSession>(
                 *st.runner, slot_cfg, st.stats, max_context(),
                 is_greedy ? nullptr : &st.hooks);
+            if (!sl.sample_history.empty()) {
+                st.session->set_prompt_history(sl.sample_history);
+            } else if (!st.prompt.empty()) {
+                st.session->set_prompt_history(st.prompt);
+            }
             std::string serr;
             if (!st.session->seed_cursor(in.token, sc.tree.prefix_len, serr)) {
                 result.decode.clear();
@@ -1036,6 +1422,11 @@ SeqEngine::StepResult Inkling2SeqEngine::step_1d_(const StepPlan & plan) {
         if (sr.rewind_pos > pos0 && sr.rewind_pos < pos0 + n) {
             n = sr.rewind_pos - pos0;
         }
+        if (seq.pending_capture.valid() &&
+            seq.pending_capture.checkpoint.tokens > pos0 &&
+            seq.pending_capture.checkpoint.tokens < pos0 + n) {
+            n = seq.pending_capture.checkpoint.tokens - pos0;
+        }
         const int end = pos0 + n;
         const bool is_last = (end == prompt_len);
         const bool is_greedy = sample_logits_is_argmax(seq.sampler);
@@ -1089,6 +1480,11 @@ SeqEngine::StepResult Inkling2SeqEngine::step_1d_(const StepPlan & plan) {
 
         PrefillOutput po;
         po.slot = s;
+        if (seq.pending_capture.valid() && end == seq.pending_capture.checkpoint.tokens) {
+            const PrefixCaptureTicket ticket = seq.pending_capture;
+            seq.pending_capture = {};
+            po.prefix_store = capture_prefix_(s, ticket);
+        }
         if (is_last) {
             slots_->commit_prefill(s);
             po.status = PrefillOutput::Status::completed;

@@ -108,6 +108,11 @@ profile and the requirements checked at startup.
 | `LUCE_INKLING2_2DSD_LM_SPLIT_MAX` | `0` | Maximum Coda row bucket that splits `w.output` across Dual-GPU (`0` keeps LM head on target GPU). |
 | `LUCE_INKLING2_2DSD_DUAL_F16` | `0` | OPT-IN: `=1` casts Dual-GPU 2DSD MoE peer activations/sums to F16 on `row_b >= 8` (default `0` keeps bit-exact F32 peer transport). |
 | `LUCE_INKLING2_2DSD_PROFILE` | `0` | DEBUG: `=1` prints per-phase (`Prelude`/`Core`/`Coda`) 2DSD latency breakdown. |
+| `LUCE_INKLING2_3DSD_CODA_PIGGYBACK` | `1` | KILL SWITCH (burn-in): `=0` disables 3rd-axis Coda `d1`/`d2` expert piggybacking (when `depth==3` rows cover `>=32` experts, early-exit Coda rows reuse those experts with 0 extra weight reads; 100% bit-exact). |
+| `LUCE_INKLING2_3DSD_TREE_BRANCH` | `0` | OPT-IN: `=1` enables confidence-guided top-2 Markov tree branching at the first uncertain draft slot (`conf ∈ [0.25, 0.72]`, 100% bit-exact). |
+| `LUCE_INKLING2_3DSD_LOOKUP` | `1` | KILL SWITCH (burn-in): `=0` disables 0.01 ms n-gram prompt-lookup trie injection (100% bit-exact). |
+| `LUCE_INKLING2_3DSD_LOOKUP_K` | `16` | Maximum prompt-lookup chain length per anchor (`2..32`). |
+| `LUCE_INKLING2_2DSD_EARLY_EXIT_P` | `0.0` (off) | OPT-IN: native `varloop` `d=2` early exit when `argmax(d1)==argmax(d2)` and `p_max(d2) >= threshold` (e.g. `0.98`); `0.0` keeps strict `R=3` bit-exactness. |
 | `LUCE_INKLING2_PREFETCH` | `0` | OPT-IN: `=1` enables next-layer MALL weight prefetch during Dual-GPU Inkling 2 MoE joins. |
 | `LUCE_MMQ_IQ4_NL_MOE_X` | `16` on sparse `gfx1151`/`gfx1201` | KILL SWITCH (burn-in): override MMQ output tile width (`8..64`, `0` restores default) for sparse `IQ4_NL` grouped MoE (`routes_per_expert <= 8`). |
 | `GGML_CUDA_MLA_STREAM_F32_STAGE` | enabled for maskless ratio-4 sparse prefill; unset otherwise | With F16-input streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. Applies only when streaming top-k is selected automatically or through `GGML_CUDA_MLA_STREAM_TOPK` / `GGML_DS4_FA_STREAM_TOPK`. Set `0` to restore F16 staging for F16 inputs. This override does not affect the compact-order HIP F32 path. |

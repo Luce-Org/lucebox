@@ -32,6 +32,13 @@ struct Inkling2TwoDSDConfig {
     int   k                = 8;     // block size (1 anchor + k-1 drafted tokens)
     float draft_confidence = 0.0f;  // >0: truncate drafted block before first slot with conf < threshold
     bool  frozen_suffix    = true;
+    // 3DSD levers (all lossless except opt-in early_exit_p > 0):
+    bool  tree_branch      = false; // opt-in: branch top-2 Markov candidate at first uncertain draft slot
+    float branch_conf_low  = 0.25f;
+    float branch_conf_high = 0.72f;
+    bool  prompt_lookup    = true;  // 0.01 ms n-gram lookup injection into 2DSD trie (skips GPU drafter on match!)
+    int   lookup_max_k     = 16;    // max prompt-lookup chain length per anchor
+    float early_exit_p     = 0.0f;  // opt-in varloop d2 early exit (>0, e.g. 0.98; 0 = OFF / 100% bit-exact R=3)
 };
 
 struct Inkling2TwoDSDStats {
@@ -41,6 +48,10 @@ struct Inkling2TwoDSDStats {
     long long drafter_calls     = 0;
     long long draft_slots       = 0;
     long long draft_slots_cut   = 0;
+    long long draft_branches    = 0;
+    long long lookup_hits       = 0;
+    long long lookup_slots      = 0;
+    long long early_exits       = 0;
     long long commit_main       = 0;
     long long commit_frozen     = 0;
     long long commit_fork       = 0;
@@ -103,6 +114,13 @@ public:
     // Seed the initial cursor at `first_token` (already committed at prefix_len - 1) and queue its anchor.
     bool seed_cursor(int32_t first_token, int prefix_len_before_first, std::string & error);
 
+    // Seed committed token history for 0.01 ms n-gram prompt-lookup drafting (optional).
+    void set_prompt_history(const std::vector<int32_t> & prompt_tokens);
+
+    // Provide per-readout max softmax probability (temp=1) from the latest advance_nodes call
+    // for opt-in native varloop d2 early exit (`cfg.early_exit_p > 0`).
+    void set_last_readout_pmax(const std::vector<float> & pmax);
+
     // Phase A: collect pending draft requests (without running the drafter) and apply returned drafts.
     void collect_draft_reqs(std::vector<Inkling2TwoDSDDraftReq> & out_reqs,
                             std::vector<int> & out_plan_heads,
@@ -151,7 +169,9 @@ bool inkling2_2dsd_run_greedy(
     Inkling2TwoDSDStats & stats,
     std::string & error);
 
-// Run 2DSD decode with optional lossless stochastic sampling hooks (`sampler == nullptr` => greedy).
+// Run 2DSD decode with optional lossless stochastic sampling hooks (`sampler == nullptr` => greedy),
+// optional prompt token history for 0.01 ms prompt-lookup drafting, and optional pmax provider for
+// opt-in varloop d2 early-exit.
 bool inkling2_2dsd_run(
     Inkling2TwoDSDRunner & runner,
     const Inkling2TwoDSDConfig & cfg,
@@ -160,7 +180,9 @@ bool inkling2_2dsd_run(
     const std::function<bool(int32_t &)> & on_commit,
     const Inkling2TwoDSDSamplerHooks * sampler,
     Inkling2TwoDSDStats & stats,
-    std::string & error);
+    std::string & error,
+    const std::vector<int32_t> * prompt_history = nullptr,
+    const std::vector<float> * last_pmax = nullptr);
 
 // Parse stage string ("stage1", "stage2a", "stage2b") and env overrides.
 Inkling2TwoDSDConfig inkling2_2dsd_config_from_env(int R, int block_size);

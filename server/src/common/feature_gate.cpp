@@ -334,8 +334,10 @@ std::string check_feature_compatibility(
             const bool per_slot_engine = (arch == "qwen4exp" || arch_is_inkling2_family(arch));
             if (!per_slot_engine)
                 return "--max-concurrency requires --paged-attention";
-            if (args.max_concurrency > 4)
-                return arch + " full-cache concurrency supports at most 4 slots";
+            const int max_per_slot = (arch == "qwen4exp" || arch_is_inkling2_family(arch)) ? 16 : 4;
+            if (args.max_concurrency > max_per_slot)
+                return arch + " full-cache concurrency supports at most " +
+                       std::to_string(max_per_slot) + " slots";
             if (args.kv_pool_tokens != 0)
                 return arch + " full-cache concurrency does not use --kv-pool-tokens";
             if (args.device.max_ctx <= 0)

@@ -980,6 +980,7 @@ static __global__ void inkling2_attn_rel_single_kernel(
     }
 }
 
+
 // ─── 8b. Split-KV Inline Relative-Bias + Zero-Sink Attention (Global Layers) ──
 template <bool KV_Q8_0, int GQA>
 static __global__ void inkling2_attn_rel_split_kernel(
@@ -2728,13 +2729,16 @@ static __global__ void inkling2_router_q8_gemv_kernel(
     }
 }
 
-// Register-only zero-spill warp Top-8 helper for n_exp == 128, top_k == 8 (eliminates scratch VRAM spills!)
+// Register-only zero-spill warp Top-K helper for n_exp == 128, top_k == 8 (eliminates scratch VRAM spills!)
+// Optional `allow_mask[128]` restricts selection to already-loaded experts (Coda d1/d2 piggybacking!).
 static __device__ __forceinline__ void inkling2_warp_top8_128(
         const float * __restrict__ lp,
         const float * __restrict__ bias,
         int32_t * op_ids,
         int32_t * op_wts,
-        float route_scale, float eps, int lane) {
+        float route_scale, float eps, int lane,
+        const uint8_t * allow_mask = nullptr,
+        int k_active = 8) {
     float p0 = sigmoid_f32(lp[lane +  0]);
     float p1 = sigmoid_f32(lp[lane + 32]);
     float p2 = sigmoid_f32(lp[lane + 64]);
@@ -2743,10 +2747,23 @@ static __device__ __forceinline__ void inkling2_warp_top8_128(
     float s1 = bias ? (p1 + bias[lane + 32]) : p1;
     float s2 = bias ? (p2 + bias[lane + 64]) : p2;
     float s3 = bias ? (p3 + bias[lane + 96]) : p3;
+    if (allow_mask) {
+        if (!allow_mask[lane +  0]) s0 = -INFINITY;
+        if (!allow_mask[lane + 32]) s1 = -INFINITY;
+        if (!allow_mask[lane + 64]) s2 = -INFINITY;
+        if (!allow_mask[lane + 96]) s3 = -INFINITY;
+    }
 
     float my_chosen_p = 0.0f;
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
+        if (k >= k_active) {
+            if (lane == k) {
+                op_ids[k] = -1;
+                my_chosen_p = 0.0f;
+            }
+            continue;
+        }
         float bv = s0, bp = p0; int bi = lane;
         if (s1 > bv) { bv = s1; bp = p1; bi = lane + 32; }
         if (s2 > bv) { bv = s2; bp = p2; bi = lane + 64; }
@@ -2762,8 +2779,8 @@ static __device__ __forceinline__ void inkling2_warp_top8_128(
             }
         }
         if (lane == k) {
-            op_ids[k] = bi;
-            my_chosen_p = bp;
+            op_ids[k] = isinf(bv) ? -1 : bi;
+            my_chosen_p = isinf(bv) ? 0.0f : bp;
         }
         if (bi == lane)           s0 = -INFINITY;
         else if (bi == lane + 32) s1 = -INFINITY;
@@ -2773,7 +2790,7 @@ static __device__ __forceinline__ void inkling2_warp_top8_128(
     const float sum_p = warp_reduce_sum(my_chosen_p);
     if (lane < 8) {
         const float inv = route_scale / fmaxf(sum_p, eps);
-        op_wts[lane] = __float_as_int(my_chosen_p * inv);
+        op_wts[lane] = __float_as_int((lane < k_active && op_ids[lane] >= 0) ? (my_chosen_p * inv) : 0.0f);
     }
 }
 
@@ -2849,19 +2866,23 @@ static __global__ void inkling2_sigmoid_topk_packed_kernel(
     }
 }
 
-// Fused 1-block Zero-Spill Top-8 + Dual-GPU O(1) Histogram/Ballot Split (supports up to T=64!):
-// Emits I32 [8, T, 3]: slice 0 = hot_sel, slice 1 = cold_sel, slice 2 = __float_as_int(wsel).
+// Fused 1-block Zero-Spill Top-8 + Optional Coda d1/d2 Expert Piggybacking (bit 2 = FLAG_EARLY_CODA)
+// + Optional Dual-GPU O(1) Histogram/Ballot Split (supports up to T=128!).
+// When target_pct > 0: emits I32 [8, T, 3] = {hot_sel, cold_sel, wsel}.
+// When target_pct == 0: emits I32 [8, T, 2] = {sel, wsel} (single-GPU with Coda piggybacking).
 static __global__ void inkling2_sigmoid_topk_split_kernel(
         const float   * __restrict__ logits, // F32 [128, T]
         const float   * __restrict__ bias,   // nullptr or F32 [128]
-        const int32_t * __restrict__ flags,  // nullptr or I32 [T] (bit 1 = FLAG_PADDING)
-        int32_t       * __restrict__ dst,    // I32 [8, T, 3]
-        int n_tokens, int target_pct, float route_scale, float eps) {
-    __shared__ int32_t s_ids[64 * 8];
+        const int32_t * __restrict__ flags,  // nullptr or I32 [T] (bit 1 = PADDING, bit 2 = EARLY_CODA)
+        int32_t       * __restrict__ dst,    // I32 [8, T, 2 or 3]
+        int n_tokens, int target_pct, float route_scale, float eps, int coda_piggyback) {
+    __shared__ int32_t s_ids[128 * 8];
     __shared__ int32_t s_freq[128];
-    __shared__ int32_t s_hist[65];
+    __shared__ int32_t s_hist[129];
     __shared__ int32_t s_warp_cnt[8];
     __shared__ uint8_t s_is_hot[128];
+    __shared__ uint8_t s_d3_mask[128];
+    __shared__ int32_t s_n_d3_exp;
     __shared__ int32_t s_cut_f;
     __shared__ int32_t s_cut_rem;
 
@@ -2870,20 +2891,75 @@ static __global__ void inkling2_sigmoid_topk_split_kernel(
     const int lane   = tid & 31;
     const int nwarps = blockDim.x >> 5;
     const int total  = n_tokens * 8;
+    const int wts_slice = (target_pct > 0) ? 2 : 1;
 
     if (tid < 128) {
-        s_freq[tid] = 0;
-        s_is_hot[tid] = 0;
+        s_freq[tid]    = 0;
+        s_is_hot[tid]  = 0;
+        s_d3_mask[tid] = 0;
     }
-    if (tid < 65) s_hist[tid] = 0;
-
-    for (int row = warp; row < n_tokens; row += nwarps) {
-        const int src_row = (flags && (flags[row] & 2) != 0) ? 0 : row;
-        const float * lp = logits + (size_t) src_row * 128;
-        int32_t * op_wts = dst + (size_t) 2 * total + (size_t) row * 8;
-        inkling2_warp_top8_128(lp, bias, s_ids + row * 8, op_wts, route_scale, eps, lane);
-    }
+    if (tid == 0) s_n_d3_exp = 0;
+    for (int b = tid; b < 129; b += blockDim.x) s_hist[b] = 0;
     __syncthreads();
+
+    if (coda_piggyback && flags) {
+        // Pass 1: exact full top-8 for all non-early, non-padding (depth == 3) rows!
+        for (int row = warp; row < n_tokens; row += nwarps) {
+            if ((flags[row] & 6) != 0) continue;
+            const float * lp = logits + (size_t) row * 128;
+            int32_t * op_wts = dst + (size_t) wts_slice * total + (size_t) row * 8;
+            inkling2_warp_top8_128(lp, bias, s_ids + row * 8, op_wts, route_scale, eps, lane, nullptr, 8);
+            if (lane < 8) {
+                const int32_t e = s_ids[row * 8 + lane];
+                if (e >= 0 && e < 128) s_d3_mask[e] = 1;
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int cnt = 0;
+            for (int e = 0; e < 128; ++e) cnt += (int) s_d3_mask[e];
+            s_n_d3_exp = cnt;
+        }
+        __syncthreads();
+
+        // Pass 2: early-Coda (d1/d2) rows piggyback strictly on depth-3 experts (0 extra weight reads!)
+        // ONLY when depth-3 already covers >= 32 experts (e.g. high-acceptance or multi-stream batches);
+        // otherwise keep full exact top-8 so low-acceptance single-stream d1/d2 accuracy never degrades.
+        const uint8_t * emask = (s_n_d3_exp >= 32) ? s_d3_mask : nullptr;
+        const int ek = 8;
+        for (int row = warp; row < n_tokens; row += nwarps) {
+            if ((flags[row] & 4) == 0 || (flags[row] & 2) != 0) continue;
+            const float * lp = logits + (size_t) row * 128;
+            int32_t * op_wts = dst + (size_t) wts_slice * total + (size_t) row * 8;
+            inkling2_warp_top8_128(lp, bias, s_ids + row * 8, op_wts, route_scale, eps, lane, emask, ek);
+        }
+        __syncthreads();
+
+        // Pass 3: padding rows copy row 0's already-chosen experts & weights (0 extra experts!)
+        for (int row = warp; row < n_tokens; row += nwarps) {
+            if ((flags[row] & 2) == 0) continue;
+            if (lane < 8) {
+                s_ids[row * 8 + lane] = s_ids[lane];
+                dst[(size_t) wts_slice * total + (size_t) row * 8 + lane] = dst[(size_t) wts_slice * total + lane];
+            }
+        }
+        __syncthreads();
+    } else {
+        for (int row = warp; row < n_tokens; row += nwarps) {
+            const int src_row = (flags && (flags[row] & 2) != 0) ? 0 : row;
+            const float * lp = logits + (size_t) src_row * 128;
+            int32_t * op_wts = dst + (size_t) wts_slice * total + (size_t) row * 8;
+            inkling2_warp_top8_128(lp, bias, s_ids + row * 8, op_wts, route_scale, eps, lane);
+        }
+        __syncthreads();
+    }
+
+    if (target_pct <= 0) {
+        for (int i = tid; i < total; i += blockDim.x) {
+            dst[i] = s_ids[i];
+        }
+        return;
+    }
 
     for (int i = tid; i < total; i += blockDim.x) {
         const int32_t e = s_ids[i];
@@ -3966,6 +4042,544 @@ static __global__ void inkling2_tree_attn_rel_kernel(
     }
 }
 
+#ifdef GGML_USE_HIP
+// Native RDNA4 (gfx1201) & RDNA3.5 (gfx1151) Wave32 WMMA Global Tree Attention Prefix Kernel!
+// Packs up to BM = 128 GQA-grouped query rows (42 tree cells at GQA=3) sharing the same
+// storage plane into ONE 40+ TFLOPS WMMA pass over the 268K prefix KV cache (with Split-K
+// across all 64 CUs), eliminating the 32x redundant HBM reads and scalar ALU bottleneck!
+template <bool KV_Q8_0, int GQA>
+static __global__ void __launch_bounds__(256, 1)
+inkling2_tree_attn_rel_wmma_prefix_kernel(
+        const float   * __restrict__ q_ptr,          // [128, Hq, T]
+        const char    * __restrict__ prefix_k,       // [128, cap, Hk, P_storage]
+        const char    * __restrict__ prefix_v,       // [128, cap, Hk, P_storage]
+        size_t pk_nb1, size_t pk_nb2, size_t pk_nb3,
+        size_t pv_nb1, size_t pv_nb2, size_t pv_nb3,
+        const float   * __restrict__ rel_table,      // [rel_extent+1, Hq, T]
+        const int32_t * __restrict__ meta,           // [m_stride, T]
+        const int32_t * __restrict__ prefix_len_buf, // contiguous or paged [2 + max_blocks, n_seq]
+        float         * __restrict__ part_out,       // [(128+2), Hq, T, num_splits + 1]
+        int Hq, int T, int prefix_cap, int p_storage, int p_logical,
+        int rel_extent, int m_stride, int block_size, int max_blocks,
+        int shared_kv_window, int shared_tail_cap,
+        int prefix_len_n, int prefix_len_rows, int planes_per_seq_arg,
+        int tiles_per_plane, int num_splits) {
+#if defined(RDNA4) || defined(RDNA3) || defined(RDNA3_5)
+    constexpr int D  = 128;
+    constexpr int BN = 32;
+    constexpr int BM = 128;
+    constexpr int ND = 8; // 128 / 16
+    constexpr int NT = 2; // 32 / 16
+    constexpr int MAX_CELLS = BM / GQA; // 42 for GQA=3
+
+    __shared__ __align__(16) _Float16 KV_lds[BN * D];
+    __shared__ int s_qtok[MAX_CELLS];
+    __shared__ int s_qpos[MAX_CELLS];
+    __shared__ int s_qscut[MAX_CELLS];
+    __shared__ int s_my_cnt;
+    __shared__ int s_grp_seq;
+    __shared__ int s_grp_cut;
+
+    const int lane      = threadIdx.x;      // 0..31
+    const int wave      = threadIdx.y;      // 0..7
+    const int tid       = wave * 32 + lane; // 0..255
+    const int r         = lane & 15;        // 0..15
+    const int hi        = lane >> 4;        // 0 or 1
+
+    const int kv_head       = blockIdx.x;
+    const int target_pplane = blockIdx.y / tiles_per_plane;
+    const int tile_idx      = blockIdx.y - target_pplane * tiles_per_plane;
+    const int split_idx     = blockIdx.z;
+
+    const int n_seq          = (prefix_len_rows > 1) ? prefix_len_rows : 1;
+    const int planes_per_seq = (planes_per_seq_arg > 0) ? planes_per_seq_arg
+                             : ((n_seq > 1) ? max(1, p_logical / n_seq) : p_logical);
+    const bool use_shared_tail = (shared_kv_window > 0 && planes_per_seq > 1 && shared_tail_cap > 0);
+    const int pool_cap         = use_shared_tail ? (prefix_cap - (planes_per_seq - 1) * shared_tail_cap) : prefix_cap;
+
+    if (tid == 0) {
+        int seen = 0;
+        int cnt  = 0;
+        int gseq = 0;
+        int gcut = 0;
+        const int cell_lo = tile_idx * MAX_CELLS;
+        const int cell_hi = cell_lo + MAX_CELLS;
+        for (int t = 0; t < T; ++t) {
+            const int32_t * mt = meta + (size_t) t * m_stride;
+            const int plane    = mt[2];
+            const int seq_slot = (n_seq > 1) ? (plane / planes_per_seq) : 0;
+            const int pplane   = (p_storage == 1) ? 0
+                               : (n_seq > 1 && p_storage == n_seq) ? seq_slot
+                               : plane;
+            if (pplane != target_pplane) continue;
+            if (seen >= cell_lo && seen < cell_hi) {
+                const int q_pos  = mt[1];
+                const int lplane = (n_seq > 1) ? (plane - seq_slot * planes_per_seq) : plane;
+                int pref_len = 0;
+                if (block_size > 0 && max_blocks > 0) {
+                    pref_len = prefix_len_buf[(size_t) seq_slot * (2 + max_blocks)];
+                } else if (prefix_len_rows > 1) {
+                    pref_len = prefix_len_buf[(size_t) seq_slot * prefix_len_n];
+                } else {
+                    pref_len = (prefix_len_n > 1) ? prefix_len_buf[plane] : prefix_len_buf[0];
+                }
+                const int pref_end   = min(q_pos + 1, pref_len);
+                const bool early_sh  = use_shared_tail && (lplane < planes_per_seq - 1);
+                const int shared_cut = early_sh ? min(pref_end, max(0, pref_len - shared_kv_window)) : pref_end;
+                s_qtok[cnt]  = t;
+                s_qpos[cnt]  = q_pos;
+                s_qscut[cnt] = shared_cut;
+                if (cnt == 0) gseq = seq_slot;
+                if (shared_cut > gcut) gcut = shared_cut;
+                ++cnt;
+            }
+            ++seen;
+        }
+        s_my_cnt  = cnt;
+        s_grp_seq = gseq;
+        s_grp_cut = gcut;
+    }
+    __syncthreads();
+
+    const int my_cnt = s_my_cnt;
+    if (my_cnt == 0) return;
+
+    const int grp_seq = s_grp_seq;
+    const int grp_cut = s_grp_cut;
+    const int32_t * block_table = (block_size > 0 && max_blocks > 0)
+        ? (prefix_len_buf + (size_t) grp_seq * (2 + max_blocks) + 2)
+        : nullptr;
+
+    const int row_idx  = wave * 16 + r;
+    const int local_q  = row_idx / GQA;
+    const bool valid_q = (local_q < my_cnt);
+    const int q_tok    = valid_q ? s_qtok[local_q] : 0;
+    const int head     = valid_q ? (kv_head * GQA + (row_idx - local_q * GQA)) : 0;
+    const int q_pos    = valid_q ? s_qpos[local_q] : 0;
+    const int my_scut  = valid_q ? s_qscut[local_q] : 0;
+
+    const float q_scale = kInvSqrt128 * kLog2E;
+    i2_f16x8_t Q_reg[ND];
+    const float * rt_base = nullptr;
+    float rt_clamp_l2 = 0.0f;
+    if (valid_q) {
+        const float * qp = q_ptr + ((size_t) q_tok * Hq + head) * D;
+        rt_base = rel_table + ((size_t) q_tok * Hq + head) * (rel_extent + 1);
+        rt_clamp_l2 = rt_base[rel_extent] * kLog2E;
+#pragma unroll
+        for (int kt = 0; kt < ND; ++kt) {
+            const float4 f0 = *reinterpret_cast<const float4 *>(qp + kt * 16 + hi * 8 + 0);
+            const float4 f1 = *reinterpret_cast<const float4 *>(qp + kt * 16 + hi * 8 + 4);
+            const uint4 qu = make_uint4(
+                i2_pack_f16x2(f0.x * q_scale, f0.y * q_scale),
+                i2_pack_f16x2(f0.z * q_scale, f0.w * q_scale),
+                i2_pack_f16x2(f1.x * q_scale, f1.y * q_scale),
+                i2_pack_f16x2(f1.z * q_scale, f1.w * q_scale));
+            Q_reg[kt] = __builtin_bit_cast(i2_f16x8_t, qu);
+        }
+    } else {
+#pragma unroll
+        for (int kt = 0; kt < ND; ++kt) {
+            Q_reg[kt] = {(_Float16)0.f, (_Float16)0.f, (_Float16)0.f, (_Float16)0.f,
+                         (_Float16)0.f, (_Float16)0.f, (_Float16)0.f, (_Float16)0.f};
+        }
+    }
+
+    i2_f32x8_t O[ND];
+#pragma unroll
+    for (int dt = 0; dt < ND; ++dt) O[dt] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m_max = -INFINITY;
+    float l_sum = 0.0f;
+
+    const char * k_head = prefix_k + (size_t) target_pplane * pk_nb3 + (size_t) kv_head * pk_nb2;
+    const char * v_head = prefix_v + (size_t) target_pplane * pv_nb3 + (size_t) kv_head * pv_nb2;
+
+    const int n_tiles_tot = (grp_cut + BN - 1) / BN;
+    const int tiles_per_s = (n_tiles_tot + num_splits - 1) / num_splits;
+    const int kb_beg      = split_idx * tiles_per_s * BN;
+    const int kb_end      = min(grp_cut, (split_idx + 1) * tiles_per_s * BN);
+
+    for (int kb = kb_beg; kb < kb_end; kb += BN) {
+        uint32_t tile_valid_mask = 0xFFFFFFFFu;
+        if (block_table != nullptr) {
+            tile_valid_mask = 0u;
+            const int n_k = min(BN, kb_end - kb);
+            for (int ki = 0; ki < n_k; ++ki) {
+                if (inkling2_resolve_kv_slot(kb + ki, pool_cap, 0, 0, block_table, block_size, max_blocks) >= 0) {
+                    tile_valid_mask |= (1u << ki);
+                }
+            }
+            if (tile_valid_mask == 0u) continue;
+        }
+        // 1. Load K[kb .. kb+31] into XOR-swizzled KV_lds[32][128]
+        {
+            constexpr int chunks_per_row = D / 8; // 16
+            constexpr int total_chunks   = BN * chunks_per_row; // 512
+#pragma unroll 1
+            for (int idx = tid; idx < total_chunks; idx += 256) {
+                const int ki = idx / chunks_per_row;
+                const int c  = idx - ki * chunks_per_row;
+                const int kp = kb + ki;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (kp < kb_end && (block_table == nullptr || (tile_valid_mask & (1u << ki)))) {
+                    const int slot = (block_table != nullptr)
+                        ? inkling2_resolve_kv_slot(kp, pool_cap, 0, 0, block_table, block_size, max_blocks)
+                        : (kp < pool_cap ? kp : -1);
+                    if (slot >= 0) {
+                        if constexpr (!KV_Q8_0) {
+                            v = *reinterpret_cast<const uint4 *>(k_head + (size_t) slot * pk_nb1 + c * 16);
+                        } else {
+                            const block_q8_0 * bp = reinterpret_cast<const block_q8_0 *>(k_head + (size_t) slot * pk_nb1) + (c >> 2);
+                            v = i2_dequant_q8_0_quad(bp, c & 3);
+                        }
+                    }
+                }
+                const int sc = i2_k_swiz(ki, c);
+                *reinterpret_cast<uint4 *>(KV_lds + ki * D + sc * 8) = v;
+            }
+        }
+        __syncthreads();
+
+        // 2. S = K * Q^T via Wave32 WMMA
+        i2_f32x8_t S[NT];
+        S[0] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        S[1] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int kt = 0; kt < ND; ++kt) {
+#if defined(RDNA4)
+            const i2_f16x8_t qb = Q_reg[kt];
+            const int c_raw = kt * 2 + hi;
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const int ki = t * 16 + r;
+                const int sc = i2_k_swiz(ki, c_raw);
+                const uint4 ku = *reinterpret_cast<const uint4 *>(KV_lds + ki * D + sc * 8);
+                S[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(i2_f16x8_t, ku), qb, S[t]);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#else
+            const uint4 q_self = __builtin_bit_cast(uint4, Q_reg[kt]);
+            const uint4 q_peer = make_uint4(
+                __shfl_xor(q_self.x, 16, 32), __shfl_xor(q_self.y, 16, 32),
+                __shfl_xor(q_self.z, 16, 32), __shfl_xor(q_self.w, 16, 32));
+            const uint4 q0 = hi ? q_peer : q_self;
+            const uint4 q1 = hi ? q_self : q_peer;
+            const i2_f16x16_t qb = __builtin_bit_cast(i2_f16x16_t, (uint4[2]){q0, q1});
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const int ki = t * 16 + r;
+                const uint4 ku0 = *reinterpret_cast<const uint4 *>(KV_lds + ki * D + i2_k_swiz(ki, kt * 2 + 0) * 8);
+                const uint4 ku1 = *reinterpret_cast<const uint4 *>(KV_lds + ki * D + i2_k_swiz(ki, kt * 2 + 1) * 8);
+                S[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(i2_f16x16_t, (uint4[2]){ku0, ku1}), qb, S[t]);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#endif
+        }
+
+        // 3. Inline mask + clamped relative-position bias (99.6% register hit at 268K!)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                const int ki = t * 16 + hi * 8 + e;
+#else
+                const int ki = t * 16 + 2 * e + hi;
+#endif
+                const int kp = kb + ki;
+                const int d_pos = q_pos - kp;
+                if (!valid_q || kp >= my_scut || kp >= kb_end || kp >= pool_cap || d_pos < 0 ||
+                    (block_table != nullptr && ((tile_valid_mask & (1u << ki)) == 0u))) {
+                    S[t][e] = -INFINITY;
+                } else {
+                    S[t][e] += (d_pos >= rel_extent) ? rt_clamp_l2 : (rt_base[d_pos] * kLog2E);
+                }
+            }
+        }
+
+        // 4. Online Softmax (single-cycle exp2f)
+        float m_tile = m_max;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) m_tile = fmaxf(m_tile, S[t][e]);
+        }
+        m_tile = fmaxf(m_tile, __shfl_xor(m_tile, 16, 32));
+
+        const bool valid_tile = isfinite(m_tile);
+        const float alpha = (valid_tile && isfinite(m_max)) ? exp2f(m_max - m_tile) : 0.0f;
+        if (valid_tile) {
+            m_max = m_tile;
+            l_sum *= alpha;
+#pragma unroll
+            for (int dt = 0; dt < ND; ++dt) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) O[dt][e] *= alpha;
+            }
+        }
+
+        i2_f16x8_t P[NT];
+        float p_sum = 0.0f;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            float pv[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                pv[e] = (valid_tile && isfinite(S[t][e])) ? exp2f(S[t][e] - m_max) : 0.0f;
+                p_sum += pv[e];
+            }
+            const uint4 pu = make_uint4(
+                i2_pack_f16x2(pv[0], pv[1]), i2_pack_f16x2(pv[2], pv[3]),
+                i2_pack_f16x2(pv[4], pv[5]), i2_pack_f16x2(pv[6], pv[7]));
+            P[t] = __builtin_bit_cast(i2_f16x8_t, pu);
+        }
+        p_sum += __shfl_xor(p_sum, 16, 32);
+        l_sum += p_sum;
+
+        __syncthreads();
+
+        // 5. Load V[kb .. kb+31] transposed into XOR-swizzled KV_lds[128][32]
+        {
+            constexpr int chunks_per_row = D / 8; // 16
+            constexpr int row_groups     = BN / 4; // 8
+            constexpr int total_tasks    = row_groups * chunks_per_row; // 128
+            if (tid < total_tasks) {
+                const int g   = tid / chunks_per_row;
+                const int c   = tid - g * chunks_per_row;
+                const int ki0 = g * 4;
+                const int d0  = c * 8;
+                auto load_v_row = [&](int kp) -> uint4 {
+                    const int ki = kp - kb;
+                    if (kp >= kb_end || (block_table != nullptr && ((tile_valid_mask & (1u << ki)) == 0u))) {
+                        return make_uint4(0u, 0u, 0u, 0u);
+                    }
+                    const int slot = (block_table != nullptr)
+                        ? inkling2_resolve_kv_slot(kp, pool_cap, 0, 0, block_table, block_size, max_blocks)
+                        : (kp < pool_cap ? kp : -1);
+                    if (slot < 0) return make_uint4(0u, 0u, 0u, 0u);
+                    if constexpr (!KV_Q8_0) {
+                        return *reinterpret_cast<const uint4 *>(v_head + (size_t) slot * pv_nb1 + c * 16);
+                    } else {
+                        const block_q8_0 * bp = reinterpret_cast<const block_q8_0 *>(v_head + (size_t) slot * pv_nb1) + (c >> 2);
+                        return i2_dequant_q8_0_quad(bp, c & 3);
+                    }
+                };
+                uint4 r0 = load_v_row(kb + ki0 + 0);
+                uint4 r1 = load_v_row(kb + ki0 + 1);
+                uint4 r2 = load_v_row(kb + ki0 + 2);
+                uint4 r3 = load_v_row(kb + ki0 + 3);
+                i2_store_v_4rows32(KV_lds, d0, g, r0, r1, r2, r3);
+            }
+        }
+        __syncthreads();
+
+        // 6. O += V^T * P via Wave32 WMMA
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+#if defined(RDNA4)
+            const i2_f16x8_t pt = P[t];
+#pragma unroll
+            for (int dt = 0; dt < ND; ++dt) {
+                const int d = dt * 16 + r;
+                const int sc = i2_v_swiz32(d, t * 2 + hi);
+                const uint4 vu = *reinterpret_cast<const uint4 *>(KV_lds + d * BN + sc * 8);
+                O[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(i2_f16x8_t, vu), pt, O[dt]);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+#else
+            const uint4 p_self = __builtin_bit_cast(uint4, P[t]);
+            const uint4 p_peer = make_uint4(
+                __shfl_xor(p_self.x, 16, 32), __shfl_xor(p_self.y, 16, 32),
+                __shfl_xor(p_self.z, 16, 32), __shfl_xor(p_self.w, 16, 32));
+            const uint4 lo_s = hi ? p_peer : p_self;
+            const uint4 hi_s = hi ? p_self : p_peer;
+            auto ilo = [](uint32_t a, uint32_t b) -> uint32_t { return (a & 0xFFFFu) | (b << 16); };
+            auto ihi = [](uint32_t a, uint32_t b) -> uint32_t { return (a >> 16) | (b & 0xFFFF0000u); };
+            const uint4 p0 = make_uint4(ilo(lo_s.x, hi_s.x), ihi(lo_s.x, hi_s.x), ilo(lo_s.y, hi_s.y), ihi(lo_s.y, hi_s.y));
+            const uint4 p1 = make_uint4(ilo(lo_s.z, hi_s.z), ihi(lo_s.z, hi_s.z), ilo(lo_s.w, hi_s.w), ihi(lo_s.w, hi_s.w));
+            const i2_f16x16_t pt = __builtin_bit_cast(i2_f16x16_t, (uint4[2]){p0, p1});
+#pragma unroll
+            for (int dt = 0; dt < ND; ++dt) {
+                const int d = dt * 16 + r;
+                const uint4 v0 = *reinterpret_cast<const uint4 *>(KV_lds + d * BN + i2_v_swiz32(d, t * 2 + 0) * 8);
+                const uint4 v1 = *reinterpret_cast<const uint4 *>(KV_lds + d * BN + i2_v_swiz32(d, t * 2 + 1) * 8);
+                O[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(i2_f16x16_t, (uint4[2]){v0, v1}), pt, O[dt]);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+#endif
+        }
+        __syncthreads();
+    }
+
+    // 7. Write split partial (converting m_max from log2 -> ln for inkling2_attn_rel_reduce_splits_kernel!)
+    if (valid_q) {
+        const size_t split_stride = (size_t) T * Hq * 130;
+        float * out = part_out + (size_t) split_idx * split_stride + ((size_t) q_tok * Hq + head) * 130;
+#pragma unroll
+        for (int dt = 0; dt < ND; ++dt) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+#if defined(RDNA4)
+                const int d = dt * 16 + hi * 8 + e;
+#else
+                const int d = dt * 16 + 2 * e + hi;
+#endif
+                out[d] = O[dt][e];
+            }
+        }
+        if (hi == 0) {
+            out[128] = isinf(m_max) ? -INFINITY : (m_max * kLn2);
+            out[129] = l_sum;
+        }
+    }
+#endif
+}
+
+// Companion tail+tree+sink split (split_idx = num_splits): 1 warp per (kv_head, q_tok) over <= 76 rows!
+template <bool KV_Q8_0, int GQA>
+static __global__ void inkling2_tree_attn_rel_tail_kernel(
+        const float   * __restrict__ q_ptr,
+        const char    * __restrict__ prefix_k,
+        const char    * __restrict__ prefix_v,
+        size_t pk_nb1, size_t pk_nb2, size_t pk_nb3,
+        size_t pv_nb1, size_t pv_nb2, size_t pv_nb3,
+        const char    * __restrict__ tree_k,
+        const char    * __restrict__ tree_v,
+        size_t tk_nb1, size_t tk_nb2, size_t tk_nb3,
+        size_t tv_nb1, size_t tv_nb2, size_t tv_nb3,
+        const float   * __restrict__ rel_table,
+        const int32_t * __restrict__ meta,
+        const int32_t * __restrict__ prefix_len_buf,
+        float         * __restrict__ part_out,
+        int Hq, int T, int prefix_cap, int p_storage, int p_logical,
+        int rel_extent, int m_stride, int path_w,
+        int block_size, int max_blocks, int exclude_sink,
+        int shared_kv_window, int shared_tail_cap,
+        int prefix_len_n, int prefix_len_rows, int planes_per_seq_arg, int tail_split_idx) {
+    const int lane    = threadIdx.x;
+    const int kv_head = blockIdx.x;
+    const int q_tok   = blockIdx.y;
+
+    const int32_t * mt  = meta + (size_t) q_tok * m_stride;
+    const int q_pos     = mt[1];
+    const int plane     = mt[2];
+    const int n_seq          = (prefix_len_rows > 1) ? prefix_len_rows : 1;
+    const int planes_per_seq = (planes_per_seq_arg > 0) ? planes_per_seq_arg
+                             : ((n_seq > 1) ? max(1, p_logical / n_seq) : p_logical);
+    const int seq_slot       = (n_seq > 1) ? (plane / planes_per_seq) : 0;
+    const int local_plane    = (n_seq > 1) ? (plane - seq_slot * planes_per_seq) : plane;
+    int pref_len = 0;
+    if (block_size > 0 && max_blocks > 0) {
+        pref_len = prefix_len_buf[(size_t) seq_slot * (2 + max_blocks)];
+    } else if (prefix_len_rows > 1) {
+        pref_len = prefix_len_buf[(size_t) seq_slot * prefix_len_n];
+    } else {
+        pref_len = (prefix_len_n > 1) ? prefix_len_buf[plane] : prefix_len_buf[0];
+    }
+
+    float q_reg[GQA][4], o_acc[GQA][4], m_max[GQA], l_sum[GQA];
+    const float * rt_base[GQA];
+    const bool include_sink = (exclude_sink == 0);
+    #pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+        const int h = kv_head * GQA + g;
+        const float * qp = q_ptr + ((size_t) q_tok * Hq + h) * 128;
+        q_reg[g][0] = qp[lane +  0] * kInvSqrt128;
+        q_reg[g][1] = qp[lane + 32] * kInvSqrt128;
+        q_reg[g][2] = qp[lane + 64] * kInvSqrt128;
+        q_reg[g][3] = qp[lane + 96] * kInvSqrt128;
+        rt_base[g]  = rel_table + ((size_t) q_tok * Hq + h) * (rel_extent + 1);
+        m_max[g]    = include_sink ? 0.0f : -INFINITY;
+        l_sum[g]    = include_sink ? 1.0f : 0.0f;
+        o_acc[g][0] = 0.0f; o_acc[g][1] = 0.0f; o_acc[g][2] = 0.0f; o_acc[g][3] = 0.0f;
+    }
+
+    auto attend_row = [&](int kp, const char * k_row, const char * v_row) {
+        float kv[4], vv[4];
+        if constexpr (KV_Q8_0) {
+            const block_q8_0 * kb = reinterpret_cast<const block_q8_0 *>(k_row);
+            const block_q8_0 * vb = reinterpret_cast<const block_q8_0 *>(v_row);
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                kv[b] = __half2float(kb[b].d) * (float) kb[b].qs[lane];
+                vv[b] = __half2float(vb[b].d) * (float) vb[b].qs[lane];
+            }
+        } else {
+            const half * kh = reinterpret_cast<const half *>(k_row);
+            const half * vh = reinterpret_cast<const half *>(v_row);
+            kv[0] = __half2float(kh[lane +  0]); kv[1] = __half2float(kh[lane + 32]);
+            kv[2] = __half2float(kh[lane + 64]); kv[3] = __half2float(kh[lane + 96]);
+            vv[0] = __half2float(vh[lane +  0]); vv[1] = __half2float(vh[lane + 32]);
+            vv[2] = __half2float(vh[lane + 64]); vv[3] = __half2float(vh[lane + 96]);
+        }
+        const int dist = min(q_pos - kp, rel_extent);
+        #pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+            float dot = q_reg[g][0] * kv[0] + q_reg[g][1] * kv[1]
+                      + q_reg[g][2] * kv[2] + q_reg[g][3] * kv[3];
+            dot = warp_reduce_sum(dot);
+            const float score = dot + rt_base[g][dist];
+            const float m_new = fmaxf(m_max[g], score);
+            const float alpha = isinf(m_max[g]) ? 0.0f : expf(m_max[g] - m_new);
+            const float p     = expf(score - m_new);
+            l_sum[g]    = l_sum[g] * alpha + p;
+            o_acc[g][0] = o_acc[g][0] * alpha + p * vv[0];
+            o_acc[g][1] = o_acc[g][1] * alpha + p * vv[1];
+            o_acc[g][2] = o_acc[g][2] * alpha + p * vv[2];
+            o_acc[g][3] = o_acc[g][3] * alpha + p * vv[3];
+            m_max[g]    = m_new;
+        }
+    };
+
+    const bool use_shared_tail = (shared_kv_window > 0 && planes_per_seq > 1 && shared_tail_cap > 0);
+    const int pool_cap         = use_shared_tail ? (prefix_cap - (planes_per_seq - 1) * shared_tail_cap) : prefix_cap;
+    const int pref_end         = min(q_pos + 1, pref_len);
+    const bool early_shared    = use_shared_tail && (local_plane < planes_per_seq - 1);
+    if (early_shared) {
+        const int shared_cut = min(pref_end, max(0, pref_len - shared_kv_window));
+        if (shared_cut < pref_end) {
+            const int pref_plane = (p_storage == 1) ? 0
+                                 : (n_seq > 1 && p_storage == n_seq) ? seq_slot
+                                 : plane;
+            const char * pk_head = prefix_k + (size_t) pref_plane * pk_nb3 + (size_t) kv_head * pk_nb2;
+            const char * pv_head = prefix_v + (size_t) pref_plane * pv_nb3 + (size_t) kv_head * pv_nb2;
+            const int tail_base  = pool_cap + local_plane * shared_tail_cap;
+            for (int kp = shared_cut; kp < pref_end; ++kp) {
+                const int pslot = tail_base + (kp % shared_tail_cap);
+                attend_row(kp, pk_head + (size_t) pslot * pk_nb1, pv_head + (size_t) pslot * pv_nb1);
+            }
+        }
+    }
+    if (tree_k != nullptr && tree_v != nullptr && pref_len < q_pos + 1) {
+        const char * tk_head = tree_k + (size_t) plane * tk_nb3 + (size_t) kv_head * tk_nb2;
+        const char * tv_head = tree_v + (size_t) plane * tv_nb3 + (size_t) kv_head * tv_nb2;
+        for (int kp = pref_len; kp < q_pos + 1; ++kp) {
+            const int e = kp - pref_len;
+            if (e < 0 || e >= path_w) continue;
+            const int tslot = mt[11 + e];
+            if (tslot < 0) continue;
+            attend_row(kp, tk_head + (size_t) tslot * tk_nb1, tv_head + (size_t) tslot * tv_nb1);
+        }
+    }
+
+    const size_t split_stride = (size_t) T * Hq * 130;
+    #pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+        const int h = kv_head * GQA + g;
+        float * out = part_out + (size_t) tail_split_idx * split_stride + ((size_t) q_tok * Hq + h) * 130;
+        out[lane +  0] = o_acc[g][0];
+        out[lane + 32] = o_acc[g][1];
+        out[lane + 64] = o_acc[g][2];
+        out[lane + 96] = o_acc[g][3];
+        if (lane == 0) {
+            out[128] = m_max[g];
+            out[129] = l_sum[g];
+        }
+    }
+}
+#endif // GGML_USE_HIP
+
+
 // ─── 36. Tree Commit: Copy Accepted Path Slots from Tree -> Prefix KV & Conv ──
 static __global__ void inkling2_tree_commit_kv_kernel(
         char          * __restrict__ prefix_k, size_t pk_nb1, size_t pk_nb2, size_t pk_nb3,
@@ -3990,8 +4604,6 @@ static __global__ void inkling2_tree_commit_kv_kernel(
 
     char * pk_h = prefix_k + (size_t) dst_plane * pk_nb3 + (size_t) h * pk_nb2;
     char * pv_h = prefix_v + (size_t) dst_plane * pv_nb3 + (size_t) h * pv_nb2;
-    const char * tk_h = tree_k + (size_t) plane * tk_nb3 + (size_t) h * tk_nb2;
-    const char * tv_h = tree_v + (size_t) plane * tv_nb3 + (size_t) h * tv_nb2;
 
     for (int i = 0; i < n_commit; ++i) {
         const int pos = pref_len + i;
@@ -4004,7 +4616,12 @@ static __global__ void inkling2_tree_commit_kv_kernel(
             dst_slot = (swa_window > 0) ? (pos % prefix_cap) : pos;
         }
         if (dst_slot < 0 || dst_slot >= prefix_cap) continue;
-        const int src_slot = commit_slots[i];
+        const int raw_slot  = commit_slots[i];
+        const bool from_d2  = (raw_slot < 0);
+        const int src_slot  = from_d2 ? -(raw_slot + 1) : raw_slot;
+        const int src_plane = (from_d2 && plane == 2) ? 1 : plane;
+        const char * tk_h   = tree_k + (size_t) src_plane * tk_nb3 + (size_t) h * tk_nb2;
+        const char * tv_h   = tree_v + (size_t) src_plane * tv_nb3 + (size_t) h * tv_nb2;
         uint32_t * d_k = reinterpret_cast<uint32_t *>(pk_h + (size_t) dst_slot * pk_nb1);
         uint32_t * d_v = reinterpret_cast<uint32_t *>(pv_h + (size_t) dst_slot * pv_nb1);
         const uint32_t * s_k = reinterpret_cast<const uint32_t *>(tk_h + (size_t) src_slot * tk_nb1);
@@ -4029,11 +4646,14 @@ static __global__ void inkling2_tree_commit_conv_kernel(
     if (n_commit <= 0) return;
 
     float * pc = prefix_conv + ((size_t) plane * s_ch + c) * 3;
-    const float * tc_plane = tree_conv + (size_t) plane * s_max * s_ch;
     float h0 = pc[0], h1 = pc[1], h2 = pc[2];
     const int start = max(0, n_commit - 3);
     for (int i = start; i < n_commit; ++i) {
-        const int slot = commit_slots[i];
+        const int raw_slot = commit_slots[i];
+        const bool from_d2 = (raw_slot < 0);
+        const int slot = from_d2 ? -(raw_slot + 1) : raw_slot;
+        const int src_plane = (from_d2 && plane == 2) ? 1 : plane;
+        const float * tc_plane = tree_conv + (size_t) src_plane * s_max * s_ch;
         h0 = h1;
         h1 = h2;
         h2 = tc_plane[(size_t) slot * s_ch + c];
@@ -4231,7 +4851,19 @@ static __global__ void inkling2_2dsd_draft_mask_kernel(
     }
 }
 
-// ─── 40. Batched 2DSD Top-1024 Candidate Vanilla Markov Argmax (32-Block Full-GPU Parallel!) ─
+// ─── 40. Batched 2DSD Top-1024 Candidate Vanilla Markov Top-2 Argmax (32-Block Full-GPU Parallel!) ─
+static __device__ __forceinline__ void i2_insert_top2(
+        float sc, int32_t id,
+        float & b1_v, int32_t & b1_i,
+        float & b2_v, int32_t & b2_i) {
+    if (sc > b1_v || (sc == b1_v && id < b1_i)) {
+        if (id != b1_i) { b2_v = b1_v; b2_i = b1_i; }
+        b1_v = sc; b1_i = id;
+    } else if (id != b1_i && (sc > b2_v || (sc == b2_v && id < b2_i))) {
+        b2_v = sc; b2_i = id;
+    }
+}
+
 template <bool IS_Q8>
 static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
         const int32_t * __restrict__ cand_ids,    size_t cand_stride, // [1024, L]
@@ -4239,8 +4871,10 @@ static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
         const int32_t * __restrict__ prev_tok,                        // [L]
         const half    * __restrict__ markov_w1,   size_t w1_stride,   // [256, V] F16
         const char    * __restrict__ markov_w2,   size_t w2_nb1,      // [256, V] Q8_0 or F16
-        float         * __restrict__ part_val,                        // [32, L]
-        int32_t       * __restrict__ part_id,                         // [32, L]
+        float         * __restrict__ part_v1,                         // [32, L]
+        int32_t       * __restrict__ part_i1,                         // [32, L]
+        float         * __restrict__ part_v2,                         // [32, L]
+        int32_t       * __restrict__ part_i2,                         // [32, L]
         int n_vocab, int n_cands) {
     // grid = (32, L, 1), block = (32, 8, 1) -> 32 CUs/leaf, only 4 candidates/warp (25x faster!)
     const int lane = threadIdx.x; // 0..31
@@ -4259,8 +4893,8 @@ static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
     const int k_beg = blockIdx.x * chunk;
     const int k_end = min(n_cands, k_beg + chunk);
 
-    float best_v = -INFINITY;
-    int32_t best_id = 0;
+    float   b1_v = -INFINITY, b2_v = -INFINITY;
+    int32_t b1_i = 0,         b2_i = 0;
 
     if constexpr (IS_Q8) {
         const int blk = lane >> 2;
@@ -4279,11 +4913,7 @@ static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
                       + (float)(int8_t)(p3 & 0xFFu) * l6 + (float)(int8_t)(p3 >> 8) * l7;
             const float dot = warp_reduce_sum(acc * __half2float(bp->d));
             if (lane == 0) {
-                const float sc = base_row[v] + dot;
-                if (sc > best_v || (sc == best_v && v < best_id)) {
-                    best_v = sc;
-                    best_id = v;
-                }
+                i2_insert_top2(base_row[v] + dot, v, b1_v, b1_i, b2_v, b2_i);
             }
         }
     } else {
@@ -4301,55 +4931,59 @@ static __global__ void inkling2_2dsd_markov_topk_stage1_kernel(
                       + f2.x * l4 + f2.y * l5 + f3.x * l6 + f3.y * l7;
             const float dot = warp_reduce_sum(acc);
             if (lane == 0) {
-                const float sc = base_row[v] + dot;
-                if (sc > best_v || (sc == best_v && v < best_id)) {
-                    best_v = sc;
-                    best_id = v;
-                }
+                i2_insert_top2(base_row[v] + dot, v, b1_v, b1_i, b2_v, b2_i);
             }
         }
     }
 
-    __shared__ float s_wv[8];
-    __shared__ int32_t s_wi[8];
+    __shared__ float s_wv1[8], s_wv2[8];
+    __shared__ int32_t s_wi1[8], s_wi2[8];
     if (lane == 0) {
-        s_wv[warp] = best_v;
-        s_wi[warp] = best_id;
+        s_wv1[warp] = b1_v; s_wi1[warp] = b1_i;
+        s_wv2[warp] = b2_v; s_wi2[warp] = b2_i;
     }
     __syncthreads();
     if (warp == 0 && lane == 0) {
-        float bv = s_wv[0];
-        int32_t bi = s_wi[0];
+        float   bv1 = s_wv1[0], bv2 = s_wv2[0];
+        int32_t bi1 = s_wi1[0], bi2 = s_wi2[0];
         for (int w = 1; w < 8; ++w) {
-            if (s_wv[w] > bv || (s_wv[w] == bv && s_wi[w] < bi)) {
-                bv = s_wv[w];
-                bi = s_wi[w];
-            }
+            i2_insert_top2(s_wv1[w], s_wi1[w], bv1, bi1, bv2, bi2);
+            i2_insert_top2(s_wv2[w], s_wi2[w], bv1, bi1, bv2, bi2);
         }
-        part_val[(size_t) leaf * 32 + blockIdx.x] = bv;
-        part_id[(size_t) leaf * 32 + blockIdx.x]  = bi;
+        part_v1[(size_t) leaf * 32 + blockIdx.x] = bv1;
+        part_i1[(size_t) leaf * 32 + blockIdx.x] = bi1;
+        part_v2[(size_t) leaf * 32 + blockIdx.x] = bv2;
+        part_i2[(size_t) leaf * 32 + blockIdx.x] = bi2;
     }
 }
 
 static __global__ void inkling2_2dsd_markov_topk_stage2_kernel(
-        const float   * __restrict__ part_val, // [32, L]
-        const int32_t * __restrict__ part_id,  // [32, L]
-        int32_t       * __restrict__ out_best) { // [L]
+        const float   * __restrict__ part_v1, // [32, L]
+        const int32_t * __restrict__ part_i1, // [32, L]
+        const float   * __restrict__ part_v2, // [32, L]
+        const int32_t * __restrict__ part_i2, // [32, L]
+        int32_t       * __restrict__ out_best, // [L] or [L, 2]
+        int L, int emit_top2) {
     // 1 warp per leaf, zero __syncthreads(), 5 warp shuffles!
     const int lane = threadIdx.x;
     const int leaf = blockIdx.x;
-    float   bv = part_val[(size_t) leaf * 32 + lane];
-    int32_t bi = part_id[(size_t) leaf * 32 + lane];
+    float   bv1 = part_v1[(size_t) leaf * 32 + lane];
+    int32_t bi1 = part_i1[(size_t) leaf * 32 + lane];
+    float   bv2 = part_v2[(size_t) leaf * 32 + lane];
+    int32_t bi2 = part_i2[(size_t) leaf * 32 + lane];
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        const float   ov = i2_shfl_xor(bv, off);
-        const int32_t oi = i2_shfl_xor(bi, off);
-        if (ov > bv || (ov == bv && oi < bi)) {
-            bv = ov;
-            bi = oi;
-        }
+        const float   ov1 = i2_shfl_xor(bv1, off);
+        const int32_t oi1 = i2_shfl_xor(bi1, off);
+        const float   ov2 = i2_shfl_xor(bv2, off);
+        const int32_t oi2 = i2_shfl_xor(bi2, off);
+        i2_insert_top2(ov1, oi1, bv1, bi1, bv2, bi2);
+        i2_insert_top2(ov2, oi2, bv1, bi1, bv2, bi2);
     }
-    if (lane == 0) out_best[leaf] = bi;
+    if (lane == 0) {
+        out_best[leaf] = bi1;
+        if (emit_top2) out_best[L + leaf] = bi2;
+    }
 }
 
 // ─── 41. Fused SWA Tree K+V ShortConv + KV-Write (1 Launch for Both K and V!) ──
@@ -5296,12 +5930,13 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 logits_ptr = tmp_logits.get();
             }
             const ggml_tensor * flags = dst->src[3];
-            if (target_pct > 0 && n_exp == 128 && top_k == 8 && T <= 64) {
+            const int coda_piggyback  = ggml_get_op_params_i32(dst, 5);
+            if ((target_pct > 0 || coda_piggyback != 0) && n_exp == 128 && top_k == 8 && T <= 128) {
                 const int nthr = std::min(1024, std::max(128, T * WARP_SIZE));
                 inkling2_sigmoid_topk_split_kernel<<<1, nthr, 0, stream>>>(
                     logits_ptr, bias ? (const float *) bias->data : nullptr,
                     flags ? (const int32_t *) flags->data : nullptr,
-                    (int32_t *) dst->data, T, target_pct, route_scale, eps);
+                    (int32_t *) dst->data, T, target_pct, route_scale, eps, coda_piggyback);
             } else {
                 inkling2_sigmoid_topk_packed_kernel<<<T, WARP_SIZE, 0, stream>>>(
                     logits_ptr, bias ? (const float *) bias->data : nullptr,
@@ -5607,6 +6242,86 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             if (block_size > 0) {
                 GGML_ASSERT(swa_window == 0 && prefix_len_buf->type == GGML_TYPE_I32 && max_blocks > 0);
             }
+#ifdef GGML_USE_HIP
+            {
+                const int cc = ggml_cuda_info().devices[ctx.device].cc;
+                if (cc >= GGML_CUDA_CC_RDNA3 && swa_window == 0 && T >= 1) {
+                    const int max_cells       = 128 / gqa;
+                    const int tiles_per_plane = (T + max_cells - 1) / max_cells;
+                    const int y_total         = p_storage * tiles_per_plane;
+                    const int base_blocks     = Hk * y_total;
+                    int num_splits = 1;
+                    if (prefix_cap >= 4096) {
+                        if (base_blocks < 64) {
+                            num_splits = std::min(8, (64 + base_blocks - 1) / base_blocks);
+                        } else if (base_blocks < 128 && prefix_cap >= 32768) {
+                            num_splits = 2;
+                        }
+                    }
+                    ggml_cuda_pool_alloc<float> part_buf(ctx.pool(), (size_t) (num_splits + 1) * T * Hq * 130);
+                    dim3 wgrid(Hk, y_total, num_splits);
+                    dim3 wblock(WARP_SIZE, 8, 1);
+                    dim3 tgrid(Hk, T, 1);
+                    dim3 tblock(WARP_SIZE, 1, 1);
+                    auto launch_wmma_tree = [&](auto q8_tag, auto gqa_tag) {
+                        constexpr bool IS_Q8 = decltype(q8_tag)::value;
+                        constexpr int  G     = decltype(gqa_tag)::value;
+                        inkling2_tree_attn_rel_wmma_prefix_kernel<IS_Q8, G><<<wgrid, wblock, 0, stream>>>(
+                            (const float *) q->data,
+                            (const char *) prefix_k->data, (const char *) prefix_v->data,
+                            prefix_k->nb[1], prefix_k->nb[2], prefix_k->nb[3],
+                            prefix_v->nb[1], prefix_v->nb[2], prefix_v->nb[3],
+                            (const float *) rel_table->data,
+                            (const int32_t *) meta->data,
+                            (const int32_t *) prefix_len_buf->data,
+                            part_buf.get(),
+                            Hq, T, prefix_cap, p_storage, p_logical,
+                            rel_extent, m_stride, block_size, max_blocks,
+                            shared_kv_window, shared_tail_cap,
+                            (int) prefix_len_buf->ne[0], (int) prefix_len_buf->ne[1], planes_per_seq_arg,
+                            tiles_per_plane, num_splits);
+                        inkling2_tree_attn_rel_tail_kernel<IS_Q8, G><<<tgrid, tblock, 0, stream>>>(
+                            (const float *) q->data,
+                            (const char *) prefix_k->data, (const char *) prefix_v->data,
+                            prefix_k->nb[1], prefix_k->nb[2], prefix_k->nb[3],
+                            prefix_v->nb[1], prefix_v->nb[2], prefix_v->nb[3],
+                            tree_k ? (const char *) tree_k->data : nullptr,
+                            tree_v ? (const char *) tree_v->data : nullptr,
+                            tree_k ? tree_k->nb[1] : 0, tree_k ? tree_k->nb[2] : 0, tree_k ? tree_k->nb[3] : 0,
+                            tree_v ? tree_v->nb[1] : 0, tree_v ? tree_v->nb[2] : 0, tree_v ? tree_v->nb[3] : 0,
+                            (const float *) rel_table->data,
+                            (const int32_t *) meta->data,
+                            (const int32_t *) prefix_len_buf->data,
+                            part_buf.get(),
+                            Hq, T, prefix_cap, p_storage, p_logical,
+                            rel_extent, m_stride, path_w,
+                            block_size, max_blocks, exclude_sink,
+                            shared_kv_window, shared_tail_cap,
+                            (int) prefix_len_buf->ne[0], (int) prefix_len_buf->ne[1], planes_per_seq_arg,
+                            num_splits);
+                    };
+                    if (prefix_k->type == GGML_TYPE_Q8_0) {
+                        if      (gqa == 3) launch_wmma_tree(std::true_type{}, std::integral_constant<int, 3>{});
+                        else if (gqa == 4) launch_wmma_tree(std::true_type{}, std::integral_constant<int, 4>{});
+                        else if (gqa == 2) launch_wmma_tree(std::true_type{}, std::integral_constant<int, 2>{});
+                        else               launch_wmma_tree(std::true_type{}, std::integral_constant<int, 1>{});
+                    } else {
+                        if      (gqa == 3) launch_wmma_tree(std::false_type{}, std::integral_constant<int, 3>{});
+                        else if (gqa == 4) launch_wmma_tree(std::false_type{}, std::integral_constant<int, 4>{});
+                        else if (gqa == 2) launch_wmma_tree(std::false_type{}, std::integral_constant<int, 2>{});
+                        else               launch_wmma_tree(std::false_type{}, std::integral_constant<int, 1>{});
+                    }
+                    dim3 rgrid(Hq, T, 1);
+                    inkling2_attn_rel_reduce_splits_kernel<<<rgrid, WARP_SIZE, 0, stream>>>(
+                        part_buf.get(),
+                        gate ? (const float *) gate->data : nullptr,
+                        gate ? (gate->nb[1] / sizeof(float)) : 0,
+                        (float *) dst->data,
+                        Hq, T, num_splits + 1, partial_out);
+                    break;
+                }
+            }
+#endif
             dim3 grid(Hk, T, 1);
             dim3 block(WARP_SIZE, 8, 1);
             auto launch_tree_attn = [&](auto q8_tag, auto gqa_tag) {
@@ -5755,18 +6470,21 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const int32_t *) draft_meta->data, (half *) dst->data, kv_span, B);
             break;
         }
-        case 40: { // 2DSD_MARKOV_TOPK_STEP (32-block/leaf parallel top-1024 vanilla Markov argmax)
+        case 40: { // 2DSD_MARKOV_TOPK_STEP (32-block/leaf parallel top-1024 vanilla Markov Top-2 argmax)
             const ggml_tensor * cand_ids    = dst->src[0];
             const ggml_tensor * base_logits = dst->src[1];
             const ggml_tensor * prev_tok    = dst->src[2];
             const ggml_tensor * markov_w1   = dst->src[3];
             const ggml_tensor * markov_w2   = dst->src[4];
-            const int n_vocab = ggml_get_op_params_i32(dst, 1);
-            const int n_cands = (int) cand_ids->ne[0];
-            const int L       = (int) prev_tok->ne[0];
+            const int n_vocab   = ggml_get_op_params_i32(dst, 1);
+            const int n_cands   = (int) cand_ids->ne[0];
+            const int L         = (int) prev_tok->ne[0];
+            const int emit_top2 = (dst->ne[1] >= 2) ? 1 : 0;
             GGML_ASSERT(markov_w1->ne[0] == 256 && markov_w1->type == GGML_TYPE_F16);
-            ggml_cuda_pool_alloc<float>   part_v(ctx.pool(), (size_t) 32 * L);
-            ggml_cuda_pool_alloc<int32_t> part_i(ctx.pool(), (size_t) 32 * L);
+            ggml_cuda_pool_alloc<float>   part_v1(ctx.pool(), (size_t) 32 * L);
+            ggml_cuda_pool_alloc<int32_t> part_i1(ctx.pool(), (size_t) 32 * L);
+            ggml_cuda_pool_alloc<float>   part_v2(ctx.pool(), (size_t) 32 * L);
+            ggml_cuda_pool_alloc<int32_t> part_i2(ctx.pool(), (size_t) 32 * L);
             dim3 grid1(32, L, 1);
             dim3 block1(WARP_SIZE, 8, 1);
             if (markov_w2->type == GGML_TYPE_Q8_0) {
@@ -5776,7 +6494,7 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     (const int32_t *) prev_tok->data,
                     (const half *) markov_w1->data, markov_w1->nb[1] / sizeof(half),
                     (const char *) markov_w2->data, markov_w2->nb[1],
-                    part_v.get(), part_i.get(), n_vocab, n_cands);
+                    part_v1.get(), part_i1.get(), part_v2.get(), part_i2.get(), n_vocab, n_cands);
             } else {
                 GGML_ASSERT(markov_w2->type == GGML_TYPE_F16);
                 inkling2_2dsd_markov_topk_stage1_kernel<false><<<grid1, block1, 0, stream>>>(
@@ -5785,10 +6503,11 @@ void ggml_cuda_op_inkling2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                     (const int32_t *) prev_tok->data,
                     (const half *) markov_w1->data, markov_w1->nb[1] / sizeof(half),
                     (const char *) markov_w2->data, markov_w2->nb[1],
-                    part_v.get(), part_i.get(), n_vocab, n_cands);
+                    part_v1.get(), part_i1.get(), part_v2.get(), part_i2.get(), n_vocab, n_cands);
             }
             inkling2_2dsd_markov_topk_stage2_kernel<<<L, WARP_SIZE, 0, stream>>>(
-                part_v.get(), part_i.get(), (int32_t *) dst->data);
+                part_v1.get(), part_i1.get(), part_v2.get(), part_i2.get(),
+                (int32_t *) dst->data, L, emit_top2);
             break;
         }
         case 41: { // TREE_SCONV_KV_WRITE_KV (1 launch for both K and V on SWA layers!)

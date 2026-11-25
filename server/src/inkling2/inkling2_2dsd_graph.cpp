@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -80,7 +81,8 @@ static ggml_tensor * make_clip_qr_rel_table(
 
 static ggml_tensor * make_fused_router_q8_topk(
         ggml_context * c, ggml_tensor * w_q8, ggml_tensor * cur, ggml_tensor * bias,
-        ggml_tensor * flags, int top_k, float route_scale, float eps, int target_pct) {
+        ggml_tensor * flags, int top_k, float route_scale, float eps, int target_pct,
+        int coda_piggyback = 0) {
     const int64_t T = cur->ne[1];
     ggml_tensor * logits = ggml_mul_mat(c, w_q8, cur);
     ggml_tensor * res = ggml_new_tensor_3d(c, GGML_TYPE_I32, top_k, T, target_pct > 0 ? 3 : 2);
@@ -94,6 +96,7 @@ static ggml_tensor * make_fused_router_q8_topk(
     set_op_f32(res, 2, route_scale);
     set_op_f32(res, 3, eps);
     set_op_i32(res, 4, target_pct);
+    set_op_i32(res, 5, coda_piggyback);
     return res;
 }
 
@@ -277,6 +280,11 @@ static bool twodsd_profile_enabled() {
 static bool batch_invariant_2dsd_enabled() {
     const char * e = std::getenv("LUCE_BATCH_INVARIANT");
     return (e != nullptr && std::atoi(e) != 0);
+}
+
+static bool coda_piggyback_enabled() {
+    const char * e = std::getenv("LUCE_INKLING2_3DSD_CODA_PIGGYBACK");
+    return (e == nullptr || std::atoi(e) != 0);
 }
 
 static ggml_tensor * make_exact_gpu_top_cands(ggml_context * c, ggml_tensor * logits, float temp) {
@@ -667,13 +675,14 @@ static ggml_tensor * build_tree_layer(
 
     // Fused Q8_0 router (with FLAG_PADDING -> copies row 0 experts!) + MoE SITU (Single or Dual-GPU)
     const bool do_split = use_split && w.expert_backend && w.split_exp > 0 && w.split_exp < w.n_expert &&
-                          L.exp_gate_up_tail && row_b <= 64 && w.n_expert == 128 && w.n_expert_used == 8;
+                          L.exp_gate_up_tail && row_b <= 128 && w.n_expert == 128 && w.n_expert_used == 8;
+    const int coda_piggy = (phase_id == 2 && coda_piggyback_enabled()) ? 1 : 0;
     ggml_tensor * w_router = L.ffn_gate_inp_q8 ? L.ffn_gate_inp_q8 : L.ffn_gate_inp;
 
     if (do_split) {
         const int spct = dual_2dsd_split_pct(w);
         ggml_tensor * packed = make_fused_router_q8_topk(
-            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, spct);
+            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, spct, coda_piggy);
         ggml_tensor * hot_sel  = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], 0);
         ggml_tensor * cold_sel = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], packed->nb[2]);
         ggml_tensor * wsel     = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], 2 * packed->nb[2]);
@@ -714,7 +723,7 @@ static ggml_tensor * build_tree_layer(
             2 * kv_sz + w.n_embd, m_stride);
     } else {
         ggml_tensor * packed = make_fused_router_q8_topk(
-            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, 0);
+            c, w_router, cur, L.ffn_exp_probs_b, g.inp_flags, w.n_expert_used, w.route_scale, 1e-20f, 0, coda_piggy);
         ggml_tensor * sel  = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], 0);
         ggml_tensor * wsel = ggml_view_2d(c, packed, w.n_expert_used, row_b, packed->nb[1], packed->nb[2]);
 
@@ -1249,11 +1258,15 @@ static bool run_phase(
         out_sample->logits_dev = g.out_logits;
         out_sample->n_vocab    = w.n_vocab_unpadded;
         out_sample->top_cands.clear();
-        if (out_sample->fast_temp > 0.0f) {
+        out_sample->pmax.clear();
+        const float eff_temp = (out_sample->fast_temp > 0.0f)
+            ? out_sample->fast_temp
+            : (out_sample->need_pmax ? 1.0f : 0.0f);
+        if (eff_temp > 0.0f) {
             // Rebuild cached 1-node top-cand extractor if temp or active row count changed
             const bool need_build = !g.sample_gf || !g.sample_cands ||
                                     g.sample_cands->ne[1] != n_out ||
-                                    g.sample_temp != out_sample->fast_temp;
+                                    g.sample_temp != eff_temp;
             if (need_build) {
                 if (g.sample_alloc) { ggml_gallocr_free(g.sample_alloc); g.sample_alloc = nullptr; }
                 if (g.sample_ctx)   { ggml_free(g.sample_ctx); g.sample_ctx = nullptr; }
@@ -1268,7 +1281,7 @@ static bool run_phase(
                 g.sample_logits = ggml_new_tensor_2d(g.sample_ctx, GGML_TYPE_F32, w.n_vocab_unpadded, n_out);
                 g.sample_logits->data   = g.out_logits->data;
                 g.sample_logits->buffer = g.out_logits->buffer;
-                g.sample_cands = make_exact_gpu_top_cands(g.sample_ctx, g.sample_logits, out_sample->fast_temp);
+                g.sample_cands = make_exact_gpu_top_cands(g.sample_ctx, g.sample_logits, eff_temp);
                 ggml_set_output(g.sample_cands);
                 ggml_build_forward_expand(g.sample_gf, g.sample_cands);
                 g.sample_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend));
@@ -1278,7 +1291,7 @@ static bool run_phase(
                     g.sample_gf = nullptr; g.sample_logits = nullptr; g.sample_cands = nullptr;
                     return false;
                 }
-                g.sample_temp = out_sample->fast_temp;
+                g.sample_temp = eff_temp;
             }
             g.sample_logits->data   = g.out_logits->data;
             g.sample_logits->buffer = g.out_logits->buffer;
@@ -1288,6 +1301,14 @@ static bool run_phase(
             out_sample->top_cands.resize((size_t) 516 * n_out);
             ggml_backend_tensor_get(g.sample_cands, out_sample->top_cands.data(), 0,
                                     out_sample->top_cands.size() * sizeof(int32_t));
+            if (out_sample->need_pmax) {
+                out_sample->pmax.resize((size_t) n_out, 0.0f);
+                for (int r = 0; r < n_out; ++r) {
+                    float Z = 0.0f;
+                    std::memcpy(&Z, &out_sample->top_cands[(size_t) r * 516 + 2], sizeof(float));
+                    out_sample->pmax[(size_t) r] = (Z > 0.0f && std::isfinite(Z)) ? (1.0f / Z) : 0.0f;
+                }
+            }
         }
     }
     if (prof) {
@@ -3019,6 +3040,7 @@ bool inkling2_2dsd_advance_nodes_batched(
     out_readout_argmax.clear();
     if (out_sample) {
         out_sample->top_cands.clear();
+        out_sample->pmax.clear();
         out_sample->logits_dev = nullptr;
         out_sample->n_vocab = w.n_vocab_unpadded;
     }
@@ -3075,13 +3097,14 @@ bool inkling2_2dsd_advance_nodes_batched(
     // 3. Fused Multi-Depth Coda for nodes reaching a readout depth (depth + 1 in readout_mask)
     std::vector<const Inkling2TwoDSDNodeDesc *> read_rows;
     std::vector<int> read_planes, read_flags, read_extra;
+    const bool use_piggy = coda_piggyback_enabled();
     for (int i = 0; i < (int) nodes.size(); ++i) {
         const int new_depth = nodes[i].depth + 1;
         if ((readout_mask & (1u << new_depth)) != 0u) {
             out_readout_rows.push_back(i);
             read_rows.push_back(&nodes[i]);
             read_planes.push_back(new_depth - 1); // 0, 1, or 2
-            read_flags.push_back(0);
+            read_flags.push_back((use_piggy && new_depth < w.n_passes) ? kInkling2TwoDSDFlagsEarlyCoda : 0);
             read_extra.push_back(new_depth - 1);
         }
     }
