@@ -261,17 +261,14 @@ jobs:
             ${{ steps.meta.outputs.bake-file }}
           targets: ${{ matrix.variant }}
           push: ${{ github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.push) }}
-          # Store multi-arch main/release/dispatch BuildKit layer caches in GHCR
-          # instead of the GitHub Actions cache. Those multi-arch blobs previously
-          # consumed ~8.7 GB of the 10 GB repo-wide Actions cache quota, evicting
-          # compiler and uv caches from ci.yml. Off-main publishes export to
-          # separate tags (importing main as fallback) so they cannot evict main.
-          # PR builds compile a single arch without GHCR write access; they keep a
-          # bounded single-arch PR GHA cache so reruns reuse compile layers, plus
-          # read-only fallback to main's GHCR cache for shared base layers.
+          # Store BuildKit layer caches in GHCR instead of the GitHub Actions cache.
+          # Both multi-arch main blobs (~8.7 GB) and single-arch PR mode=max blobs
+          # (4.26 GB on PR #1070 alone) consume the 10 GB repo-wide Actions cache
+          # quota and evict ci.yml's sccache and uv caches. Off-main publishes export
+          # to separate GHCR tags (importing main as fallback) so they cannot evict
+          # main. PR builds import main's GHCR layer cache read-only for shared base
+          # layers and restore main's docker-ccache read-only without writing to GHA.
           set: |
-            ${{ github.event_name == 'pull_request' && format('{0}.cache-from+=type=gha,scope=docker-pr-{0}', matrix.variant) || '' }}
             ${{ steps.identity.outputs.export_cache_ref != '' && steps.identity.outputs.export_cache_ref != steps.identity.outputs.main_cache_ref && format('{0}.cache-from+=type=registry,ref={1}', matrix.variant, steps.identity.outputs.export_cache_ref) || '' }}
             ${{ matrix.variant }}.cache-from+=type=registry,ref=${{ steps.identity.outputs.main_cache_ref }}
             ${{ steps.identity.outputs.export_cache_ref != '' && format('{0}.cache-to=type=registry,ref={1},mode=max', matrix.variant, steps.identity.outputs.export_cache_ref) || '' }}
-            ${{ github.event_name == 'pull_request' && format('{0}.cache-to=type=gha,scope=docker-pr-{0},mode=max,ignore-error=true', matrix.variant) || '' }}
