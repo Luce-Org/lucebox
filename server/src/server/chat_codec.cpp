@@ -736,57 +736,80 @@ bool tool_declared(const nlohmann::json & tools, const std::string & name) {
     return false;
 }
 
+// Where a raw value from `pos` ends: at the first `close` that `next` or
+// `last` follows. With `quoted`, the first such close outside a call the
+// value quotes, or the first one when every one is inside (a value that
+// quotes an opener alone). npos: none.
+size_t raw_value_end(const std::string & text, size_t pos, const std::string & close, const std::string & next,
+                     const std::string & last, QuotedCall * quoted) {
+    size_t plain = std::string::npos;
+    for (size_t end = text.find(close, pos); end != std::string::npos; end = text.find(close, end + 1)) {
+        const size_t after = end + close.size();
+        if (text.compare(after, next.size(), next) != 0 && text.compare(after, last.size(), last) != 0) continue;
+        if (!quoted || !quoted->open_before(end)) return end;
+        if (plain == std::string::npos) plain = end;
+    }
+    return plain;
+}
+
 // Calls in the template's format from `pos`: "<tool_call>\n<function=NAME>\n",
 // then "<parameter=KEY>\nVALUE\n</parameter>\n" per argument, then
 // "</function>\n</tool_call>", calls joined by "\n". Whitespace may follow.
-bool parse_qwen_calls(const std::string & text, size_t pos, const nlohmann::json & tools,
+// A value ends at the first "\n</parameter>\n" the next argument or the end
+// of the call follows. A value is raw text and may hold these tags itself (a
+// command that writes a test of this reader): when that reading fails, a
+// second one skips the closes inside a call the value quotes (more
+// "<function=" than "</function>" before them), and takes the first close for
+// a value that quotes an opener alone. Both readings take the first close
+// they accept and never look back, so a value cannot stretch over the next
+// call, and a reply neither reads goes to the heuristic reader.
+bool parse_qwen_calls(const std::string & text, size_t start, const nlohmann::json & tools,
                       bool python, std::vector<ChatToolCall> & calls) {
     static const std::string kOpen = "<tool_call>\n<function=", kParam = "<parameter=",
                              kParamEnd = "\n</parameter>\n", kClose = "</function>\n</tool_call>";
-    const auto at = [&](const std::string & token) { return text.compare(pos, token.size(), token) == 0; };
-    // A function name or argument key: the text up to ">\n", on one line.
-    const auto read_name = [&](std::string & name) {
-        const size_t end = text.find(">\n", pos);
-        if (end == std::string::npos || end == pos) return false;
-        name = text.substr(pos, end - pos);
-        if (name.find('\n') != std::string::npos) return false;
-        pos = end + 2;
-        return true;
-    };
-    calls.clear();
-    while (true) {
-        if (!at(kOpen)) return false;
-        pos += kOpen.size();
-        ChatToolCall call;
-        if (!read_name(call.name) || !tool_declared(tools, call.name)) return false;
-        const nlohmann::json properties = tool_parameter_properties(tools, call.name);
-        call.arguments = nlohmann::ordered_json::object();
-        while (at(kParam)) {
-            pos += kParam.size();
-            std::string key;
-            if (!read_name(key) || call.arguments.contains(key)) return false;
-            // The value ends at the first "\n</parameter>\n" the next argument or the end follows.
-            size_t end = pos;
-            while (true) {
-                end = text.find(kParamEnd, end);
+    const auto read = [&](bool skip_quoted) {
+        size_t pos = start;
+        const auto at = [&](size_t p, const std::string & token) { return text.compare(p, token.size(), token) == 0; };
+        // A function name or argument key: the text up to ">\n", on one line.
+        const auto read_name = [&](std::string & name) {
+            const size_t end = text.find(">\n", pos);
+            if (end == std::string::npos || end == pos) return false;
+            name = text.substr(pos, end - pos);
+            if (name.find('\n') != std::string::npos) return false;
+            pos = end + 2;
+            return true;
+        };
+        calls.clear();
+        while (true) {
+            if (!at(pos, kOpen)) return false;
+            pos += kOpen.size();
+            ChatToolCall call;
+            if (!read_name(call.name) || !tool_declared(tools, call.name)) return false;
+            const nlohmann::json properties = tool_parameter_properties(tools, call.name);
+            call.arguments = nlohmann::ordered_json::object();
+            while (at(pos, kParam)) {
+                pos += kParam.size();
+                std::string key;
+                if (!read_name(key) || call.arguments.contains(key)) return false;
+                QuotedCall quoted(text, pos, "<function=", "</function>");
+                const size_t end = raw_value_end(text, pos, kParamEnd, kParam, kClose, skip_quoted ? &quoted : nullptr);
                 if (end == std::string::npos) return false;
-                const size_t next = end + kParamEnd.size();
-                if (text.compare(next, kParam.size(), kParam) == 0 ||
-                    text.compare(next, kClose.size(), kClose) == 0) break;
-                ++end;
+                call.arguments[key] = qwen_parameter_value(text.substr(pos, end - pos), properties, key, python);
+                pos = end + kParamEnd.size();
             }
-            call.arguments[key] = qwen_parameter_value(text.substr(pos, end - pos), properties, key, python);
-            pos = end + kParamEnd.size();
+            if (!at(pos, kClose)) return false;
+            pos += kClose.size();
+            calls.push_back(std::move(call));
+            if (at(pos, "\n<tool_call>")) {
+                ++pos;
+                continue;
+            }
+            return python_strip(text.substr(pos)).empty();
         }
-        if (!at(kClose)) return false;
-        pos += kClose.size();
-        calls.push_back(std::move(call));
-        if (at("\n<tool_call>")) {
-            ++pos;
-            continue;
-        }
-        return python_strip(text.substr(pos)).empty();
-    }
+    };
+    if (read(false) || read(true)) return true;
+    calls.clear();
+    return false;
 }
 
 bool QwenCodec::parse_tool_calls(const std::string & block, const nlohmann::json & tools,
@@ -1241,71 +1264,71 @@ bool DeepSeekCodec::render(const ChatCodecInput & input, RenderedPrompt & out,
 // The calls block from `pos`: "<｜DSML｜ calls>\n", invokes joined by "\n",
 // each "<｜DSML｜ invoke name=\"NAME\">\n" + parameters joined by "\n" +
 // "\n</｜DSML｜ invoke>", then "\n</｜DSML｜ calls>". Whitespace may follow.
-bool parse_deepseek_calls(const DeepSeekDialect & d, const std::string & text, size_t pos,
+// A value ends at the first close the next parameter or the end of the
+// invoke follows; when that reading fails, a second one skips the closes
+// inside an invoke the value quotes, as in parse_qwen_calls.
+bool parse_deepseek_calls(const DeepSeekDialect & d, const std::string & text, size_t start,
                          const nlohmann::json & tools, std::vector<ChatToolCall> & calls) {
-    const auto at = [&](const std::string & token) { return text.compare(pos, token.size(), token) == 0; };
-    const auto take = [&](const std::string & token) {
-        if (!at(token)) return false;
-        pos += token.size();
-        return true;
-    };
-    // An attribute value: the text up to the closing quote, on one line.
-    const auto read_quoted = [&](std::string & value) {
-        const size_t end = text.find('"', pos);
-        if (end == std::string::npos || end == pos) return false;
-        value = text.substr(pos, end - pos);
-        if (value.find('\n') != std::string::npos) return false;
-        pos = end + 1;
-        return true;
-    };
-    calls.clear();
-    if (!take(std::string(d.calls_open) + "\n")) return false;
-    while (true) {
-        ChatToolCall call;
-        if (!take(d.invoke_open) || !read_quoted(call.name) || !take(">\n") ||
-            !tool_declared(tools, call.name)) {
-            return false;
-        }
-        call.arguments = nlohmann::ordered_json::object();
-        const std::string invoke_end = std::string("\n") + d.invoke_close;
-        for (bool first = true; !at(invoke_end); first = false) {
-            if (!first && !take("\n")) return false;
-            std::string key, is_string;
-            if (!take(d.param_open) || !read_quoted(key) || !take(" string=\"") ||
-                !read_quoted(is_string) || !take(">") || call.arguments.contains(key)) {
+    const std::string invoke_end = std::string("\n") + d.invoke_close, next_param = std::string("\n") + d.param_open,
+                      close = d.param_close;
+    const auto read = [&](bool skip_quoted) {
+        size_t pos = start;
+        const auto at = [&](size_t p, const std::string & token) { return text.compare(p, token.size(), token) == 0; };
+        const auto take = [&](const std::string & token) {
+            if (!at(pos, token)) return false;
+            pos += token.size();
+            return true;
+        };
+        // An attribute value: the text up to the closing quote, on one line.
+        const auto read_quoted = [&](std::string & value) {
+            const size_t end = text.find('"', pos);
+            if (end == std::string::npos || end == pos) return false;
+            value = text.substr(pos, end - pos);
+            if (value.find('\n') != std::string::npos) return false;
+            pos = end + 1;
+            return true;
+        };
+        calls.clear();
+        if (!take(std::string(d.calls_open) + "\n")) return false;
+        while (true) {
+            ChatToolCall call;
+            if (!take(d.invoke_open) || !read_quoted(call.name) || !take(">\n") ||
+                !tool_declared(tools, call.name)) {
                 return false;
             }
-            // The value ends at the first close the next parameter or the end of the call follows.
-            size_t end = pos;
-            const std::string close = d.param_close;
-            while (true) {
-                end = text.find(close, end);
-                if (end == std::string::npos) return false;
-                const size_t next = end + close.size();
-                if (text.compare(next, 1 + std::strlen(d.param_open), std::string("\n") + d.param_open) == 0 ||
-                    text.compare(next, 1 + std::strlen(d.invoke_close), std::string("\n") + d.invoke_close) == 0) {
-                    break;
+            call.arguments = nlohmann::ordered_json::object();
+            for (bool first = true; !at(pos, invoke_end); first = false) {
+                if (!first && !take("\n")) return false;
+                std::string key, is_string;
+                if (!take(d.param_open) || !read_quoted(key) || !take(" string=\"") ||
+                    !read_quoted(is_string) || !take(">") || call.arguments.contains(key)) {
+                    return false;
                 }
-                ++end;
+                QuotedCall quoted(text, pos, d.invoke_open, d.invoke_close);
+                const size_t end = raw_value_end(text, pos, close, next_param, invoke_end, skip_quoted ? &quoted : nullptr);
+                if (end == std::string::npos) return false;
+                const std::string value = text.substr(pos, end - pos);
+                if (is_string == "true") {
+                    call.arguments[key] = value;
+                } else if (is_string == "false") {
+                    const auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
+                    if (parsed.is_discarded()) return false;
+                    call.arguments[key] = parsed;
+                } else {
+                    return false;
+                }
+                pos = end + close.size();
             }
-            const std::string value = text.substr(pos, end - pos);
-            if (is_string == "true") {
-                call.arguments[key] = value;
-            } else if (is_string == "false") {
-                const auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
-                if (parsed.is_discarded()) return false;
-                call.arguments[key] = parsed;
-            } else {
-                return false;
-            }
-            pos = end + close.size();
+            if (!take(invoke_end)) return false;
+            calls.push_back(std::move(call));
+            if (take(std::string("\n") + d.calls_close)) break;
+            if (!take("\n")) return false;
         }
-        if (!take(std::string("\n") + d.invoke_close)) return false;
-        calls.push_back(std::move(call));
-        if (take(std::string("\n") + d.calls_close)) break;
-        if (!take("\n")) return false;
-    }
-    return python_strip(text.substr(pos)).empty();
+        return python_strip(text.substr(pos)).empty();
+    };
+    if (read(false) || read(true)) return true;
+    calls.clear();
+    return false;
 }
 
 bool DeepSeekCodec::parse_tool_calls(const std::string & block, const nlohmann::json & tools,
@@ -1369,6 +1392,374 @@ bool DeepSeekCodec::generated_turn(const std::string & rendered, const std::vect
     return true;
 }
 
+// ─── Inkling 2 / Inkling 2 Mini Codec ────────────────────────────────────
+// Reproduces the official Thinking Machines Lab Inkling 2 Mini GGUF Jinja
+// template byte-for-byte:
+//   - Tool declarations:
+//       <|message_system|>tool_declare<|content_xml|>[...]<|end_message|>
+//   - Thinking effort (emitted before the first non-system message):
+//       <|message_system|><|content_text|>Thinking effort level: <num><|end_message|>
+//   - Messages:
+//       <|message_system|><|content_text|>...<|end_message|>
+//       <|message_user|><|content_text|>...<|end_message|>
+//       <|message_tool|><name><|content_text|>...<|end_message|>
+//       <|message_model|><|content_thinking|>...<|end_message|>
+//       <|message_model|><|content_text|>...<|end_message|>
+//       <|message_model|><name><|content_invoke_tool_json|>{"name":...,"args":{...}}<|end_message|>
+//       <|content_model_end_sampling|>
+class Inkling2Codec final : public ChatCodec {
+public:
+    Inkling2Codec() : id_("inkling2/1") {}
+    const std::string & id() const override { return id_; }
+    std::vector<std::string> tool_call_openers() const override {
+        return {"<|content_invoke_tool_json|>"};
+    }
+    std::string default_effort() const override { return "high"; }
+    std::string template_effort(const std::string & tier) const override {
+        if (!tier.empty() && (tier[0] >= '0' && tier[0] <= '9')) return tier;
+        if (tier == "none") return "0";
+        if (tier == "minimal") return "0.1";
+        if (tier == "low") return "0.2";
+        if (tier == "medium") return "0.7";
+        if (tier == "x-high" || tier == "xhigh" || tier == "max") return "0.99";
+        return "0.9";
+    }
+
+    bool render(const ChatCodecInput & input, RenderedPrompt & out,
+                std::string & error) const override;
+    bool parse_tool_calls(const std::string & block, const nlohmann::json & tools,
+                          ToolParseResult & out) const override;
+    bool parse_turn(const std::string & turn, const nlohmann::json & tools,
+                    ChatMessage & out) const override;
+    bool generated_turn(const std::string & rendered, const std::vector<int32_t> & prompt_tokens,
+                        const std::vector<int32_t> & generated, const Tokenizer & tokenizer,
+                        const nlohmann::json & tools, ChatMessage & message,
+                        TurnMemory::Turn & turn) const override;
+
+private:
+    static bool tool_allowed_name(const nlohmann::json & tools, const std::string & name) {
+        if (!tools.is_array() || tools.empty()) return true;
+        for (const auto & t : tools) {
+            const auto & fn = t.is_object() && t.contains("function") ? t["function"] : t;
+            if (fn.is_object() && fn.value("name", std::string()) == name) return true;
+        }
+        return false;
+    }
+
+    static bool parse_call_json(const std::string & json_str, const nlohmann::json & tools,
+                                ChatToolCall & out_call) {
+        const auto parsed = nlohmann::ordered_json::parse(json_str, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object()) return false;
+        if (!parsed.contains("name") || !parsed["name"].is_string()) return false;
+        const std::string name = parsed["name"].get<std::string>();
+        if (name.empty() || !tool_allowed_name(tools, name)) return false;
+        nlohmann::ordered_json args = nlohmann::ordered_json::object();
+        if (parsed.contains("args")) {
+            if (!parsed["args"].is_object()) return false;
+            args = parsed["args"];
+        } else if (parsed.contains("arguments")) {
+            if (parsed["arguments"].is_object()) {
+                args = parsed["arguments"];
+            } else if (parsed["arguments"].is_string()) {
+                const auto a = nlohmann::ordered_json::parse(
+                    parsed["arguments"].get<std::string>(), nullptr, false);
+                if (a.is_discarded() || !a.is_object()) return false;
+                args = a;
+            } else {
+                return false;
+            }
+        }
+        out_call = {};
+        out_call.name = name;
+        out_call.arguments = std::move(args);
+        return true;
+    }
+
+    std::string id_;
+};
+
+bool Inkling2Codec::render(const ChatCodecInput & input, RenderedPrompt & out,
+                           std::string & error) const {
+    out = RenderedPrompt();
+    if (!input.messages || input.messages->empty()) {
+        error = "No messages provided.";
+        return false;
+    }
+    const auto & messages = *input.messages;
+    out.messages.assign(messages.size(), MessageLayout());
+    out.literal = {
+        "<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>",
+        "<|content_text|>", "<|content_thinking|>", "<|content_xml|>", "<|content_image|>",
+        "<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>", "<|content_tool_error|>",
+        "<|end_message|>", "<|content_model_end_sampling|>", "<|endoftext|>", "<|begin_of_text|>",
+    };
+    PromptWriter w(out);
+
+    // 1. Tool declarations (sorted keys, compact JSON, matching official Jinja).
+    if (input.tools && input.tools->is_array() && !input.tools->empty()) {
+        nlohmann::json specs = nlohmann::json::array();
+        for (const auto & tool : openai_tool_definitions(*input.tools)) {
+            const auto & fn = tool.contains("function") && tool["function"].is_object()
+                ? tool["function"] : tool;
+            nlohmann::json spec = nlohmann::json::object();
+            spec["description"] = (fn.contains("description") && fn["description"].is_string())
+                ? fn["description"].get<std::string>() : std::string();
+            spec["name"] = (fn.contains("name") && fn["name"].is_string())
+                ? fn["name"].get<std::string>() : std::string();
+            if (fn.contains("parameters") && fn["parameters"].is_object()) {
+                spec["parameters"] = nlohmann::json::parse(fn["parameters"].dump());
+            } else {
+                spec["parameters"] = nlohmann::json::object();
+            }
+            spec["type"] = (tool.contains("type") && tool["type"].is_string())
+                ? tool["type"].get<std::string>() : std::string("function");
+            specs.push_back(std::move(spec));
+        }
+        out.tools.begin = w.at();
+        w.control("<|message_system|>");
+        w.text("tool_declare");
+        w.control("<|content_xml|>");
+        w.data(specs.dump());
+        w.control("<|end_message|>");
+        out.tools.end = w.at();
+    }
+
+    auto emit_effort = [&]() {
+        const std::string eff = !input.enable_thinking
+            ? std::string("0")
+            : template_effort(input.reasoning_effort.empty() ? default_effort() : input.reasoning_effort);
+        w.control("<|message_system|>");
+        w.control("<|content_text|>");
+        w.text("Thinking effort level: " + eff);
+        w.control("<|end_message|>");
+    };
+
+    auto resolve_tool_name = [&](const ChatMessage & msg) -> std::string {
+        if (!msg.tool_name.empty()) return msg.tool_name;
+        if (!msg.tool_call_id.empty()) {
+            for (const auto & prev : messages) {
+                if (prev.role == "assistant") {
+                    for (const auto & tc : prev.tool_calls) {
+                        if (tc.id == msg.tool_call_id && !tc.name.empty()) return tc.name;
+                    }
+                }
+            }
+        }
+        return {};
+    };
+
+    bool effort_emitted = false;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto & msg = messages[i];
+        const bool is_system = (msg.role == "system" || msg.role == "developer");
+        if (!effort_emitted && !is_system) {
+            emit_effort();
+            effort_emitted = true;
+        }
+
+        auto & layout = out.messages[i];
+        layout.turn.begin = w.at();
+
+        if (is_system) {
+            w.control("<|message_system|>");
+            w.control("<|content_text|>");
+            w.content(msg.content, input.image_marker, layout.content);
+            w.control("<|end_message|>");
+        } else if (msg.role == "user") {
+            w.control("<|message_user|>");
+            w.control("<|content_text|>");
+            w.content(msg.content, input.image_marker, layout.content);
+            w.control("<|end_message|>");
+        } else if (msg.role == "tool") {
+            w.control("<|message_tool|>");
+            const std::string tname = resolve_tool_name(msg);
+            if (!tname.empty()) w.data(tname);
+            w.control("<|content_text|>");
+            w.content(msg.content, input.image_marker, layout.content);
+            w.control("<|end_message|>");
+        } else if (msg.role == "assistant") {
+            TurnMemory::Turn remembered;
+            const bool hit = input.memory && input.memory->lookup(msg, w.context(), remembered);
+            if (hit) {
+                w.generated(remembered, msg.content, 0, true, layout.content);
+            } else {
+                if (!msg.reasoning_content.empty()) {
+                    w.control("<|message_model|>");
+                    w.control("<|content_thinking|>");
+                    w.data(msg.reasoning_content);
+                    w.control("<|end_message|>");
+                }
+                if (!msg.content.empty() || (msg.tool_calls.empty() && msg.reasoning_content.empty())) {
+                    w.control("<|message_model|>");
+                    w.control("<|content_text|>");
+                    w.content(msg.content, input.image_marker, layout.content);
+                    w.control("<|end_message|>");
+                }
+                for (const auto & tc : msg.tool_calls) {
+                    if (tc.name.empty()) {
+                        error = "tool call function name must be non-empty";
+                        return false;
+                    }
+                    nlohmann::json sorted_args = nlohmann::json::object();
+                    if (tc.arguments.is_object()) {
+                        for (const auto & [k, v] : tc.arguments.items()) {
+                            sorted_args[k] = nlohmann::json::parse(v.dump());
+                        }
+                    }
+                    const std::string payload =
+                        "{\"name\":" + nlohmann::json(tc.name).dump() +
+                        ",\"args\":" + sorted_args.dump() + "}";
+                    w.control("<|message_model|>");
+                    w.data(tc.name);
+                    w.control("<|content_invoke_tool_json|>");
+                    w.data(payload);
+                    w.control("<|end_message|>");
+                }
+            }
+            w.control("<|content_model_end_sampling|>");
+        } else {
+            error = "Unknown message role: " + msg.role;
+            return false;
+        }
+        layout.turn.end = w.at();
+    }
+
+    if (!effort_emitted) {
+        emit_effort();
+    }
+
+    if (input.add_generation_prompt) {
+        out.context = w.context();
+    }
+    return true;
+}
+
+bool Inkling2Codec::parse_tool_calls(const std::string & block, const nlohmann::json & tools,
+                                     ToolParseResult & out) const {
+    static const std::string kOpen = "<|content_invoke_tool_json|>";
+    static const std::string kEnd  = "<|end_message|>";
+    std::vector<ToolCall> calls;
+    std::string cleaned;
+    size_t pos = 0;
+    while (pos < block.size()) {
+        const size_t open = block.find(kOpen, pos);
+        if (open == std::string::npos) {
+            const std::string tail = python_strip(block.substr(pos));
+            if (!tail.empty() && tail != kEnd) {
+                if (!cleaned.empty()) cleaned += "\n";
+                cleaned += tail;
+            }
+            break;
+        }
+        if (open > pos) {
+            const std::string pre = python_strip(block.substr(pos, open - pos));
+            // Ignore inter-call delimiters or model header prefixes.
+            if (!pre.empty() && pre != kEnd && !starts_with(pre, "<|message_model|>")) {
+                if (!cleaned.empty()) cleaned += "\n";
+                cleaned += pre;
+            }
+        }
+        const size_t body_start = open + kOpen.size();
+        const size_t end_msg = block.find(kEnd, body_start);
+        const size_t next_open = block.find(kOpen, body_start);
+        size_t body_end = std::min(end_msg, next_open);
+        if (body_end == std::string::npos) body_end = block.size();
+
+        const std::string payload = python_strip(block.substr(body_start, body_end - body_start));
+        ChatToolCall call;
+        if (!parse_call_json(payload, tools, call)) return false;
+        calls.push_back({new_tool_call_id(), std::move(call.name), call.arguments.dump()});
+
+        if (end_msg != std::string::npos && end_msg == body_end) {
+            pos = end_msg + kEnd.size();
+        } else {
+            pos = body_end;
+        }
+    }
+    if (calls.empty()) return false;
+    out = {};
+    out.tool_calls = std::move(calls);
+    out.cleaned_text = std::move(cleaned);
+    return true;
+}
+
+bool Inkling2Codec::parse_turn(const std::string & turn, const nlohmann::json & tools,
+                               ChatMessage & out) const {
+    static const std::string kModel  = "<|message_model|>";
+    static const std::string kThink  = "<|content_thinking|>";
+    static const std::string kText   = "<|content_text|>";
+    static const std::string kTool   = "<|content_invoke_tool_json|>";
+    static const std::string kEnd    = "<|end_message|>";
+    static const std::string kEos    = "<|content_model_end_sampling|>";
+
+    out = {};
+    out.role = "assistant";
+    size_t pos = 0;
+    bool parsed_any = false;
+    while (pos < turn.size()) {
+        if (turn.compare(pos, kEos.size(), kEos) == 0) {
+            pos += kEos.size();
+            continue;
+        }
+        if (turn.compare(pos, kModel.size(), kModel) != 0) {
+            // Skip stray whitespace between messages; reject arbitrary garbage.
+            if (turn[pos] == ' ' || turn[pos] == '\n' || turn[pos] == '\r' || turn[pos] == '\t') {
+                ++pos;
+                continue;
+            }
+            return false;
+        }
+        pos += kModel.size();
+
+        const size_t p_think = turn.find(kThink, pos);
+        const size_t p_text  = turn.find(kText, pos);
+        const size_t p_tool  = turn.find(kTool, pos);
+        const size_t p_end_h = turn.find(kEnd, pos);
+        const size_t p_next  = std::min({p_think, p_text, p_tool});
+        if (p_next == std::string::npos || (p_end_h != std::string::npos && p_end_h < p_next)) {
+            return false;
+        }
+        const size_t kind = (p_next == p_think) ? 0 : (p_next == p_text ? 1 : 2);
+        const size_t tag_len = (kind == 0) ? kThink.size() : (kind == 1 ? kText.size() : kTool.size());
+        const size_t body_start = p_next + tag_len;
+        const size_t body_end = turn.find(kEnd, body_start);
+        const std::string body = (body_end == std::string::npos)
+            ? turn.substr(body_start)
+            : turn.substr(body_start, body_end - body_start);
+
+        if (kind == 0) {
+            if (!out.reasoning_content.empty()) out.reasoning_content += "\n";
+            out.reasoning_content += body;
+        } else if (kind == 1) {
+            out.content += body;
+        } else {
+            ChatToolCall call;
+            if (!parse_call_json(python_strip(body), tools, call)) return false;
+            call.id = new_tool_call_id();
+            out.tool_calls.push_back(std::move(call));
+        }
+        parsed_any = true;
+        if (body_end == std::string::npos) break;
+        pos = body_end + kEnd.size();
+    }
+    return parsed_any;
+}
+
+bool Inkling2Codec::generated_turn(const std::string & rendered, const std::vector<int32_t> & prompt_tokens,
+                                   const std::vector<int32_t> & generated, const Tokenizer & tokenizer,
+                                   const nlohmann::json & tools, ChatMessage & message,
+                                   TurnMemory::Turn & turn) const {
+    (void) rendered;
+    (void) prompt_tokens;
+    if (generated.empty()) return false;
+    turn.tokens = generated;
+    turn.text = tokenizer.decode(generated);
+    if (!parse_turn(turn.text, tools, message)) return false;
+    turn.thinking = !message.reasoning_content.empty();
+    turn.reasoning = message.reasoning_content;
+    return true;
+}
+
 }  // namespace
 
 int32_t think_close_token(const Tokenizer & tokenizer) {
@@ -1392,6 +1783,7 @@ std::unique_ptr<ChatCodec> make_chat_codec(const std::string & name) {
     if (name == "qwen3.5") return std::make_unique<QwenCodec>(QwenVersion::k35);
     if (name == "deepseek4") return std::make_unique<DeepSeekCodec>(kDeepSeek4);
     if (name == "deepseek4.1") return std::make_unique<DeepSeekCodec>(kDeepSeek41);
+    if (name == "inkling2") return std::make_unique<Inkling2Codec>();
     return nullptr;
 }
 
@@ -1399,13 +1791,14 @@ std::string default_chat_codec_for_arch(const std::string & arch) {
     if (arch == "deepseek41") return "deepseek4.1";
     if (arch == "deepseek4") return "deepseek4";
     if (arch == "qwen4exp") return "qwen3.8";
+    if (arch == "inkling2_loop" || arch == "inkling2") return "inkling2";
     // Qwen3.5 27B and 35B-A3B; the Qwen3.6 and Qwen3.8 27B cards name their own codec.
     if (arch == "qwen35" || arch == "qwen35moe") return "qwen3.5";
     return {};
 }
 
 const std::vector<std::string> & chat_codec_names() {
-    static const std::vector<std::string> kNames = {"qwen3.8", "qwen3.6", "qwen3.5", "deepseek4.1", "deepseek4"};
+    static const std::vector<std::string> kNames = {"qwen3.8", "qwen3.6", "qwen3.5", "deepseek4.1", "deepseek4", "inkling2"};
     return kNames;
 }
 

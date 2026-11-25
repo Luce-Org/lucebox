@@ -25,6 +25,7 @@
 #include "cluster/cluster_worker_main.h"
 #include "common/chain_rollback_policy.h"
 #include "common/gguf_inspect.h"
+#include "gguf.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
 #include "common/paged_attention_config.h"
@@ -1313,9 +1314,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     // --max-ctx auto starts from the trained context; the backend lowers it to what its devices hold.
     if (bargs.device.fit_ctx) {
         const GgufMetadata meta = read_gguf_metadata(bargs.model_path, false);
-        if (meta.general_architecture != "qwen4exp" || meta.context_length <= 0) {
+        const bool fit_ok = (meta.general_architecture == "qwen4exp" ||
+                             luce::common::arch_is_inkling2_family(meta.general_architecture));
+        if (!fit_ok || meta.context_length <= 0) {
             std::fprintf(stderr, "[server] --max-ctx auto needs a model whose backend fits its context to the "
-                                 "devices (Qwen3.8-Flash-Next); give --max-ctx a token count\n");
+                                 "devices (Qwen3.8-Flash-Next, Inkling 2); give --max-ctx a token count\n");
             return 2;
         }
         bargs.device.max_ctx = meta.context_length;
@@ -1551,9 +1554,10 @@ static bool apply_expert_device(const DevicePlacement & expert,
                                 const BackendPlan & plan) {
     const DevicePlacement & target = plan.placement().target;
     const bool qwen4exp = plan.arch() == "qwen4exp";
-    if (!luce::common::arch_is_deepseek4_family(plan.arch()) && !qwen4exp) {
+    const bool inkling2 = luce::common::arch_is_inkling2_family(plan.arch());
+    if (!luce::common::arch_is_deepseek4_family(plan.arch()) && !qwen4exp && !inkling2) {
         std::fprintf(stderr,
-            "[server] --expert-device is only valid for DeepSeek V4 / V4.1 and Qwen3.8-Flash-Next models "
+            "[server] --expert-device is only valid for DeepSeek V4 / V4.1, Qwen3.8-Flash-Next, and Inkling 2 models "
             "(detected '%s')\n",
             plan.arch().c_str());
         return false;
@@ -1571,7 +1575,7 @@ static bool apply_expert_device(const DevicePlacement & expert,
         std::fprintf(stderr, "[server] --expert-device must differ from the target device\n");
         return false;
     }
-    if (qwen4exp) return true;
+    if (qwen4exp || inkling2) return true;
     const std::string gpu = std::to_string(expert.gpu);
     set_environment_variable("LUCE_DS4_MOE_TP", "1", true);
     set_environment_variable("LUCE_DS4_MOE_TP_INPROC", "1", true);
@@ -2646,7 +2650,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (sconfig.hard_limit_reply_budget > 0) {
         std::string marker = card.thinking_marker;
         if (marker.empty()) {
-            marker = (arch == "gemma4") ? "<channel|>" : "</think>";
+            marker = (arch == "gemma4") ? "<channel|>"
+                   : luce::common::arch_is_inkling2_family(arch) ? "<|end_message|>"
+                   : "</think>";
         }
         const std::string close_text = card.thinking_terminator_hint.empty()
                                            ? marker

@@ -11,8 +11,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <functional>
+#include <random>
 #include <stdexcept>
+#include <unistd.h>
 #include <vector>
 
 using namespace luce::common;
@@ -312,4 +316,249 @@ TEST_CASE(KvflashPagerTruncateFixture, refill_keeps_protected_chunks_resident_un
     for (int c = 0; c < pa.n_chunks(); c++) if (pa.is_resident(c)) resident.push_back(c);
     // sink 0 + tail window 7..11, then the two best discretionary chunks (1, 2).
     CHECK(resident == (std::vector<int>{0, 1, 2, 7, 8, 9, 10, 11}));
+}
+
+// A forward's own span must survive the allocation of the span: with a scorer installed (the recall hook of a
+// two-pass tail prefill) the earlier chunks of the same alloc_span call are the lowest scored, and must not be
+// evicted to make room for the later ones (their slot would be -1: rows written to row -1, keys masked).
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_never_evicts_a_chunk_of_its_own_span) {
+    for (const int span_chunks : {2, 4, 6}) {
+        Harness A;
+        TestPager pa;
+        must(pa.attach(make_cfg(), A.k, A.v));
+        append(A, pa, 0, 20 * kChunk);
+        // Recalled chunks (the old ones) outrank every chunk the forward is about to write.
+        pa.score_hook = [](int c) { return c < 12 ? 100.f + (float)c : 1.f + (float)c * 1e-3f; };
+        pa.reselect(2);
+        pa.truncate(12 * kChunk);
+        pa.synchronize_paging();
+        const int from = 12 * kChunk;
+        must(pa.alloc_span(from, span_chunks * kChunk));
+        for (int c = 12; c < 12 + span_chunks; c++) {
+            CHECK(pa.is_resident(c));
+            CHECK(pa.slot_of(c * kChunk) >= 0);
+        }
+        // The next forward of the same prefill: its predecessors are old now, and may be victims again.
+        must(pa.alloc_span(from + span_chunks * kChunk, span_chunks * kChunk));
+        for (int c = 12 + span_chunks; c < 12 + 2 * span_chunks; c++) CHECK(pa.slot_of(c * kChunk) >= 0);
+    }
+}
+
+// The two-pass tail's second prefill at serving scale (tensor-less pager, logic only): LRU first pass over the whole
+// prompt, the recall scorer and reselect, a rollback to the tail's start, then the tail in forwards of 4..31 chunks
+// with the scorer still installed and one poorly voted tail chunk. No chunk of a forward may lose its slot.
+TEST_CASE(KvflashPagerTruncateFixture, tail_forwards_under_a_scorer_keep_every_inflight_chunk) {
+    constexpr int pool_chunks = 256, n_chunks = 900, tail_chunks = 32;
+    for (const int fwd : {4, 8, 16, 31}) {
+        KvFlashConfig cfg;
+        cfg.pool_tokens = pool_chunks * kChunk;
+        TestPager p;
+        must(p.attach(cfg, {}, {}));
+        const int P = n_chunks * kChunk, tail_pos = P - tail_chunks * kChunk;
+        for (int pos = 0; pos < P; pos += fwd * kChunk) must(p.alloc_span(pos, std::min(fwd * kChunk, P - pos)));
+        std::vector<float> score(n_chunks);
+        for (int c = 0; c < n_chunks; ++c) score[(size_t)c] = (float)((c * 7919) % 500);
+        for (int c = n_chunks - tail_chunks; c < n_chunks; ++c) score[(size_t)c] = 400;
+        score[(size_t)(n_chunks - tail_chunks + 3)] = 1;
+        p.score_hook = [&](int c) { return c < n_chunks ? score[(size_t)c] : 1e6f + (float)c; };
+        p.reselect(5);
+        p.truncate(tail_pos);
+        for (int pos = tail_pos; pos < P; pos += fwd * kChunk) {
+            const int n = std::min(fwd * kChunk, P - pos);
+            must(p.alloc_span(pos, n));
+            for (int q = pos; q < pos + n; q += kChunk) CHECK(p.slot_of(q) >= 0);
+        }
+    }
+}
+
+// A tensor-less pager of `blocks` chunks (default sink and tail window), filled to its head with LRU appends.
+namespace {
+KvFlashConfig logic_cfg(int blocks) {
+    KvFlashConfig cfg;
+    cfg.pool_tokens = blocks * kChunk;
+    return cfg;
+}
+// Append [0, tokens) one chunk per forward, as a prompt prefill does.
+void fill(TestPager & p, int tokens) {
+    for (int pos = 0; pos < tokens; pos += kChunk) must(p.alloc_span(pos, std::min(kChunk, tokens - pos)));
+}
+}
+
+// The protection is scoped: a scorer that throws mid-allocation must not leave the span's chunks unevictable.
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_protection_is_cleared_when_a_scorer_throws) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    fill(p, 8 * kChunk);
+    bool armed = false;
+    p.score_hook = [&](int c) {
+        if (armed && p.is_resident(12) && !p.is_resident(13)) throw std::runtime_error("scorer failed");
+        return (float)c;
+    };
+    armed = true;
+    bool threw = false;
+    try { p.alloc_span(8 * kChunk, 6 * kChunk); } catch (const std::runtime_error &) { threw = true; }
+    CHECK(threw);
+    // The head sits at chunk 13, so chunk 8 is past the tail window: an eviction may take it again.
+    CHECK(p.is_resident(8));
+    CHECK(p.evictable_(8));
+}
+
+// Only the span's own chunks are protected, not everything above its start: re-allocating a paged-out chunk far behind
+// the head must still find a victim (an old chunk outside the span), as it did before the protection existed.
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_behind_the_head_evicts_outside_the_span) {
+    TestPager p;
+    must(p.attach(logic_cfg(24), {}, {}));
+    fill(p, 101 * kChunk);   // head at chunk 100: residents are the sink and the newest chunks
+    CHECK(!p.is_resident(50));
+    CHECK(p.alloc_span(50 * kChunk, 1));
+    CHECK(p.is_resident(50));
+    CHECK(p.is_resident(0));
+}
+
+// The documented limit: a span that cannot sit in the pool beside the sink is not protected (its early chunks stay
+// evictable, as for bulk bookkeeping callers), so a forward that big is not possible. Pinned here so a change to it
+// is a decision.
+TEST_CASE(KvflashPagerTruncateFixture, oversized_span_keeps_its_early_chunks_evictable) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    fill(p, 8 * kChunk);
+    p.score_hook = [](int c) { return c >= 8 ? (float)c : 100.f + (float)c; };   // the span's chunks rank lowest
+    p.alloc_span(8 * kChunk, 8 * kChunk);   // 8 chunks + the sink do not fit 8 blocks
+    bool lost = false;
+    for (int c = 8; c < 16; c++) lost |= !p.is_resident(c);
+    CHECK(lost);
+}
+
+// A span that contains the sink chunks (alloc_span(0, n) on an identity pager) needs no slot beside them: filling the
+// pool from chunk 0 fits, nothing is evicted, and the one-time "cannot be protected" warning must not fire.
+TEST_CASE(KvflashPagerTruncateFixture, span_holding_the_sink_chunks_fills_the_pool_without_warning) {
+    TestPager p;
+    must(p.attach(logic_cfg(8), {}, {}));
+    std::fflush(stderr);
+    const int saved = dup(2);
+    std::FILE * cap = std::tmpfile();
+    dup2(fileno(cap), 2);
+    const bool ok = p.alloc_span(0, 8 * kChunk);
+    std::fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    std::rewind(cap);
+    char line[256];
+    const bool warned = std::fgets(line, sizeof line, cap) != nullptr;
+    std::fclose(cap);
+    CHECK(ok);
+    CHECK(!warned);
+    for (int c = 0; c < 8; c++) CHECK(p.is_resident(c));
+}
+
+// qwen4exp caps a forward at pool - 2 chunks of rows (qwen4exp_max_forward_rows): even unaligned that touches at most
+// pool_blocks - 1 chunks, which sit beside the sink, so every qwen4exp span is protected.
+TEST_CASE(KvflashPagerTruncateFixture, qwen4exp_forward_row_cap_keeps_every_span_protectable) {
+    for (const int blocks : {8, 9, 16, 31, 64}) {
+        for (const int offset : {0, 1, kChunk / 2, kChunk - 1}) {
+            TestPager p;
+            must(p.attach(logic_cfg(blocks), {}, {}));
+            const int head = (blocks + 3) * kChunk;   // a pool that has been evicting
+            fill(p, head);
+            p.score_hook = [&](int c) { return c >= blocks + 3 ? (float)c : 100.f + (float)c; };
+            const int rows = (blocks - 2) * kChunk;
+            must(p.alloc_span(head + offset, rows));
+            for (int q = head + offset; q < head + offset + rows; q += kChunk) CHECK(p.slot_of(q) >= 0);
+            CHECK(p.slot_of(head + offset + rows - 1) >= 0);
+        }
+    }
+}
+
+namespace {
+
+// The eviction rules of slot_for/alloc_span as they were before the span protection (victim: resident, past the sink
+// and the tail window, lowest score or oldest use, lower chunk id on ties), over chunk residency only.
+struct PreFixModel {
+    int blocks, cur = 0, resident = 0;
+    uint64_t clock = 0;
+    std::vector<uint8_t> res;
+    std::vector<uint64_t> use;
+    std::function<float(int)> score;
+    bool evicted_touched = false, evicted_untouched = false;   // a victim among the span's chunks: already written / not yet
+    PreFixModel(int b, int max_chunks) : blocks(b), res((size_t)max_chunks, 0), use((size_t)max_chunks, 0) {}
+
+    int victim() const {
+        int best = -1;
+        for (int c = 0; c < (int)res.size(); c++) {
+            if (!res[(size_t)c] || c < 1 || c > cur - 1 - 4) continue;
+            if (best < 0) { best = c; continue; }
+            const bool less = score ? score(c) < score(best) : use[(size_t)c] < use[(size_t)best];
+            if (less) best = c;
+        }
+        return best;
+    }
+    int slot_for(int pos, int span_first, int span_last) {
+        const int c = pos / kChunk, prev = cur;
+        cur = std::max(cur, c);
+        if (!res[(size_t)c]) {
+            if (resident == blocks) {
+                const int v = victim();
+                if (v < 0) { cur = prev; return -1; }
+                (v < c ? evicted_touched : evicted_untouched) |= v >= span_first && v <= span_last;
+                res[(size_t)v] = 0;
+                resident--;
+            }
+            res[(size_t)c] = 1;
+            resident++;
+        }
+        use[(size_t)c] = ++clock;
+        return 0;
+    }
+    bool alloc_span(int start, int n) {
+        for (int i = 0; i < n; i++) if (slot_for(start + i, start / kChunk, (start + n - 1) / kChunk) < 0) return false;
+        return true;
+    }
+};
+
+}  // namespace
+
+// Evidence that the span protection leaves every other KVFlash caller alone: random forwards that fit the pool (appends
+// with an unaligned restart, and re-forwards of older rows), run on the pager and on the pre-fix rules, keep the same
+// resident set and the same result, including re-forwards of paged-out chunks behind the head (victims outside the span,
+// above or below it, are compared like any other). A run ends at the first forward where the pre-fix rules would have
+// taken a victim among the forward's own chunks [first, last]. For an append that is only a
+// chunk already written (the bug the fix is for, only with a scorer: LRU ranks a forward's chunks newest). A re-forward over resident rows far behind the head can also lose a
+// chunk it has not reached yet under the pre-fix rules (it would page back in); the fix keeps it, the one intended
+// difference.
+TEST_CASE(KvflashPagerTruncateFixture, alloc_span_victims_match_the_pre_fix_selection_for_normal_forwards) {
+    constexpr int blocks = 24, max_chunks = 400;
+    int compared = 0, ended_by_touched = 0, ended_by_untouched = 0;
+    for (const bool scored : {false, true}) {
+        for (uint32_t seed = 1; seed <= 150; seed++) {
+            std::mt19937 rng(seed * 2654435761u + scored);
+            const auto sc = [seed](int c) { return (float)(((uint32_t)c * 2246822519u ^ seed * 3266489917u) % 1000); };
+            TestPager p;
+            must(p.attach(logic_cfg(blocks), {}, {}));
+            PreFixModel m(blocks, max_chunks);
+            if (scored) { p.score_hook = sc; m.score = sc; }
+            int head = 0;
+            for (int step = 0; step < 60 && head < (max_chunks - 30) * kChunk; step++) {
+                const int cap = (blocks - 2) * kChunk;
+                const bool append = step == 0 || rng() % 12 != 0;
+                const int start = append ? std::max(0, head - (int)(rng() % kChunk)) : (int)(rng() % head);
+                const int n = 1 + (int)(rng() % (append ? cap : 4 * kChunk));
+                m.evicted_touched = m.evicted_untouched = false;
+                const bool want = m.alloc_span(start, n);
+                if (m.evicted_touched || m.evicted_untouched) {
+                    CHECK(scored || !m.evicted_touched);
+                    CHECK(append ? !m.evicted_untouched : true);
+                    (m.evicted_touched ? ended_by_touched : ended_by_untouched)++;
+                    break;
+                }
+                CHECK(p.alloc_span(start, n) == want);
+                for (int c = 0; c < max_chunks; c++) CHECK(p.is_resident(c) == (bool)m.res[(size_t)c]);
+                head = std::max(head, start + n);
+                compared++;
+            }
+        }
+    }
+    CHECK(compared > 2000);
+    CHECK(ended_by_touched > 0);   // the scored runs do reach the case the fix exists for
+    std::printf("[differential] compared=%d ended_by_touched=%d ended_by_untouched=%d\n", compared, ended_by_touched,
+                ended_by_untouched);
 }
