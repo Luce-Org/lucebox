@@ -10099,22 +10099,6 @@ struct Ds4PagedGatheredRuntime {
     const MoeHybridStorage * hybrid_identity = nullptr;
     ggml_backend_t hybrid_cpu_backend = nullptr;
     ggml_backend_t hybrid_cold_backend = nullptr;
-    // Reused per-step scratch buffers for deepseek4_paged_gathered_step.
-    std::vector<int32_t> physical_owner;
-    std::vector<int64_t> physical_logical;
-    std::vector<int64_t> shape_key;
-    struct RatioVariant {
-        uint32_t ratio = 0;
-        uint64_t comp_physical_rows = 0;
-        std::vector<DeepSeek4GatheredLaneRows> rows;
-    };
-    std::vector<RatioVariant> rows_by_variant;
-    std::vector<size_t> layer_variant_idx;
-    std::vector<float> engram_keys;
-    std::vector<float> engram_lane_keys;
-    std::vector<int32_t> pos_batch;
-    std::vector<int32_t> neg_batch;
-    std::vector<int32_t> hash_values;
 };
 
 // A gathered graph's scheduler buffer grows with its lanes' histories (a
@@ -10213,17 +10197,11 @@ bool deepseek4_paged_gathered_step(
         if (previous_position >= 0 && (hybrid || bucket_history ||
                          positions[lane] != previous_position + 1)) return false;
     }
-    auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
-    if (!rt) {
-        rt = new (std::nothrow) Ds4PagedGatheredRuntime;
-        if (!rt) return false;
-        cache.gathered_runtime = rt;
-    }
     // Active logical pages must have valid, exclusive physical ownership.
     // Aliasing would make one lane's compressor write mutate another lane's
     // chronological history and is therefore malformed addressing.
-    rt->physical_owner.assign(cache.plan.physical_blocks, -1);
-    rt->physical_logical.assign(cache.plan.physical_blocks, -1);
+    std::vector<int32_t> physical_owner(cache.plan.physical_blocks, -1);
+    std::vector<int64_t> physical_logical(cache.plan.physical_blocks, -1);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         if (slots[lane] < 0) continue;
         const uint64_t last_block = (uint64_t) positions[lane] / DS4_PAGE_TOKENS;
@@ -10231,11 +10209,11 @@ bool deepseek4_paged_gathered_step(
         for (uint64_t logical = 0; logical <= last_block; ++logical) {
             const int32_t physical = block_tables[(size_t) lane * block_table_stride + logical];
             if (physical < 0 || (uint32_t) physical >= cache.plan.physical_blocks ||
-                (rt->physical_owner[(size_t)physical] >= 0 &&
-                 (rt->physical_owner[(size_t)physical] != slots[lane] ||
-                  rt->physical_logical[(size_t)physical] != (int64_t)logical))) return false;
-            rt->physical_owner[(size_t)physical] = slots[lane];
-            rt->physical_logical[(size_t)physical] = (int64_t)logical;
+                (physical_owner[(size_t)physical] >= 0 &&
+                 (physical_owner[(size_t)physical] != slots[lane] ||
+                  physical_logical[(size_t)physical] != (int64_t)logical))) return false;
+            physical_owner[(size_t)physical] = slots[lane];
+            physical_logical[(size_t)physical] = (int64_t)logical;
         }
     }
     const auto build_t0 = Ds4TimingClock::now();
@@ -10243,6 +10221,12 @@ bool deepseek4_paged_gathered_step(
         "ds4.paged_gathered_step",
         {InferencePhase::Batched, static_cast<int>(lanes), 0, w.n_layer,
          device});
+    auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
+    if (!rt) {
+        rt = new (std::nothrow) Ds4PagedGatheredRuntime;
+        if (!rt) return false;
+        cache.gathered_runtime = rt;
+    }
     if (rt->hybrid_identity != hybrid ||
         rt->hybrid_cpu_backend != (hybrid ? hybrid->cpu_backend : nullptr) ||
         rt->hybrid_cold_backend != (hybrid ? hybrid->cold_backend : nullptr)) {
@@ -10259,61 +10243,42 @@ bool deepseek4_paged_gathered_step(
         return false;
     }
 
-    std::vector<int64_t> & key = rt->shape_key;
-    key.clear();
-    key.reserve(5 + (size_t) lanes + (size_t) w.n_layer * lanes * 3);
-    key.push_back(0x5041474544LL);
-    key.push_back((int64_t) lanes);
-    key.push_back(token_ids ? 1 : 0);
-    key.push_back(hybrid ? 1 : 0);
-    key.push_back(bucket_history ? 1 : 0);
+    std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
+    std::vector<int64_t> key = {0x5041474544LL, (int64_t) lanes,
+                                token_ids ? 1 : 0, hybrid ? 1 : 0,
+                                bucket_history ? 1 : 0};
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
-    // The gathered lane rows depend on a layer only through its compress ratio
-    // and (when bucketed) its compressed source's physical row cap. Prepare and
-    // pad each distinct variant once per round and index layers into them
-    // without deep-copying across all layers on warm graph hits.
-    size_t n_variants = 0;
-    rt->layer_variant_idx.resize((size_t) w.n_layer);
+    // The gathered lane rows depend on the layer only through its compress
+    // ratio, so prepare each distinct ratio once per round and copy; the
+    // per-layer copies are still padded independently below.
+    std::vector<std::pair<uint32_t, std::vector<DeepSeek4GatheredLaneRows>>> rows_by_ratio;
     for (int il = 0; il < w.n_layer; ++il) {
         const uint32_t ratio = cache.layers[(size_t) il].ratio;
-        const uint64_t comp_phys = (bucket_history && ratio > 0)
-            ? ds4_comp_cache(cache, w, il).physical_rows : 0;
-        size_t v_idx = n_variants;
-        for (size_t v = 0; v < n_variants; ++v) {
-            if (rt->rows_by_variant[v].ratio == ratio &&
-                rt->rows_by_variant[v].comp_physical_rows == comp_phys) {
-                v_idx = v;
-                break;
-            }
-        }
-        if (v_idx == n_variants) {
-            if (n_variants == rt->rows_by_variant.size()) {
-                rt->rows_by_variant.emplace_back();
-            }
-            auto & var = rt->rows_by_variant[n_variants++];
-            var.ratio = ratio;
-            var.comp_physical_rows = comp_phys;
+        auto rows_it = std::find_if(rows_by_ratio.begin(), rows_by_ratio.end(),
+                                    [&](const auto & entry) { return entry.first == ratio; });
+        if (rows_it == rows_by_ratio.end()) {
+            rows_by_ratio.emplace_back(ratio, std::vector<DeepSeek4GatheredLaneRows>{});
+            rows_it = rows_by_ratio.end() - 1;
             if (!prepare_deepseek4_gathered_lane_rows(
                     slots, positions, lanes, block_tables, block_table_stride,
-                    cache.plan.physical_blocks, ratio, var.rows)) return false;
-            if (bucket_history) {
-                for (auto & row : var.rows) {
-                    row.raw_history.resize(
-                        (size_t) ds4_padded_gathered_raw_rows(
-                            (int) row.raw_history_valid),
-                        0);
-                    if (ratio > 0) {
-                        row.compressed_history.resize(
-                            (size_t) ds4_padded_comp_rows(
-                                (int) row.compressed_history_valid,
-                                (int) comp_phys),
-                            0);
-                    }
-                }
-            }
+                    cache.plan.physical_blocks, ratio, rows_it->second)) return false;
         }
-        rt->layer_variant_idx[(size_t) il] = v_idx;
-        for (const auto & row : rt->rows_by_variant[v_idx].rows) {
+        prepared[(size_t) il] = rows_it->second;
+        for (auto & row : prepared[(size_t) il]) {
+            if (bucket_history) {
+                row.raw_history.resize(
+                    (size_t) ds4_padded_gathered_raw_rows(
+                        (int) row.raw_history_valid),
+                    0);
+            }
+            if (bucket_history && ratio > 0) {
+                row.compressed_history.resize(
+                    (size_t) ds4_padded_comp_rows(
+                        (int) row.compressed_history_valid,
+                        // Readers pad to their kv source rows.
+                        (int) ds4_comp_cache(cache, w, il).physical_rows),
+                    0);
+            }
             key.push_back((int64_t) row.raw_history.size());
             key.push_back((int64_t) row.compressed_history.size());
             // The gathered graph's topology depends on the lane's position only
@@ -10362,16 +10327,11 @@ bool deepseek4_paged_gathered_step(
         fg = &vc.slots[pick]; ex = &vc.extra[pick];
         fg->release_for_rebuild(vc.backend, vc.peer_backend);
         ex->reset();
-        std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
-        for (int il = 0; il < w.n_layer; ++il) {
-            prepared[(size_t) il] = rt->rows_by_variant[rt->layer_variant_idx[(size_t) il]].rows;
-        }
-        std::vector<int64_t> owned_key = key;
         if (!ds4_build_fused_verify_graph(
                 mc, *fg, *ex, backend, w, nullptr,
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
-                token_ids != nullptr, {}, hybrid, /*vocab_split=*/false, std::move(owned_key),
+                token_ids != nullptr, {}, hybrid, /*vocab_split=*/false, std::move(key),
                 &cache, &prepared, bucket_history, /*engram_upload=*/nullptr, &vc.stage)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
@@ -10413,32 +10373,33 @@ bool deepseek4_paged_gathered_step(
         const DeepSeek4EngramRuntime & engram = *w.engram_runtime;
         const size_t width = engram.key_floats();
         if (cache.engram_tokens.size() < cache.plan.slots) cache.engram_tokens.resize(cache.plan.slots);
-        rt->engram_keys.assign((size_t) engram.n_layers() * lanes * width, 0.0f);
+        std::vector<float> keys((size_t) engram.n_layers() * lanes * width, 0.0f);
+        std::vector<float> lane_keys;
         for (uint32_t lane = 0; lane < lanes; ++lane) {
             if (slots[lane] < 0) continue;
             if (!ds4_engram_read_keys(w, cache.engram_tokens[(size_t) slots[lane]], token_ids ? token_ids + lane : nullptr,
-                                      (int) positions[lane], 1, rt->engram_lane_keys, telemetry)) {
+                                      (int) positions[lane], 1, lane_keys, telemetry)) {
                 return false;
             }
             for (int e = 0; e < engram.n_layers(); ++e) {
-                std::memcpy(rt->engram_keys.data() + ((size_t) e * lanes + lane) * width,
-                            rt->engram_lane_keys.data() + (size_t) e * width, width * sizeof(float));
+                std::memcpy(keys.data() + ((size_t) e * lanes + lane) * width,
+                            lane_keys.data() + (size_t) e * width, width * sizeof(float));
             }
         }
-        set_paged_input(ex->engram_keys, rt->engram_keys.data(), sizeof(float) * rt->engram_keys.size());
+        set_paged_input(ex->engram_keys, keys.data(), sizeof(float) * keys.size());
     }
     // The shared Q/KV prologue rotates all gathered lanes at once. Padding
     // lanes use position zero, matching their passive prepared row record.
     {
-        rt->pos_batch.assign(lanes, 0);
-        rt->neg_batch.assign(lanes, 0);
+        std::vector<int32_t> pos_batch(lanes, 0);
+        std::vector<int32_t> neg_batch(lanes, 0);
         for (uint32_t lane = 0; lane < lanes; ++lane) {
             if (slots[lane] < 0) continue;
-            rt->pos_batch[lane] = (int32_t) positions[lane];
-            rt->neg_batch[lane] = -(int32_t) positions[lane];
+            pos_batch[lane] = (int32_t) positions[lane];
+            neg_batch[lane] = -(int32_t) positions[lane];
         }
-        set_paged_input(ex->pos_q, rt->pos_batch.data(), sizeof(int32_t) * lanes);
-        set_paged_input(ex->neg_q, rt->neg_batch.data(), sizeof(int32_t) * lanes);
+        set_paged_input(ex->pos_q, pos_batch.data(), sizeof(int32_t) * lanes);
+        set_paged_input(ex->neg_q, neg_batch.data(), sizeof(int32_t) * lanes);
     }
 
     auto & bundle_i32 = ex->bundle_i32;
@@ -10458,9 +10419,8 @@ bool deepseek4_paged_gathered_step(
     size_t pi = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) cache.layers[(size_t) il].ratio;
-        const auto & layer_rows = rt->rows_by_variant[rt->layer_variant_idx[(size_t) il]].rows;
         for (uint32_t lane = 0; lane < lanes; ++lane, ++pi) {
-            const auto & row = layer_rows[lane];
+            const auto & row = prepared[(size_t) il][lane];
             const auto & px = ex->paged[pi];
             if (px.i32_base < 0 || px.i64_base < 0) return false;
             const int32_t pos = (int32_t) row.position;
@@ -10531,16 +10491,16 @@ bool deepseek4_paged_gathered_step(
     if (token_ids) {
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * ids = fg->hash_ids[(size_t) il]; if (!ids) continue;
-            rt->hash_values.resize((size_t) ids->ne[0] * lanes);
+            std::vector<int32_t> values((size_t) ids->ne[0] * lanes);
             for (uint32_t lane = 0; lane < lanes; ++lane) {
                 const int32_t * src = hash_routing_row(rt->model.hash_routing_tables[(size_t) il],
                                                        slots[lane] < 0 ? 0 : token_ids[lane],
                                                        w.n_expert_used);
                 if (!src) return false;
-                std::memcpy(rt->hash_values.data() + lane * ids->ne[0], src,
+                std::memcpy(values.data() + lane * ids->ne[0], src,
                             (size_t) ids->ne[0] * sizeof(int32_t));
             }
-            set_paged_input(ids, rt->hash_values.data(), rt->hash_values.size() * sizeof(int32_t));
+            set_paged_input(ids, values.data(), values.size() * sizeof(int32_t));
         }
     }
     // Monolithic exact serving reuses a gathered graph for only a few rounds
@@ -10573,74 +10533,28 @@ bool deepseek4_paged_gathered_step(
     const auto read_t0 = Ds4TimingClock::now();
     ds4_fused_consume_route_diagnostics(*fg, hybrid, routing_stats, slots);
     out_argmax.resize(lanes);
+    ggml_backend_tensor_get(ex->argmax, out_argmax.data(), 0,
+                            out_argmax.size() * sizeof(int32_t));
+
     const uint32_t requested_logits = static_cast<uint32_t>(std::count_if(
         logit_lanes, logit_lanes + lanes,
         [](uint8_t requested) { return requested != 0; }));
-    const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
-    const size_t argmax_bytes = (size_t) lanes * sizeof(int32_t);
-    const size_t read_stage_bytes =
-        argmax_bytes + 64 + (requested_logits > 0 ? (size_t) requested_logits * (row_bytes + 64) : 0);
-    // ds4_fused_graph_compute synchronized the compute backends, so vc.stage
-    // has no uploads in flight and can coalesce all async D2H readbacks into
-    // a single synchronize.
-    const bool staged_read = vc.stage.reserve(backend, read_stage_bytes);
-    if (staged_read) vc.stage.reset();
-    const void * argmax_staged = staged_read
-        ? vc.stage.get(backend, ex->argmax, 0, argmax_bytes) : nullptr;
-    bool any_async_read = argmax_staged != nullptr;
-    const void * logits_all_staged = nullptr;
-    std::array<const void *, DEEPSEEK4_MAX_GATHERED_ROWS> logits_lane_staged{};
     if (requested_logits == 0) {
         out_logits.clear();
     } else {
-        out_logits.resize((size_t) w.n_vocab * lanes);
+        out_logits.assign((size_t) w.n_vocab * lanes, 0.0f);
+        const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
         if (requested_logits == lanes) {
-            if (staged_read) {
-                logits_all_staged = vc.stage.get(
-                    backend, fg->logits, 0, (size_t) lanes * row_bytes);
-                any_async_read = any_async_read || logits_all_staged != nullptr;
-            }
-        } else {
-            for (uint32_t lane = 0; lane < lanes; ++lane) {
-                if (!logit_lanes[lane]) {
-                    std::fill_n(out_logits.data() + (size_t) lane * w.n_vocab,
-                                w.n_vocab, 0.0f);
-                    continue;
-                }
-                if (staged_read) {
-                    logits_lane_staged[lane] = vc.stage.get(
-                        backend, fg->logits, (size_t) lane * fg->logits->nb[1], row_bytes);
-                    any_async_read = any_async_read || logits_lane_staged[lane] != nullptr;
-                }
-            }
-        }
-    }
-    if (any_async_read) ggml_backend_synchronize(backend);
-    if (argmax_staged) {
-        std::memcpy(out_argmax.data(), argmax_staged, argmax_bytes);
-    } else {
-        ggml_backend_tensor_get(ex->argmax, out_argmax.data(), 0, argmax_bytes);
-    }
-    if (requested_logits > 0) {
-        if (requested_logits == lanes) {
-            if (logits_all_staged) {
-                std::memcpy(out_logits.data(), logits_all_staged,
-                            (size_t) lanes * row_bytes);
-            } else {
-                ggml_backend_tensor_get(fg->logits, out_logits.data(), 0,
-                                        (size_t) lanes * row_bytes);
-            }
+            ggml_backend_tensor_get(
+                fg->logits, out_logits.data(), 0,
+                out_logits.size() * sizeof(float));
         } else {
             for (uint32_t lane = 0; lane < lanes; ++lane) {
                 if (!logit_lanes[lane]) continue;
-                float * dst_row = out_logits.data() + (size_t) lane * w.n_vocab;
-                if (logits_lane_staged[lane]) {
-                    std::memcpy(dst_row, logits_lane_staged[lane], row_bytes);
-                } else {
-                    ggml_backend_tensor_get(
-                        fg->logits, dst_row,
-                        (size_t) lane * fg->logits->nb[1], row_bytes);
-                }
+                ggml_backend_tensor_get(
+                    fg->logits,
+                    out_logits.data() + (size_t) lane * w.n_vocab,
+                    (size_t) lane * fg->logits->nb[1], row_bytes);
             }
         }
     }
