@@ -157,7 +157,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
             const int64_t max_blocks = (static_cast<int64_t>(max_ctx) + ratio - 1) / ratio;
             out.indexer_k[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
                 w.indexer_head_size, max_blocks + 1);
-            out.indexer_raw[i] = ggml_new_tensor_2d(rows, GGML_TYPE_F32,
+            out.indexer_raw[i] = ggml_new_tensor_2d(rows, kvflash_pool > 0 ? GGML_TYPE_F16 : GGML_TYPE_F32,
                 w.indexer_head_size, max_ctx);
         }
     }

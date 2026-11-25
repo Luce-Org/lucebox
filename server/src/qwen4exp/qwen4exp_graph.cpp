@@ -759,6 +759,7 @@ static ggml_tensor * qsa_pooled_keys(ggml_context * c, ggml_cgraph * gf, const Q
         ggml_tensor * span = cached > 0
             ? ggml_view_2d(c, indexer_raw, idim, cached, indexer_raw->nb[1], (size_t) t0 * indexer_raw->nb[1])
             : nullptr;
+        if (span && span->type != GGML_TYPE_F32) span = ggml_cast(c, span, GGML_TYPE_F32);
         if (t1 > pos0) {
             ggml_tensor * now = ggml_view_2d(c, kraw, idim, t1 - pos0, kraw->nb[1], 0);
             span = span ? ggml_concat(c, span, now, 1) : now;
@@ -1436,8 +1437,8 @@ static ggml_tensor * build_full_attn_slots(ggml_context * c, ggml_cgraph * gf,
     // Like dense solo, retain raw keys and leave pooling/indexer_blocks lazy until QSA runs.
     ggml_tensor * keys = indexer && caches[0]->indexer_raw[(size_t) fi]
         ? mm(c, L.indexer_k_proj, cur) : nullptr;
-    // ponytail: indexer recall is serial-only; a pool's indexer rows are position-indexed, these writes are slot-indexed.
-    GGML_ASSERT(!keys || !caches[0]->kvflash);
+    // With KVFlash + pool_qsa, indexer_raw is position-indexed (section 0 of `positions`) while attn_k/v are slot-indexed.
+    GGML_ASSERT(!keys || !caches[0]->kvflash || caches[0]->pool_qsa);
     const Qwen4ExpAttnQkv qkv = attn_qkv(c, L, w, qfull, kraw, vraw, positions);
     ggml_tensor * q = qkv.q, * gate = qkv.gate, * k = qkv.k, * v = qkv.v;
     ggml_tensor * qfa = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));   // [D, S, Hq]
@@ -1446,7 +1447,8 @@ static ggml_tensor * build_full_attn_slots(ggml_context * c, ggml_cgraph * gf,
         const Qwen4ExpCache & cache = *caches[s];
         ggml_tensor * k_cache = cache.attn_k[(size_t) fi];
         ggml_tensor * v_cache = cache.attn_v[(size_t) fi];
-        ggml_tensor * raw = keys ? ggml_set_rows(c, cache.indexer_raw[(size_t) fi], column(c, keys, s), kv_rows[s]) : nullptr;
+        ggml_tensor * raw_row = cache.kvflash ? ggml_view_1d(c, positions, 1, (size_t) s * sizeof(int32_t)) : kv_rows[s];
+        ggml_tensor * raw = keys ? ggml_set_rows(c, cache.indexer_raw[(size_t) fi], column(c, keys, s), raw_row) : nullptr;
         if (raw) ggml_build_forward_expand(gf, raw);
         // One row's [D, Hk] is already the [D, 1, Hk] layout the cache rows take.
         ggml_tensor * krow = ggml_reshape_3d(c, ggml_view_2d(c, k, D, Hk, k->nb[1], s * k->nb[2]), D, 1, Hk);
@@ -1462,10 +1464,11 @@ static ggml_tensor * build_full_attn_slots(ggml_context * c, ggml_cgraph * gf,
             GGML_ASSERT(raw && cache.indexer_k[(size_t) fi]);
             const Qwen4ExpQsaRow in = qsa_row(c, ws, 0, 1);
             ggml_tensor * pooled = qsa_pooled_keys_stable(c, L, w, cache.indexer_k[(size_t) fi], raw, ws, 1);
+            const int64_t qsa_span = ws.chunk_rows ? kw->ne[1] : ws.kv_bucket;
             attn = build_qsa_attn(c, column(c, cur, s),
                 ggml_view_3d(c, q, D, Hq, 1, q->nb[1], q->nb[2], s * q->nb[2]),
-                ggml_view_3d(c, kw, D, ws.kv_bucket, Hk, kw->nb[1], kw->nb[2], 0),
-                ggml_view_3d(c, vw, D, ws.kv_bucket, Hk, vw->nb[1], vw->nb[2], 0),
+                ggml_view_3d(c, kw, D, qsa_span, Hk, kw->nb[1], kw->nb[2], 0),
+                ggml_view_3d(c, vw, D, qsa_span, Hk, vw->nb[1], vw->nb[2], 0),
                 L, w, qsa_ratio(w), ws.positions, 0, pooled, ws.qsa_blocks, false, &in);
         } else {
             const int64_t span = spans[s];
@@ -3796,7 +3799,8 @@ bool qwen4exp_can_batch(const Qwen4ExpWeights & w,
     for (int s = 0; s < n_segments; ++s) {
         const auto & segment = segments[s];
         if (segment.n_tokens != 1) return false;
-        const Qwen4ExpQsaMode mode = qsa_mode(w, *segment.cache, 1, segment.pos0, use_qsa);
+        const Qwen4ExpQsaMode mode = qsa_mode(w, *segment.cache, 1, segment.pos0, use_qsa,
+                                              qsa_rows && segment.cache->pool_qsa);
         if (mode != QSA_DENSE && !(qsa_rows && mode == QSA_DECODE)) return false;
     }
     return true;
@@ -3840,7 +3844,8 @@ static int64_t batched_span(const Qwen4ExpCache & cache, int32_t pos, bool qsa) 
 // turn) and `positions` (I32 [4 * rows]). A slot's positions are section-major over its R rows when they are all
 // QSA (they attend in one pass), else one [4] group per row. The other slots keep qsa_blocks < 0.
 static std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_views(ggml_context * ctx, const std::vector<int64_t> & spans,
-        int R, ggml_tensor * params, ggml_tensor * visibility, ggml_tensor * positions) {
+        int R, ggml_tensor * params, ggml_tensor * visibility, ggml_tensor * positions,
+        ggml_tensor * chunk_rows = nullptr, int chunk_tokens = 0, int n_chunks = 0) {
     std::vector<Qwen4ExpDecodeWorkspace> slots(spans.size() / (size_t) R);
     int64_t offset = 0;
     for (size_t s = 0; s < slots.size(); ++s) {
@@ -3852,19 +3857,23 @@ static std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_views(ggml_context * ctx, c
         slot.qsa_params = ggml_view_1d(ctx, params, 10 * R, (size_t) 10 * s * R * sizeof(int32_t));
         slot.qsa_visibility = ggml_view_1d(ctx, visibility, slot.qsa_blocks * R, (size_t) offset * sizeof(float));
         slot.positions = ggml_view_1d(ctx, positions, 4 * R, (size_t) 4 * s * R * sizeof(int32_t));
+        if (chunk_rows && n_chunks > 0) {
+            slot.chunk_tokens = chunk_tokens;
+            slot.chunk_rows = ggml_view_1d(ctx, chunk_rows, n_chunks, (size_t) s * n_chunks * sizeof(int32_t));
+        }
         offset += slot.qsa_blocks * R;
     }
     return slots;
 }
 
-// The graph's QSA inputs and each slot's views of them (slot_qsa_views) in `ws`: three shared inputs, so a split
+// The graph's QSA inputs and each slot's views of them (slot_qsa_views) in `ws`: shared inputs, so a split
 // scheduler still sees few graph inputs. No inputs when no row is QSA.
-static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & spans, int R,
-                           Qwen4ExpBatchedDecodeWorkspace & ws) {
+static void build_slot_qsa(ggml_context * ctx, Qwen4ExpCache * const * caches, const std::vector<int64_t> & spans,
+                           int R, Qwen4ExpBatchedDecodeWorkspace & ws) {
     const int64_t T = (int64_t) spans.size();
     int64_t cells = 0;   // every QSA slot's [blocks, R] visibility
     for (int64_t r = R - 1; r < T; r += R) if (spans[(size_t) r] < 0) cells += -spans[(size_t) r] / 4 * R;
-    ws.qsa_params = ws.qsa_visibility = ws.qsa_positions = nullptr;
+    ws.qsa_params = ws.qsa_visibility = ws.qsa_positions = ws.qsa_chunk_rows = nullptr;
     ws.slot_qsa.assign((size_t) (T / R), {});
     if (cells == 0) return;
     ws.qsa_params = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 10 * T);
@@ -3873,7 +3882,15 @@ static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & span
     ggml_set_input(ws.qsa_params);
     ggml_set_input(ws.qsa_visibility);
     ggml_set_input(ws.qsa_positions);
-    ws.slot_qsa = slot_qsa_views(ctx, spans, R, ws.qsa_params, ws.qsa_visibility, ws.qsa_positions);
+    const bool paged = caches && caches[0] && caches[0]->pool_qsa && caches[0]->kvflash;
+    const int chunk_tokens = paged ? caches[0]->kvflash->chunk_tokens() : 0;
+    const int n_chunks = chunk_tokens > 0 ? (caches[0]->max_ctx + chunk_tokens - 1) / chunk_tokens : 0;
+    if (paged && n_chunks > 0) {
+        ws.qsa_chunk_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_chunks * (T / R));
+        ggml_set_input(ws.qsa_chunk_rows);
+    }
+    ws.slot_qsa = slot_qsa_views(ctx, spans, R, ws.qsa_params, ws.qsa_visibility, ws.qsa_positions,
+                                 ws.qsa_chunk_rows, chunk_tokens, n_chunks);
 }
 
 // The graph's QSA inputs: each QSA slot's for its R rows from positions[s], as its stable graph has them
@@ -3888,6 +3905,8 @@ static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * 
     in.split = split;
     in.qsa_params.assign((size_t) 10 * R * n_slots, 0);
     in.i32.assign((size_t) 4 * R * n_slots, 0);
+    const int n_chunks = ws.qsa_chunk_rows ? (int) (ws.qsa_chunk_rows->ne[0] / (int64_t) n_slots) : 0;
+    if (ws.qsa_chunk_rows) in.chunk_rows.assign((size_t) n_chunks * n_slots, -1);
     Qwen4ExpStableInputs slot;
     slot.T = R;
     for (size_t s = 0; s < n_slots; ++s) {
@@ -3896,6 +3915,12 @@ static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * 
         slot.kv_len = (int64_t) positions[s] + R;
         slot.max_ctx = caches[s]->max_ctx;
         fill_stable_qsa(slot, ws.slot_qsa[s].qsa_blocks);
+        if (ws.qsa_chunk_rows && caches[s]->kvflash) {
+            q4_pool_qsa_inputs(*caches[s]->kvflash, ws.slot_qsa[s].chunk_tokens, n_chunks,
+                               ws.slot_qsa[s].qsa_blocks, R, slot.chunk_rows, slot.qsa_visibility);
+            std::copy(slot.chunk_rows.begin(), slot.chunk_rows.end(),
+                      in.chunk_rows.begin() + (std::ptrdiff_t) (s * (size_t) n_chunks));
+        }
         in.qsa_visibility.insert(in.qsa_visibility.end(), slot.qsa_visibility.begin(), slot.qsa_visibility.end());
         std::copy(slot.qsa_params.begin(), slot.qsa_params.end(),
                   in.qsa_params.begin() + (std::ptrdiff_t) (10 * R * s));
@@ -3906,6 +3931,7 @@ static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * 
                 p[at_once ? section * R + j : 4 * j + section] = positions[s] + j;
         }
     }
+    if (ws.qsa_chunk_rows) in.set(ws.qsa_chunk_rows, in.chunk_rows.data(), in.chunk_rows.size() * sizeof(int32_t));
     in.set(ws.qsa_visibility, in.qsa_visibility.data(), in.qsa_visibility.size() * sizeof(float));
     in.set(ws.qsa_params, in.qsa_params.data(), in.qsa_params.size() * sizeof(int32_t));
     in.set(ws.qsa_positions, in.i32.data(), in.i32.size() * sizeof(int32_t));
@@ -3944,7 +3970,7 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
         ggml_set_input(ws.slot_ids);
     }
     // QSA slots: each one's runtime inputs (a stable T=1 graph's) and M-RoPE position.
-    build_slot_qsa(ctx, spans, 1, ws);
+    build_slot_qsa(ctx, caches, spans, 1, ws);
 
     // Split mode: the slots form two groups whose layers interleave in the graph like a prompt chunk's streams (see
     // interleave_layers). The matmuls are batch-invariant, so a row computes the same in either group.
@@ -4014,7 +4040,8 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
                 }
                 return mm(ctx, L.wo, build_full_attn_slots(ctx, gf, qfull, kraw, vraw, cur, G.positions,
                     ws.masks.data() + G.s0, ws.kv_rows.data() + G.s0, spans.data() + G.s0, L, w,
-                    caches + G.s0, lb.full_idx[il], use_qsa, ws.slot_qsa.data() + G.s0));
+                    caches + G.s0, lb.full_idx[il], use_qsa && (!caches[0]->kvflash || caches[0]->pool_qsa),
+                    ws.slot_qsa.data() + G.s0));
             });
         } else {
             // Dense input projections are batched; with stacked slot states the conv and
@@ -4177,7 +4204,8 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     std::vector<bool> qsa_slot((size_t) n_slots, false);
     bool qsa_rows = true;
     for (int s = 0; s < n_slots; ++s) {
-        qsa_slot[(size_t) s] = qsa_mode(w, *caches[s], 1, positions[s], w.qsa) == QSA_DECODE;
+        const bool paged_qsa = caches[s]->pool_qsa && stable_qsa_supported(backend, w, *caches[s], (int64_t) positions[s] + 1);
+        qsa_slot[(size_t) s] = qsa_mode(w, *caches[s], 1, positions[s], w.qsa, paged_qsa) == QSA_DECODE;
         if (qsa_slot[(size_t) s] && !stable_qsa_supported(backend, w, *caches[s], (int64_t) positions[s] + 1))
             qsa_rows = false;
     }
@@ -4448,7 +4476,7 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
     ws.slot_ids = nullptr;
     // QSA slots: each one's runtime inputs (a stable verify graph's of R rows) and M-RoPE positions, and their views
     // of the inputs' copy on the expert device for the layers that run there (as a group's masks).
-    build_slot_qsa(ctx, spans, R, ws);
+    build_slot_qsa(ctx, caches, spans, R, ws);
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa_remote;
 
     struct SlotGroup {
@@ -4527,8 +4555,8 @@ bool build_batched_verify_nodes(ggml_context * ctx, const Qwen4ExpWeights & w, Q
                 ggml_tensor * kraw = mm(ctx, L.wk, cur);
                 ggml_tensor * vraw = mm(ctx, L.wv, cur);
                 return mm(ctx, L.wo, build_full_attn_verify(ctx, gf, qfull, kraw, vraw, cur, G.positions, mask,
-                    ws.kv_rows.data() + G.s0, spans.data() + (size_t) G.s0 * R, L, w, gc, G.ns, R, fi, w.qsa,
-                    qsa + G.s0));
+                    ws.kv_rows.data() + G.s0, spans.data() + (size_t) G.s0 * R, L, w, gc, G.ns, R, fi,
+                    w.qsa && !caches[0]->kvflash, qsa + G.s0));
             });
         } else {
             // The input projections run over the group's rows; each slot's conv and recurrence over its own rows and
@@ -4819,6 +4847,64 @@ bool qwen4exp_verify_batched_row(const Qwen4ExpBatchedDecodeWorkspace & ws, cons
         return true;
     }
     return false;
+}
+
+void qwen4exp_run_indexer_recall(ggml_backend_t backend, const Qwen4ExpWeights & w,
+                                 Qwen4ExpCache & cache, int recall_mode,
+                                 std::optional<ScopedScoreHook> & keep) {
+    const auto t0 = std::chrono::steady_clock::now();
+    KvFlashPager * pager = cache.kvflash.get();
+    const int n_pos = cache.cur_pos;
+    const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
+    const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
+    if (pager && !q4_recall_pages(n_pos, pager->pool_tokens())) return;   // nothing paged out: nothing to recall
+    Qwen4ExpRecallPicks picks;
+    if (!qwen4exp_recall_picks(backend, w, cache, picks)) {
+        if (picks.graph_failed) std::fprintf(stderr, "[q4-recall] FAILED: the pick graph did not allocate or compute (%d positions)\n", n_pos);
+        else std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
+        return;
+    }
+    const int bpc = chunk_tokens / picks.ratio, n_chunks = (n_pos + chunk_tokens - 1) / chunk_tokens;
+    if (chunk_tokens % picks.ratio != 0) {
+        std::fprintf(stderr, "[q4-recall] chunk of %d tokens is not a multiple of the %d-token block; skipping\n",
+                     chunk_tokens, picks.ratio);
+        return;
+    }
+    std::vector<int> visible((size_t) picks.queries);   // query t sees the blocks complete at its own position
+    for (int t = 0; t < picks.queries; ++t) visible[(size_t) t] = (picks.pos0 + t + 1) / picks.ratio;
+    const std::vector<float> votes = q4_recall_chunk_votes(picks.ids, picks.layers, picks.queries, picks.budget, bpc,
+                                                           n_chunks, &visible);
+    const std::vector<float> scores = q4_recall_chunk_scores(votes);
+    double total = 0;
+    for (float v : votes) total += v;
+    const std::vector<int> top = q4_recall_top(scores, pool_chunks > 0 ? pool_chunks : 8);
+    std::string top_s;
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%s%d:%d", i ? "," : "", top[i], (int) votes[(size_t) top[i]]);
+        top_s += b;
+    }
+    int nonres = 0;
+    for (int c : top) nonres += !(pager && pager->is_resident(c));
+    char resid[48] = "n/a";
+    if (pager) std::snprintf(resid, sizeof resid, "%d/%d", nonres, pool_chunks);
+    const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
+    std::fprintf(stderr, "[q4-recall] n_chunks=%d pool_chunks=%d top=[%s] nonresident_in_top=%s votes_total=%.0f ms=%.1f\n",
+                 n_chunks, pool_chunks, top_s.c_str(), resid, total, ms());
+    if (recall_mode < 2 || !pager) return;
+
+    // Mode 2: rank every chunk (resident or paged out) by votes. Chunks past the prompt (generated ones) outrank every
+    // prompt chunk so the decode's evictions take prompt chunks first. The hook stays for this request's decode.
+    keep.emplace(*pager);
+    pager->score_hook = [scores](int c) { return c < (int) scores.size() ? scores[(size_t) c] : 1e6f + (float) c; };
+    // ponytail: the newest chunks (the last turn) are protected by widening reselect's tail to the captured queries' span.
+    const int tail = std::min(4 + (picks.queries + chunk_tokens - 1) / chunk_tokens, pool_chunks / 2);
+    std::vector<uint8_t> was(n_chunks);
+    for (int c = 0; c < n_chunks; ++c) was[(size_t) c] = pager->is_resident(c);
+    const int events = pager->reselect(tail);
+    int page_ins = 0;
+    for (int c = 0; c < n_chunks; ++c) page_ins += !was[(size_t) c] && pager->is_resident(c);
+    std::fprintf(stderr, "[q4-recall] reselect tail=%d page_ins=%d page_events=%d ms=%.1f\n", tail, page_ins, events, ms());
 }
 
 }  // namespace luce::common

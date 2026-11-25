@@ -333,8 +333,8 @@ std::string check_feature_compatibility(
         if (!args.paged_attention) {
             if (arch != "qwen4exp")
                 return "--max-concurrency requires --paged-attention";
-            if (args.max_concurrency > 4)
-                return "qwen4exp full-cache concurrency supports at most 4 slots";
+            if (args.max_concurrency > 16)
+                return "qwen4exp full-cache concurrency supports at most 16 slots";
             if (args.kv_pool_tokens != 0)
                 return "qwen4exp full-cache concurrency does not use --kv-pool-tokens";
             if (args.device.max_ctx <= 0)

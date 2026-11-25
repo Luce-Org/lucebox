@@ -7,16 +7,24 @@
 #include "qwen4exp_cache.h"
 #include "qwen4exp_graph.h"
 #include "qwen4exp_mtp.h"
+#include "qwen4exp_recall.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <future>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace luce::common {
 
 struct Qwen4ExpRow;
+
+struct Qwen4ExpRecallConfig {
+    int mode = 0;
+    int queries = 64;
+    int tail = kQ4RecallTailDefault;
+};
 
 // N-way independent-slot engine. Each slot owns a full cache; the pool is
 // admission/headroom bookkeeping only (there is no paged KV).
@@ -59,13 +67,14 @@ public:
     // How decoding slots beside each other step (above): measured, or always verify (where the plan allows it) or
     // always plain. Tests force each mode to check both against the requests' alone streams.
     enum class DecodeMode { measured, verify, plain };
+    using Q4RecallConfig = Qwen4ExpRecallConfig;
 
     Qwen4ExpSeqEngine(ggml_backend_t backend, const Qwen4ExpWeights & weights,
                       std::vector<Qwen4ExpCache *> caches, int max_ctx,
                       int prefill_granule = 512, size_t prefix_allowance = 0,
                       int verify_width = 1, AdaptiveSpecWidth * mtp_width = nullptr,
                       SpecWidthCostMemory * mtp_costs = nullptr, ggml_backend_t snapshot_store = nullptr,
-                      PromptLookupPolicy * lookup_policy = nullptr);
+                      PromptLookupPolicy * lookup_policy = nullptr, Qwen4ExpRecallConfig recall = {});
     ~Qwen4ExpSeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
@@ -198,6 +207,22 @@ private:
         std::future<Qwen4ExpInputs> inputs;
     };
     std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); joined first by the destructor
+    struct RecallState {
+        bool recall = false;
+        bool tail_armed = false;
+        int restored_pos = 0;
+        int tail_pos = -1;
+        Q4TailPath tail_path = Q4TailPath::Off;
+        Q4TailStage tail_stage = Q4TailStage::Planned;
+        Qwen4ExpSnapshot tail_snap;
+        Qwen4ExpMtpPending tail_mtp;
+        bool tail_mtp_live = false;
+        std::optional<ScopedScoreHook> hook;
+    };
+    void arm_recall(int slot);
+    void clear_recall(int slot);
+    Q4RecallConfig recall_;
+    std::vector<RecallState> recall_state_;
 };
 
 } // namespace luce::common

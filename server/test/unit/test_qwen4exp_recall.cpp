@@ -73,8 +73,9 @@ int main() {
     assert((q4_prefill_cuts({500, 900}, 400, 994, 936, 600) == std::vector<int>{500, 600, 900, 936, 994}));
     assert((q4_prefill_cuts({500, 900}, 600, 994, -1, -1) == std::vector<int>{500, 900, 994}));
     assert((q4_prefill_cuts({}, 950, -1, 936, 600) == std::vector<int>{}));   // cuts at or before pos add nothing
-    // Recall storage per full-attention layer: 640 B per position at the 4-token block (512 raw + 128 pooled), plus one block.
+    // Recall storage per full-attention layer: 640 B/pos F32 raw (384 B/pos F16 raw under KVFlash), plus one pooled block.
     assert(q4_recall_layer_bytes(131072, 128, 4) == 640LL * 131072 + 512);
+    assert(q4_recall_layer_bytes(131072, 128, 4, true) == 384LL * 131072 + 512);
     assert(q4_recall_layer_bytes(131072, 128, 0) == 0 && q4_recall_layer_bytes(131072, 0, 4) == 0);   // no indexer
     // The [q4-tail] line names what ran: a planned two-pass run reports how far it got, every other path is itself.
     using S = Q4TailStage;
