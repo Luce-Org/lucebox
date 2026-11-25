@@ -388,6 +388,46 @@ bool build_target_step(
     bool keep_base_ssm_state,
     ggml_tensor * single_replay_slot_ids,
     bool capture_q_all) {
+    static thread_local std::unique_ptr<uint8_t[]> g_step_arena;
+    static thread_local size_t g_step_arena_size = 0;
+    static thread_local uint64_t g_step_arena_gen = 0;
+
+    // Pure compact paged decode: topology depends only on bucket width,
+    // 256-aligned launch KV bound, capture, and top_n. Reuse the built graph
+    // across steps when g_step_arena has not been overwritten by another call.
+    const bool cacheable_paged_decode =
+        paged_attention && compact_slots && n_prefill_tokens == 0 &&
+        !with_mask && !capture_delta_intermediate && !capture_moe_router &&
+        !kvflash_mask && !capture_qk && !keep_base_ssm_state &&
+        !single_replay_slot_ids && !capture_q_all &&
+        n_tokens == n_seqs && n_seqs >= 1 && n_seqs <= 64 &&
+        fa_window == 0 && cache.paged_block_table && cache.paged_kv_seq_lens &&
+        (int)cache.paged_block_table->ne[1] == cache.n_seq_slots &&
+        (int)cache.paged_kv_seq_lens->ne[0] == cache.n_seq_slots;
+    std::optional<TargetPagedDecodeGraphKey> decode_cache_key;
+    if (cacheable_paged_decode) {
+        const int64_t table_cap =
+            cache.paged_block_table->ne[0] * PAGED_BLOCK_SIZE;
+        const int64_t logical_cap = std::min<int64_t>(cache.max_ctx, table_cap);
+        if (logical_cap >= 1 && logical_cap <= INT32_MAX) {
+            const int64_t req_kv = std::min<int64_t>(
+                std::max<int64_t>(1, paged_max_kv_len), logical_cap);
+            const int launch_kv = static_cast<int>(
+                std::min<int64_t>(((req_kv + 255) / 256) * 256, logical_cap));
+            paged_max_kv_len = launch_kv;
+            decode_cache_key = TargetPagedDecodeGraphKey{
+                &w, &cache, backend, n_seqs, launch_kv, capture,
+                top_n, logits_tail_rows, kq_stride_pad,
+            };
+            if (sg.gf && sg.paged_decode_key &&
+                *sg.paged_decode_key == *decode_cache_key &&
+                sg.step_arena_gen == g_step_arena_gen &&
+                sg.alloc != nullptr) {
+                return true;
+            }
+        }
+    }
+
     step_graph_free(sg);
 
     // KEEP_BASE: only the single-sequence chain capture verify may
@@ -459,12 +499,11 @@ bool build_target_step(
     // step-invariant set_rows KV write (kv_write_rows) below.
     ggml_init_params ip{};
     ip.mem_size   = 512 * 1024 * 1024;
-    static thread_local std::unique_ptr<uint8_t[]> g_step_arena;
-    static thread_local size_t g_step_arena_size = 0;
     if (g_step_arena_size < ip.mem_size) {
         g_step_arena.reset(new uint8_t[ip.mem_size]);
         g_step_arena_size = ip.mem_size;
     }
+    ++g_step_arena_gen;
     ip.mem_buffer = g_step_arena.get();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
@@ -736,6 +775,10 @@ bool build_target_step(
         ggml_backend_tensor_set(sg.specla_hld, hld_schedule.packed.data(), 0,
             hld_schedule.packed.size()*sizeof(int32_t));
     }
+    if (decode_cache_key) {
+        sg.paged_decode_key = decode_cache_key;
+        sg.step_arena_gen = g_step_arena_gen;
+    }
     return true;
 }
 
@@ -857,7 +900,8 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad,
-    int mapped_ar_seqs) {
+    int mapped_ar_seqs,
+    int top_n) {
     (void)kq_stride_pad;
 
     if (mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots) {
@@ -886,9 +930,10 @@ bool build_target_step_paged_tree(
     const TargetPagedTreeGraphKey graph_key{
         &w, &cache, backend, tree_width, n_tree_seqs,
         paged_launch_kv_len, tree_scratch_base, tree_scratch_stride,
-        mapped_ar_seqs,
+        mapped_ar_seqs, top_n,
     };
-    if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
+    if (sg.gf && sg.paged_tree_key && *sg.paged_tree_key == graph_key &&
+        sg.alloc != nullptr) {
         return true;
     }
     step_graph_free(sg);
@@ -901,11 +946,18 @@ bool build_target_step_paged_tree(
     const int n_tokens = mapped_ar_seqs + tree_width * n_tree_seqs;
     const int n_mapped_seqs = mapped_ar_seqs + n_tree_seqs;
 
+    // Size the per-graph metadata arena from graph_capacity, with a 64 MiB floor.
+    const size_t want_arena = std::max<size_t>(
+        64u * 1024 * 1024,
+        ggml_graph_overhead_custom(graph_capacity, false) +
+            graph_capacity * 6 * ggml_tensor_overhead() +
+            16u * 1024 * 1024);
     ggml_init_params ip{};
-    ip.mem_size = 512 * 1024 * 1024;
-    if (!sg.paged_tree_meta_arena) {
+    ip.mem_size = want_arena;
+    if (!sg.paged_tree_meta_arena || sg.paged_tree_meta_arena_size < ip.mem_size) {
         sg.paged_tree_meta_arena.reset(
             new uint8_t[ip.mem_size], std::default_delete<uint8_t[]>());
+        sg.paged_tree_meta_arena_size = ip.mem_size;
     }
     ip.mem_buffer = sg.paged_tree_meta_arena.get();
     ip.no_alloc = true;
@@ -998,6 +1050,19 @@ bool build_target_step_paged_tree(
     ggml_set_name(sg.argmax_tokens, "paged_tree_verify_argmax");
     ggml_set_output(sg.argmax_tokens);
     ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    // Top-N candidates per row for sampled verify under top_k: lets the host
+    // draw from ~64 logits/row instead of copying the full vocab per row.
+    if (top_n > 0 && top_n < sg.logits->ne[0] && ggml_is_contiguous(sg.logits)) {
+        sg.top_ids = ggml_top_k(sg.ctx, sg.logits, top_n);
+        sg.top_vals = ggml_get_rows(sg.ctx,
+            ggml_reshape_3d(sg.ctx, sg.logits, 1, sg.logits->ne[0], sg.logits->ne[1]),
+            sg.top_ids);
+        ggml_set_output(sg.top_ids);
+        ggml_set_output(sg.top_vals);
+        ggml_build_forward_expand(sg.gf, sg.top_ids);
+        ggml_build_forward_expand(sg.gf, sg.top_vals);
+    }
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(

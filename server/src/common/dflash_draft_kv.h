@@ -21,6 +21,7 @@
 #include "dflash_feature_ring.h"
 #include "draft/draft_graph.h"
 #include "internal.h"  // DraftWeights
+#include "pinned_stage.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -71,6 +72,13 @@ struct DraftKvState {
     const void *          built_for = nullptr;  // DraftWeights the graph was built against
     int64_t               next_pos = 0;  // first ctx position not yet appended
     std::vector<int32_t>  slot_pos;      // absolute position per ring slot, -1 empty
+    std::vector<uint16_t> mask_full_row0;
+    std::vector<uint16_t> mask_swa_row0;
+    int64_t               mask_full_lo = -1;
+    int64_t               mask_full_hi = -1;
+    int                   mask_full_noise_width = -1;
+    int64_t               mask_swa_lo = -1;
+    int64_t               mask_swa_hi = -1;
     std::vector<uint16_t> mask_hbuf;
     std::vector<int32_t>  i32_hbuf;
 };
@@ -108,7 +116,10 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width = 0);
+                         int width = 0,
+                         int append_cap = 0,
+                         bool defer_sync = false,
+                         PinnedStage * stage = nullptr);
 
 struct DraftKvBatchGraph {
     DraftKvBatchGraph() = default;
@@ -117,6 +128,7 @@ struct DraftKvBatchGraph {
 
     int n_lanes = 0;
     int q_len = 0;  // noise positions per lane
+    int a_step = 0; // active append rows per lane
     const void * built_for = nullptr;
     ggml_backend_t backend = nullptr;
     std::vector<DraftKvState *> lane_states;
@@ -129,6 +141,25 @@ struct DraftKvBatchGraph {
 };
 
 void draft_kv_batch_free(DraftKvBatchGraph & batch);
+
+// Whether `batch` was built for exactly these lanes, width and append rows,
+// so draft_kv_batch_compute_device runs it without a rebuild.
+bool draft_kv_batch_reusable(const DraftKvBatchGraph & batch,
+                             const DraftWeights & dw,
+                             ggml_backend_t backend,
+                             const std::vector<DraftKvState *> & lane_states,
+                             int width,
+                             int append_cap);
+
+// Run the packed draft backbone graph and leave per-lane hidden_states tensors
+// on-device in `batch.hidden_by_lane` (no D2H copy).
+bool draft_kv_batch_compute_device(
+    DraftKvBatchGraph & batch,
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    const std::vector<DraftKvState *> & lane_states,
+    int width = 0,
+    int append_cap = 0);
 
 // All lane states must already have draft_kv_begin_step() inputs and
 // inp_embed uploaded. The packed graph computes the shared backbone and
@@ -144,6 +175,7 @@ bool draft_kv_batch_compute(
     ggml_backend_t backend,
     const std::vector<DraftKvState *> & lane_states,
     std::vector<std::vector<float>> & hidden_by_lane,
-    int width = 0);
+    int width = 0,
+    int append_cap = 0);
 
 }  // namespace luce::common

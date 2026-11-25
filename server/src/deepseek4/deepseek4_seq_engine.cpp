@@ -590,21 +590,21 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     if ((int)inputs.size() != slots_.decoding_count()) {
         return fail_step("decode plan does not cover every live DeepSeek4 slot");
     }
-    std::vector<uint8_t> decode_seen((size_t)n_slots, 0);
+    slot_seen_.assign((size_t)n_slots, 0);
+    uint8_t * seen = slot_seen_.data();
     for (const StepInput & input : inputs) {
         if (input.slot < 0 || input.slot >= n_slots || input.token < 0 ||
-            decode_seen[(size_t)input.slot] ||
+            (seen[input.slot] & 1u) ||
             !slots_.slot(input.slot).decoding()) {
             return fail_step("invalid or duplicate DeepSeek4 decode row");
         }
-        decode_seen[(size_t)input.slot] = 1;
+        seen[input.slot] |= 1u;
     }
 
     const StepPlanLimits limits = step_plan_limits((int)inputs.size());
     if ((int)plan.prefills.size() > limits.max_prefill_sequences) {
         return fail_step("DeepSeek4 step exceeds the six-lane graph");
     }
-    std::vector<uint8_t> prefill_seen((size_t)n_slots, 0);
     int prefill_rows = 0;
     for (const PrefillSlice & slice : plan.prefills) {
         prefill_rows += slice.max_tokens;
@@ -612,12 +612,11 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             slice.max_tokens < 1 ||
             slice.max_tokens > limits.max_prefill_tokens_per_sequence ||
             prefill_rows > limits.max_prefill_tokens_total ||
-            prefill_seen[(size_t)slice.slot] ||
-            decode_seen[(size_t)slice.slot] ||
+            seen[slice.slot] != 0 ||
             !slots_.is_prefilling(slice.slot)) {
             return fail_step("invalid or duplicate DeepSeek4 prefill row");
         }
-        prefill_seen[(size_t)slice.slot] = 1;
+        seen[slice.slot] |= 2u;
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
@@ -627,10 +626,14 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         advance_pending_images(!inputs.empty(), idle);
     }
 
-    std::vector<int32_t> lane_tokens;
-    std::vector<int64_t> lane_positions;
-    std::vector<int32_t> lane_slots;
-    std::vector<int> decode_lanes;
+    auto & lane_tokens = lane_tokens_;
+    auto & lane_positions = lane_positions_;
+    auto & lane_slots = lane_slots_;
+    auto & decode_lanes = decode_lanes_;
+    lane_tokens.clear();
+    lane_positions.clear();
+    lane_slots.clear();
+    decode_lanes.clear();
     lane_tokens.reserve(inputs.size() + plan.prefills.size());
     lane_positions.reserve(inputs.size() + plan.prefills.size());
     lane_slots.reserve(inputs.size() + plan.prefills.size());
@@ -744,40 +747,38 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     }
 
     const auto embed_t0 = Clock::now();
-    std::vector<float> embeddings(
-        (size_t)b_.w_.n_embd * lane_tokens.size());
+    step_embeddings_.resize((size_t)b_.w_.n_embd * lane_tokens.size());
     if (!b_.w_.embedder.embed(lane_tokens.data(), (int)lane_tokens.size(),
-                              embeddings.data())) {
+                              step_embeddings_.data())) {
         return fail_step("DeepSeek4 token embedding failed");
     }
 
     if (timing) telemetry.embed_us += std::chrono::duration_cast<
         std::chrono::microseconds>(Clock::now() - embed_t0).count();
-    std::vector<int32_t> compact_tables(
-        lane_tokens.size() * stride_, -1);
+    compact_tables_.resize(lane_tokens.size() * stride_);
     for (size_t lane = 0; lane < lane_slots.size(); ++lane) {
         std::copy_n(
             host_tables_.data() + (size_t)lane_slots[lane] * stride_,
-            stride_, compact_tables.data() + lane * stride_);
+            stride_, compact_tables_.data() + lane * stride_);
     }
 
-    std::vector<uint8_t> logit_lanes(lane_tokens.size(), 0);
+    logit_lanes_.assign(lane_tokens.size(), 0);
     for (size_t i = 0; i < inputs.size(); ++i) {
         const int lane = decode_lanes[i];
         if (lane >= 0 &&
             slots_.slot(inputs[i].slot).sampler.needs_logit_processing()) {
-            logit_lanes[(size_t) lane] = 1;
+            logit_lanes_[(size_t) lane] = 1;
         }
     }
     for (const PrefillLane & prefill : prefill_lanes) {
         if (prefill.commit &&
             slots_.slot(prefill.slot).sampler.needs_logit_processing()) {
-            logit_lanes[(size_t) prefill.lane] = 1;
+            logit_lanes_[(size_t) prefill.lane] = 1;
         }
     }
 
-    std::vector<float> logits;
-    std::vector<int32_t> argmax;
+    auto & logits = step_logits_;
+    auto & argmax = step_argmax_;
     // Bucketed histories pad each lane's rows to a stride (masked), which
     // changes the attention reduction. V4.1 buckets every hybrid step, so a
     // sequence's arithmetic never depends on whether another one is still
@@ -786,10 +787,10 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         (plan.prefills.empty() || b_.w_.hc_staggered_pre);
     if (!deepseek4_paged_gathered_step(
             b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
-            embeddings.data(), lane_tokens.data(), lane_positions.data(),
+            step_embeddings_.data(), lane_tokens.data(), lane_positions.data(),
             lane_slots.data(), (uint32_t)lane_tokens.size(),
-            compact_tables.data(), stride_, bucket_history,
-            logit_lanes.data(), logits, argmax,
+            compact_tables_.data(), stride_, bucket_history,
+            logit_lanes_.data(), logits, argmax,
             b_.moe_hybrid_.get(), b_.routing_stats_.get(),
             timing ? &telemetry : nullptr)) {
         return fail_step("DeepSeek4 gathered paged graph failed");

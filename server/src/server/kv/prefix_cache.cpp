@@ -273,17 +273,24 @@ std::pair<int, int> PrefixCache::lookup(
 
 std::pair<int, int> PrefixCache::lookup_candidate(
         const std::vector<int32_t> & prompt_ids,
-        int max_prefix_tokens) {
-    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false);
+        int max_prefix_tokens,
+        const std::vector<int> * precomputed_boundaries) {
+    return lookup_impl(
+        prompt_ids, max_prefix_tokens, /*record_hit=*/false,
+        precomputed_boundaries);
 }
 
 std::pair<int, int> PrefixCache::lookup_impl(
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
-        bool record_hit) {
+        bool record_hit,
+        const std::vector<int> * precomputed_boundaries) {
     if (disabled_ || max_prefix_tokens <= 0) return {-1, 0};
 
-    auto boundaries = find_all_boundaries(prompt_ids, markers_);
+    std::vector<int> computed_boundaries;
+    const std::vector<int> & boundaries = precomputed_boundaries
+        ? *precomputed_boundaries
+        : (computed_boundaries = find_all_boundaries(prompt_ids, markers_));
     int best_slot = -1, best_len = 0;
     int best_idx = -1;
     // A state-only entry restores with the rows of a deeper resident one.
@@ -522,7 +529,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int reachable_from,
         int restore_point_spacing,
         bool forced_cut_learned,
-        int restore_kv_slot) {
+        int restore_kv_slot,
+        const std::vector<int> * precomputed_boundaries) {
     if (disabled_) return {};
     // The rows this request restores with stay where they are while it is
     // planned: slot_reserved() answers for them until the plan is made.
@@ -532,7 +540,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     } planning_scope{planning_kv_slot_};
     planning_kv_slot_ = restore_kv_slot;
 
-    const auto candidates = find_all_boundaries(prompt_ids, markers_);
+    std::vector<int> computed_candidates;
+    const std::vector<int> & candidates = precomputed_boundaries
+        ? *precomputed_boundaries
+        : (computed_candidates = find_all_boundaries(prompt_ids, markers_));
     // A conversation's first turn (one message past a head it did not
     // restore) saves its system head, which every new conversation on that
     // head restores; each later turn saves its end. Tool requests keep their

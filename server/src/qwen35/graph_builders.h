@@ -242,7 +242,8 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad = KQ_MASK_PAD,
-    int mapped_ar_seqs = 0);
+    int mapped_ar_seqs = 0,
+    int top_n = 0);
 
 // One AR decode step: run `build` (a build_target_step call for one token),
 // then upload the token's embedding (`n_embd` floats) into sg.inp_embed and

@@ -21,7 +21,11 @@ namespace luce::common {
 
 using TargetPagedTreeGraphKey = std::tuple<
     const TargetWeights *, const TargetCache *, ggml_backend_t,
-    int, int, int, int, int, int>;
+    int, int, int, int, int, int, int>;
+
+using TargetPagedDecodeGraphKey = std::tuple<
+    const TargetWeights *, const TargetCache *, ggml_backend_t,
+    int, int, bool, int, int, int>;
 
 struct StepGraph {
     ggml_context *  ctx = nullptr;
@@ -30,14 +34,17 @@ struct StepGraph {
     ggml_context * commit_ctx = nullptr;
     ggml_backend_buffer_t commit_buffer = nullptr;
     std::optional<TargetPagedTreeGraphKey> paged_tree_key;
+    std::optional<TargetPagedDecodeGraphKey> paged_decode_key;
+    uint64_t step_arena_gen = 0;
 
     // Persistent metadata arena for the draft graph. Reusing the same arena
     // keeps ggml_tensor addresses stable for CUDA-graph replay.
     std::vector<uint8_t> meta_arena;
 
     // Paged-tree metadata is retained with the graph. Use uninitialized
-    // storage: vector::resize would zero 512 MiB on the first decode round.
+    // storage: vector::resize would zero the arena on the first decode round.
     std::shared_ptr<uint8_t> paged_tree_meta_arena;
+    size_t paged_tree_meta_arena_size = 0;
 
     // The ctx_len last used for ggml_gallocr_reserve (draft only).
     // When the real ctx_len fits within this, alloc_graph is a no-op.
@@ -159,6 +166,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.tree_features = nullptr;
     sg.moe_selected.clear();
     sg.paged_tree_key.reset();
+    sg.paged_decode_key.reset();
+    sg.step_arena_gen = 0;
 }
 
 // Full cleanup: release the persistent gallocr + its CUDA buffer.
@@ -166,6 +175,7 @@ inline void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     step_graph_free(sg);
     sg.paged_tree_meta_arena.reset();
+    sg.paged_tree_meta_arena_size = 0;
     sg.meta_arena.clear();
     sg.meta_arena.shrink_to_fit();
     sg.alloc_reserved_ctx = 0;

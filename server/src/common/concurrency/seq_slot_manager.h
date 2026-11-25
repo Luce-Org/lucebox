@@ -65,15 +65,42 @@ struct SeqSlot {
             : 0;
     }
 
+    struct PenaltyHistoryView {
+        const int32_t * data = nullptr;
+        size_t size = 0;
+    };
+
+    // Zero-copy view of the penalty history window (valid while sample_history
+    // is not mutated).
+    PenaltyHistoryView penalty_history_view() const {
+        const int gen = generated_tokens();
+        const int keep = std::max(0, std::min(gen, sampler.rep_window));
+        return {
+            keep > 0 ? sample_history.data() + (sample_history.size() - (size_t)keep) : nullptr,
+            (size_t)keep,
+        };
+    }
+
+    // Fill a caller-owned vector with the penalty history window, reusing its
+    // capacity across steps.
+    void copy_penalty_history(std::vector<int32_t> & out) const {
+        const PenaltyHistoryView v = penalty_history_view();
+        if (v.size == 0) {
+            out.clear();
+        } else {
+            out.assign(v.data, v.data + v.size);
+        }
+    }
+
     // What the sampler's penalties read: the tokens generated for this
     // request (the prompt excluded, as on the single-lane path and in the
     // OpenAI meaning of presence/frequency penalties), cut to the sampler's
     // rep_window, which the sampler would apply anyway.
     std::vector<int32_t> penalty_history() const {
-        const int gen = generated_tokens();
-        const int keep = std::max(0, std::min(gen, sampler.rep_window));
-        return std::vector<int32_t>(sample_history.end() - keep,
-                                    sample_history.end());
+        const PenaltyHistoryView v = penalty_history_view();
+        return v.size > 0
+            ? std::vector<int32_t>(v.data, v.data + v.size)
+            : std::vector<int32_t>{};
     }
 
     bool active() const { return phase != SeqSlotPhase::free; }
@@ -105,9 +132,13 @@ public:
     // Prompts larger than the whole pool hard-fail; temporary capacity pressure
     // reports busy. Seeds sampling from sampler.seed, including zero. Greedy
     // slots never draw, so their RNG state is intentionally unspecified.
+    // When `pre_shared_blocks > 0`, the caller will immediately bind that many
+    // already-pinned shared full prefix blocks via seed_shared_prefix(), so
+    // admission reserves only the remaining private blocks.
     SeqEngine::AdmitResult admit(uint64_t request_id,
                                  const std::vector<int32_t> & prompt,
-                                 const SamplerCfg & sampler);
+                                 const SamplerCfg & sampler,
+                                 uint32_t pre_shared_blocks = 0);
 
     struct PrefillChunk {
         bool ok = false;
@@ -129,6 +160,13 @@ public:
     // engine scatters the checkpoint's logical K/V rows. The slot remains in
     // prefill so the uncached suffix can continue normally.
     PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
+
+    // Zero-copy prefix restore: bind `shared_blocks[0..shared_block_count-1]`
+    // directly into the slot's page table and allocate a private partial tail
+    // block if `restored_tokens % block_size != 0`.
+    PrefillChunk seed_shared_prefix(int slot, const uint32_t * shared_blocks,
+                                    uint32_t shared_block_count,
+                                    int restored_tokens);
 
     void commit_prefill(int slot);
 
@@ -187,12 +225,13 @@ public:
 
     int slot_count() const { return (int)slots_.size(); }
     int max_context() const { return max_ctx_; }
-    // Free counts the blocks neither appended nor reserved by any slot; a
-    // parked slot holds none until it resumes.
+    // Free counts the blocks neither appended nor reserved by any slot, plus
+    // those only cached prefix pins hold (dropped on demand); a parked slot
+    // holds none until it resumes.
     SeqEngine::KvPoolTokens kv_pool_tokens() const {
         const int64_t block = (int64_t)kv_.block_size();
         return {(int64_t)kv_.physical_block_count() * block,
-                (int64_t)kv_.free_block_count() * block};
+                (int64_t)(kv_.free_block_count() + kv_.reclaimable_block_count()) * block};
     }
     int decoding_count() const;
     bool is_active(int slot) const;

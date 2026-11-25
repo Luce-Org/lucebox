@@ -16,6 +16,7 @@ public:
     virtual uint32_t physical_block_count() const = 0;
     virtual uint32_t max_sequences() const = 0;
     virtual uint32_t free_block_count() const = 0;
+    virtual uint32_t reclaimable_block_count() const { return 0; }
     virtual PagedKvStatus acquire_reserved(PagedKvRequestId request_id, uint32_t token_capacity,
                                            PagedKvSequenceHandle & out_handle) = 0;
     virtual PagedKvStatus reserve_capacity(PagedKvSequenceHandle handle, uint32_t token_capacity) = 0;
@@ -25,6 +26,13 @@ public:
     virtual PagedKvStatus clear(PagedKvSequenceHandle handle) = 0;
     virtual PagedKvStatus release(PagedKvSequenceHandle handle) = 0;
     virtual PagedKvStatus owned_block_count(PagedKvSequenceHandle handle, uint32_t & out_count) const = 0;
+    virtual PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle, const uint32_t *, uint32_t,
+                                             uint32_t) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    virtual PagedKvStatus sequence(PagedKvSequenceHandle, PagedKvSequenceSnapshot &) const {
+        return PagedKvStatus::InvalidArgument;
+    }
 };
 
 // Owns nothing: the pool must outlive the adapter.
@@ -35,6 +43,7 @@ public:
     uint32_t physical_block_count() const override { return pool_.physical_block_count(); }
     uint32_t max_sequences() const override { return pool_.max_sequences(); }
     uint32_t free_block_count() const override { return pool_.free_block_count(); }
+    uint32_t reclaimable_block_count() const override { return pool_.pinned_only_block_count(); }
     PagedKvStatus acquire_reserved(PagedKvRequestId id, uint32_t cap, PagedKvSequenceHandle & h) override {
         return pool_.acquire_reserved(id, cap, h);
     }
@@ -51,6 +60,13 @@ public:
     PagedKvStatus release(PagedKvSequenceHandle h) override { return pool_.release(h); }
     PagedKvStatus owned_block_count(PagedKvSequenceHandle h, uint32_t & n) const override {
         return pool_.owned_block_count(h, n);
+    }
+    PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle h, const uint32_t * shared,
+                                     uint32_t shared_count, uint32_t tokens) override {
+        return pool_.seed_shared_prefix(h, shared, shared_count, tokens);
+    }
+    PagedKvStatus sequence(PagedKvSequenceHandle h, PagedKvSequenceSnapshot & out) const override {
+        return pool_.sequence(h, out);
     }
 private:
     PagedKvPool & pool_;

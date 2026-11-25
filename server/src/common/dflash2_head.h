@@ -34,18 +34,24 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           int32_t last_tok,
                           std::vector<int32_t> & draft_tok);
 
-// Same selector, batched over host-resident drafter hidden blocks and using a
-// local target lm_head tensor. The expensive lm_head projection covers every
-// (lane, depth) in one graph, GPU top-K is invoked once, and selector
-// projections/readback are shared across the cohort.
-bool dflash2_select_chains_batched(
+// Same selector, batched over a cohort of lanes with a local target lm_head
+// tensor: the lm_head projection covers every (lane, depth) in one graph, GPU
+// top-K runs once, and selector projections/readback are shared. Reads rows
+// 1..q_len-1 of each lane's on-device [n_embd, q_len] f32 hidden_states
+// tensor via async D2D copies. The graphs stay cached per shape on the
+// calling thread until dflash2_select_chains_release() on that thread.
+bool dflash2_select_chains_batched_device(
     const DraftWeights & dw,
     ggml_backend_t backend,
     ggml_tensor * lm_head,
-    const std::vector<const float *> & hidden_by_lane,
+    const std::vector<ggml_tensor *> & hidden_by_lane,
     int q_len,
     const std::vector<int32_t> & last_tokens,
     std::vector<std::vector<int32_t>> & draft_tokens);
+
+// Free the calling thread's cached batched-selection graphs and their device
+// buffers (park, idle scratch release).
+void dflash2_select_chains_release();
 
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on

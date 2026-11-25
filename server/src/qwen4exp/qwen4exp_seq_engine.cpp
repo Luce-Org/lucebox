@@ -57,7 +57,8 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       next_inputs_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
-    next_inputs_.clear();   // waits for any lookahead gather still running
+    next_inputs_.clear();
+    stop_lookahead_worker();
     ggml_backend_synchronize(backend_);
     for (Qwen4ExpSnapshot & checkpoint : own_checkpoints_) free_qwen4exp_snapshot(checkpoint);
     for (Qwen4ExpSnapshot & checkpoint : own_displaced_) free_qwen4exp_snapshot(checkpoint);
@@ -66,11 +67,74 @@ Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
 }
 
+std::future<Qwen4ExpInputs> Qwen4ExpSeqEngine::submit_lookahead(
+        std::vector<int32_t> tokens, std::vector<int32_t> ple_prev) {
+    LookaheadJob job;
+    job.tokens = std::move(tokens);
+    job.ple_prev = std::move(ple_prev);
+    std::future<Qwen4ExpInputs> fut = job.promise.get_future();
+    {
+        std::lock_guard<std::mutex> lock(lookahead_mu_);
+        if (!lookahead_thread_.joinable()) {
+            lookahead_stop_ = false;
+            lookahead_thread_ = std::thread([this] {
+                for (;;) {
+                    LookaheadJob current;
+                    {
+                        std::unique_lock<std::mutex> ul(lookahead_mu_);
+                        lookahead_cv_.wait(ul, [this] {
+                            return lookahead_stop_ || !lookahead_queue_.empty();
+                        });
+                        if (lookahead_stop_ && lookahead_queue_.empty()) return;
+                        current = std::move(lookahead_queue_.front());
+                        lookahead_queue_.pop_front();
+                        lookahead_busy_ = true;
+                    }
+                    try {
+                        current.promise.set_value(qwen4exp_prepare_inputs(
+                            weights_, current.tokens.data(), (int)current.tokens.size(),
+                            current.ple_prev));
+                    } catch (...) {
+                        current.promise.set_exception(std::current_exception());
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock2(lookahead_mu_);
+                        lookahead_busy_ = false;
+                        if (lookahead_queue_.empty()) lookahead_idle_cv_.notify_all();
+                    }
+                }
+            });
+        }
+        lookahead_queue_.push_back(std::move(job));
+    }
+    lookahead_cv_.notify_one();
+    return fut;
+}
+
+void Qwen4ExpSeqEngine::wait_lookahead_idle() {
+    std::unique_lock<std::mutex> ul(lookahead_mu_);
+    lookahead_queue_.clear();   // discard unstarted jobs so release does not wait for them
+    lookahead_idle_cv_.wait(ul, [this] { return !lookahead_busy_ && lookahead_queue_.empty(); });
+}
+
+void Qwen4ExpSeqEngine::stop_lookahead_worker() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(lookahead_mu_);
+        lookahead_queue_.clear();
+        if (!lookahead_thread_.joinable()) return;
+        lookahead_stop_ = true;
+        worker = std::move(lookahead_thread_);
+    }
+    lookahead_cv_.notify_all();
+    if (worker.joinable()) worker.join();
+}
+
 void Qwen4ExpSeqEngine::release_device_state() {
     for (InputGather & gather : next_inputs_) {
-        if (gather.inputs.valid()) gather.inputs.wait();   // a lookahead gather may still read the PLE table
         gather = InputGather{};
     }
+    wait_lookahead_idle();   // ensure no lookahead gather still reads the PLE table
     ggml_backend_synchronize(backend_);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
     clear_qwen4exp_batched_decode_workspace(verify_workspace_);
@@ -130,7 +194,6 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
         return result;
     }
     reset_qwen4exp_state(backend_, *caches_[(size_t)result.slot]);
-    ggml_backend_synchronize(backend_);
     prefill_cuts_[(size_t)result.slot].clear();
     if (mtp_capable(result.slot)) {
         MtpState & m = mtp_[(size_t)result.slot];
@@ -201,7 +264,6 @@ bool Qwen4ExpSeqEngine::restore_prefix(int slot, const std::vector<int32_t> & pr
     if (!restore_qwen4exp_snapshot(backend_, s, cache, rows_from)) return false;
     if (!slots_.seed_restored_prefix(slot, checkpoint.tokens).ok) {
         reset_qwen4exp_state(backend_, cache);
-        ggml_backend_synchronize(backend_);
         return false;
     }
     return true;
@@ -440,27 +502,29 @@ void Qwen4ExpSeqEngine::record_mode(int n, bool verify, double tokens, double se
     ++r.steps;
 }
 
-int Qwen4ExpSeqEngine::batched_verify_rows(const StepPlan & plan) const {
-    if (decode_mode_ == DecodeMode::plain) return 0;
-    const int rows = batched_verify_width(plan);
-    return rows > 0 && (decode_mode_ == DecodeMode::verify || verify_pays((int)plan.decode.size())) ? rows : 0;
+int Qwen4ExpSeqEngine::batched_verify_rows(const StepPlan & plan, int width) const {
+    if (width <= 0 || decode_mode_ == DecodeMode::plain) return 0;
+    return decode_mode_ == DecodeMode::verify || verify_pays((int)plan.decode.size()) ? width : 0;
 }
 
 int Qwen4ExpSeqEngine::batched_verify_width(const StepPlan & plan) const {
-    if (!plan.prefills.empty() || plan.decode.empty() || mtp_eligible(plan)) return 0;
+    if (!plan.prefills.empty() || plan.decode.empty() ||
+        plan.decode.size() > (size_t)kQwen4ExpMaxBatchedSlots || mtp_eligible(plan)) return 0;
     int rows = kQwen4ExpBatchedVerifyRows;
-    std::vector<Qwen4ExpCache *> caches;
-    std::vector<int32_t> positions;
+    std::array<Qwen4ExpCache *, kQwen4ExpMaxBatchedSlots> caches{};
+    std::array<int32_t, kQwen4ExpMaxBatchedSlots> positions{};
+    int n = 0;
     for (const StepInput & input : plan.decode) {
         const SeqSlot & slot = slots_.slot(input.slot);
         if (!mtp_[(size_t)input.slot].live || !input.allow_speculation) return 0;
         // Each cache's rollback rows bound its verify (a fixed --verify-width of 2 or 3 leaves 2 or 3).
         rows = std::min({rows, max_context() - slot.cur_pos, caches_[(size_t)input.slot]->mtp_draft + 1});
-        caches.push_back(caches_[(size_t)input.slot]);
-        positions.push_back(slot.cur_pos);
+        caches[(size_t)n] = caches_[(size_t)input.slot];
+        positions[(size_t)n] = slot.cur_pos;
+        ++n;
     }
     if (rows < 2 || !qwen4exp_verify_batched_supported(backend_, weights_, caches.data(), positions.data(),
-                                                       (int)caches.size(), rows)) return 0;
+                                                       n, rows)) return 0;
     return rows;
 }
 
@@ -694,7 +758,7 @@ Qwen4ExpInputs Qwen4ExpSeqEngine::prompt_inputs(int slot, const Qwen4ExpForwardS
         }
     }
     if (!inputs.ok) inputs = qwen4exp_prepare_inputs(weights_, segment.tokens, segment.n_tokens, ple_prev);
-    next = InputGather{};   // a missed lookahead goes only now, so the inline gather above did not wait for it
+    next = InputGather{};
     // The slot's next chunk as the next step plans it when nothing else changes (this chunk is appended already): a
     // whole granule, cut at the slot's restore points and capture boundary (prefill_segment). The step limits grant
     // every prefilling sequence a whole granule (step_plan_limits), so it is the next slice unless the scheduler
@@ -706,9 +770,7 @@ Qwen4ExpInputs Qwen4ExpSeqEngine::prompt_inputs(int slot, const Qwen4ExpForwardS
         next.tokens.assign(s.sample_history.begin() + s.cur_pos, s.sample_history.begin() + s.cur_pos + n);
         next.ple_prev = inputs.ple_prev;
         try {
-            next.inputs = std::async(std::launch::async, [&w = weights_, tokens = next.tokens, prev = next.ple_prev] {
-                return qwen4exp_prepare_inputs(w, tokens.data(), (int) tokens.size(), prev);
-            });
+            next.inputs = submit_lookahead(next.tokens, next.ple_prev);
         } catch (const std::exception &) {   // no thread for it (std::system_error): the next chunk is gathered inline
             next = InputGather{};
         }
@@ -749,36 +811,38 @@ StepPlanLimits Qwen4ExpSeqEngine::step_plan_limits(int decode_rows) const {
 
 bool Qwen4ExpSeqEngine::reserve_decode(const StepPlan & plan) {
     if ((int)plan.decode.size() != slots_.decoding_count()) return false;
-    std::vector<int> growth((size_t)slot_count(), 0);
-    std::vector<uint8_t> assigned((size_t)slot_count(), 0);
+    const int n = slot_count();
+    reserve_growth_.assign((size_t)n, 0);
+    slot_seen_.assign((size_t)n, 0);
+    uint8_t * assigned = slot_seen_.data();
     for (const StepInput & input : plan.decode) {
-        if (input.slot < 0 || input.slot >= slot_count() ||
+        if (input.slot < 0 || input.slot >= n ||
             input.token < 0 || input.token >= weights_.n_vocab ||
-            growth[(size_t)input.slot] != 0 ||
+            reserve_growth_[(size_t)input.slot] != 0 ||
             !slots_.slot(input.slot).decoding()) return false;
-        growth[(size_t)input.slot] = 1;
-        assigned[(size_t)input.slot] = 1;
+        reserve_growth_[(size_t)input.slot] = 1;
+        assigned[input.slot] = 1;
     }
     if (mtp_eligible(plan)) {
         const int slot = plan.decode[0].slot;
-        growth[(size_t)slot] = std::max(1, std::min(caches_[(size_t)slot]->mtp_draft + 1,
-                                                    max_context() - slots_.slot(slot).cur_pos));
-    } else if (const int rows = batched_verify_rows(plan)) {
-        for (const StepInput & input : plan.decode) growth[(size_t)input.slot] = rows;
+        reserve_growth_[(size_t)slot] = std::max(1, std::min(caches_[(size_t)slot]->mtp_draft + 1,
+                                                             max_context() - slots_.slot(slot).cur_pos));
+    } else if (const int rows = batched_verify_rows(plan, batched_verify_width(plan))) {
+        for (const StepInput & input : plan.decode) reserve_growth_[(size_t)input.slot] = rows;
     }
     const StepPlanLimits limits = step_plan_limits((int)plan.decode.size());
     if (plan.prefills.size() > (size_t)limits.max_prefill_sequences) return false;
     int prefill_total = 0;
     for (const PrefillSlice & slice : plan.prefills) {
-        if (slice.slot < 0 || slice.slot >= slot_count() ||
+        if (slice.slot < 0 || slice.slot >= n ||
             slice.max_tokens < 1 ||
             slice.max_tokens > limits.max_prefill_tokens_per_sequence ||
             (prefill_total += slice.max_tokens) > limits.max_prefill_tokens_total ||
-            assigned[(size_t)slice.slot] ||
+            assigned[slice.slot] ||
             !slots_.is_prefilling(slice.slot)) return false;
-        assigned[(size_t)slice.slot] = 1;
+        assigned[slice.slot] = 1;
     }
-    return slots_.reserve_decode(growth);
+    return slots_.reserve_decode(reserve_growth_);
 }
 
 SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
@@ -797,17 +861,18 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     // A replaced checkpoint the scheduler did not claim after the last step (a capture it could not match) goes now.
     for (int i = 0; i < kPrefixCheckpoints; ++i) free_qwen4exp_snapshot(displaced_[i]);
 
-    std::vector<uint8_t> seen((size_t)n, 0);
+    slot_seen_.assign((size_t)n, 0);
+    uint8_t * seen = slot_seen_.data();
     for (const StepInput & input : plan.decode) {
         if (input.slot < 0 || input.slot >= n || input.token < 0 ||
-            input.token >= weights_.n_vocab || seen[(size_t)input.slot] ||
+            input.token >= weights_.n_vocab || seen[input.slot] ||
             !slots_.slot(input.slot).decoding() ||
             !caches_[(size_t)input.slot] ||
             caches_[(size_t)input.slot]->cur_pos !=
                 slots_.slot(input.slot).cur_pos ||
             slots_.slot(input.slot).cur_pos >= max_context())
             return fail("invalid or duplicate qwen4exp decode row");
-        seen[(size_t)input.slot] = 1;
+        seen[input.slot] = 1;
     }
     const StepPlanLimits limits = step_plan_limits((int)plan.decode.size());
     if (plan.prefills.size() > (size_t)limits.max_prefill_sequences)
@@ -820,18 +885,19 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         if (slice.slot < 0 || slice.slot >= n || slice.max_tokens < 1 ||
             slice.max_tokens > limits.max_prefill_tokens_per_sequence ||
             remaining <= 0 ||
-            seen[(size_t)slice.slot] || !slots_.is_prefilling(slice.slot) ||
+            seen[slice.slot] || !slots_.is_prefilling(slice.slot) ||
             !caches_[(size_t)slice.slot] ||
             caches_[(size_t)slice.slot]->cur_pos !=
                 slots_.slot(slice.slot).cur_pos)
             return fail("invalid qwen4exp prefill slice");
-        seen[(size_t)slice.slot] = 1;
+        seen[slice.slot] = 1;
     }
     if (plan.decode.empty() && plan.prefills.empty()) return result;
     if (mtp_eligible(plan)) return mtp_step(plan.decode[0]);
-    if (const int rows = batched_verify_rows(plan)) return batched_verify_step(plan, rows);
+    const int verify_w = batched_verify_width(plan);
+    if (const int rows = batched_verify_rows(plan, verify_w)) return batched_verify_step(plan, rows);
     // A step that could have verified drafts: its time and tokens rate the plain mode (verify_pays), once it succeeded.
-    const bool rate_plain = batched_verify_width(plan) > 0;
+    const bool rate_plain = verify_w > 0;
     const auto plain_t0 = std::chrono::steady_clock::now();
 
     struct PendingPrefill {
@@ -840,11 +906,9 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         size_t segment;
     };
     std::vector<PendingPrefill> pending_prefills;
-    std::vector<std::vector<int32_t>> segment_tokens;
     std::vector<Qwen4ExpForwardSegment> forward_segments;
     std::vector<size_t> decode_rows;
     std::vector<int> decode_positions;
-    segment_tokens.reserve(plan.decode.size() + plan.prefills.size());
     forward_segments.reserve(plan.decode.size() + plan.prefills.size());
     decode_rows.reserve(plan.decode.size());
     decode_positions.reserve(plan.decode.size());
@@ -852,11 +916,10 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (const StepInput & input : plan.decode) {
         const auto appended = slots_.append_token(input.slot, input.token);
         if (!appended.ok) return fail("qwen4exp decode reservation failed");
-        segment_tokens.emplace_back(1, input.token);
         decode_positions.push_back(appended.position);
         decode_rows.push_back(forward_segments.size());
         forward_segments.push_back({
-            caches_[(size_t)input.slot], segment_tokens.back().data(),
+            caches_[(size_t)input.slot], &input.token,
             1, appended.position});
     }
     for (const PrefillSlice & slice : plan.prefills) {
@@ -864,16 +927,14 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         const int count = prefill_segment(slice.slot, slice.max_tokens);
         if (count <= 0) return fail("qwen4exp prefill made no progress");
         const int pos = before.cur_pos;
-        segment_tokens.emplace_back(
-            before.sample_history.begin() + pos,
-            before.sample_history.begin() + pos + count);
+        const int32_t * tokens_ptr = before.sample_history.data() + pos;
         const SeqSlotManager::PrefillChunk appended =
             slots_.append_prefill(slice.slot, count);
         if (!appended.ok || appended.rows.size() != (size_t) count)
             return fail("qwen4exp prefill reservation failed");
         const size_t segment_index = forward_segments.size();
         forward_segments.push_back({
-            caches_[(size_t) slice.slot], segment_tokens.back().data(),
+            caches_[(size_t) slice.slot], tokens_ptr,
             count, pos});
         const bool complete = slots_.slot(slice.slot).cur_pos ==
                               slots_.slot(slice.slot).prompt_len;
@@ -985,7 +1046,6 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         result.prefills.push_back(std::move(output));
     }
     if (rate_plain) {
-        ggml_backend_synchronize(backend_);
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - plain_t0).count();
         record_mode((int)plan.decode.size(), false, (double)plan.decode.size(), s);
         ++batched_.plain_steps;
@@ -1036,11 +1096,9 @@ void Qwen4ExpSeqEngine::retire(int slot) {
         }
     }
     if (last) batched_ = {};
-    ggml_backend_synchronize(backend_);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();
     reset_qwen4exp_state(backend_, *caches_[(size_t)slot]);
-    ggml_backend_synchronize(backend_);
 }
 
 } // namespace luce::common
