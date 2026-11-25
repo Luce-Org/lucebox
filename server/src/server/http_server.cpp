@@ -21,6 +21,7 @@
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
+#include "admit_timing.h"
 #include "common/platform_env.h"
 #include "luce.h"
 #include "common/concurrency/seq_engine.h"
@@ -7334,7 +7335,12 @@ void HttpServer::worker_loop() {
 void HttpServer::process_job(ServerJob * job) {
     SocketHandle fd = job->fd;
     const auto & req = job->req;
-    auto started_at = std::chrono::steady_clock::now();
+    const auto started_at = std::chrono::steady_clock::now();
+    // Wait spent in the HTTP queue before the classic serial worker picked up the job.
+    // Guard against default-constructed arrived_at in unit tests that bypass enqueue().
+    const double queue_s = (job->arrived_at != std::chrono::steady_clock::time_point{})
+        ? (std::max)(0.0, luce::common::admit_timing(job->arrived_at, started_at, started_at).queue_s)
+        : 0.0;
 
     // Track live status for /status page. RAII guard ensures idle on all paths.
     std::string prompt_excerpt;
@@ -7632,6 +7638,7 @@ void HttpServer::process_job(ServerJob * job) {
         effective_prompt_tokens,
         agent_turn_cache_hit,
         prepared.pflash_stats,
+        queue_s,
     };
 
     // Record performance for /status page.

@@ -442,6 +442,7 @@ struct HttpServerTestAccess {
         return server.sse_pending_;
     }
     static void handle_client(HttpServer & server, int fd) { server.handle_client(fd); }
+    static void process_job(HttpServer & server, ServerJob * job) { server.process_job(job); }
     static void broadcast_token(HttpServer & server, const std::string & text) { server.broadcast_token(text); }
 #endif
     static std::string apply_pflash_compression(
@@ -21688,5 +21689,66 @@ TEST_CASE(ServerUnitFixture, test_status_subscriber_handshake_during_shutdown_cl
     TEST_ASSERT(HttpServerTestAccess::sse_pending(*rig.server) == 0);
     TEST_ASSERT(HttpServerTestAccess::sse_subscribers(*rig.server) == 0);
     close(sp[1]);
+}
+
+TEST_CASE(ServerUnitFixture, test_classic_worker_reports_queue_ms_from_arrived_at) {
+    struct OkBackend : MockBackend {
+        GenerateResult generate_impl(const GenerateRequest &, const DaemonIO & io) override {
+            GenerateResult res;
+            res.tokens = {2};
+            res.prefill_s = 0.01;
+            res.decode_s = 0.02;
+            io.emit(2);
+            res.succeed();
+            return res;
+        }
+    };
+    const std::string tok_path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tok_path.c_str()));
+    LuceEngine engine(std::make_unique<OkBackend>());
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    HttpServer server(engine, tokenizer, config);
+    auto run_case = [&](std::chrono::steady_clock::time_point arrived) -> double {
+        int sp[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        ServerJob job;
+        job.fd = sp[0];
+        job.arrived_at = arrived;
+        job.req.stream = false;
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.response_id = "chatcmpl-queue-test";
+        job.req.model = "test-model";
+        job.req.prompt_tokens = {1, 2};
+        job.req.max_output = 4;
+        HttpServerTestAccess::process_job(server, &job);
+        shutdown(sp[0], SHUT_WR);
+        close(sp[0]);
+        std::string raw;
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = recv(sp[1], buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            raw.append(buf, (size_t) n);
+        }
+        close(sp[1]);
+        const size_t body_pos = raw.find("\r\n\r\n");
+        TEST_ASSERT(body_pos != std::string::npos);
+        const json body = json::parse(raw.substr(body_pos + 4));
+        TEST_ASSERT(body.contains("usage") && body["usage"].contains("timings"));
+        TEST_ASSERT(body["usage"]["timings"].contains("queue_ms"));
+        return body["usage"]["timings"]["queue_ms"].get<double>();
+    };
+
+    const double queued_ms = run_case(
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(250));
+    TEST_ASSERT(queued_ms >= 200.0);
+
+    const double unqueued_ms = run_case(std::chrono::steady_clock::time_point{});
+    TEST_ASSERT(unqueued_ms == 0.0);
+    unlink(tok_path.c_str());
 }
 #endif
