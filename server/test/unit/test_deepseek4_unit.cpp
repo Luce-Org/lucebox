@@ -5283,6 +5283,12 @@ static ggml_backend_t get_shared_gpu_backend() {
     if (!g_shared_gpu_initialized) {
         g_shared_gpu_initialized = true;
         g_shared_gpu_backend = ggml_backend_cuda_init(0);
+    } else if (g_shared_gpu_backend) {
+        // Release cached pool blocks and legacy-pool graph caches between
+        // independent test functions so peak VRAM stays bounded and no test
+        // inherits stale graph state. Graph-replay tests keep their own
+        // dedicated backends.
+        ggml_backend_cuda_trim_pool(g_shared_gpu_backend);
     }
     return g_shared_gpu_backend;
 }
@@ -5593,7 +5599,7 @@ static void test_ds4_saved_raw_rows_replay_gpu() {
     std::fprintf(stderr, " skipped (HIP-only replay qualification)\n");
     return;
 #endif
-    auto * backend = get_shared_gpu_backend();
+    auto * backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -5685,6 +5691,7 @@ static void test_ds4_saved_raw_rows_replay_gpu() {
             ggml_free(ctx);
         }
     }
+    ggml_backend_free(backend);
     std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
     TEST_ASSERT_MSG(cases == 72 && passed == cases, "cached verifier saved rows from a stale ring position");
 }
@@ -5801,6 +5808,8 @@ static bool run_ds4_preserved_raw_rows_case(
     }
     if (!ok) std::fprintf(stderr, " saved-row FAIL q=%d comp=%d visible=%d kv=%s direct=%d\n",
                           width, compressed_rows, visible_suffix, ggml_type_name(kv_type), direct);
+    ggml_backend_cuda_graph_invalidate_range(
+        backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     return ok;
@@ -5812,7 +5821,7 @@ static void test_ds4_preserved_raw_rows_gpu() {
     std::fprintf(stderr, " skipped (HIP-only indexed attention)\n");
     return;
 #endif
-    auto * backend = get_shared_gpu_backend();
+    auto * backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -5837,6 +5846,7 @@ static void test_ds4_preserved_raw_rows_gpu() {
     TEST_ASSERT_MSG(run_ds4_preserved_raw_rows_case(
         backend, 5, 30720, true, GGML_TYPE_F16, false, 128),
         "indexed attention saved-row replay stress failed");
+    ggml_backend_free(backend);
 }
 
 static void test_ds4_flash_attention_segmented_kv_gpu(bool benchmark = false) {
@@ -7453,7 +7463,7 @@ static void test_ds4_flash_rope_replay_gpu() {
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    auto backend = get_shared_gpu_backend();
+    auto backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -7576,11 +7586,14 @@ static void test_ds4_flash_rope_replay_gpu() {
                 if (!ok) std::fprintf(stderr, " FAIL width=%d kv=%s forward=%d",
                                       width, ggml_type_name(type), forward);
                 passed += ok;
+                ggml_backend_cuda_graph_invalidate_range(
+                    backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
             }
         }
     }
+    ggml_backend_free(backend);
     std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
     TEST_ASSERT_MSG(passed == cases, "fused RoPE replay used stale token positions");
 }
@@ -7743,7 +7756,7 @@ static void test_ds4_flash_attention_position_replay_gpu(bool require_gpu = fals
     std::fprintf(stderr, "    skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = get_shared_gpu_backend();
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         TEST_ASSERT_MSG(!require_gpu, "position replay requires a GPU");
         std::fprintf(stderr, "    skipped (no GPU backend)\n");
@@ -7831,11 +7844,14 @@ static void test_ds4_flash_attention_position_replay_gpu(bool require_gpu = fals
                         ++cases;
                     }
                 }
+                ggml_backend_cuda_graph_invalidate_range(
+                    backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
             }
         }
     }
+    ggml_backend_free(backend);
     TEST_ASSERT_MSG(cases == 100, "all position replay cases must run");
     std::fprintf(stderr, "    %d position-replay cases; failures=%d\n", cases, g_failures);
 }
