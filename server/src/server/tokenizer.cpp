@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -307,6 +308,111 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
         pieces.push_back(text.substr(start, pos - start));
     }
 
+    return pieces;
+}
+
+// The CJK class of DeepSeek's second split, [一-龥぀-ゟ゠-ヿ]: CJK Unified
+// Ideographs U+4E00..U+9FA5, Hiragana and Katakana.
+static bool is_deepseek_cjk(uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF);
+}
+
+// \p{N}, the Unicode Number category (Nd, Nl, No), for DeepSeek's first split:
+// its 144 ranges in Unicode 16.0 (the code points whose Python
+// unicodedata.category() starts with "N"), the same 1,911 code points Hugging
+// Face tokenizers match with \p{N}. is_digit() covers only some decimal digits.
+static constexpr uint32_t kUnicodeNumberRanges[][2] = {
+    {0x0030, 0x0039}, {0x00B2, 0x00B3}, {0x00B9, 0x00B9}, {0x00BC, 0x00BE}, {0x0660, 0x0669},
+    {0x06F0, 0x06F9}, {0x07C0, 0x07C9}, {0x0966, 0x096F}, {0x09E6, 0x09EF}, {0x09F4, 0x09F9},
+    {0x0A66, 0x0A6F}, {0x0AE6, 0x0AEF}, {0x0B66, 0x0B6F}, {0x0B72, 0x0B77}, {0x0BE6, 0x0BF2},
+    {0x0C66, 0x0C6F}, {0x0C78, 0x0C7E}, {0x0CE6, 0x0CEF}, {0x0D58, 0x0D5E}, {0x0D66, 0x0D78},
+    {0x0DE6, 0x0DEF}, {0x0E50, 0x0E59}, {0x0ED0, 0x0ED9}, {0x0F20, 0x0F33}, {0x1040, 0x1049},
+    {0x1090, 0x1099}, {0x1369, 0x137C}, {0x16EE, 0x16F0}, {0x17E0, 0x17E9}, {0x17F0, 0x17F9},
+    {0x1810, 0x1819}, {0x1946, 0x194F}, {0x19D0, 0x19DA}, {0x1A80, 0x1A89}, {0x1A90, 0x1A99},
+    {0x1B50, 0x1B59}, {0x1BB0, 0x1BB9}, {0x1C40, 0x1C49}, {0x1C50, 0x1C59}, {0x2070, 0x2070},
+    {0x2074, 0x2079}, {0x2080, 0x2089}, {0x2150, 0x2182}, {0x2185, 0x2189}, {0x2460, 0x249B},
+    {0x24EA, 0x24FF}, {0x2776, 0x2793}, {0x2CFD, 0x2CFD}, {0x3007, 0x3007}, {0x3021, 0x3029},
+    {0x3038, 0x303A}, {0x3192, 0x3195}, {0x3220, 0x3229}, {0x3248, 0x324F}, {0x3251, 0x325F},
+    {0x3280, 0x3289}, {0x32B1, 0x32BF}, {0xA620, 0xA629}, {0xA6E6, 0xA6EF}, {0xA830, 0xA835},
+    {0xA8D0, 0xA8D9}, {0xA900, 0xA909}, {0xA9D0, 0xA9D9}, {0xA9F0, 0xA9F9}, {0xAA50, 0xAA59},
+    {0xABF0, 0xABF9}, {0xFF10, 0xFF19}, {0x10107, 0x10133}, {0x10140, 0x10178}, {0x1018A, 0x1018B},
+    {0x102E1, 0x102FB}, {0x10320, 0x10323}, {0x10341, 0x10341}, {0x1034A, 0x1034A},
+    {0x103D1, 0x103D5}, {0x104A0, 0x104A9}, {0x10858, 0x1085F}, {0x10879, 0x1087F},
+    {0x108A7, 0x108AF}, {0x108FB, 0x108FF}, {0x10916, 0x1091B}, {0x109BC, 0x109BD},
+    {0x109C0, 0x109CF}, {0x109D2, 0x109FF}, {0x10A40, 0x10A48}, {0x10A7D, 0x10A7E},
+    {0x10A9D, 0x10A9F}, {0x10AEB, 0x10AEF}, {0x10B58, 0x10B5F}, {0x10B78, 0x10B7F},
+    {0x10BA9, 0x10BAF}, {0x10CFA, 0x10CFF}, {0x10D30, 0x10D39}, {0x10D40, 0x10D49},
+    {0x10E60, 0x10E7E}, {0x10F1D, 0x10F26}, {0x10F51, 0x10F54}, {0x10FC5, 0x10FCB},
+    {0x11052, 0x1106F}, {0x110F0, 0x110F9}, {0x11136, 0x1113F}, {0x111D0, 0x111D9},
+    {0x111E1, 0x111F4}, {0x112F0, 0x112F9}, {0x11450, 0x11459}, {0x114D0, 0x114D9},
+    {0x11650, 0x11659}, {0x116C0, 0x116C9}, {0x116D0, 0x116E3}, {0x11730, 0x1173B},
+    {0x118E0, 0x118F2}, {0x11950, 0x11959}, {0x11BF0, 0x11BF9}, {0x11C50, 0x11C6C},
+    {0x11D50, 0x11D59}, {0x11DA0, 0x11DA9}, {0x11F50, 0x11F59}, {0x11FC0, 0x11FD4},
+    {0x12400, 0x1246E}, {0x16130, 0x16139}, {0x16A60, 0x16A69}, {0x16AC0, 0x16AC9},
+    {0x16B50, 0x16B59}, {0x16B5B, 0x16B61}, {0x16D70, 0x16D79}, {0x16E80, 0x16E96},
+    {0x1CCF0, 0x1CCF9}, {0x1D2C0, 0x1D2D3}, {0x1D2E0, 0x1D2F3}, {0x1D360, 0x1D378},
+    {0x1D7CE, 0x1D7FF}, {0x1E140, 0x1E149}, {0x1E2F0, 0x1E2F9}, {0x1E4F0, 0x1E4F9},
+    {0x1E5F1, 0x1E5FA}, {0x1E8C7, 0x1E8CF}, {0x1E950, 0x1E959}, {0x1EC71, 0x1ECAB},
+    {0x1ECAD, 0x1ECAF}, {0x1ECB1, 0x1ECB4}, {0x1ED01, 0x1ED2D}, {0x1ED2F, 0x1ED3D},
+    {0x1F100, 0x1F10C}, {0x1FBF0, 0x1FBF9},
+};
+
+static bool is_unicode_number(uint32_t cp) {
+    if (cp < 0x80) return cp >= '0' && cp <= '9';
+    const auto * end = std::end(kUnicodeNumberRanges);
+    const auto * it = std::upper_bound(std::begin(kUnicodeNumberRanges), end, cp,
+        [](uint32_t c, const uint32_t (&range)[2]) { return c < range[0]; });
+    return it != std::begin(kUnicodeNumberRanges) && cp <= (*(it - 1))[1];
+}
+
+// DeepSeek V3/V4's tokenizer.json runs Split(\p{N}{1,3}), then
+// Split([一-龥぀-ゟ゠-ヿ]+), both Isolated, before the main pattern, which then
+// sees each piece on its own. The main pattern's \s+(?!\S) therefore keeps a
+// whitespace run before a number or CJK text whole: "a  1" is a | "  " | 1,
+// where one pass of the main pattern gives a | " " | " " | 1. The main pattern
+// matches nothing in a run of numbers, so the run stays one piece. The two
+// classes are disjoint, so one scan isolating both equals the two splits.
+std::vector<std::string> Tokenizer::pre_split(const std::string & text) const {
+    if (pre_type_ != PreTokenizer::DEEPSEEK3) return pre_tokenize(text);
+
+    std::vector<std::string> pieces;
+    const auto main_split = [&](size_t from, size_t to) {
+        if (to <= from) return;
+        for (auto & piece : pre_tokenize(text.substr(from, to - from))) {
+            pieces.push_back(std::move(piece));
+        }
+    };
+    const char * s = text.c_str();
+    const size_t len = text.size();
+    size_t seg = 0, pos = 0;
+    while (pos < len) {
+        int cplen = 0;
+        const uint32_t cp = utf8_decode(s + pos, len - pos, &cplen);
+        if (cplen <= 0) cplen = 1;
+        const bool number = is_unicode_number(cp);
+        if (!number && !is_deepseek_cjk(cp)) {
+            pos += cplen;
+            continue;
+        }
+        size_t end = pos;
+        int run = 0;
+        while (end < len) {
+            int cl = 0;
+            const uint32_t c = utf8_decode(s + end, len - end, &cl);
+            if (cl <= 0) cl = 1;
+            if (number ? (run == 3 || !is_unicode_number(c)) : !is_deepseek_cjk(c)) break;
+            end += cl;
+            ++run;
+        }
+        main_split(seg, pos);
+        if (number) {
+            pieces.push_back(text.substr(pos, end - pos));
+        } else {
+            main_split(pos, end);
+        }
+        seg = pos = end;
+    }
+    main_split(seg, len);
     return pieces;
 }
 
@@ -653,6 +759,10 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         const char * pre = gguf_get_val_str(gctx, pre_key);
         if (pre && std::strcmp(pre, "qwen35") == 0) {
             pre_type_ = PreTokenizer::QWEN35;
+        } else if (pre && (std::strcmp(pre, "deepseek-v3") == 0 ||
+                           std::strcmp(pre, "joyai-llm") == 0)) {
+            // llama.cpp's DEEPSEEK3_LLM / JOYAI_LLM pre types.
+            pre_type_ = PreTokenizer::DEEPSEEK3;
         } else {
             pre_type_ = PreTokenizer::QWEN2;
         }
@@ -697,7 +807,9 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 
     std::fprintf(stderr, "[tokenizer] loaded vocab=%d merges=%zu bos=%d eos=%d eot=%d pre=%s sp=%s\n",
                  n_vocab, merge_rank_.size(), bos_id_, eos_id_, eos_chat_id_,
-                 pre_type_ == PreTokenizer::QWEN35 ? "qwen35" : "qwen2",
+                 pre_type_ == PreTokenizer::QWEN35      ? "qwen35"
+                 : pre_type_ == PreTokenizer::DEEPSEEK3 ? "deepseek3"
+                                                        : "qwen2",
                  is_sentencepiece_ ? "yes" : "no");
     return true;
 }
@@ -728,7 +840,7 @@ std::vector<int32_t> Tokenizer::encode_matching(
     std::vector<int32_t> ids;
     // Pre-tokenize + BPE a run of plain text.
     const auto plain = [&](const std::string & segment) {
-        for (const auto & piece : pre_tokenize(segment)) {
+        for (const auto & piece : pre_split(segment)) {
             auto piece_ids = bpe_encode_piece(piece);
             ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
         }

@@ -714,7 +714,8 @@ static std::string write_pflash_bpe_tokenizer_fixture(
         const std::string & byte_cover,
         const std::vector<std::string> & control_tokens =
             {"<|im_start|>", "<|im_end|>"},
-        const std::vector<std::string> & user_defined_tokens = {}) {
+        const std::vector<std::string> & user_defined_tokens = {},
+        const char * pre = "qwen35") {
     std::vector<std::string> tokens = control_tokens;
     std::vector<uint32_t> types(tokens.size(), 3);
     tokens.insert(tokens.end(), user_defined_tokens.begin(), user_defined_tokens.end());
@@ -736,7 +737,7 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
                       types.data(), (int32_t) types.size());
     gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", pre);
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
     // A case may build several (test_tmp_path is per process).
@@ -785,6 +786,45 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline)
     TEST_ASSERT(tok.encode(a).size() == 3);
     TEST_ASSERT(tok.encode(x).size() == 3);
     TEST_ASSERT(tok.decode(tok.encode(x)) == x);
+}
+
+// DeepSeek V3/V4 (`deepseek-v3`, `joyai-llm` pre) isolates \p{N}{1,3} and
+// [一-龥぀-ゟ゠-ヿ]+ before its main split, so a whitespace run in front of a
+// number or CJK text ends its segment and stays one piece: HF splits "a  1" as
+// a | "  " | 1. The engine split it as Qwen does: a | " " | " " | 1.
+TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
+    const std::string text = "a  1\t\t42  中文x 12345 10² ①②③④";
+    for (const char * pre : {"joyai-llm", "deepseek-v3", "qwen35"}) {
+        const std::string path = write_pflash_bpe_tokenizer_fixture(
+            {"  ", "\t\t", "42", "中文", " 中文", "123", "45", "²", "10²", "①②③", "④"},
+            text, {}, {}, pre);
+        Tokenizer tok;
+        TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+        unlink(path.c_str());
+        const auto id = [&](const std::string & raw) {
+            return tok.token_to_id(test_gpt2_encode(raw));
+        };
+        const auto ids = [&](const std::vector<std::string> & raws) {
+            std::vector<int32_t> out;
+            for (const auto & raw : raws) out.push_back(id(raw));
+            return out;
+        };
+        if (std::strcmp(pre, "qwen35") == 0) {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", " ", " ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t4") == ids({"\t", "\t", "4"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({" ", " 中文"}));
+        } else {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", "  ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t42") == ids({"\t\t", "42"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({"  ", "中文"}));
+            TEST_ASSERT(tok.encode("x 12345") == ids({"x", " ", "123", "45"}));
+            // \p{N} is the whole Number category, not only decimal digits.
+            TEST_ASSERT(tok.encode("a  ²") == ids({"a", "  ", "²"}));
+            TEST_ASSERT(tok.encode("x 10²") == ids({"x", " ", "10²"}));
+            TEST_ASSERT(tok.encode("①②③④") == ids({"①②③", "④"}));
+        }
+        TEST_ASSERT(tok.decode(tok.encode(text)) == text);
+    }
 }
 
 TEST_CASE(ServerUnitFixture,
