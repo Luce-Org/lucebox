@@ -78,6 +78,40 @@ static Result run(ggml_backend_t be, int T, int budget, int pos0, int r,
     return result;
 }
 
+// A KVFlash pool keeps K/V rows in slot order: the paged ids are the position ids mapped through the chunk table
+// (chunk c's first arena row, -1 when not resident), after the sort, so the attention order stays the position order.
+static bool run_paged(ggml_backend_t be, int T, int budget, int pos0, int r, const std::vector<int32_t> & blocks,
+                      const std::vector<int32_t> & chunk_rows, int chunk, std::vector<int32_t> * got) {
+    ggml_context * c = ggml_init({1024 * 1024, nullptr, true});
+    ggml_tensor * selected = ggml_new_tensor_2d(c, GGML_TYPE_I32, budget, T);
+    ggml_tensor * positions = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4 * T);
+    ggml_tensor * map = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) chunk_rows.size());
+    ggml_tensor * ids = ggml_qsa_decode_ids_paged(c, selected, ggml_view_1d(c, positions, T, 0), r, map, chunk);
+    ggml_cgraph * gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, ids);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+    bool ok = buf != nullptr;
+    if (ok) {
+        std::vector<int32_t> pos((size_t) 4 * T, -999);
+        for (int t = 0; t < T; ++t) pos[t] = pos0 + t;
+        ggml_backend_tensor_set(selected, blocks.data(), 0, ggml_nbytes(selected));
+        ggml_backend_tensor_set(positions, pos.data(), 0, ggml_nbytes(positions));
+        ggml_backend_tensor_set(map, chunk_rows.data(), 0, ggml_nbytes(map));
+        ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+        got->resize((size_t) ids->ne[0] * T);
+        if (ok) ggml_backend_tensor_get(ids, got->data(), 0, ggml_nbytes(ids));
+    }
+    if (buf) ggml_backend_buffer_free(buf);
+    ggml_free(c);
+    if (!ok) return false;
+    std::vector<int32_t> want = reference(blocks, T, budget, pos0, r);
+    for (int32_t & id : want) {
+        const int32_t base = id < 0 || id / chunk >= (int) chunk_rows.size() ? -1 : chunk_rows[(size_t) (id / chunk)];
+        id = base < 0 ? -1 : base + id % chunk;
+    }
+    return *got == want;
+}
+
 // Replay one fixed graph through every logical width in buckets around every
 // selection-route boundary. Compare the ordered 512 IDs, not just score values.
 static bool check_runtime_topk(ggml_backend_t be) {
@@ -300,6 +334,23 @@ int main(int argc, char ** argv) {
             const Result want = got.ok ? run(cpu, T, budget, pos0, 4, got.selected) : Result{};
             const bool pass = got.ok && want.ok && got.ids == want.ids;
             std::printf("qsa-ids top-k n=%-4d ties=%d %s\n", n_comp, pattern, pass ? "OK" : "FAIL");
+            ok &= pass; ++cases;
+        }
+    }
+    // Paged ids: chunks scattered over the pool in reverse order, every third one not resident (its ids drop to -1),
+    // the trailing partial block included; CPU and GPU agree with the mapped reference.
+    for (int T : {1, 5}) {
+        for (int pos0 : {700, 4095, 70001}) {
+            const int budget = 64, r = 4, chunk = 64, n_chunks = (pos0 + T) / chunk + 1;
+            std::vector<int32_t> chunk_rows((size_t) n_chunks);
+            for (int ci = 0; ci < n_chunks; ++ci) chunk_rows[(size_t) ci] = ci % 3 == 1 ? -1 : (n_chunks - 1 - ci) * chunk;
+            chunk_rows.back() = 0;   // the newest chunk is always resident
+            std::vector<int32_t> blocks((size_t) budget * T);
+            for (size_t i = 0; i < blocks.size(); ++i) blocks[i] = (int32_t) ((i * 7919) % (size_t) ((pos0 + 1) / r));
+            std::vector<int32_t> a, b;
+            const bool pass = run_paged(cpu, T, budget, pos0, r, blocks, chunk_rows, chunk, &a) &&
+                              (!gpu || (run_paged(gpu, T, budget, pos0, r, blocks, chunk_rows, chunk, &b) && a == b));
+            std::printf("qsa-ids paged T=%d pos=%-5d %s\n", T, pos0, pass ? "OK" : "FAIL");
             ok &= pass; ++cases;
         }
     }

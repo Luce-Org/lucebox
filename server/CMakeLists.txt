@@ -573,6 +573,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -590,6 +591,10 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/qwen4exp/qwen4exp_hot.cpp
+    src/inkling2/inkling2_loader.cpp
+    src/inkling2/inkling2_cache.cpp
+    src/inkling2/inkling2_graph.cpp
+    src/inkling2/inkling2_backend.cpp
     src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
@@ -2289,6 +2294,12 @@ if(LUCE_TESTS)
     add_test(NAME test_qwen4exp_chunk COMMAND test_qwen4exp_chunk)
     set_tests_properties(test_qwen4exp_chunk PROPERTIES LABELS cpu)
     list(APPEND _luce_cpu_test_targets test_qwen4exp_chunk)
+    add_executable(test_qwen4exp_recall test/unit/test_qwen4exp_recall.cpp)
+    target_include_directories(test_qwen4exp_recall PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_compile_options(test_qwen4exp_recall PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
+    add_test(NAME test_qwen4exp_recall COMMAND test_qwen4exp_recall)
+    set_tests_properties(test_qwen4exp_recall PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_recall)
     add_executable(test_qwen4exp_carve test/unit/test_qwen4exp_carve.cpp)
     target_include_directories(test_qwen4exp_carve PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_compile_options(test_qwen4exp_carve PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
@@ -2315,11 +2326,29 @@ if(LUCE_TESTS)
     target_link_libraries(test_qwen4exp_batched_verify_qsa PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
     add_test(NAME qwen4exp_batched_verify_qsa COMMAND test_qwen4exp_batched_verify_qsa)
     set_tests_properties(qwen4exp_batched_verify_qsa PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    # LUCE_Q4_INDEXER_RECALL on one synthetic layer: position-indexed raw keys under a pool, query capture, pooling and picks.
+    add_executable(test_qwen4exp_indexer_recall test/unit/test_qwen4exp_indexer_recall.cpp)
+    target_include_directories(test_qwen4exp_indexer_recall PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen4exp_indexer_recall PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+    add_test(NAME qwen4exp_indexer_recall COMMAND test_qwen4exp_indexer_recall)
+    set_tests_properties(qwen4exp_indexer_recall PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_forward.cpp")
         add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)
         target_include_directories(smoke_qwen4exp_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen4exp_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_ops.cpp")
+        add_executable(test_inkling2_ops test/unit/test_inkling2_ops.cpp)
+        target_include_directories(test_inkling2_ops PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_inkling2_ops PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME inkling2_ops COMMAND test_inkling2_ops)
+        set_tests_properties(inkling2_ops PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_inkling2_forward.cpp")
+        add_executable(smoke_inkling2_forward test/smoke/smoke_inkling2_forward.cpp)
+        target_include_directories(smoke_inkling2_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_inkling2_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_batched.cpp")
         add_executable(smoke_qwen4exp_batched test/smoke/smoke_qwen4exp_batched.cpp)
@@ -2803,6 +2832,7 @@ if(LUCE_TESTS)
             test/unit/test_mixed_mmq_policy.cpp
             test/unit/test_spec_acceptance.cpp
             test/unit/test_output_constraint.cpp
+            test/unit/test_tool_call_tags.cpp
             test/unit/test_gbnf.cpp
             test/unit/test_ds4_spec_sampling.cpp
             test/unit/test_penalty_history.cpp
@@ -3629,13 +3659,36 @@ endif()
 
 if(LUCE_TESTS)
     # `make check-cpu` — build only the CPU-safe test binaries, then run
-    # `ctest -L cpu`. The hosted CI job runs exactly this target.
+    # `ctest -L cpu` across available cores. The hosted CI job runs this target.
     if(_luce_cpu_test_targets)
+        include(ProcessorCount)
+        ProcessorCount(_luce_cpu_test_jobs)
+        if(NOT _luce_cpu_test_jobs OR _luce_cpu_test_jobs LESS 1)
+            set(_luce_cpu_test_jobs 4)
+        endif()
+        set(_luce_check_cpu_script "${CMAKE_CURRENT_BINARY_DIR}/run_check_cpu.cmake")
+        file(WRITE "${_luce_check_cpu_script}"
+            "if(DEFINED ENV{CTEST_PARALLEL_LEVEL} AND NOT \"\$ENV{CTEST_PARALLEL_LEVEL}\" STREQUAL \"\")\n"
+            "    set(_parallel_args \"\")\n"
+            "else()\n"
+            "    set(_parallel_args --parallel \"${_luce_cpu_test_jobs}\")\n"
+            "endif()\n"
+            "execute_process(\n"
+            "    COMMAND \"${CMAKE_CTEST_COMMAND}\" --output-on-failure \${_parallel_args} -L cpu --no-tests=error\n"
+            "    WORKING_DIRECTORY \"${CMAKE_CURRENT_BINARY_DIR}\"\n"
+            "    RESULT_VARIABLE _rc\n"
+            ")\n"
+            "if(NOT _rc EQUAL 0)\n"
+            "    message(FATAL_ERROR \"ctest failed with exit code \${_rc}\")\n"
+            "endif()\n"
+        )
         add_custom_target(check-cpu
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -L cpu --no-tests=error
+            COMMAND ${CMAKE_COMMAND} -P "${_luce_check_cpu_script}"
             COMMENT "Building and running the CPU-only unit subset"
             USES_TERMINAL)
         add_dependencies(check-cpu ${_luce_cpu_test_targets})
+        unset(_luce_check_cpu_script)
+        unset(_luce_cpu_test_jobs)
     endif()
     unset(_luce_cpu_test_targets)
     unset(_luce_cpu_ctest_names)
