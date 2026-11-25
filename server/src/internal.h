@@ -864,7 +864,8 @@ bool create_target_cache(const TargetWeights & w,
                          bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool allocate_q_stage = false);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -885,7 +886,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool allocate_q_stage = false);
 
 void free_target_cache(TargetCache & c);
 

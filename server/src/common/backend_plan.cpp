@@ -90,7 +90,7 @@ BackendPreparation BackendPlanBuilder::resolve(
                 "' with placement " + placement_device_name(args.device) +
                 "; using the architecture's normal decode path");
             args.specla_mode = false;
-        } else if (!args.fast_rollback) {
+        } else if (args.rollback_mode == RollbackMode::Exact) {
             // The CLI rejects --specla with --no-fast-rollback before
             // admission; this guard covers callers that build BackendArgs
             // directly.
@@ -158,8 +158,7 @@ BackendPreparation BackendPlanBuilder::resolve(
 
     plan.speculation_.draft_path = std::move(args.draft_path);
     plan.speculation_.draft_block_size = args.draft_block_size;
-    plan.speculation_.fast_rollback = args.fast_rollback;
-    plan.speculation_.fast_rollback_explicit = args.fast_rollback_explicit;
+    plan.speculation_.rollback_mode = args.rollback_mode;
     plan.speculation_.seq_verify = args.seq_verify;
     plan.speculation_.specla_mode = args.specla_mode;
     plan.speculation_.specla_top_k = args.specla_top_k;

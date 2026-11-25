@@ -388,8 +388,7 @@ bool build_target_step(
     int top_n,
     bool keep_base_ssm_state,
     ggml_tensor * single_replay_slot_ids,
-    bool capture_q_all,
-    bool capture_q_stage) {
+    TargetStepQueryCapture query_capture) {
     step_graph_free(sg);
 
     // KEEP_BASE: only the single-sequence chain capture verify may
@@ -678,8 +677,8 @@ bool build_target_step(
     gi.active_slot_ids            = sg.active_slot_ids;
     gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
-    gi.q_capture_all              = capture_qk && capture_q_all;
-    gi.q_stage                    = capture_q_stage;
+    gi.q_capture_all              = capture_qk && query_capture.q_all;
+    gi.q_stage                    = query_capture.q_stage;
     gi.n_seqs                     = n_seqs;
     gi.seq_slot                   = seq_slot;
     gi.paged_max_kv_len           = paged_max_kv_len;

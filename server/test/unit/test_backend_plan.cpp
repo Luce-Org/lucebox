@@ -156,7 +156,7 @@ void test_specla_without_fast_rollback_falls_back() {
     BackendArgs args = plain_args();
     args.draft_path = "/models/draft.gguf";
     args.specla_mode = true;
-    args.fast_rollback = false;
+    args.rollback_mode = luce::common::RollbackMode::Exact;
 
     BackendPreparation result = resolve(std::move(args), "qwen35");
     CHECK(std::holds_alternative<BackendPlan>(result));
@@ -259,14 +259,14 @@ void test_supported_specla_requires_a_draft() {
 void test_no_draft_target_only_disables_speculation() {
     BackendArgs args = plain_args();
     args.draft_path = std::nullopt;
-    args.fast_rollback = false;
+    args.rollback_mode = luce::common::RollbackMode::Exact;
     args.ddtree_budget = 0;
 
     BackendPreparation result = resolve(std::move(args), "qwen35");
     CHECK(std::holds_alternative<BackendPlan>(result));
     const BackendPlan & plan = std::get<BackendPlan>(result);
     CHECK(!plan.speculation().draft_path.has_value());
-    CHECK(!plan.speculation().fast_rollback);
+    CHECK(plan.speculation().rollback_mode == luce::common::RollbackMode::Exact);
     CHECK(!plan.speculation().specla_mode);
     CHECK(!plan.speculation().ddtree_mode);
     CHECK(plan.speculation().ddtree_budget == 0);

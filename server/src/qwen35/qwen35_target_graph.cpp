@@ -113,14 +113,15 @@ bool create_target_cache(const TargetWeights & w,
                          int n_seq_slots,
                          bool concurrent_tree,
                          ggml_type cache_type_k, ggml_type cache_type_v,
-                         int target_feat_cap) {
+                         int target_feat_cap,
+                         bool allocate_q_stage) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
                                        paged_attention, n_seq_slots,
                                        concurrent_tree, cache_type_k, cache_type_v,
-                                       target_feat_cap);
+                                       target_feat_cap, allocate_q_stage);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -141,7 +142,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int n_seq_slots,
                                  bool concurrent_tree,
                          ggml_type cache_type_k, ggml_type cache_type_v,
-                         int target_feat_cap) {
+                         int target_feat_cap,
+                         bool allocate_q_stage) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -302,8 +304,9 @@ bool create_target_cache_partial(const TargetWeights & w,
                                                head_dim, T, w.n_head, n_full_attn);
             ggml_set_name(out.q_cap_all, "q_cap_all");
         }
-        // Spec verify query stage: KVFlash processes only.
-        if (const int R = luce::common::kvflash_q_stage_rows(max_verify_tokens); R > 0) {
+        // Spec verify query stage: only when the caller asks for it (serial
+        // KVFlash with the target-QK policy and a draft model).
+        if (const int R = luce::common::kvflash_q_stage_rows(max_verify_tokens, allocate_q_stage); R > 0) {
             out.q_stage_rows = R;
             out.q_stage = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
                                              head_dim, w.n_head, R, n_full_attn);
