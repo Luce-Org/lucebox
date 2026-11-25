@@ -270,13 +270,12 @@ static bool same_tokens(const GenerateResult & warm, const GenerateResult & cold
     return warm.ok() && cold.ok() && warm.tokens == cold.tokens;
 }
 
-// `store`: the backend's own memory, or system memory beside a GPU.
-static void copies(ggml_backend_t backend, ggml_backend_t store) {
-    CHECK(backend && store);
-    Qwen4ExpCache c;
+// A small cache with every kind of strip: KV heads, QSA indexer rows and blocks, recurrent and PLE state, the MTP
+// draft layer.
+static void make_small_cache(ggml_backend_t backend, Qwen4ExpCache & c, int64_t head_dim) {
     c.max_ctx = 63; // packed KV has a padded fourth key beyond the logical limit
     c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
-    auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, 64, 2); };
+    auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, head_dim, 64, 2); };
     c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
     c.mtp_k = kv(); c.mtp_v = kv();
     c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16);
@@ -289,6 +288,13 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
     }
     c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
     CHECK(c.buf);
+}
+
+// `store`: the backend's own memory, or system memory beside a GPU.
+static void copies(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
+    Qwen4ExpCache c;
+    make_small_cache(backend, c, 8);
     Qwen4ExpSnapshot s;
     for (int pos : {1, 7, 31, 63}) {
         unsigned char value = 1;
@@ -331,31 +337,70 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
                 store == backend ? "device" : "system");
 }
 
+// A release of the target device frees the cache and the next request rebuilds it, while the prefix snapshots stay
+// in system memory: dropping a snapshot's rows afterwards views the rebuilt cache's tensors, never the freed ones it
+// was saved from, and the state-only snapshot restores into the rebuilt cache, with a deeper snapshot's rows, the
+// very bytes the whole one did.
+static void rows_dropped_after_rebuild(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
+    Qwen4ExpCache saved_from, rebuilt;
+    make_small_cache(backend, saved_from, 8);
+    unsigned char value = 1;
+    for (auto * t = ggml_get_first_tensor(saved_from.ctx); t; t = ggml_get_next_tensor(saved_from.ctx, t)) {
+        ggml_backend_tensor_memset(t, value++, 0, ggml_nbytes(t));
+    }
+    auto at = [](Qwen4ExpCache & c, int pos) {
+        c.cur_pos = pos; c.indexer_blocks = pos / 4; c.mtp_prev_pos = pos - 1;
+    };
+    Qwen4ExpSnapshot backup, deeper;
+    at(saved_from, 12);
+    CHECK(save_qwen4exp_snapshot(backend, store, saved_from, backup));
+    for (int i = 0; i < 12; ++i) backup.tokens.push_back(100 + i);
+    // The conversation moves on: new point state, so the deeper snapshot's differs from the backup's.
+    for (const auto * group : {&saved_from.ssm_state, &saved_from.conv_state, &saved_from.ple_conv_state}) {
+        for (auto * t : *group) ggml_backend_tensor_memset(t, value++, 0, ggml_nbytes(t));
+    }
+    ggml_backend_tensor_memset(saved_from.mtp_prev_hidden, value++, 0, ggml_nbytes(saved_from.mtp_prev_hidden));
+    at(saved_from, 31);
+    CHECK(save_qwen4exp_snapshot(backend, store, saved_from, deeper));
+    for (int i = 0; i < 31; ++i) deeper.tokens.push_back(100 + i);
+    // The rebuild: a new cache of the same layout, made while the old one still exists so their tensors differ.
+    make_small_cache(backend, rebuilt, 8);
+    std::set<const ggml_tensor *> rebuilt_tensors;
+    for (auto * t = ggml_get_first_tensor(rebuilt.ctx); t; t = ggml_get_next_tensor(rebuilt.ctx, t)) {
+        rebuilt_tensors.insert(t);
+    }
+    free_qwen4exp_cache(saved_from);
+    auto image = [&rebuilt]() {
+        std::vector<char> all;
+        for (auto * t = ggml_get_first_tensor(rebuilt.ctx); t; t = ggml_get_next_tensor(rebuilt.ctx, t)) {
+            const auto b = bytes(t);
+            all.insert(all.end(), b.begin(), b.end());
+        }
+        return all;
+    };
+    CHECK(restore_qwen4exp_snapshot(backend, backup, rebuilt));
+    const auto whole = image();
+    CHECK(drop_qwen4exp_snapshot_rows(rebuilt, backup) && backup.state_only);
+    for (auto [live, copy] : backup.strips) CHECK(rebuilt_tensors.count(live->view_src) == 1);
+    ggml_backend_buffer_clear(rebuilt.buf, 0xa5);
+    CHECK(restore_qwen4exp_snapshot(backend, backup, rebuilt, &deeper));
+    CHECK(rebuilt.cur_pos == 12 && image() == whole);
+    free_qwen4exp_snapshot(backup);
+    free_qwen4exp_snapshot(deeper);
+    free_qwen4exp_cache(rebuilt);
+    std::printf("PASS prefix snapshot rows dropped after the cache is rebuilt (%s memory)\n",
+                store == backend ? "device" : "system");
+}
+
 // The disk session cache's form of a snapshot: a copy and a hand-over both restore the very bytes the snapshot
 // restores, with its host fields; a read back into one system-memory buffer (what the disk reader makes) is kept in
 // place; a cache of another layout and a state-only snapshot are refused.
 static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
     CHECK(backend && store);
-    auto make_cache = [&](Qwen4ExpCache & c, int64_t head_dim) {
-        c.max_ctx = 63;
-        c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
-        auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, head_dim, 64, 2); };
-        c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
-        c.mtp_k = kv(); c.mtp_v = kv();
-        c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16);
-        for (int i = 0; i < 2; ++i) {
-            c.indexer_raw.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx));
-            c.indexer_k.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx / 4 + 1));
-            c.ssm_state.push_back(ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2));
-            c.conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16));
-            c.ple_conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 9, 16));
-        }
-        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
-        CHECK(c.buf);
-    };
     Qwen4ExpCache c, other;
-    make_cache(c, 8);
-    make_cache(other, 16);
+    make_small_cache(backend, c, 8);
+    make_small_cache(backend, other, 16);
     unsigned char value = 1;
     for (auto * t = ggml_get_first_tensor(c.ctx); t; t = ggml_get_next_tensor(c.ctx, t)) {
         ggml_backend_tensor_memset(t, value++, 0, ggml_nbytes(t));
@@ -669,6 +714,7 @@ static void kvflash(ggml_backend_t backend) {
     CHECK(save_qwen4exp_snapshot(backend, backend, c, relocated));
     CHECK(relocated.rows_in_pager && relocated.strips.size() == 2 && relocated.cur_pos == 2300);
     CHECK(export_qwen4exp_snapshot("layout", relocated).empty());
+    CHECK(!drop_qwen4exp_snapshot_rows(c, relocated) && relocated.rows_in_pager);   // no rows of its own to drop
     for (int p = 2300; p < 2600; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
     c.cur_pos = 2600;
     ggml_backend_tensor_memset(c.ssm_state[0], 0x22, 0, ggml_nbytes(c.ssm_state[0]));
@@ -922,11 +968,13 @@ int main(int argc, char ** argv) {
     copies(backend, backend);
     state_backup(backend, backend);
     disk_form(backend, backend);
+    rows_dropped_after_rebuild(backend, backend);
     const ggml_backend_t store = create_snapshot_backend(backend);
     if (store != backend) {
         copies(backend, store);
         state_backup(backend, store);
         disk_form(backend, store);
+        rows_dropped_after_rebuild(backend, store);
     }
     free_snapshot_backend(store, backend);
     memory(backend);

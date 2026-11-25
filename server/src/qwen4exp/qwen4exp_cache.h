@@ -307,9 +307,11 @@ int32_t qwen4exp_kv_row(const Qwen4ExpCache & c, int64_t pos);
 void qwen4exp_causal_mask(const Qwen4ExpCache & c, ggml_fp16_t * row, int64_t cols, int64_t q);
 
 // Prefix-sized copies, in the memory of the `store` backend they were saved to:
-// the device's own, or system memory (create_snapshot_backend). Live strip views
-// remain valid until the cache is freed; callers must release snapshots first.
-// No verify scratch is retained.
+// the device's own, or system memory (create_snapshot_backend). The copies outlive
+// the cache they were saved from (a release of the target device frees and rebuilds
+// the caches and keeps the snapshots); each strip's live view does not, so nothing
+// reads it after the save: the functions below take strip places from the cache
+// they are given. No verify scratch is retained.
 struct Qwen4ExpSnapshot {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -354,7 +356,7 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
 // the position (MTP K/V: below the carry row) and pooled blocks below indexer_blocks are final once written: no
 // forward, verify rollback or MTP catch-up writes below them, so a deeper snapshot that continued from this state
 // holds the same bytes. `c`: the cache `s` was saved from, or one with its layout. False, with `s` unchanged, when
-// `s` is not whole, does not match `c` or the allocation fails.
+// `s` is not whole (state-only, or its rows in the pager), does not match `c` or the allocation fails.
 bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 

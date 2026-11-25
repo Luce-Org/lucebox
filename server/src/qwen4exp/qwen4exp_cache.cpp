@@ -680,21 +680,22 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
 }
 
 bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) {
-    if (!s.ctx || !s.buf || s.state_only) return false;
+    if (!s.ctx || !s.buf || s.state_only || s.rows_in_pager) return false;
     // Which saved strips are rows: the layout `s` was saved with, every strip of it.
     std::vector<RestoreStrip> layout;
     if (!held_strips(c, s, s.mtp, layout)) return false;
     size_t count = 0;
     for (const RestoreStrip & strip : layout) count += !strip.rows;
-    // The point strips under the same views, in a buffer of their own: a ggml buffer cannot give back part of itself.
+    // The point strips, in a buffer of their own: a ggml buffer cannot give back part of itself. Their views are of
+    // `c`'s tensors (held_strips), never the ones `s` kept, whose cache may be freed (Qwen4ExpSnapshot).
     Qwen4ExpSnapshot kept;
     kept.ctx = ggml_init({(2 * count + 1) * ggml_tensor_overhead(), nullptr, true});
     if (!kept.ctx) return false;
     kept.strips.reserve(count);
     for (size_t i = 0; i < layout.size(); ++i) {
         if (layout[i].rows) continue;
-        const auto [live, copy] = s.strips[i];
-        kept.strips.emplace_back(ggml_view_1d(kept.ctx, live->view_src, ggml_nelements(copy), live->view_offs),
+        const ggml_tensor * copy = s.strips[i].second;
+        kept.strips.emplace_back(ggml_view_1d(kept.ctx, layout[i].t, ggml_nelements(copy), layout[i].off),
                                  ggml_new_tensor_1d(kept.ctx, copy->type, ggml_nelements(copy)));
     }
     kept.buf = ggml_backend_alloc_ctx_tensors_from_buft(kept.ctx, ggml_backend_buffer_get_type(s.buf));
