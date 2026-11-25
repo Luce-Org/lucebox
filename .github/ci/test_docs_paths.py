@@ -76,6 +76,8 @@ def command_lines(lines: list[tuple[int, str]]):
         line = raw.strip()
         if line.startswith("$ "):
             line = line[2:].strip()
+        if line.endswith("\\"):
+            line = line[:-1].rstrip()
         if not line or line.startswith("#"):
             continue
         try:
