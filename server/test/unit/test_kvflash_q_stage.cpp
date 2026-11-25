@@ -106,13 +106,22 @@ TEST_CASE(KvflashQStageFixture, staged_row_reads_back_per_layer) {
     const size_t plane = q_stage->nb[2];   // one q_cap plane: [head_dim, n_head]
     CHECK(plane == (size_t)kHd * kHeads * sizeof(float));
     for (int r = 0; r < n_tokens; ++r) {
+        std::vector<float> got_2d((size_t)kLayers * kHd * kHeads);
+        ggml_backend_tensor_get_2d(q_stage, got_2d.data(),
+                                   (size_t)r * plane, plane, (size_t)kLayers,
+                                   q_stage->nb[3], plane);
         for (int l = 0; l < kLayers; ++l) {
             std::vector<float> got(kHd * kHeads);
             ggml_backend_tensor_get(q_stage, got.data(),
                                     luce::common::kvflash_q_stage_offset(q_stage, l, r), plane);
             bool same = true;
             for (int h = 0; h < kHeads; ++h)
-                for (int d = 0; d < kHd; ++d) same = same && got[(size_t)h * kHd + d] == value(l, r, h, d);
+                for (int d = 0; d < kHd; ++d) {
+                    const float expect = value(l, r, h, d);
+                    const size_t idx = (size_t)h * kHd + d;
+                    same = same && got[idx] == expect &&
+                           got_2d[(size_t)l * kHd * kHeads + idx] == expect;
+                }
             CHECK(same);
         }
     }

@@ -63,10 +63,11 @@ inline int kvflash_uq_queries() {
 }
 
 // Rows of the verify-query stage (TargetCache::q_stage): the spec verify pass
-// stages the query of each of its rows so q_cap can take the last accepted one.
-// Only a KVFlash process (LUCE_KVFLASH names a pool) allocates it.
-inline int kvflash_q_stage_rows(int max_verify_tokens) {
-    return kvflash_pool_process() ? std::max(max_verify_tokens, 0) : 0;
+// stages the query of each of its rows so decode-time target-QK reselection can
+// read the last accepted row's query directly. Only allocated when the caller
+// requests it (serial KVFlash with the target-QK policy and a draft model).
+inline int kvflash_q_stage_rows(int max_verify_tokens, bool need_q_stage) {
+    return need_q_stage ? std::max(max_verify_tokens, 0) : 0;
 }
 
 // Selector-v2 query tail (kvflash_q_tail_): rows are query vectors of `qsize` floats, oldest first, the last

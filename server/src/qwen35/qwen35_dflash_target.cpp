@@ -490,7 +490,7 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*compact_slots=*/false, verify_top_n_,
                            /*keep_base_ssm_state=*/keep_base,
                            replay_slot_ids,
-                           /*capture_q_all=*/false, /*capture_q_stage=*/stage_q)) {
+                           TargetStepQueryCapture{/*q_all=*/false, /*q_stage=*/stage_q})) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
