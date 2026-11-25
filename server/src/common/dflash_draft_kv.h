@@ -103,13 +103,26 @@ void draft_kv_free(DraftKvState & st);
 // width: noise positions the next step drafts, at most st.q_len
 // (0 = st.q_len). The full-attention mask hides the noise scratch rows past
 // it, which still hold the K/V of an earlier, wider step.
+struct DraftKvStepOpts {
+    int width = 0;       // noise positions to draft, at most st.q_len (0 = st.q_len)
+    int valid_from = 0;  // first ring position this session wrote; window never reads below it
+};
+
 bool draft_kv_begin_step(DraftKvState & st,
                          const DraftWeights & dw,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width = 0,
-                         int valid_from = 0);   // first ring position this session wrote; the window never reads below it
+                         const DraftKvStepOpts & opts);
+
+inline bool draft_kv_begin_step(DraftKvState & st,
+                                const DraftWeights & dw,
+                                ggml_backend_t backend,
+                                const DraftFeatureMirror & ring,
+                                int committed,
+                                int width = 0) {
+    return draft_kv_begin_step(st, dw, backend, ring, committed, DraftKvStepOpts{width, 0});
+}
 
 struct DraftKvBatchGraph {
     DraftKvBatchGraph() = default;

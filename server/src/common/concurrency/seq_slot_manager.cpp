@@ -297,20 +297,27 @@ void SeqSlotManager::commit_prefill(int slot) {
     s.phase = SeqSlotPhase::decode;
 }
 
-bool SeqSlotManager::rewind_prefill(int slot, int pos) {
-    if (!is_prefilling(slot)) return false;
+bool SeqSlotManager::rollback_prefill(int slot, int n_tokens) {
+    if (!is_prefilling(slot) || n_tokens < 0) return false;
     SeqSlot & s = slots_[(size_t)slot];
-    if (pos < 0 || pos > s.cur_pos || !s.staged_tokens.empty()) return false;
-    if (pos == s.cur_pos) return true;
+    if (n_tokens > s.cur_pos || !s.staged_tokens.empty()) return false;
+    if (n_tokens == 0) return true;
     const PagedKvStatus status = kv_.rollback_append(
-        s.handle, static_cast<uint32_t>(s.cur_pos - pos));
+        s.handle, static_cast<uint32_t>(n_tokens));
     if (status != PagedKvStatus::Ok) {
-        std::fprintf(stderr, "[parallel] slot %d prefill rewind to %d failed: %s\n",
-                     slot, pos, paged_kv_status_string(status));
+        std::fprintf(stderr, "[parallel] slot %d prefill rollback of %d tokens failed: %s\n",
+                     slot, n_tokens, paged_kv_status_string(status));
         return false;
     }
-    s.cur_pos = pos;
+    s.cur_pos -= n_tokens;
     return true;
+}
+
+bool SeqSlotManager::rewind_prefill(int slot, int pos) {
+    if (!is_prefilling(slot)) return false;
+    const SeqSlot & s = slots_[(size_t)slot];
+    if (pos < 0 || pos > s.cur_pos) return false;
+    return rollback_prefill(slot, s.cur_pos - pos);
 }
 
 SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
@@ -431,7 +438,7 @@ bool SeqSlotManager::reserve_decode(const std::vector<int> & growth) {
 }
 
 bool SeqSlotManager::detach_kv(int slot) {
-    if (!kv_.parkable() || !is_active(slot)) return false;
+    if (!kv_.supports_in_flight_suspend() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.parked() || !s.staged_tokens.empty()) return false;
     if (kv_.clear(s.handle) != PagedKvStatus::Ok) return false;
@@ -476,7 +483,7 @@ bool SeqSlotManager::attach_kv(int slot) {
 }
 
 bool SeqSlotManager::evict_for_recompute(int slot, int32_t pending_token) {
-    if (!kv_.parkable() || !is_active(slot)) return false;
+    if (!kv_.supports_in_flight_suspend() || !is_active(slot)) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.recomputing() || !s.staged_tokens.empty()) return false;
     // A request that cannot fit the pool even alone can never resume;
@@ -530,14 +537,14 @@ bool SeqSlotManager::kv_restore_feasible(int slot) const {
     return needed + margin <= kv_.free_block_count();
 }
 
-bool SeqSlotManager::park(int slot, std::vector<int32_t> & history) {
+bool SeqSlotManager::park_session(int slot, std::vector<int32_t> & history) {
     if (slot < 0 || slot >= (int)slots_.size()) return false;
     SeqSlot & s = slots_[(size_t)slot];
     if (!s.decoding() || !s.staged_tokens.empty() || s.cur_pos <= 0 ||
         s.sample_history.size() != (size_t)s.cur_pos) return false;
-    const PagedKvStatus status = kv_.park(s.handle);
+    const PagedKvStatus status = kv_.park_session(s.handle);
     if (status != PagedKvStatus::Ok) {
-        std::fprintf(stderr, "[parallel] slot %d park failed: %s\n", slot, paged_kv_status_string(status));
+        std::fprintf(stderr, "[parallel] slot %d park_session failed: %s\n", slot, paged_kv_status_string(status));
         return false;
     }
     history = std::move(s.sample_history);

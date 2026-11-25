@@ -250,8 +250,9 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width,
-                         int valid_from) {
+                         const DraftKvStepOpts & opts) {
+    const int width = opts.width;
+    const int valid_from = opts.valid_from;
     if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
         committed <= 0 || width < 0 || width > st.q_len) return false;
     const int noise_width = width > 0 ? width : st.q_len;

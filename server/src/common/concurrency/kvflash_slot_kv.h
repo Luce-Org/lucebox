@@ -51,11 +51,27 @@ public:
     // Logical capacity: eviction lets a slot hold max_ctx tokens in a quota-sized slice.
     uint32_t physical_block_count() const override { return (uint32_t)pagers_.size() * logical_blocks_(); }
     uint32_t max_sequences() const override { return (uint32_t)pagers_.size(); }
-    bool parkable() const override { return false; }
+    bool supports_in_flight_suspend() const override { return false; }
     uint32_t free_block_count() const override {
         uint32_t used = 0;
         for (const Slot & s : slots_) if (s.live || s.parked) used += s.capacity_blocks;
         return physical_block_count() - used;
+    }
+    uint32_t reclaimable_block_count() const override {
+        uint32_t parked_blocks = 0;
+        int64_t parked_bytes = 0;
+        for (const Slot & s : slots_) {
+            if (!s.live && s.parked) {
+                parked_blocks += s.capacity_blocks;
+                parked_bytes += ledger_.reserved_of(s.request);
+            }
+        }
+        if (parked_blocks == 0) return 0;
+        const int64_t chunk_bytes = cfg_.chunk_bytes ? cfg_.chunk_bytes
+            : (pagers_.empty() ? 0 : (int64_t)pagers_.front()->chunk_bytes());
+        if (chunk_bytes <= 0) return parked_blocks;
+        const int64_t avail_bytes = std::max<int64_t>(0, ledger_.budget_bytes() - ledger_.used_bytes() + parked_bytes);
+        return (uint32_t)std::min<uint64_t>(parked_blocks, (uint64_t)(avail_bytes / chunk_bytes));
     }
 
     // The most tokens the NEXT acquire's request can hold, prompt + generation bound (one-shot, 0 after it):
@@ -291,7 +307,7 @@ public:
 
     // Sticky session: the slot leaves the live set with its rows, pager state and
     // host reservation; a resume at the same slot continues at len.
-    PagedKvStatus park(PagedKvSequenceHandle h) override {
+    PagedKvStatus park_session(PagedKvSequenceHandle h) override {
         Slot * s = live_(h);
         if (!s) return PagedKvStatus::StaleHandle;
         pagers_[h.slot]->score_hook = nullptr;   // the turn's scores die with the request

@@ -115,11 +115,11 @@ public:
     SeqEngine::AdmitResult admit_at(int slot, uint64_t request_id,
                                     const std::vector<int32_t> & prompt,
                                     const SamplerCfg & sampler, int resume_pos);
-    // Park a decoded slot: its KV stays with the pool (SlotKv::park), its fed
-    // tokens come back as the session's history, the slot becomes inactive.
-    // False (nothing changes) unless the slot is decoding with no staged
-    // tokens and a history that matches its position.
-    bool park(int slot, std::vector<int32_t> & history);
+    // Park a finished decoded slot as a sticky session: its KV stays with the
+    // allocator (SlotKv::park_session), its fed tokens come back as the session's
+    // history, and the slot becomes inactive. False (nothing changes) unless the
+    // slot is decoding with no staged tokens and a history matching its position.
+    bool park_session(int slot, std::vector<int32_t> & history);
 
     struct PrefillChunk {
         bool ok = false;
@@ -143,9 +143,12 @@ public:
     PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
 
     void commit_prefill(int slot);
+    // Roll back the last `n_tokens` prefill rows appended to this slot.
+    // False when the slot is not prefilling, has staged tokens, or n_tokens is out of range.
+    bool rollback_prefill(int slot, int n_tokens);
     // KVFlash mode 4: drop the rows of [pos, cur_pos) and continue the prefill
-    // from pos (the pager truncates). False when the slot is not prefilling or
-    // pos is past cur_pos; true and a no-op at pos == cur_pos.
+    // from pos (delegates to rollback_prefill). False when the slot is not prefilling
+    // or pos is past cur_pos; true and a no-op at pos == cur_pos.
     bool rewind_prefill(int slot, int pos);
 
     struct StepAppend {
@@ -202,7 +205,7 @@ public:
     void retire(int slot);
 
     int slot_count() const { return (int)slots_.size(); }
-    bool parkable() const { return kv_.parkable(); }
+    bool supports_in_flight_suspend() const { return kv_.supports_in_flight_suspend(); }
     int max_context() const { return max_ctx_; }
     // Free counts the blocks neither appended nor reserved by any slot; a
     // parked slot holds none until it resumes.

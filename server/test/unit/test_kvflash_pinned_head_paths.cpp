@@ -178,7 +178,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, restart_adopts_a_full_session_and_the_r
     REQUIRE(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(a.slot, hist));
+    REQUIRE(mgr.park_session(a.slot, hist));
     CHECK(bound(w, a.slot, kK));                                 // parked-gpu: still bound
     const std::vector<uint8_t> blob = w.s[(size_t)a.slot]->serialize();
     // "restart": the pagers are fresh, the binding comes from meta.json
@@ -206,7 +206,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_restart_restores_the_parked_layout_lr
     REQUIRE(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(a.slot, hist));
+    REQUIRE(mgr.park_session(a.slot, hist));
     KvFlashSlotPager & live = *w.s[(size_t)a.slot];
     REQUIRE(live.resident_blocks() < live.n_chunks());           // it evicted: not every chunk is in the pool
     std::vector<int> identity;
@@ -238,7 +238,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_rung_rewind_of_a_parked_session_keeps
     REQUIRE(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(a.slot, hist));
+    REQUIRE(mgr.park_session(a.slot, hist));
     REQUIRE(w.kv->truncate_parked(a.slot, 700));
     CHECK(bound(w, a.slot, kK));
     REQUIRE(w.kv->truncate_parked(a.slot, kK * kChunk));         // exactly the prefix: still held
@@ -266,7 +266,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, a_failed_admission_leaves_no_stale_bind
     REQUIRE(prefill(w, mgr, a.slot, 640 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(a.slot, hist));
+    REQUIRE(mgr.park_session(a.slot, hist));
     // a resume the host ledger refuses: the session stays parked and bound as it was
     w.kv->set_next_total_tokens(20 * kChunk);
     w.kv->set_next_resume(a.slot, 640);
@@ -291,7 +291,7 @@ TwoParked two_parked(World & w, SeqSlotManager & mgr) {
     t.a = capture_on_miss(w, mgr, 1, 640);
     must(prefill(w, mgr, t.a.slot, 640 - kK * kChunk));
     mgr.commit_prefill(t.a.slot);
-    must(mgr.park(t.a.slot, hist));
+    must(mgr.park_session(t.a.slot, hist));
     t.b_slot = (t.a.slot + 1) % 3;
     t.free_slot = (t.a.slot + 2) % 3;
     w.kv->set_next_total_tokens(640 + 60);
@@ -299,7 +299,7 @@ TwoParked two_parked(World & w, SeqSlotManager & mgr) {
     must(mgr.admit_at(t.b_slot, 2, prompt_of(640, 7), SamplerCfg{}, 0).status == SeqEngine::AdmitResult::Status::admitted);
     must(prefill(w, mgr, t.b_slot, 640));
     mgr.commit_prefill(t.b_slot);
-    must(mgr.park(t.b_slot, hist));
+    must(mgr.park_session(t.b_slot, hist));
     must(w.kv->parked(t.a.slot) && w.kv->parked(t.b_slot) && w.ledger.used_bytes() == 22 * kChunkBytes);
     return t;
 }
@@ -361,7 +361,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, cold_slot_reuse_releases_the_old_bindin
     REQUIRE(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(a.slot, hist));
+    REQUIRE(mgr.park_session(a.slot, hist));
     const auto r = admit_cold(w, mgr, 2, prompt_of(2000, 4), a.slot);   // the slot's session is replaced
     REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
     REQUIRE(r.slot == a.slot);
@@ -487,7 +487,7 @@ Parked parked_with_head() {
     must(prefill(w, mgr, a.slot, 1200 - kK * kChunk));
     mgr.commit_prefill(a.slot);
     Parked p;
-    must(mgr.park(a.slot, p.hist));
+    must(mgr.park_session(a.slot, p.hist));
     p.blob = w.s[(size_t)a.slot]->serialize();
     p.hash = a.hash; p.slot = a.slot;
     return p;
@@ -529,7 +529,7 @@ TEST_CASE(KvflashPinnedHeadPathsFixture, the_binding_a_restored_session_parks_wi
         REQUIRE(prefill(w, mgr, p.slot, 1));
         mgr.commit_prefill(p.slot);
         std::vector<int32_t> hist;
-        REQUIRE(mgr.park(p.slot, hist));
+        REQUIRE(mgr.park_session(p.slot, hist));
 
         KvFlashParkStats st;
         st.tokens = hist.size();

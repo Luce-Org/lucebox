@@ -161,7 +161,7 @@ TEST_CASE(KvflashSlotKvFixture, trim_to_len_drops_the_chunk_a_chain_round_planne
     CHECK(!w.kv->trim_to_len((int)a.slot));                               // idempotent
     CHECK(!w.kv->trim_to_len(-1));
     // a park records exactly ceil(61/64) chunks (the bundle adopt that checks the count is PR 10's)
-    REQUIRE(w.kv->park(a) == PagedKvStatus::Ok);
+    REQUIRE(w.kv->park_session(a) == PagedKvStatus::Ok);
     CHECK(p.n_chunks() == 1);
 }
 
@@ -270,9 +270,9 @@ TEST_CASE(KvflashSlotKvFixture, retire_frees_the_slice_the_reservation_and_nulls
 
 TEST_CASE(KvflashSlotKvFixture, kvflash_slots_are_not_parkable) {
     World w;
-    CHECK(!w.kv->parkable());
+    CHECK(!w.kv->supports_in_flight_suspend());
     SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
-    CHECK(!mgr.parkable());
+    CHECK(!mgr.supports_in_flight_suspend());
     const SeqEngine::AdmitResult r = mgr.admit(1, std::vector<int32_t>(300, 1), SamplerCfg{});
     REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
     REQUIRE(mgr.append_prefill(r.slot, 300).ok);
@@ -375,16 +375,16 @@ TEST_CASE(KvflashSlotKvFixture, park_keeps_the_pager_and_the_reservation_and_onl
     const auto r = admit_tokens(mgr, *w.kv, 1, 640);
     REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
     std::vector<int32_t> hist;
-    CHECK(!mgr.park(r.slot, hist));                                   // still prefilling
+    CHECK(!mgr.park_session(r.slot, hist));                                   // still prefilling
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
-    CHECK(mgr.park(r.slot, hist));
+    CHECK(mgr.park_session(r.slot, hist));
     CHECK(hist.size() == 640u);
     CHECK(!mgr.is_active(r.slot));
     CHECK(w.kv->parked(r.slot));
     CHECK(w.s[(size_t)r.slot]->n_chunks() == 10);                    // the KV stays
     CHECK(w.ledger.reservation_count() == 1);                        // host backing stays charged
-    CHECK(!mgr.park(r.slot, hist));                                  // not active any more
+    CHECK(!mgr.park_session(r.slot, hist));                                  // not active any more
     w.kv->drop_parked(r.slot);
     CHECK(!w.kv->parked(r.slot));
     CHECK(w.s[(size_t)r.slot]->n_chunks() == 0);
@@ -399,7 +399,7 @@ TEST_CASE(KvflashSlotKvFixture, resume_rebinds_the_parked_slot_at_its_length_for
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t charged = w.ledger.used_bytes();
     // resume: the manager admits into the parked slot at cur_pos 640, the allocator keeps its rows
     w.kv->set_next_total_tokens(800 + 60);
@@ -429,7 +429,7 @@ TEST_CASE(KvflashSlotKvFixture, a_resume_hint_that_does_not_match_the_parked_slo
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     PagedKvSequenceHandle h;
     w.kv->set_next_resume(r.slot, 600);                              // wrong length
     CHECK(w.kv->acquire_reserved(2, 700, h) == PagedKvStatus::InvalidArgument);
@@ -454,7 +454,7 @@ TEST_CASE(KvflashSlotKvFixture, a_parked_session_truncates_to_a_checkpoint_and_r
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     CHECK(!w.kv->truncate_parked(r.slot, 641));                       // past the parked length
     CHECK(!w.kv->truncate_parked(1 - r.slot, 10));                    // not parked
     REQUIRE(w.kv->truncate_parked(r.slot, 500));
@@ -482,7 +482,7 @@ TEST_CASE(KvflashSlotKvFixture, a_resume_the_host_budget_refuses_leaves_the_sess
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     w.kv->set_next_total_tokens(1280);                               // 20 chunks in the other slot (the allocator skips the parked one)
     const auto other = mgr.admit_at(1 - r.slot, 5, std::vector<int32_t>(1280, 1), SamplerCfg{}, 0);
     REQUIRE(other.status == SeqEngine::AdmitResult::Status::admitted);
@@ -509,7 +509,7 @@ TEST_CASE(KvflashSlotKvFixture, a_resume_whose_total_exceeds_the_whole_host_budg
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t used = w.ledger.used_bytes();
     w.kv->set_next_total_tokens(4000);                               // 63 chunks: more than the whole 50-chunk budget, nothing else parked
     w.kv->set_next_resume(r.slot, 640);
@@ -529,7 +529,7 @@ TEST_CASE(KvflashSlotKvFixture, the_capacity_probe_names_a_total_above_the_whole
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t used = w.ledger.used_bytes();
     CHECK(w.kv->exceeds_host_budget(r.slot, 4000));          // 63 chunks > 50
     CHECK(!w.kv->exceeds_host_budget(r.slot, 3200));         // 50 chunks fit exactly
@@ -549,7 +549,7 @@ TEST_CASE(KvflashSlotKvFixture, the_capacity_probe_clamps_the_total_to_max_ctx_e
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     CHECK(w.kv->exceeds_host_budget(r.slot, kMaxCtx + 1));
     CHECK(w.kv->exceeds_host_budget(r.slot, kMaxCtx));
     w.kv->set_next_total_tokens(kMaxCtx + 1);                // admission agrees: the same refusal, not a different charge
@@ -567,7 +567,7 @@ TEST_CASE(KvflashSlotKvFixture, a_prompt_over_max_ctx_is_refused_by_the_manager_
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t used = w.ledger.used_bytes();
     w.kv->set_next_total_tokens(kMaxCtx + 10);
     w.kv->set_next_resume(r.slot, 640);
@@ -590,7 +590,7 @@ TEST_CASE(KvflashSlotKvFixture, the_probe_refuses_a_new_sid_above_the_budget_wit
         REQUIRE(mgr.append_prefill(r.slot, 640).ok);
         mgr.commit_prefill(r.slot);
         std::vector<int32_t> hist;
-        REQUIRE(mgr.park(r.slot, hist));
+        REQUIRE(mgr.park_session(r.slot, hist));
     }
     const int64_t used = w.ledger.used_bytes();
     CHECK(w.kv->exceeds_host_budget(0, 3900 + 100));
@@ -608,7 +608,7 @@ TEST_CASE(KvflashSlotKvFixture, a_serialized_parked_session_is_adopted_into_a_fr
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const std::vector<uint8_t> blob = w.s[(size_t)r.slot]->serialize();
     World w2;                                                         // the restarted server
     SeqSlotManager mgr2(*w2.kv, (int)kMaxCtx);
@@ -649,7 +649,7 @@ TEST_CASE(KvflashSlotKvFixture, gap4_the_parked_history_has_the_allocator_length
         REQUIRE(mgr.append_prefill(r.slot, len).ok);
         mgr.commit_prefill(r.slot);
         std::vector<int32_t> hist;
-        REQUIRE(mgr.park(r.slot, hist));
+        REQUIRE(mgr.park_session(r.slot, hist));
         CHECK(hist.size() == (size_t)len);                                      // the allocator's length at park
         const int pp = kvflash_park_point(len, c.stash, c.ckpt, c.trunk);
         if (pp < len) { REQUIRE(w.kv->truncate_parked(r.slot, (uint32_t)pp)); hist.resize((size_t)pp); }
@@ -679,7 +679,7 @@ TEST_CASE(KvflashSlotKvFixture, staging_reservation_follows_the_sessions_own_chu
     CHECK(w.kv->reserved_bytes((int)a.slot) == 2 * (kChunkBytes + 200) + 500);
     CHECK(w.kv->acquire_reserved(2, 6 * kChunk, b) == PagedKvStatus::Ok);
     CHECK(w.kv->reserved_bytes((int)b.slot) == 6 * (kChunkBytes + 200) + 500);
-    CHECK(w.kv->park(a) == PagedKvStatus::Ok);
+    CHECK(w.kv->park_session(a) == PagedKvStatus::Ok);
     CHECK(w.kv->reserved_bytes((int)a.slot) == 2 * (kChunkBytes + 200) + 500);   // a parked session keeps its reservation
     CHECK(w.ledger.used_bytes() == w.kv->reserved_bytes((int)a.slot) + w.kv->reserved_bytes((int)b.slot));
 }
@@ -695,7 +695,7 @@ TEST_CASE(KvflashSlotKvFixture, a_resume_keeps_the_larger_reservation_while_the_
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t parked_bytes = w.kv->reserved_bytes(r.slot);
     REQUIRE(parked_bytes > 0);
     REQUIRE(w.kv->truncate_parked(r.slot, 128));                      // rewind to a 2-chunk checkpoint
@@ -711,7 +711,7 @@ TEST_CASE(KvflashSlotKvFixture, a_resume_keeps_the_larger_reservation_while_the_
     const auto r2 = admit_tokens(mgr, *w.kv, 3, 640);
     REQUIRE(mgr.append_prefill(r2.slot, 640).ok);
     mgr.commit_prefill(r2.slot);
-    REQUIRE(mgr.park(r2.slot, hist));
+    REQUIRE(mgr.park_session(r2.slot, hist));
     REQUIRE(w.kv->truncate_parked(r2.slot, 128));
     w.kv->set_next_total_tokens(128 + 60);
     w.kv->set_next_resume(r2.slot, 128);
@@ -730,7 +730,7 @@ TEST_CASE(KvflashSlotKvFixture, the_reservation_floor_ends_when_the_writer_is_do
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const int64_t parked_bytes = w.kv->reserved_bytes(r.slot);
     REQUIRE(w.kv->truncate_parked(r.slot, 128));
     w.kv->set_next_total_tokens(128 + 60);
@@ -758,7 +758,7 @@ TEST_CASE(KvflashSlotKvFixture, a_restore_into_a_full_host_budget_is_busy_then_a
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));                                 // the victim holds 10 chunks
+    REQUIRE(mgr.park_session(r.slot, hist));                                 // the victim holds 10 chunks
     const std::vector<uint8_t> blob = w.s[(size_t)r.slot]->serialize();
     const int into = 1 - r.slot;
     auto adopt = [&] { return kvflash_adopt_of(w.kv->adopt_parked(into, 77, 640, blob.data(), blob.size())); };
@@ -782,7 +782,7 @@ TEST_CASE(KvflashSlotKvFixture, the_adopt_probe_matches_adopt_parked_on_the_ledg
     REQUIRE(mgr.append_prefill(r.slot, 640).ok);
     mgr.commit_prefill(r.slot);
     std::vector<int32_t> hist;
-    REQUIRE(mgr.park(r.slot, hist));
+    REQUIRE(mgr.park_session(r.slot, hist));
     const std::vector<uint8_t> blob = w.s[(size_t)r.slot]->serialize();
     const int into = 1 - r.slot;
     const int64_t used = w.ledger.used_bytes();
@@ -794,4 +794,30 @@ TEST_CASE(KvflashSlotKvFixture, the_adopt_probe_matches_adopt_parked_on_the_ledg
     CHECK(w.kv->adopt_probe(into, 77, 640) == PagedKvStatus::Ok);
     CHECK(w.ledger.used_bytes() == 0);
     CHECK(w.kv->adopt_parked(into, 77, 640, blob.data(), blob.size()) == PagedKvStatus::Ok);
+}
+
+TEST_CASE(KvflashSlotKvFixture, reclaimable_block_count_and_rollback_prefill) {
+    World w;
+    SeqSlotManager mgr(*w.kv, (int)kMaxCtx);
+    CHECK(w.kv->reclaimable_block_count() == 0u);
+
+    const auto r = admit_tokens(mgr, *w.kv, 1, 640);
+    REQUIRE(r.status == SeqEngine::AdmitResult::Status::admitted);
+    REQUIRE(mgr.append_prefill(r.slot, 320).ok);
+    CHECK(mgr.slot(r.slot).cur_pos == 320);
+    // rollback_prefill(slot, n) rewinds exact token count and rejects invalid counts.
+    CHECK(!mgr.rollback_prefill(r.slot, -1));
+    CHECK(!mgr.rollback_prefill(r.slot, 400));
+    CHECK(mgr.rollback_prefill(r.slot, 0));
+    CHECK(mgr.rollback_prefill(r.slot, 120));
+    CHECK(mgr.slot(r.slot).cur_pos == 200);
+    REQUIRE(mgr.append_prefill(r.slot, 440).ok);
+    mgr.commit_prefill(r.slot);
+    CHECK(w.kv->reclaimable_block_count() == 0u);
+
+    std::vector<int32_t> hist;
+    REQUIRE(mgr.park_session(r.slot, hist));
+    CHECK(w.kv->reclaimable_block_count() > 0u);
+    w.kv->drop_parked(r.slot);
+    CHECK(w.kv->reclaimable_block_count() == 0u);
 }

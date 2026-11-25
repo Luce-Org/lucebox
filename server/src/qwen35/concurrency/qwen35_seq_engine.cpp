@@ -495,7 +495,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
         lanes.push_back({i, input.slot, input.token, state, mirror});
         if (!draft_kv_begin_step(
                 *state, dw, b_.draft_backend_, *mirror,
-                slots_.slot(input.slot).cur_pos, draft_width, feat_from_of_(input.slot))) {
+                slots_.slot(input.slot).cur_pos,
+                DraftKvStepOpts{draft_width, feat_from_of_(input.slot)})) {
             reset_lanes();
             return std::nullopt;
         }
@@ -3878,7 +3879,7 @@ void Qwen35SeqEngine::retire_(int slot, bool reply_first) {
         trunk_[(size_t)slot] = SlotCkpt{};
         extra_[(size_t)slot] = SlotCkpt{};
         std::vector<int32_t> history;
-        if (sticky_on_ && !tainted && slots_.park(slot, history)) {   // the KV and the recurrent state stay in the slot
+        if (sticky_on_ && !tainted && slots_.park_session(slot, history)) {   // the KV and the recurrent state stay in the slot
             const int fed = (int)history.size();
             const int P = kvflash_park_point(fed, stash_pos, ckpt.pos, std::max(trunk.pos, extra.pos), park_tail_);
             if (P < fed) {   // one token short: the rows, the state and the history all stop at P
