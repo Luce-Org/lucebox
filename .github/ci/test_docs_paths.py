@@ -29,7 +29,21 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-REPO_NAME = REPO.name
+
+
+def _repo_names() -> set[str]:
+    """Names a checkout may have: the workspace (CI) and the clone directory."""
+    names = {REPO.name}
+    remote = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=REPO, capture_output=True, text=True
+    )
+    if remote.returncode == 0 and remote.stdout.strip():
+        url = remote.stdout.strip().rstrip("/").removesuffix(".git")
+        names.add(url.rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+    return names
+
+
+REPO_NAMES = _repo_names()
 
 FENCE = re.compile(r"^\s*```(\w*)")
 SHELL_LANGS = {"bash", "sh", "console", "shell"}
@@ -93,7 +107,7 @@ def command_lines(lines: list[tuple[int, str]]):
 def normalise(path: str) -> Path:
     """Resolve a documented path to a repo-relative one (repo name = root)."""
     candidate = Path(path)
-    if candidate.parts and candidate.parts[0] == REPO_NAME:
+    if candidate.parts and candidate.parts[0] in REPO_NAMES:
         candidate = Path(*candidate.parts[1:]) if len(candidate.parts) > 1 else Path()
     return candidate
 
@@ -115,7 +129,7 @@ def check_block(language: str, lines: list[tuple[int, str]]) -> list[str]:
         if tokens[:2] == ["git", "clone"]:
             url = tokens[-1].rstrip("/").removesuffix(".git")
             name = url.rsplit("/", 1)[-1]
-            if name == REPO_NAME:
+            if name in REPO_NAMES:
                 virtual.add(Path())
             elif name:
                 virtual.add(cwd / name)
