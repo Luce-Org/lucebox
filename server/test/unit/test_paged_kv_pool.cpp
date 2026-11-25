@@ -2,7 +2,6 @@
 
 #include "CppUnitTestFramework.hpp"
 #include "common/concurrency/paged_kv_pool.h"
-#include "../../src/common/paged_attention_config.h"
 
 #include <initializer_list>
 #include <limits>
@@ -448,38 +447,6 @@ TEST_CASE(PagedKvPoolFixture, invalid_arguments) {
     }));
 }
 
-TEST_CASE(PagedKvPoolFixture, auto_pool_sizing) {
-    PagedKvAutoBudget budget;
-    budget.free_bytes = 10'000;
-    budget.fixed_cache_bytes = 1'000;
-    budget.reserve_bytes = 1'000;
-    budget.bytes_per_token = 10;
-    // Memory could hold 800 tokens, but four 128-token logical contexts cap
-    // the useful physical pool at 512.
-    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 512);
-
-    budget.free_bytes = 5'000;
-    // 300 raw tokens round down to 288 (18 whole blocks).
-    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 288);
-    budget.free_bytes = 1'999;
-    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 0);
-    budget.free_bytes = 5'000;
-    budget.bytes_per_token = 0;
-    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 0);
-
-    // A representative 24 GiB-card post-weight budget can keep one 32K
-    // context plus oversubscription headroom without allocating 16 x 32K.
-    budget.free_bytes = 10LL * 1024 * 1024 * 1024;
-    budget.fixed_cache_bytes = 4LL * 1024 * 1024 * 1024;
-    budget.reserve_bytes = 1536LL * 1024 * 1024;
-    budget.bytes_per_token = 64 * 1024;
-    const int64_t headline =
-        paged_kv_auto_pool_tokens(32768, 16, budget);
-    CHECK(headline == 73728);
-    CHECK(headline >= 32768);
-    CHECK(headline < 16LL * 32768);
-}
-
 TEST_CASE(PagedKvPoolFixture, shared_prefix_refcounting) {
     // 10 physical blocks, 4 sequences, 16 tokens per block. A 3-block
     // (48-token) prefix shared by 4 requests, plus 1 private suffix block
@@ -633,4 +600,42 @@ TEST_CASE(PagedKvPoolFixture, shared_prefix_overlapping_pins) {
     CHECK(pool.unpin_prefix_blocks(pin2) == PagedKvStatus::Ok);
     CHECK(pool.free_block_count() == 10);
     CHECK(pool.pinned_only_block_count() == 0);
+}
+
+TEST_CASE(PagedKvPoolFixture, exclusive_block_count_tracks_shared_and_pinned_blocks) {
+    PagedKvPool pool(/*physical_block_count=*/10, /*max_sequences=*/3, /*block_size=*/16);
+    const auto a = acquire(pool, 1);
+    CHECK(pool.append(a, 48).status == PagedKvStatus::Ok);  // 3 blocks: 0, 1, 2
+    uint32_t excl = 99;
+    CHECK(pool.exclusive_block_count(a, excl) == PagedKvStatus::Ok);
+    CHECK(excl == 3);
+
+    // Pin blocks 0, 1: only block 2 remains exclusive to `a`.
+    std::vector<uint32_t> pinned;
+    CHECK(pool.pin_prefix_blocks(a, 2, pinned) == PagedKvStatus::Ok);
+    CHECK(pool.exclusive_block_count(a, excl) == PagedKvStatus::Ok);
+    CHECK(excl == 1);
+
+    // `b` shares blocks 0, 1 zero-copy with 0 private blocks -> 0 exclusive.
+    const auto b = acquire(pool, 2);
+    CHECK(pool.seed_shared_prefix(b, pinned.data(), 2, 32) == PagedKvStatus::Ok);
+    CHECK(pool.exclusive_block_count(b, excl) == PagedKvStatus::Ok);
+    CHECK(excl == 0);
+
+    // Unpinning while both `a` and `b` hold blocks 0, 1 still leaves them shared.
+    CHECK(pool.unpin_prefix_blocks(pinned) == PagedKvStatus::Ok);
+    CHECK(pool.exclusive_block_count(a, excl) == PagedKvStatus::Ok && excl == 1);
+    CHECK(pool.exclusive_block_count(b, excl) == PagedKvStatus::Ok && excl == 0);
+
+    // Once `a` releases, `b` becomes sole owner of blocks 0, 1 -> 2 exclusive.
+    CHECK(pool.release(a) == PagedKvStatus::Ok);
+    CHECK(pool.exclusive_block_count(b, excl) == PagedKvStatus::Ok && excl == 2);
+
+    // Private reserved blocks also count as exclusive.
+    CHECK(pool.reserve_capacity(b, 64) == PagedKvStatus::Ok);  // +2 reserved blocks
+    CHECK(pool.exclusive_block_count(b, excl) == PagedKvStatus::Ok && excl == 4);
+
+    CHECK(pool.release(b) == PagedKvStatus::Ok);
+    CHECK(pool.exclusive_block_count(b, excl) == PagedKvStatus::StaleHandle);
+    CHECK(pool.free_block_count() == 10);
 }

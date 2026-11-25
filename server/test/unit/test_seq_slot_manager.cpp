@@ -743,6 +743,54 @@ int main() {
         CHECK(mgr.slot(a.slot).prefilling());
     }
 
+    // Hysteresis margin for kv_restore_feasible(), kv_offload_footprint() with
+    // shared blocks, and rollback_prefill() recovery.
+    {
+        PagedKvPool pool(20, 3, /*block_size=*/4);
+        SeqSlotManager mgr(pool, 64);
+        auto a = admit(mgr, 1, prompt_tokens(12), greedy_sampler());  // reserves 4 blocks (12 + 4 headroom)
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 12).ok);  // 3 blocks: 0, 1, 2
+        // Pin first 2 blocks (8 tokens) and seed slot `b` zero-copy.
+        std::vector<uint32_t> pinned;
+        CHECK(pool.pin_prefix_blocks(mgr.slot(a.slot).handle, 2, pinned) == PagedKvStatus::Ok);
+        mgr.commit_prefill(a.slot);
+
+        auto b = mgr.admit(2, prompt_tokens(12), greedy_sampler(), /*pre_shared_blocks=*/2);
+        CHECK(is_admitted(b));
+        CHECK(mgr.seed_shared_prefix(b.slot, pinned.data(), 2, 8).ok);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        // Test rollback_prefill rewinds cur_pos and keeps blocks reusable on retry.
+        CHECK(mgr.rollback_prefill(b.slot, 4));
+        CHECK(mgr.slot(b.slot).cur_pos == 8);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(b.slot);
+
+        // Slot `a` owns 4 blocks (2 pinned + 1 private + 1 reserved) -> 2 exclusive = 8 tokens.
+        const auto fp_a = mgr.kv_offload_footprint(a.slot);
+        CHECK(fp_a.total_tokens == 16 && fp_a.reclaimable_tokens == 8);
+        // Slot `b` owns 4 blocks (2 pinned + 1 private + 1 reserved) -> 2 exclusive = 8 tokens.
+        const auto fp_b = mgr.kv_offload_footprint(b.slot);
+        CHECK(fp_b.total_tokens == 16 && fp_b.reclaimable_tokens == 8);
+
+        // Unpin prefix; suspend `b` and check hysteresis margin while `a` is resident.
+        CHECK(pool.unpin_prefix_blocks(pinned) == PagedKvStatus::Ok);
+        CHECK(mgr.detach_kv(b.slot));
+        // `b` needs resume_token_capacity(13) = 4 blocks; with 1 active resident,
+        // hysteresis margin = 2 * (1 + 1) = 4 blocks -> requires >= 8 free blocks.
+        // Currently `a` holds 4 blocks out of 20 -> 16 free -> feasible!
+        CHECK(mgr.kv_restore_feasible(b.slot));
+        // Consume 10 more blocks on `a` (13 blocks total out of 20) so only
+        // 7 free blocks remain (< 4 + 4 hysteresis).
+        std::vector<int32_t> grow(40, 9);
+        CHECK(mgr.append_tokens(a.slot, grow.data(), (int)grow.size()).ok);
+        mgr.commit_step(a.slot);
+        CHECK(pool.free_block_count() == 7);
+        CHECK(!mgr.kv_restore_feasible(b.slot));  // hysteresis blocks ping-pong
+        mgr.retire(a.slot);
+        CHECK(mgr.kv_restore_feasible(b.slot));   // alone: resumes immediately
+    }
+
     std::printf("OK test_seq_slot_manager (%d checks)\n", g_checks);
     return 0;
 }

@@ -24,6 +24,12 @@ static std::vector<char> bytes(ggml_tensor * t) {
     return b;
 }
 
+// An unrelated request's writes over the whole cache: every row is dirty.
+static void scribble(Qwen4ExpCache & c) {
+    ggml_backend_buffer_clear(c.buf, 0xa5);
+    c.kv_dirty_rows = c.indexer_dirty_blocks = std::numeric_limits<int>::max();
+}
+
 static void rollback_reset() {
     // Deterministically delay the real rollback's device-copy queue until a
     // backend barrier. Buffer memset remains synchronous on a separate stream.
@@ -306,7 +312,7 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
         // All states, including QSA raw incomplete blocks and MTP carry, must
         // survive a reset and an unrelated request overwriting the live buffer.
         reset_qwen4exp_state(backend, c);
-        ggml_backend_buffer_clear(c.buf, 0xa5);
+        scribble(c);
         CHECK(restore_qwen4exp_snapshot(backend, s, c));
         CHECK(c.cur_pos == pos && c.indexer_blocks == pos / 4 && c.mtp_prev_pos == pos - 1);
         CHECK(c.kv_bucket_base == 512 && c.ple_prev == std::vector<int32_t>({11, 12}));
@@ -328,6 +334,88 @@ static void copies(ggml_backend_t backend, ggml_backend_t store) {
     free_qwen4exp_snapshot(s); free_qwen4exp_snapshot(s);
     free_qwen4exp_cache(c);
     std::printf("PASS prefix snapshot bytes, metadata, overwrite/reset, MTP validity (%s memory)\n",
+                store == backend ? "device" : "system");
+}
+
+// Tracked dirty-tail restore: only clears [s.cur_pos, kv_dirty_rows) and the
+// indexer scratch row instead of zeroing the entire max_ctx buffer.
+static void dirty_tail_tracked(ggml_backend_t backend, ggml_backend_t store) {
+    CHECK(backend && store);
+    Qwen4ExpCache c;
+    c.max_ctx = 63;
+    c.ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
+    auto kv = [&]() { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, 64, 2); };
+    c.attn_k = {kv(), kv()}; c.attn_v = {kv(), kv()};
+    c.mtp_k = kv(); c.mtp_v = kv();
+    c.mtp_prev_hidden = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, 16);
+    for (int i = 0; i < 2; ++i) {
+        c.indexer_raw.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx));
+        c.indexer_k.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 8, c.max_ctx / 4 + 1));
+        c.ssm_state.push_back(ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2));
+        c.conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16));
+        c.ple_conv_state.push_back(ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 9, 16));
+    }
+    c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
+    CHECK(c.buf);
+    ggml_backend_buffer_clear(c.buf, 0);
+
+    // Simulate filling positions [0, 9), then save a snapshot at pos=9.
+    for (auto * t : {c.attn_k[0], c.attn_v[0], c.mtp_k, c.mtp_v}) {
+        for (int64_t h = 0; h < t->ne[2]; ++h) {
+            ggml_backend_tensor_memset(t, 0x33, (size_t)h * t->nb[2], 9 * t->nb[1]);
+        }
+    }
+    ggml_backend_tensor_memset(c.indexer_raw[0], 0x44, 0, 9 * c.indexer_raw[0]->nb[1]);
+    ggml_backend_tensor_memset(c.indexer_k[0], 0x55, 0, 2 * c.indexer_k[0]->nb[1]);
+    c.cur_pos = 9; c.indexer_blocks = 2; c.mtp_prev_pos = 8;
+    c.kv_dirty_rows = 9; c.indexer_dirty_blocks = 2;
+    Qwen4ExpSnapshot s;
+    CHECK(save_qwen4exp_snapshot(backend, store, c, s));
+
+    // Simulate a deeper run writing rows [0, 25) plus indexer_k scratch row,
+    // and plant a sentinel at row 48 (> kv_dirty_rows) to prove untouched
+    // high rows are NOT cleared by full-buffer clear.
+    for (auto * t : {c.attn_k[0], c.attn_v[0], c.mtp_k, c.mtp_v}) {
+        for (int64_t h = 0; h < t->ne[2]; ++h) {
+            ggml_backend_tensor_memset(t, 0xaa, (size_t)h * t->nb[2], 25 * t->nb[1]);
+            ggml_backend_tensor_memset(t, 0x77, (size_t)h * t->nb[2] + 48 * t->nb[1], t->nb[1]);
+        }
+    }
+    ggml_backend_tensor_memset(c.indexer_raw[0], 0xbb, 0, 25 * c.indexer_raw[0]->nb[1]);
+    ggml_backend_tensor_memset(c.indexer_k[0], 0xcc, 0, 6 * c.indexer_k[0]->nb[1]);
+    ggml_backend_tensor_memset(c.indexer_k[0], 0xdd,
+        (size_t)(c.indexer_k[0]->ne[1] - 1) * c.indexer_k[0]->nb[1], c.indexer_k[0]->nb[1]);
+    c.cur_pos = 25; c.indexer_blocks = 6; c.kv_dirty_rows = 20; c.indexer_dirty_blocks = 4;
+
+    // A reset before the restore keeps the rows written up to cur_pos dirty.
+    reset_qwen4exp_state(backend, c);
+    CHECK(restore_qwen4exp_snapshot(backend, s, c));
+    CHECK(c.cur_pos == 9);
+    for (auto [live, copy] : s.strips) CHECK(bytes(live) == bytes(copy));
+
+    // Written tail [9, 28) (rounded to 4) must be zeroed; untouched row 48 stays 0x77.
+    const auto k_bytes = bytes(c.attn_k[0]);
+    for (int64_t h = 0; h < c.attn_k[0]->ne[2]; ++h) {
+        const size_t base = (size_t)h * c.attn_k[0]->nb[2];
+        for (size_t r = 9; r < 28; ++r) {
+            for (size_t b = 0; b < c.attn_k[0]->nb[1]; ++b) {
+                CHECK(k_bytes[base + r * c.attn_k[0]->nb[1] + b] == 0);
+            }
+        }
+        for (size_t b = 0; b < c.attn_k[0]->nb[1]; ++b) {
+            CHECK((unsigned char)k_bytes[base + 48 * c.attn_k[0]->nb[1] + b] == 0x77);
+        }
+    }
+    // Indexer scratch row and blocks [2, 6) must be zeroed.
+    const auto ik_bytes = bytes(c.indexer_k[0]);
+    for (int64_t r : {2, 3, 4, 5, (int)(c.indexer_k[0]->ne[1] - 1)}) {
+        for (size_t b = 0; b < c.indexer_k[0]->nb[1]; ++b) {
+            CHECK(ik_bytes[(size_t)r * c.indexer_k[0]->nb[1] + b] == 0);
+        }
+    }
+    free_qwen4exp_snapshot(s);
+    free_qwen4exp_cache(c);
+    std::printf("PASS dirty-tail tracked restore skips untouched rows (%s memory)\n",
                 store == backend ? "device" : "system");
 }
 
@@ -380,7 +468,7 @@ static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
         CHECK(back.strips.size() == saved.size());
         for (size_t i = 0; i < saved.size(); ++i) CHECK(bytes(back.strips[i].second) == saved[i]);
         reset_qwen4exp_state(backend, c);
-        ggml_backend_buffer_clear(c.buf, 0xa5);
+        scribble(c);
         CHECK(restore_qwen4exp_snapshot(backend, back, c));
         CHECK(c.cur_pos == pos && c.ple_prev == std::vector<int32_t>({11, 12}));
         for (size_t i = 0; i < saved.size(); ++i) CHECK(bytes(s.strips.empty() ? back.strips[i].first
@@ -525,13 +613,13 @@ static void state_backup(ggml_backend_t backend, ggml_backend_t store) {
           qwen4exp_snapshot_bytes(store, c, 63, nullptr, false));   // the same at every length
 
     // The reference: the whole snapshot restored over a dirty cache.
-    ggml_backend_buffer_clear(c.buf, 0xa5);
+    scribble(c);
     CHECK(restore_qwen4exp_snapshot(backend, whole, c));
     const auto expected = image(c);
     CHECK(c.cur_pos == 30 && c.indexer_blocks == 5 && c.mtp_prev_pos == 29 && c.kv_bucket_base == 512);
     // No donor, itself, a state-only one, a shallower one, one with fewer pooled blocks or of another prompt: refused,
     // with the cache as it was.
-    ggml_backend_buffer_clear(c.buf, 0xa5);
+    scribble(c);
     at(c, 7, 1, 0, {});
     const auto dirty = image(c);
     const std::vector<const Qwen4ExpSnapshot *> refused = {nullptr, &backup, &thin, &shallow, &unpooled, &unrelated};
@@ -540,22 +628,22 @@ static void state_backup(ggml_backend_t backend, ggml_backend_t store) {
         CHECK(image(c) == dirty);
     }
     CHECK(restore_qwen4exp_snapshot(backend, backup, c, &deeper) && image(c) == expected);
-    ggml_backend_buffer_clear(c.buf, 0xa5);
+    scribble(c);
     CHECK(restore_qwen4exp_snapshot(backend, whole, c, &shallow) && image(c) == expected);   // whole: no donor
 
     // Into a slot without the draft layer, from either donor.
-    ggml_backend_buffer_clear(plain.buf, 0xa5);
+    scribble(plain);
     CHECK(restore_qwen4exp_snapshot(backend, whole, plain));
     const auto plain_expected = image(plain);
     for (const Qwen4ExpSnapshot * donor : {&deeper, &plain_deeper}) {
-        ggml_backend_buffer_clear(plain.buf, 0xa5);
+        scribble(plain);
         CHECK(restore_qwen4exp_snapshot(backend, backup, plain, donor) && image(plain) == plain_expected);
     }
     // A donor without the draft layer: the trunk, and no draft state, as from a whole snapshot without it.
-    ggml_backend_buffer_clear(c.buf, 0xa5);
+    scribble(c);
     CHECK(restore_qwen4exp_snapshot(backend, plain_whole, c) && c.mtp_prev_pos == -1);
     const auto undrafted = image(c);
-    ggml_backend_buffer_clear(c.buf, 0xa5);
+    scribble(c);
     CHECK(restore_qwen4exp_snapshot(backend, backup, c, &plain_deeper) && image(c) == undrafted);
 
     for (auto * s : {&backup, &whole, &plain_whole, &deeper, &plain_deeper, &thin, &unrelated, &unpooled, &shallow}) {
@@ -688,6 +776,59 @@ static void kvflash(ggml_backend_t backend) {
     free_qwen4exp_cache(c);
     CHECK(!c.kvflash);
     std::puts("PASS KVFlash pooled rows: identity fit, LRU paging past the pool, slot-space masks, pager-held snapshot past the pool");
+}
+
+// A restore of a pager-held snapshot drops the pager's rows but leaves the draft layer's rows past it written, so a
+// later restore of a shorter whole snapshot still clears them.
+static void kvflash_pager_restore_keeps_dirty_rows(ggml_backend_t backend) {
+    constexpr int pool = 512;
+    Qwen4ExpCache c;
+    c.max_ctx = 4096;
+    c.ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
+    auto kv = [&](int64_t rows) { return ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, 8, rows, 2); };
+    c.attn_k = {kv(pool)}; c.attn_v = {kv(pool)};
+    c.indexer_raw = c.indexer_k = {nullptr};
+    c.mtp_k = kv(c.max_ctx); c.mtp_v = kv(c.max_ctx);
+    c.ssm_state = {ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 4, 4, 2)};
+    c.conv_state = {ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, 3, 16)};
+    c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, backend);
+    CHECK(c.buf);
+    ggml_backend_buffer_clear(c.buf, 0);
+    c.kv_dirty_rows = c.indexer_dirty_blocks = 0;  // as create_qwen4exp_cache leaves them
+    KvFlashConfig cfg;
+    cfg.pool_tokens = pool;
+    c.kvflash = std::make_unique<KvFlashPager>();
+    c.kvflash->set_pinned_host_backing(false);
+    CHECK(c.kvflash->attach(cfg, c.attn_k, c.attn_v));
+    auto advance = [&](int from, int to) {
+        for (int p = from; p < to; ++p) CHECK(qwen4exp_kvflash_reserve(c, p, 1));
+        c.cur_pos = to;
+        c.mtp_prev_pos = to - 1;
+        c.kv_dirty_rows = std::max(c.kv_dirty_rows, to);
+    };
+    Qwen4ExpSnapshot whole, held;
+    advance(0, 300);
+    CHECK(save_qwen4exp_snapshot(backend, backend, c, whole) && !whole.rows_in_pager && whole.mtp);
+    advance(300, 2300);
+    CHECK(save_qwen4exp_snapshot(backend, backend, c, held) && held.rows_in_pager);
+    advance(2300, 2600);
+    for (auto * t : {c.mtp_k, c.mtp_v}) {
+        for (int64_t h = 0; h < t->ne[2]; ++h) ggml_backend_tensor_memset(t, 0x3c, (size_t) h * t->nb[2], 2600 * t->nb[1]);
+    }
+    CHECK(restore_qwen4exp_snapshot(backend, held, c) && c.cur_pos == 2300);
+    CHECK(restore_qwen4exp_snapshot(backend, whole, c) && c.cur_pos == 300);
+    for (auto * t : {c.mtp_k, c.mtp_v}) {
+        const auto b = bytes(t);
+        for (int64_t h = 0; h < t->ne[2]; ++h) {
+            const size_t row0 = (size_t) h * t->nb[2];
+            CHECK(std::all_of(b.begin() + row0 + 299 * t->nb[1], b.begin() + row0 + 2600 * t->nb[1],
+                              [](char x) { return x == 0; }));
+        }
+    }
+    free_qwen4exp_snapshot(held);
+    free_qwen4exp_snapshot(whole);
+    free_qwen4exp_cache(c);
+    std::puts("PASS a pager-held restore keeps the draft rows past it dirty for the next whole restore");
 }
 
 // expert_gpu >= 0 runs split mode (the routed experts on that GPU), with the hot experts of `placement` if given.
@@ -920,17 +1061,20 @@ int main(int argc, char ** argv) {
     auto backend = argc > 1 ? ggml_backend_cuda_init(0) : ggml_backend_cpu_init();
     CHECK(backend);
     copies(backend, backend);
+    dirty_tail_tracked(backend, backend);
     state_backup(backend, backend);
     disk_form(backend, backend);
     const ggml_backend_t store = create_snapshot_backend(backend);
     if (store != backend) {
         copies(backend, store);
+        dirty_tail_tracked(backend, store);
         state_backup(backend, store);
         disk_form(backend, store);
     }
     free_snapshot_backend(store, backend);
     memory(backend);
     kvflash(backend);
+    kvflash_pager_restore_keeps_dirty_rows(backend);
     ggml_backend_free(backend);
     // test_qwen4exp_prefix_cache MODEL [width] [chunk] [ctx] [expert_gpu] [placement.csv]
     if (argc > 1) model(argv[1], argc > 2 ? std::atoi(argv[2]) : 0,
