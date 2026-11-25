@@ -321,6 +321,21 @@ jobs:
           export CCACHE_BASEDIR="$GITHUB_WORKSPACE"
           deps_cache="$HOME/.cache/lucebox-ci-deps"
           mkdir -p "$deps_cache"
+          json_dir="$deps_cache/nlohmann-json-3.11.3"
+          if [ ! -f "$json_dir/CMakeLists.txt" ]; then
+            url="https://codeload.github.com/nlohmann/json/tar.gz/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03"
+            sha="0dbc5e40a01ff142e7e68c03e85247a4dcede2f592d12d3677dee3664d17975a"
+            tmp="$RUNNER_TEMP/nlohmann-json.tar.gz"
+            stage="$deps_cache/.nlohmann-json-3.11.3.stage.$$"
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            tar -xzf "$tmp" --strip-components=1 -C "$stage"
+            rm -rf "$json_dir"
+            mv -T "$stage" "$json_dir" 2>/dev/null || rm -rf "$stage"
+            test -f "$json_dir/CMakeLists.txt"
+          fi
           cd server
           gen=()
           command -v ninja >/dev/null && gen=(-G Ninja)
@@ -330,7 +345,7 @@ jobs:
             -DLUCE_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
             -DLUCE_ENABLE_BSA=OFF \
             -DLUCE_FA_ALL_QUANTS=OFF \
-            -DFETCHCONTENT_BASE_DIR="$deps_cache" \
+            -DFETCHCONTENT_SOURCE_DIR_JSON="$json_dir" \
             -DLUCE_IMAGE_CODECS_CACHE_DIR="$deps_cache" \
             -DCMAKE_BUILD_TYPE=Release
           if [[ "$CUDA_ARCH" == "121" ]]; then
@@ -497,6 +512,21 @@ jobs:
           if ! command -v ld.lld >/dev/null && [ ! -x "$HOME/.local/bin/ld.lld" ] && [ -x /opt/rocm/lib/llvm/bin/ld.lld ]; then
             ln -sf /opt/rocm/lib/llvm/bin/ld.lld "$HOME/.local/bin/ld.lld"
           fi
+          json_dir="$deps_cache/nlohmann-json-3.11.3"
+          if [ ! -f "$json_dir/CMakeLists.txt" ]; then
+            url="https://codeload.github.com/nlohmann/json/tar.gz/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03"
+            sha="0dbc5e40a01ff142e7e68c03e85247a4dcede2f592d12d3677dee3664d17975a"
+            tmp="$RUNNER_TEMP/nlohmann-json.tar.gz"
+            stage="$deps_cache/.nlohmann-json-3.11.3.stage.$$"
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            tar -xzf "$tmp" --strip-components=1 -C "$stage"
+            rm -rf "$json_dir"
+            mv -T "$stage" "$json_dir" 2>/dev/null || rm -rf "$stage"
+            test -f "$json_dir/CMakeLists.txt"
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/ccache" --version 2>/dev/null || ccache --version
           "$HOME/.local/bin/ninja" --version 2>/dev/null || ninja --version || true
@@ -569,7 +599,7 @@ jobs:
             -DLUCE_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DGGML_CCACHE=OFF \
-            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
+            -DFETCHCONTENT_SOURCE_DIR_JSON="$LUCE_CI_DEPS_CACHE/nlohmann-json-3.11.3" \
             -DLUCE_IMAGE_CODECS_CACHE_DIR="$LUCE_CI_DEPS_CACHE" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -661,7 +691,7 @@ jobs:
             -DGGML_CCACHE=OFF \
             -DGGML_CUDA_FA=OFF \
             -DLUCE_IMAGE_CODECS=OFF \
-            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
+            -DFETCHCONTENT_SOURCE_DIR_JSON="$LUCE_CI_DEPS_CACHE/nlohmann-json-3.11.3" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
@@ -744,6 +774,21 @@ jobs:
           if ! command -v ld.lld >/dev/null && [ ! -x "$HOME/.local/bin/ld.lld" ] && [ -x /opt/rocm/lib/llvm/bin/ld.lld ]; then
             ln -sf /opt/rocm/lib/llvm/bin/ld.lld "$HOME/.local/bin/ld.lld"
           fi
+          json_dir="$deps_cache/nlohmann-json-3.11.3"
+          if [ ! -f "$json_dir/CMakeLists.txt" ]; then
+            url="https://codeload.github.com/nlohmann/json/tar.gz/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03"
+            sha="0dbc5e40a01ff142e7e68c03e85247a4dcede2f592d12d3677dee3664d17975a"
+            tmp="$RUNNER_TEMP/nlohmann-json.tar.gz"
+            stage="$deps_cache/.nlohmann-json-3.11.3.stage.$$"
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            curl -fsSL "$url" -o "$tmp"
+            echo "$sha  $tmp" | sha256sum -c -
+            tar -xzf "$tmp" --strip-components=1 -C "$stage"
+            rm -rf "$json_dir"
+            mv -T "$stage" "$json_dir" 2>/dev/null || rm -rf "$stage"
+            test -f "$json_dir/CMakeLists.txt"
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build luce_server for the R9700 and the Strix Halo
@@ -762,7 +807,7 @@ jobs:
             -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DCMAKE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DGGML_CCACHE=OFF \
-            -DFETCHCONTENT_BASE_DIR="$LUCE_CI_DEPS_CACHE" \
+            -DFETCHCONTENT_SOURCE_DIR_JSON="$LUCE_CI_DEPS_CACHE/nlohmann-json-3.11.3" \
             -DLUCE_IMAGE_CODECS_CACHE_DIR="$LUCE_CI_DEPS_CACHE" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
