@@ -2560,9 +2560,6 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     const int32_t n_logical_blocks = std::min<int32_t>(
         paged_attn_ceil_div(std::min<int32_t>(max_kv_seq_len, committed_cap) + tree_width, block_size),
         extent_blocks);
-    if (paged_attn_ceil_div(table_blocks, blocks_per_partition) == 1) {
-        blocks_per_partition = std::max<int32_t>(blocks_per_partition, extent_blocks);
-    }
     blocks_per_partition = paged_attn_occupancy_blocks_per_partition(
         blocks_per_partition, n_logical_blocks,
         (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 4,
