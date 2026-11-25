@@ -149,6 +149,15 @@ inline std::vector<PrefillSlice> plan_prefill_slices(
     return slices;
 }
 
+// Admission metadata carried from HTTP to an engine supporting sticky sessions
+// or shared pinned heads. Declared at namespace scope so default member
+// initializers work in default arguments on member functions under C++17.
+struct SeqAdmitMeta {
+    std::string sid;
+    std::string client;
+    int head_cut = 0;
+};
+
 class SeqEngine {
 public:
     virtual ~SeqEngine() = default;
@@ -207,7 +216,7 @@ public:
     // identity (empty when the client sent none). The default ignores both.
     // Image and prefix-store admissions carry neither.
     // head_cut (0 when not given): the shared system/tools head the server found (tokens); 0 none, -1 sharing is off.
-    struct AdmitMeta { std::string sid, client; int head_cut; };
+    using AdmitMeta = SeqAdmitMeta;
     virtual AdmitResult admit_bounded(uint64_t request_id,
                                       const std::vector<int32_t> & prompt,
                                       const SamplerCfg & sampler,
