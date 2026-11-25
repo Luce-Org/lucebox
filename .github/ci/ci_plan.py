@@ -137,6 +137,10 @@ def plan(paths: list[str] | None) -> tuple[frozenset[str], dict[str, list[str]]]
         rule = next((rule for rule in RULES if matches(path, rule[0])), None)
         needs, why = (rule[1], rule[2]) if rule else (ALL, UNKNOWN)
         jobs |= needs
+        # Specific directory rules shadow "*.md", but every markdown change
+        # must reach the quick-start path check in the Python lane.
+        if path.endswith(".md"):
+            jobs |= PY
         reasons.setdefault(why, []).append(path)
     return frozenset(jobs), reasons
 
