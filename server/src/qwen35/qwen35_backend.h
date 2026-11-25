@@ -412,11 +412,15 @@ protected:
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask(int cur_pos);
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
-    void kvflash_maybe_reselect(int generated);
-    // Spec: copy the staged verify query of position new_committed - 1 into
-    // q_cap, so the next reselection reads AR's query. False when that row is
-    // not staged (q_cap is left as is).
-    bool kvflash_q_cap_from_stage(int new_committed);
+    // When `query` is non-null (spec decode passing a row read straight from
+    // q_stage), the target-QK scorer uses it directly instead of reading q_cap.
+    void kvflash_maybe_reselect(int generated,
+                                const float * query = nullptr,
+                                size_t query_size = 0);
+    // Spec: read the staged verify query of position new_committed - 1 directly
+    // into `out` (in q_cap [n_fa, n_head, head_dim] float order) via a single
+    // strided 2D transfer. False when that row is not staged.
+    bool kvflash_read_q_stage_row(int new_committed, std::vector<float> & out) const;
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
@@ -558,6 +562,7 @@ private:
     int  layout_ctx_alloc_ = 0;
     int  layout_feat_cap_ = 0;
     bool layout_fixed_chain_ = false;
+    bool layout_allocate_q_stage_ = false;
     bool released_ = false;
     void init_feature_mirror(bool fixed_chain_enabled);
 

@@ -194,7 +194,7 @@ static FILE * open_dflash_floor_log() {
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
         int64_t kv_bytes_per_token, int64_t scratch_tokens,
-        bool fixed_chain, int max_verify_tokens) {
+        bool fixed_chain) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -213,11 +213,10 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)w.n_capture_layers * w.n_embd *
         (fixed_chain ? target_feat_cap * n_slots + 1 : target_feat_cap) *
         (int64_t)sizeof(uint16_t);
+    // Concurrent mode never allocates q_stage (serial KVFlash QK-spec only).
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
-        (int64_t)sizeof(float) * (1 + luce::common::kvflash_q_cap_all_rows() +
-         luce::common::kvflash_q_stage_rows(
-             max_verify_tokens > 0 ? max_verify_tokens : LUCE_DRAFT_BLOCK_SIZE));
+        (int64_t)sizeof(float) * (1 + luce::common::kvflash_q_cap_all_rows());
     const int64_t paged_metadata =
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
@@ -583,7 +582,7 @@ bool Qwen35Backend::init() {
             kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
         budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
             w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-            scratch_tokens, fixed_chain.enabled, max_verify_tokens);
+            scratch_tokens, fixed_chain.enabled);
         if (cfg_.kv_pool_tokens > 0) {
             const int64_t max_pool_tokens =
                 ((int64_t)INT32_MAX - scratch_tokens) /
@@ -646,11 +645,13 @@ bool Qwen35Backend::init() {
     // it, so preserve its established 4K ring.
     const int target_feat_cap = luce::common::dflash_feature_ring_cap(
         cfg_.device.max_ctx, cfg_.draft_path && w_.is_moe);
+    const bool allocate_q_stage =
+        kvflash_active() && kvflash_qk_policy_ && cfg_.draft_path && !cfg_.paged_attention;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
                              cfg_.paged_attention, n_slots,
                              fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v,
-                             target_feat_cap)) {
+                             target_feat_cap, allocate_q_stage)) {
         std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
@@ -660,6 +661,7 @@ bool Qwen35Backend::init() {
     layout_ctx_alloc_ = ctx_alloc;
     layout_feat_cap_ = target_feat_cap;
     layout_fixed_chain_ = fixed_chain.enabled;
+    layout_allocate_q_stage_ = allocate_q_stage;
     if (cfg_.paged_attention) {
         const auto supported_type = [](ggml_type type) {
             return type == GGML_TYPE_F16 ||
@@ -865,7 +867,8 @@ bool Qwen35Backend::reinstate(std::string & error) {
     const auto t_weights = std::chrono::steady_clock::now();
     if (!create_target_cache(w_, cfg_.device.max_ctx, layout_max_verify_tokens_, target_backend_, cache_,
                              /*prefill_only=*/true, layout_ctx_alloc_, /*paged=*/false, /*n_slots=*/1,
-                             layout_fixed_chain_, cfg_.cache_type_k, cfg_.cache_type_v, layout_feat_cap_)) {
+                             layout_fixed_chain_, cfg_.cache_type_k, cfg_.cache_type_v, layout_feat_cap_,
+                             layout_allocate_q_stage_)) {
         error = std::string("qwen35: cache: ") + luce_last_error();
         free_target_cache(cache_);
         cache_ = TargetCache{};
@@ -3041,8 +3044,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr, /*n_prefill_segments=*/0,
                                /*n_logits_rows=*/0, /*compact_slots=*/false, /*top_n=*/0,
                                /*keep_base_ssm_state=*/false, /*single_replay_slot_ids=*/nullptr,
-                               /*capture_q_all=*/luce::common::kvflash_capture_q_all(
-                                   kvflash_prefill_reselect_ != 0, kvflash_uq_queries_ > 0, kvflash_tp_degree(), q_window))) {
+                               TargetStepQueryCapture{
+                                   /*q_all=*/luce::common::kvflash_capture_q_all(
+                                       kvflash_prefill_reselect_ != 0, kvflash_uq_queries_ > 0,
+                                       kvflash_tp_degree(), q_window),
+                                   /*q_stage=*/false})) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -3864,23 +3870,24 @@ int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_st
     return 1;
 }
 
-bool Qwen35Backend::kvflash_q_cap_from_stage(int new_committed) {
+bool Qwen35Backend::kvflash_read_q_stage_row(int new_committed,
+                                             std::vector<float> & out) const {
     const int row = kvflash_q_stage_row(cache_.q_stage_base, cache_.q_stage_n, new_committed);
     if (row < 0 || !cache_.q_stage || !cache_.q_cap) return false;
-    // Row r of every layer plane is one q_cap plane; q_cap is the planes in layer order.
+    // Row r of every layer plane is one q_cap plane; q_stage is [head_dim, n_head, R, n_fa].
     const size_t plane = cache_.q_stage->nb[2];
-    const int n_fa = (int)cache_.q_stage->ne[3];
-    if (plane * (size_t)n_fa != ggml_nbytes(cache_.q_cap)) return false;
-    std::vector<uint8_t> q(plane * (size_t)n_fa);
-    for (int fa = 0; fa < n_fa; ++fa) {
-        ggml_backend_tensor_get(cache_.q_stage, q.data() + (size_t)fa * plane,
-                                luce::common::kvflash_q_stage_offset(cache_.q_stage, fa, row), plane);
-    }
-    ggml_backend_tensor_set(cache_.q_cap, q.data(), 0, q.size());
+    const size_t n_fa = (size_t)cache_.q_stage->ne[3];
+    if (plane * n_fa != ggml_nbytes(cache_.q_cap)) return false;
+    out.resize((plane * n_fa) / sizeof(float));
+    ggml_backend_tensor_get_2d(cache_.q_stage, out.data(),
+                               (size_t)row * plane, plane, n_fa,
+                               cache_.q_stage->nb[3], plane);
     return true;
 }
 
-void Qwen35Backend::kvflash_maybe_reselect(int generated) {
+void Qwen35Backend::kvflash_maybe_reselect(int generated,
+                                           const float * query,
+                                           size_t query_size) {
     if (kvflash_tau_ <= 0) return;
     const int tau = kvflash_reselect_tau(kvflash_tau_, kvflash_history_.size());
     if (generated % tau != 0) return;
@@ -3890,11 +3897,16 @@ void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     if (!kvflash_scorer_) return;
     if (kvflash_qk_scorer_) {
         // Feed the last decode step's captured query (post-RoPE/-rotation,
-        // [n_fa, n_head, head_dim] f32) before scoring.
-        if (!cache_.q_cap) return;
-        std::vector<float> q((size_t)ggml_nelements(cache_.q_cap));
-        ggml_backend_tensor_get(cache_.q_cap, q.data(), 0, q.size() * sizeof(float));
-        kvflash_qk_scorer_->set_query(q.data(), q.size());
+        // [n_fa, n_head, head_dim] f32) before scoring. Spec decode passes a
+        // row read straight from q_stage to avoid bouncing through q_cap.
+        if (query && query_size > 0) {
+            kvflash_qk_scorer_->set_query(query, query_size);
+        } else {
+            if (!cache_.q_cap) return;
+            std::vector<float> q((size_t)ggml_nelements(cache_.q_cap));
+            ggml_backend_tensor_get(cache_.q_cap, q.data(), 0, q.size() * sizeof(float));
+            kvflash_qk_scorer_->set_query(q.data(), q.size());
+        }
     }
     if (!kvflash_scorer_->score_chunks(kvflash_history_, kvflash_pager_.chunk_tokens(), kvflash_scores_)) {
         return;  // scorer failure -> keep LRU behavior this round
@@ -4723,11 +4735,14 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
             kvflash_reselect_points(history_guard.base, reselect_done_g, g_seed, kvflash_tau_);
         reselect_done_g = std::max(reselect_done_g, g_seed);
         if (pts.empty()) return;
-        if (kvflash_qk_policy_) kvflash_q_cap_from_stage(committed);
+        std::vector<float> staged_q;
+        const bool have_staged_q =
+            kvflash_qk_policy_ && kvflash_read_q_stage_row(committed, staged_q);
         for (int g : pts) {
             kvflash_reselect_history(kvflash_history_, history_guard.base, out_tokens,
                                      history_guard.entry, g, g_seed, budget, last_tok);
-            kvflash_maybe_reselect(g);
+            kvflash_maybe_reselect(g, have_staged_q ? staged_q.data() : nullptr,
+                                   have_staged_q ? staged_q.size() : 0);
         }
     };
     // Every handoff to AR from the spec loop: AR continues the same request, so
