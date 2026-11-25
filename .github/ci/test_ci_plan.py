@@ -34,14 +34,16 @@ REPO = Path(__file__).resolve().parents[2]
     [
         (["server/src/qwen35/qwen35_backend.cpp", "server/test/unit/test_qwen35_x.cpp"], CPP_QWEN38),
         (["server/src/deepseek4/deepseek4_dspark.cpp"], CPP_DS41),
-        (["server/share/deepseek41/placement_lucebox.json", "server/docs/DS41.md"], DS41_PROFILE),
+        # The doc also runs the Python lane, which holds the quick-start path check.
+        (["server/share/deepseek41/placement_lucebox.json", "server/docs/DS41.md"], DS41_PROFILE | PY),
         (["server/test/unit/test_server_unit.cpp"], CPP_GPU),
         (["server/test/python/test_bench_ds4_decode.py"], PY),
         (["share/model_cards/README.md"], NONE),
         (["share/model_cards/qwen3.8-27b.json"], CARD_QWEN38),
         (["share/model_cards/deepseek-v4.1-flash.json", "share/model_cards/README.md"], CARD_DS41),
         (["share/model_cards/gemma-4-31b-it.json", "share/model_cards/_schema.json"], CARD_OTHER),
-        (["README.md", "server/docs/DS41.md", "docs/guide.md"], NONE),
+        # Markdown runs the Python lane, which holds the quick-start path check.
+        (["README.md", "server/docs/DS41.md", "docs/guide.md"], PY),
         ([".github/workflows/docker.yml", "Dockerfile"], NONE),
         (["harness/clients/run_pi.sh"], PY_CPP),
         (["harness/clients/common.sh"], PY_CPP),

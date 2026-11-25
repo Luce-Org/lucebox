@@ -76,8 +76,10 @@ RULES = [
     ("share/model_cards/", CARD_OTHER, "cards of models the serve jobs don't run"),
     ("server/test/python/", PY, "Python server tests"),
     ("server/test/", CPP_GPU, "C++ tests (luce_server links none of them)"),
-    # Documentation and static media affect no build or test target.
-    ("*.md", NONE, "documentation"),
+    # Markdown runs the Python lane so test_docs_paths.py can check that the
+    # quick-start commands still resolve against this tree. Other static media
+    # affects no build or test target.
+    ("*.md", PY, "documentation, whose quick-start paths the Python lane checks"),
     ("docs/", NONE, "documentation"),
     ("server/docs/", NONE, "documentation"),
     ("assets/", NONE, "images"),
