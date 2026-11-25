@@ -1042,11 +1042,12 @@ int invariance_mismatches(ggml_backend_t backend, ggml_type kv_type, int a_len, 
 
 }  // namespace
 
-// The fixed context cuts are the batch-invariant mode's; default mode moves
-// them with the batch for occupancy.
+// The fixed context cuts are FULL batch-invariant mode's; default and MMVQ modes
+// move them with the batch for occupancy.
 struct InvariantScope {
-    bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
-    ~InvariantScope() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
+    enum ggml_cuda_batch_invariant_mode prev =
+        ggml_backend_cuda_set_batch_invariant_mode(GGML_CUDA_BATCH_INVARIANT_FULL);
+    ~InvariantScope() { ggml_backend_cuda_set_batch_invariant_mode(prev); }
 };
 
 // The chain-vs-AR cases compare routes by the WMMA launch counter. A replayed CUDA graph launches no kernel from the

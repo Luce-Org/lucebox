@@ -44,6 +44,12 @@ struct Invariant {
     ~Invariant() { ggml_backend_cuda_set_mmvq_batch_invariant(prev); }
     bool prev;
 };
+struct FullInvariant {
+    explicit FullInvariant(enum ggml_cuda_batch_invariant_mode mode)
+        : prev(ggml_backend_cuda_set_batch_invariant_mode(mode)) {}
+    ~FullInvariant() { ggml_backend_cuda_set_batch_invariant_mode(prev); }
+    enum ggml_cuda_batch_invariant_mode prev;
+};
 
 // One pattern: its tensors (each with its own memory), its graph and the tensors compared.
 struct Pattern {
@@ -435,10 +441,12 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
     }
 
     // ── HC_COMBINE_NORM writing the HC down projection's q8_1 rows ─────────────────────────────────────────────────
-    // The rows are MMVQ's. A batch-invariant product runs on MMQ at every column count, so there the combine must
-    // not write them (0 runs) and the one graph still equals the segments.
-    void hc_cn_q8(ggml_backend_t be, int T, bool invariant) {
-        const std::string name = "hc_cn_q8 T=" + std::to_string(T) + (invariant ? "" : " (not batch-invariant)");
+    // MMVQ mode (Qwen4Exp/DeepSeek V4) keeps the fusion active (1 run). FULL batch-invariant mode runs on MMQ at every
+    // column count, so there the combine must not write them (0 runs) and the one graph still equals the segments.
+    void hc_cn_q8(ggml_backend_t be, int T, enum ggml_cuda_batch_invariant_mode mode = GGML_CUDA_BATCH_INVARIANT_MMVQ) {
+        const std::string name = "hc_cn_q8 T=" + std::to_string(T) +
+            (mode == GGML_CUDA_BATCH_INVARIANT_FULL ? " (full)" :
+             mode == GGML_CUDA_BATCH_INVARIANT_MMVQ ? " (mmvq)" : " (off)");
         const int n_embd = 2560, hc = 4, rank = 320;
         Pattern p;
         ggml_tensor * inject = p.input(GGML_TYPE_F32, hc, T);
@@ -457,18 +465,20 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         if (!p.alloc(be)) { fail(name + ": alloc"); return; }
         p.fill_rest();
         const Profile prof(true);
-        const Invariant inv(invariant);
-        check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_CN_Q8, invariant ? 0 : 1);
+        const FullInvariant inv(mode);
+        check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_HC_CN_Q8,
+              mode == GGML_CUDA_BATCH_INVARIANT_FULL ? 0 : 1);
     }
 
     // ── The layer output's ADD (split mode: cold plus hot expert sums) folded into the next HC_COMBINE_NORM ─────────
-    // Node by node is the reference. q8: a product reads xn; where it is MMVQ's (not batch-invariant) the fused launch
-    // writes its q8_1 rows too.
+    // Node by node is the reference. q8: an MMVQ product reads xn (OFF/MMVQ), so the fused launch writes its q8_1 rows;
+    // FULL mode runs MMQ everywhere so HC_CN_Q8 does not fire.
     // reuse: the ADD's sources are computed and the graph allocator places every tensor, as the scheduler does; it may
     // give the norm's output their memory, and then the fold must decline.
-    void hc_cn_add(ggml_backend_t be, int T, bool q8, bool reuse, bool invariant = true) {
+    void hc_cn_add(ggml_backend_t be, int T, bool q8, bool reuse,
+                   enum ggml_cuda_batch_invariant_mode mode = GGML_CUDA_BATCH_INVARIANT_MMVQ) {
         const std::string name = "hc_cn_add T=" + std::to_string(T) + (q8 ? " q8" : "") + (reuse ? " reuse" : "") +
-                                 (invariant ? "" : " (not batch-invariant)");
+            (mode == GGML_CUDA_BATCH_INVARIANT_FULL ? " (full)" : "");
         const int n_embd = 2560, hc = 4, rank = 320;
         Pattern p;
         ggml_tensor * inject = p.input(GGML_TYPE_F32, hc, T);
@@ -503,9 +513,9 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
             for (size_t k = 0; k < p.inputs.size(); ++k) ggml_backend_tensor_set(p.inputs[k], saved[k].data(), 0, saved[k].size());
         };
         const Profile prof(true);
-        const Invariant inv(invariant);
+        const FullInvariant inv(mode);
         Expect expect{{GGML_CUDA_QN_HC_CN_ADD, fold ? 1u : 0u}};
-        if (W) expect.push_back({GGML_CUDA_QN_HC_CN_Q8, invariant ? 0u : 1u});
+        if (W) expect.push_back({GGML_CUDA_QN_HC_CN_Q8, mode == GGML_CUDA_BATCH_INVARIANT_FULL ? 0u : 1u});
         check(be, name, p, {}, expect, reset);
     }
 
@@ -598,7 +608,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         };
         const Profile prof(true);
         const Invariant inv(invariant);
-        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && T == 1 && !invariant && !lo_out;
+        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && T <= 4 && (T == 1 || invariant) && !lo_out;
         check(be, name, p, {}, Expect{{GGML_CUDA_QN_HC_MIX_RDNA4, fuses ? 1 : 0}}, reset);
     }
 
@@ -912,7 +922,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         const Profile prof(true);
         const Invariant inv(invariant);
         const bool same_shape = (rows_a > 1024) == (rows_b > 1024);
-        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && same_shape && T == 1 && !invariant;
+        const bool fuses = ggml_backend_cuda_mmvq_twin_supported(be) && same_shape && (T == 1 || invariant);
         check(be, name, p, {}, GGML_CUDA_QN_MMVQ_TWIN, fuses ? 1 : 0);
     }
 
@@ -1323,8 +1333,9 @@ TEST_CASE(QnSplitFusionsFixture, hc_cn_q8) {
     each_gpu([&](ggml_backend_t be) {
         if (!hc_supported(be)) return;
         ran = true;
-        for (int T : {1, 2, 8}) hc_cn_q8(be, T, true);
-        for (int T : {1, 2, 3}) hc_cn_q8(be, T, false);   // MMVQ's default column limit is 3 (LUCE_MMVQ_MAX_NCOLS)
+        for (int T : {1, 2, 8}) hc_cn_q8(be, T, GGML_CUDA_BATCH_INVARIANT_MMVQ);
+        for (int T : {1, 2, 8}) hc_cn_q8(be, T, GGML_CUDA_BATCH_INVARIANT_FULL);
+        for (int T : {1, 2, 3}) hc_cn_q8(be, T, GGML_CUDA_BATCH_INVARIANT_OFF);
     });
     if (!ran) SKIP("HC_COMBINE_NORM is HIP-only");
 }
@@ -1337,9 +1348,9 @@ TEST_CASE(QnSplitFusionsFixture, hc_cn_add) {
         for (int T : {1, 2, 3, 8}) hc_cn_add(be, T, false, false);
         for (int T : {1, 3}) {
             hc_cn_add(be, T, false, true);
-            for (bool invariant : {true, false}) {
-                hc_cn_add(be, T, true, false, invariant);
-                hc_cn_add(be, T, true, true, invariant);
+            for (auto mode : {GGML_CUDA_BATCH_INVARIANT_MMVQ, GGML_CUDA_BATCH_INVARIANT_FULL, GGML_CUDA_BATCH_INVARIANT_OFF}) {
+                hc_cn_add(be, T, true, false, mode);
+                hc_cn_add(be, T, true, true, mode);
             }
         }
     });

@@ -38,8 +38,8 @@ public:
           batch_invariant_(mmvq_batch_invariant),
           override_invariant_width_(mmvq_invariant_max_ncols > 0) {
         if (batch_invariant_) {
-            previous_batch_invariant_ =
-                ggml_backend_cuda_set_mmvq_batch_invariant(true);
+            previous_batch_invariant_mode_ =
+                ggml_backend_cuda_set_batch_invariant_mode(GGML_CUDA_BATCH_INVARIANT_MMVQ);
         }
         if (override_invariant_width_) {
             previous_invariant_width_ =
@@ -69,7 +69,7 @@ public:
             ggml_backend_cuda_set_mmvq_invariant_max_ncols(previous_invariant_width_);
         }
         if (batch_invariant_) {
-            ggml_backend_cuda_set_mmvq_batch_invariant(previous_batch_invariant_);
+            ggml_backend_cuda_set_batch_invariant_mode(previous_batch_invariant_mode_);
         }
         if (override_ds4_mix_) {
             ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(previous_ds4_mix_max_tokens_);
@@ -99,7 +99,7 @@ private:
     bool batch_invariant_ = false;
     bool override_invariant_width_ = false;
     bool previous_graphs_disabled_ = false;
-    bool previous_batch_invariant_ = false;
+    enum ggml_cuda_batch_invariant_mode previous_batch_invariant_mode_ = GGML_CUDA_BATCH_INVARIANT_OFF;
     bool previous_skip_property_check_ = false;
     int previous_mmvq_max_ncols_ = 0;
     int previous_ds4_mix_max_tokens_ = 0;
@@ -107,10 +107,16 @@ private:
 };
 
 // Computes a qwen35 target graph (plain decode, verify or prefill) under the
-// batch-invariant scope when LUCE_BATCH_INVARIANT=1.
+// FULL batch-invariant scope when LUCE_BATCH_INVARIANT=1.
 inline ggml_status target_graph_compute(ggml_backend_t backend, ggml_cgraph * gf) {
-    const ScopedCudaGraphOverrides invariant(false, 0, false, 0, batch_invariant_requested());
-    return ggml_backend_graph_compute(backend, gf);
+    if (!batch_invariant_requested()) {
+        return ggml_backend_graph_compute(backend, gf);
+    }
+    const enum ggml_cuda_batch_invariant_mode prev =
+        ggml_backend_cuda_set_batch_invariant_mode(GGML_CUDA_BATCH_INVARIANT_FULL);
+    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    ggml_backend_cuda_set_batch_invariant_mode(prev);
+    return st;
 }
 
 }  // namespace luce::common

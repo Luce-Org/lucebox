@@ -131,7 +131,7 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
 static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
-static thread_local bool ggml_cuda_mmvq_batch_invariant_enabled = false;
+static thread_local ggml_cuda_batch_invariant_mode ggml_cuda_batch_invariant_state = GGML_CUDA_BATCH_INVARIANT_OFF;
 static thread_local int ggml_cuda_mmvq_invariant_max_ncols_value = 0;
 
 static thread_local ggml_cuda_qwen4exp_profile qwen4exp_profile = GGML_CUDA_QWEN4EXP_OFF;
@@ -190,8 +190,15 @@ bool ggml_backend_cuda_qsa_supported(ggml_backend_t backend) {
 }
 
 extern "C" bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled) {
-    const bool previous = ggml_cuda_mmvq_batch_invariant_enabled;
-    ggml_cuda_mmvq_batch_invariant_enabled = enabled;
+    const bool previous = ggml_cuda_batch_invariant_state != GGML_CUDA_BATCH_INVARIANT_OFF;
+    ggml_cuda_batch_invariant_state = enabled ? GGML_CUDA_BATCH_INVARIANT_MMVQ : GGML_CUDA_BATCH_INVARIANT_OFF;
+    return previous;
+}
+
+extern "C" enum ggml_cuda_batch_invariant_mode ggml_backend_cuda_set_batch_invariant_mode(
+        enum ggml_cuda_batch_invariant_mode mode) {
+    const auto previous = ggml_cuda_batch_invariant_state;
+    ggml_cuda_batch_invariant_state = mode;
     return previous;
 }
 
@@ -206,7 +213,11 @@ extern "C" void ggml_backend_cuda_mul_mat_id_grouped(ggml_tensor * mul_mat_id) {
 }
 
 bool ggml_cuda_mmvq_batch_invariant() {
-    return ggml_cuda_mmvq_batch_invariant_enabled;
+    return ggml_cuda_batch_invariant_state != GGML_CUDA_BATCH_INVARIANT_OFF;
+}
+
+bool ggml_cuda_full_batch_invariant() {
+    return ggml_cuda_batch_invariant_state == GGML_CUDA_BATCH_INVARIANT_FULL;
 }
 
 extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
@@ -217,8 +228,10 @@ extern "C" int ggml_backend_cuda_set_mmvq_invariant_max_ncols(int max_ncols) {
 }
 
 int ggml_cuda_mmvq_invariant_max_ncols() {
-    return ggml_cuda_mmvq_invariant_max_ncols_value > 0 ? ggml_cuda_mmvq_invariant_max_ncols_value
-                                                        : MMVQ_INVARIANT_MAX_NCOLS;
+    if (ggml_cuda_mmvq_invariant_max_ncols_value > 0) {
+        return ggml_cuda_mmvq_invariant_max_ncols_value;
+    }
+    return ggml_cuda_full_batch_invariant() ? MMVQ_INVARIANT_MAX_NCOLS : MMVQ_MAX_BATCH_SIZE;
 }
 
 static thread_local int ggml_cuda_mmvq_invariant_rows_override_value = 0;
@@ -3213,7 +3226,7 @@ static int ggml_cuda_mmvq_max_ncols() {
         const int v = e ? atoi(e) : 3;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
-    if (ggml_cuda_mmvq_batch_invariant_enabled) {
+    if (ggml_cuda_mmvq_batch_invariant()) {
         return ggml_cuda_mmvq_invariant_max_ncols();
     }
     return ggml_cuda_mmvq_max_ncols_override > 0
@@ -3277,8 +3290,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                              src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 &&
                              ncols_dst <= (is_mul_mat_id ? MMVQ_MAX_MOE_BATCH_SIZE
-                                           : ggml_cuda_mmvq_batch_invariant_enabled ? ggml_cuda_mmvq_invariant_max_ncols()
-                                                                                    : MMVQ_MAX_BATCH_SIZE);
+                                           : ggml_cuda_mmvq_batch_invariant() ? ggml_cuda_mmvq_invariant_max_ncols()
+                                                                              : MMVQ_MAX_BATCH_SIZE);
 #ifdef ROCMFP2_AFFINE
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
     // Keep the conservative dequantize fallback unless explicitly enabled.
@@ -3302,8 +3315,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
             return false;
         }
     }
-    // Batch-invariant mode runs MUL_MAT on MMQ at every width (ggml_cuda_mul_mat_prefers_mmq); the fused kernel is MMVQ.
-    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] != 1 || ggml_cuda_mmvq_batch_invariant_enabled)) {
+    // Full batch-invariant mode runs MUL_MAT on MMQ at every width (ggml_cuda_mul_mat_prefers_mmq); the fused kernel is MMVQ.
+    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] != 1 || ggml_cuda_full_batch_invariant())) {
         return false;
     }
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
@@ -3493,8 +3506,9 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 
     // RDNA4 Q8_0 gate/up pairs at several columns (the cluster shared expert in
     // a verify, qwen4exp's shared expert): one launch reads both matrices and writes the SwiGLU.
-    // Not in batch-invariant mode: it is an MMVQ kernel, and that mode runs MUL_MAT on MMQ at every width.
-    if (!ids && direct_vector_layout && !ggml_cuda_mmvq_batch_invariant_enabled && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
+    // Disabled only in FULL batch-invariant mode (which runs MUL_MAT on MMQ at every width);
+    // MMVQ mode keeps it enabled for Qwen4Exp & DeepSeek V4.
+    if (!ids && direct_vector_layout && !ggml_cuda_full_batch_invariant() && src1->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
         !ggml_backend_buft_is_cuda_split(src0->buffer->buft) &&
         !ggml_backend_buft_is_cuda_split(gate->src[0]->buffer->buft) &&
         ggml_cuda_mmvq_rdna4_glu_pair(gate, up, glu)) {
@@ -3650,10 +3664,11 @@ static bool ggml_cuda_mul_mat_vec_q_eligible(const ggml_tensor * src0, const ggm
 
 // Whether a product that both MMVQ and MMQ can run takes MMQ on device cc.
 static bool ggml_cuda_mul_mat_prefers_mmq(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
-    // Batch-invariant mode: MMQ at every column count. MMVQ and MMQ give different bits, and the engine packs decode
+    // FULL batch-invariant mode: MMQ at every column count. MMVQ and MMQ give different bits, and the engine packs decode
     // rows into one product with prefill cuts, so a width threshold between the two kernels would make a token's bits
     // depend on what the scheduler packed into its step (test_mul_mat_invariant_wide_batch).
-    return ggml_cuda_mmvq_batch_invariant_enabled ||
+    // MMVQ mode (Qwen4Exp & DeepSeek V4) stays on MMVQ for small N.
+    return ggml_cuda_full_batch_invariant() ||
            (src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
             src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS);
 }
@@ -3930,11 +3945,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
 #if defined(GGML_USE_HIP)
-    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_full_batch_invariant() && ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
-    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_small_m_gemm_supported(ctx.device, src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_full_batch_invariant() && ggml_cuda_small_m_gemm_supported(ctx.device, src0, src1, dst)) {
         ggml_cuda_small_m_gemm(ctx, src0, src1, dst);
-    } else if (!split && !ggml_cuda_mmvq_batch_invariant_enabled && ggml_cuda_small_m_qgemm_supported(cc, src0, src1, dst)) {
+    } else if (!split && !ggml_cuda_full_batch_invariant() && ggml_cuda_small_m_qgemm_supported(cc, src0, src1, dst)) {
         ggml_cuda_small_m_qgemm(ctx, src0, src1, dst);
 #endif // defined(GGML_USE_HIP)
     } else if (!split && use_mul_mat_q) {
@@ -4041,7 +4056,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 // Batch-invariant mode (DS4.1 verification) keeps every small batch on MMVQ, whose per-token
                 // single-column path reproduces decode exactly; MMQ would reduce in another order. Types with no
                 // MMVQ case at all (mmvq_mmid_max == 0, the mix formats) keep their own dispatch below.
-                if (ne2 <= mmvq_mmid_max || (ggml_cuda_mmvq_batch_invariant_enabled && mmvq_mmid_max > 0)) {
+                if (ne2 <= mmvq_mmid_max || (ggml_cuda_mmvq_batch_invariant() && mmvq_mmid_max > 0)) {
                     log_dispatch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -8072,7 +8087,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const enum ggml_op ops3[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
                             const int outs[1] = { k };
                             if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops3, outs, 1) &&
-                                !ggml_cuda_mmvq_batch_invariant_enabled &&
+                                !ggml_cuda_full_batch_invariant() &&
                                 up_n->src[1]->ne[1] <= ggml_cuda_mmvq_max_ncols() &&
                                 !ggml_backend_buft_is_cuda_split(up_n->src[0]->buffer->buft) &&
                                 !ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft) &&

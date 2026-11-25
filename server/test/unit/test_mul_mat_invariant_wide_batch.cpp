@@ -41,9 +41,10 @@ std::vector<float> product(ggml_backend_t gpu, ggml_type type, const std::vector
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, gpu);
     ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
     ggml_backend_tensor_set(src1, x, 0, (size_t) K * N * sizeof(float));
-    const bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
+    const enum ggml_cuda_batch_invariant_mode prev =
+        ggml_backend_cuda_set_batch_invariant_mode(GGML_CUDA_BATCH_INVARIANT_FULL);
     const bool ok = ggml_backend_graph_compute(gpu, gf) == GGML_STATUS_SUCCESS;
-    ggml_backend_cuda_set_mmvq_batch_invariant(prev);
+    ggml_backend_cuda_set_batch_invariant_mode(prev);
     std::vector<float> out((size_t) N * M);
     if (ok) ggml_backend_tensor_get(o, out.data(), 0, out.size() * sizeof(float));
     else out.clear();

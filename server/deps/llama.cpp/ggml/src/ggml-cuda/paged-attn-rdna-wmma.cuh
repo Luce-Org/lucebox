@@ -765,7 +765,7 @@ static bool try_launch_paged_attn_rdna_wmma(ggml_backend_cuda_context & ctx, ggm
         const char * e = getenv("LUCE_PAGED_WMMA");
         return !(e && atoi(e) == 0);
     }();
-    if (!enabled || ggml_cuda_mmvq_batch_invariant()) {
+    if (!enabled || ggml_cuda_full_batch_invariant()) {
         return false;
     }
 

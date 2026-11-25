@@ -28,8 +28,10 @@ bool ggml_cuda_mmvq_mmid_grouped_enabled(
 // (ggml_backend_cuda_mul_mat_id_grouped). Grouped nodes are not fused with their GLU.
 bool ggml_cuda_mmvq_mmid_grouped_for(const ggml_tensor * mul_mat_id, int cc);
 
-// Set by ggml_backend_cuda_set_mmvq_batch_invariant (calling thread).
+// Set by ggml_backend_cuda_set_mmvq_batch_invariant / set_batch_invariant_mode (calling thread).
+// mmvq_batch_invariant() is true in both MMVQ and FULL modes; full_batch_invariant() is true only in FULL.
 bool ggml_cuda_mmvq_batch_invariant();
+bool ggml_cuda_full_batch_invariant();
 // Columns up to which batch-invariant dense products stay on the matrix-vector kernels (calling thread):
 // MMVQ_INVARIANT_MAX_NCOLS unless ggml_backend_cuda_set_mmvq_invariant_max_ncols set it.
 int ggml_cuda_mmvq_invariant_max_ncols();

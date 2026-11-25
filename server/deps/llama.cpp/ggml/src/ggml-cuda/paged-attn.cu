@@ -68,7 +68,7 @@ static int32_t paged_attn_blocks_per_partition(int64_t table_blocks) {
 static int32_t paged_attn_occupancy_blocks_per_partition(
         int32_t blocks_per_partition, int32_t live_blocks, int64_t target_blocks,
         int64_t work_groups, int64_t n_rows) {
-    if (ggml_cuda_mmvq_batch_invariant() || work_groups < 1 || n_rows < 1) {
+    if (ggml_cuda_full_batch_invariant() || work_groups < 1 || n_rows < 1) {
         return blocks_per_partition;
     }
     const int64_t floor = std::min<int64_t>(
@@ -1245,7 +1245,7 @@ static bool try_launch_paged_attn(
     const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
         std::min<int32_t>(max_partitions, PAGED_ATTN_MAX_PARTITIONS),
         paged_attn_ceil_div(live_blocks, blocks_per_partition)));
-    const bool write_partials = max_partitions > 1;
+    const bool write_partials = (ggml_cuda_full_batch_invariant() ? max_partitions : n_partitions) > 1;
     if (n_partitions > 1) { ++g_paged_attn_partitioned_launch_count; }
 
     // The partials of a large row count (a prompt chunk) would not fit the
@@ -2560,6 +2560,9 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     const int32_t n_logical_blocks = std::min<int32_t>(
         paged_attn_ceil_div(std::min<int32_t>(max_kv_seq_len, committed_cap) + tree_width, block_size),
         extent_blocks);
+    if (paged_attn_ceil_div(table_blocks, blocks_per_partition) == 1) {
+        blocks_per_partition = std::max<int32_t>(blocks_per_partition, extent_blocks);
+    }
     blocks_per_partition = paged_attn_occupancy_blocks_per_partition(
         blocks_per_partition, n_logical_blocks,
         (int64_t) ggml_cuda_info().devices[ctx.device].nsm * 4,
@@ -2573,9 +2576,10 @@ static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_ten
     const int32_t n_partitions = std::max<int32_t>(1, std::min<int32_t>(
         max_partitions, paged_attn_ceil_div(n_logical_blocks, blocks_per_partition)));
     // The direct path (f32 output) and the partials path (half partials, then
-    // the combine) round differently, so that choice is a launch constant too:
-    // partials whenever the table can need more than one partition.
-    const int write_partials = max_partitions > 1 ? 1 : 0;
+    // the combine) round differently: FULL batch-invariant mode locks that
+    // choice to the table capacity (max_partitions > 1), while default mode
+    // skips the FP16 partial round-trip whenever n_partitions == 1.
+    const int write_partials = (ggml_cuda_full_batch_invariant() ? max_partitions : n_partitions) > 1 ? 1 : 0;
 
     const int32_t rows_per_block = 4;
     const dim3 block(32, 8);

@@ -225,14 +225,27 @@ GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
-// Calling-thread switch for batch-invariant quantized MUL_MAT: while set,
-// products of up to eight columns stay on the matrix-vector path with the
-// single-column block shape (Q8_0 reads each weight row once for all
-// columns, other types run the single-column kernel per column), so each
-// output column is bit-identical to the same product of that column alone
-// and a speculative verifier reproduces single-token decode exactly.
-// Returns the previous setting.
+// Calling-thread batch-invariance scope for quantized MUL_MAT and attention:
+//   OFF  — default maximum-throughput dispatch.
+//   MMVQ — small-N MMVQ bit parity with N=1 (used by Qwen4Exp & DeepSeek V4;
+//          keeps RDNA4 Q8_0 twin/GLU/HC fusions and RDNA WMMA FA2 active).
+//   FULL — strict N=1..1024 cross-width invariance (mixed prefill+decode+verify):
+//          data-parallel MMQ at every column count, fixed paged-attention cuts,
+//          disables batch-dependent fusions and RDNA WMMA/small-M routes.
+enum ggml_cuda_batch_invariant_mode {
+    GGML_CUDA_BATCH_INVARIANT_OFF  = 0,
+    GGML_CUDA_BATCH_INVARIANT_MMVQ = 1,
+    GGML_CUDA_BATCH_INVARIANT_FULL = 2,
+};
+
+// Calling-thread switch for batch-invariant quantized MUL_MAT (MMVQ scope):
+// maps false -> OFF, true -> MMVQ. Returns whether any invariant mode was active.
 GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_batch_invariant(bool enabled);
+
+// Calling-thread selector for the full 3-mode batch-invariance scope.
+// Returns the previous mode.
+GGML_BACKEND_API enum ggml_cuda_batch_invariant_mode ggml_backend_cuda_set_batch_invariant_mode(
+        enum ggml_cuda_batch_invariant_mode mode);
 
 // Calling-thread column ceiling of those batch-invariant products: 0 = eight (the default), 8..16 = that many.
 // Above eight columns Q8_0 still reads each weight row once for all columns where the device runs the generic
