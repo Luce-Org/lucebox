@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <limits>
 #include <vector>
 
 namespace qwen4exp_test {
@@ -56,7 +55,6 @@ inline bool equal_cache(Qwen4ExpCache & c, const SavedCache & in) {
 constexpr uint8_t kIndexerPoison = 0x3f;
 constexpr uint32_t kIndexerPoisonBits = 0x3f3f3f3fu;
 inline void poison_indexer(Qwen4ExpCache & c) {
-    c.kv_dirty_rows = c.indexer_dirty_blocks = std::numeric_limits<int>::max();  // every row poisoned
     for (const auto * tensors : {&c.indexer_raw, &c.indexer_k})
         for (auto * t : *tensors)
             if (t) ggml_backend_tensor_memset(t, kIndexerPoison, 0, ggml_nbytes(t));

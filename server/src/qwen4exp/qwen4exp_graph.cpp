@@ -2312,8 +2312,6 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
 // once, on the device holding each layer's rows (Qwen4ExpCache::remote). The stable graph handles this forward's own
 // blocks.
 static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos0) {
-    // Recorded before any device writes, so a failure on the second device still leaves the pooled rows tracked.
-    if (pos0 / 4 > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = pos0 / 4;
     for (ggml_backend_t device : {backend, cache.remote_backend}) {
         if (!device) continue;
         ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
@@ -2370,7 +2368,6 @@ bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
         tops.push_back(top);
     }
     ggml_gallocr_t ba = tops.empty() ? nullptr : ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (nb > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = nb;   // the pooling may write them even if it fails
     const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) && ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
     out.graph_failed = !ok && !tops.empty();
     if (ok) {
@@ -2807,10 +2804,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
         if (split && w.hot) w.hot->tick(backend, w);   // hot expert swaps go live between graphs
-        if ((int) kv_len > cache.kv_dirty_rows) cache.kv_dirty_rows = (int) kv_len;
-        if (stable_qsa && (int) (kv_len / 4) > cache.indexer_dirty_blocks) {
-            cache.indexer_dirty_blocks = (int) (kv_len / 4);
-        }
         if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
                               out_rows)) {
             return res;
@@ -3044,11 +3037,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         // capture fails on allocating kernels such as the CUB segmented sort).
         ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
         if (split && w.hot) w.hot->tick(backend, w, T <= QWEN4EXP_MTP_MAX_VERIFY ? 0 : (int) T);
-        if ((int) kv_len > cache.kv_dirty_rows) cache.kv_dirty_rows = (int) kv_len;
-        if (qsa_ratio(w) > 0) {
-            const int max_blk = (int) ((pos0 + T) / qsa_ratio(w));
-            if (max_blk > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = max_blk;
-        }
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -3067,7 +3055,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     cache.ple_prev = inputs->ple_prev;
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     cache.cur_pos = (int) kv_len;
-    if (cache.cur_pos > cache.kv_dirty_rows) cache.kv_dirty_rows = cache.cur_pos;
     if (mtp_prefill) cache.mtp_prev_pos = pos0 + n_tokens - 1;
     if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; cache.spec_log = stable_ws.spec_log; }
     // The all-keys branch did not pool anything. Leaving this prefix at zero
@@ -3077,9 +3064,6 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     } else if ((qsa != QSA_DENSE || (verify && rows.back().qsa != QSA_DENSE)) &&
         (pos0 + T) / qsa_ratio(w) > w.indexer_top_k / qsa_ratio(w)) {
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
-    }
-    if (cache.indexer_blocks > cache.indexer_dirty_blocks) {
-        cache.indexer_dirty_blocks = cache.indexer_blocks;
     }
 
     // A pool (T=1 decode, verify) keeps the graph's tensors until its next forward: only then may the rows stay.
@@ -3351,7 +3335,6 @@ bool qwen4exp_mtp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwe
         return false;
     }
     // Keep the original slices even for K/V-only prefill: matmul dispatch/numerics depend on batch width.
-    if (pos0 + n > cache.kv_dirty_rows) cache.kv_dirty_rows = pos0 + n;
     constexpr int slice = 512;
     const size_t hd = (size_t) w.n_embd * w.n_hc;
     for (int i = 0; i < n; i += slice) {
@@ -3385,7 +3368,6 @@ bool mtp_draft_args_ok(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, c
 // K/V pair; later ranks read the preceding GPU argmax and HC residual directly. MTP has no PLE.
 bool mtp_draft_launch(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                       const int32_t * tokens, const float * hidden, int n, int pos0, int ranks) {
-    if (pos0 + n + ranks > cache.kv_dirty_rows) cache.kv_dirty_rows = pos0 + n + ranks;
     std::vector<float> unused;
     for (int rank = 0; rank < ranks; ++rank) {
         if (!mtp_forward_batch(backend, w, cache, tokens, hidden, rank ? 1 : n,
@@ -3609,12 +3591,7 @@ bool qwen4exp_mtp_draft_slots(ggml_backend_t backend, const Qwen4ExpWeights & w,
         }
         std::vector<int> pos((size_t) n_slots);
         for (int rank = 1; batched && rank < k; ++rank) {
-            for (int s = 0; s < n_slots; ++s) {
-                pos[(size_t) s] = pos0[s] + n[s] + rank - 1;
-                if (pos[(size_t) s] + 1 > caches[s]->kv_dirty_rows) {
-                    caches[s]->kv_dirty_rows = pos[(size_t) s] + 1;
-                }
-            }
+            for (int s = 0; s < n_slots; ++s) pos[(size_t) s] = pos0[s] + n[s] + rank - 1;
             if (!mtp_rank_slots(backend, w, caches, pos.data(), n_slots, rank, ranks[(size_t) rank])) return false;
         }
     }
@@ -4375,13 +4352,6 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         }
     }
 
-    // The rows this graph writes, recorded before it runs: a failed compute may still have written them.
-    for (int s = 0; s < n_slots; ++s) {
-        if (positions[s] + 1 > caches[s]->kv_dirty_rows) caches[s]->kv_dirty_rows = positions[s] + 1;
-        if (qsa_slot[(size_t) s] && (positions[s] + 1) / 4 > caches[s]->indexer_dirty_blocks) {
-            caches[s]->indexer_dirty_blocks = (positions[s] + 1) / 4;
-        }
-    }
     ggml_status status;
     Qwen4ExpPinnedReads reads;
     {
@@ -4917,13 +4887,6 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     }
     rs.push_back({ws.hidden, hidden.data()});
 
-    // The rows this graph writes, recorded before it runs: a failed compute may still have written them.
-    for (int s = 0; s < n_slots; ++s) {
-        if (positions[s] + R > caches[s]->kv_dirty_rows) caches[s]->kv_dirty_rows = positions[s] + R;
-        if ((positions[s] + R) / 4 > caches[s]->indexer_dirty_blocks) {
-            caches[s]->indexer_dirty_blocks = (positions[s] + R) / 4;
-        }
-    }
     ggml_status status;
     Qwen4ExpPinnedReads reads;
     {

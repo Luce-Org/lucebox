@@ -255,6 +255,10 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
         free_qwen4exp_cache(out);
         return false;
     }
+    if (out.spec_slot0) {
+        const int32_t slab = 0;
+        ggml_backend_tensor_set(out.spec_slot0, &slab, 0, sizeof slab);
+    }
     if (kvflash_pool > 0) {
         // Attached right after the target's allocation, so the pager's page stream is the target's. Slots read before
         // any write (masked) must hold zeros: a masked NaN row would still poison its query.
@@ -266,32 +270,16 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
             return false;
         }
         ggml_backend_buffer_clear(out.buf, 0);
-    } else {
-        // Zero once at cache creation so restore_qwen4exp_snapshot only needs
-        // to zero the dirty suffix [s.cur_pos, kv_dirty_rows) instead of
-        // clearing the entire max_ctx buffer on every restore.
-        ggml_backend_buffer_clear(out.buf, 0);
-        if (out.remote_buf && !reuse_remote_buf) {
-            ggml_backend_buffer_clear(out.remote_buf, 0);
-        }
-    }
-    if (out.spec_slot0) {
-        const int32_t slab = 0;
-        ggml_backend_tensor_set(out.spec_slot0, &slab, 0, sizeof slab);
     }
 
     // Stable scoring converts the whole bucket, including its masked suffix.
-    if (reuse_remote_buf) {
-        for (ggml_tensor * t : out.indexer_k) {
-            if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
-        }
+    for (ggml_tensor * t : out.indexer_k) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
 
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
     out.indexer_blocks = 0;
-    out.kv_dirty_rows = reuse_remote_buf ? static_cast<int>(attn_rows) : 0;
-    out.indexer_dirty_blocks = reuse_remote_buf ? max_ctx : 0;
     out.input_ring.enabled = qwen4exp_uma_ring_supported(backend);
     if (out.input_ring.enabled) {
         std::fprintf(stderr,
@@ -342,12 +330,6 @@ void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & wo
     workspace = {};
 }
 
-// A tensor of the expert GPU's layers, whose copies go through its own stream.
-static bool on_remote_buf(const Qwen4ExpCache & c, const ggml_tensor * t) {
-    const ggml_tensor * base = t && t->view_src ? t->view_src : t;
-    return c.remote_backend && c.remote_buf && base && base->buffer == c.remote_buf;
-}
-
 // Every retained graph of the cache: the stable T=1 decode graph, the verify graph per width and the MTP graphs.
 static void clear_retained_graphs(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
@@ -365,8 +347,6 @@ static void clear_position_bound_graphs(Qwen4ExpCache & c) {
 }
 
 void free_qwen4exp_cache(Qwen4ExpCache & c) {
-    c.local_transfer.release();
-    c.remote_transfer.release();
     clear_retained_graphs(c);
     c.kvflash.reset();   // waits for its page work on the rows freed below
     c.kvflash_slot_pos.clear();
@@ -416,8 +396,6 @@ void free_qwen4exp_cache(Qwen4ExpCache & c) {
     c.ple_prev.clear();
     c.cur_pos = 0;
     c.max_ctx = 0;
-    c.kv_dirty_rows = std::numeric_limits<int>::max();
-    c.indexer_dirty_blocks = std::numeric_limits<int>::max();
 }
 
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
@@ -426,11 +404,6 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     ggml_backend_synchronize(backend);
     clear_position_bound_graphs(c);
     if (c.kvflash) c.kvflash->reset();
-    // Preserve high-water dirty row bounds across state resets (KV tensors are
-    // intentionally left intact here so restore_qwen4exp_snapshot knows what
-    // suffix may still hold non-zero rows).
-    if (c.cur_pos > c.kv_dirty_rows) c.kv_dirty_rows = c.cur_pos;
-    if (c.indexer_blocks > c.indexer_dirty_blocks) c.indexer_dirty_blocks = c.indexer_blocks;
     for (ggml_tensor * t : c.ssm_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
@@ -565,57 +538,42 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const 
     // Delta snapshot save: when saving a prefix extending an existing host-RAM ancestor snapshot,
     // memcpy the shared [0, anc_bytes) KV/indexer rows in system RAM and DMA only the new tail rows from GPU.
     std::vector<RestoreStrip> anc_strips;
-    const bool host_store = ggml_backend_buffer_is_host(s.buf);
     const bool can_delta = !pager && ancestor && ancestor != &s && ancestor->buf &&
                            !ancestor->state_only && !ancestor->rows_in_pager &&
                            ancestor->cur_pos > 0 && ancestor->cur_pos <= c.cur_pos &&
                            ancestor->indexer_blocks <= c.indexer_blocks &&
-                           host_store && ggml_backend_buffer_is_host(ancestor->buf) &&
+                           ggml_backend_buffer_is_host(s.buf) && ggml_backend_buffer_is_host(ancestor->buf) &&
                            held_strips(c, *ancestor, ancestor->mtp && c.mtp_k != nullptr, anc_strips);
-    if (host_store) {
-        // Double-buffered pinned host DMA routed to each strip's owning backend
-        // (target vs. remote expert device), avoiding device-mismatch sync
-        // fallbacks and pageable-memory stalls on ROCm/HIP.
-        ggml_backend_synchronize(backend);
-        c.local_transfer.begin(backend);
-        if (c.remote_backend) c.remote_transfer.begin(c.remote_backend);
-        for (size_t i = 0; i < s.strips.size(); ++i) {
-            auto [live, copy] = s.strips[i];
-            (void) live;
-            const auto & m = metas[i];
-            PinnedTransfer & xfer = on_remote_buf(c, m.t) ? c.remote_transfer : c.local_transfer;
-            bool did_delta = false;
-            if (can_delta && m.rows) {
-                for (const auto & a : anc_strips) {
-                    if (a.rows && a.t == m.t && a.off == m.off && a.bytes > 0 && a.bytes <= m.bytes &&
-                        a.src && a.src->type == copy->type) {
-                        std::memcpy(copy->data, a.src->data, a.bytes);
-                        const size_t tail = m.bytes - a.bytes;
-                        if (tail > 0) {
-                            xfer.d2h(m.t, m.off + a.bytes,
-                                     static_cast<uint8_t *>(copy->data) + a.bytes, tail);
-                        }
-                        did_delta = true;
-                        break;
+    ggml_context * delta_ctx = can_delta ? ggml_init({(2 * count + 2) * ggml_tensor_overhead(), nullptr, true}) : nullptr;
+    for (size_t i = 0; i < s.strips.size(); ++i) {
+        auto [live, copy] = s.strips[i];
+        const auto & m = metas[i];
+        bool did_delta = false;
+        if (can_delta && delta_ctx && m.rows) {
+            for (const auto & a : anc_strips) {
+                if (a.rows && a.t == m.t && a.off == m.off && a.bytes > 0 && a.bytes <= m.bytes &&
+                    a.src && a.src->type == copy->type) {
+                    std::memcpy(copy->data, a.src->data, a.bytes);
+                    const size_t tail = m.bytes - a.bytes;
+                    if (tail > 0) {
+                        const int64_t tn = tail / ggml_type_size(m.t->type) * ggml_blck_size(m.t->type);
+                        auto * d_live = ggml_view_1d(delta_ctx, m.t, tn, m.off + a.bytes);
+                        auto * d_copy = ggml_view_1d(delta_ctx, copy, tn, a.bytes);
+                        d_live->buffer = m.t->buffer;
+                        d_copy->buffer = copy->buffer;
+                        ggml_backend_tensor_copy_async(backend, store, d_live, d_copy);
                     }
+                    did_delta = true;
+                    break;
                 }
             }
-            if (!did_delta) {
-                xfer.d2h(m.t, m.off, copy->data, m.bytes);
-            }
         }
-        c.local_transfer.finish();
-        if (c.remote_backend) c.remote_transfer.finish();
-    } else {
-        for (size_t i = 0; i < s.strips.size(); ++i) {
-            auto [live, copy] = s.strips[i];
-            const auto & m = metas[i];
-            ggml_backend_t strip_backend = on_remote_buf(c, m.t) ? c.remote_backend : backend;
-            ggml_backend_tensor_copy_async(strip_backend, store, live, copy);
+        if (!did_delta) {
+            ggml_backend_tensor_copy_async(backend, store, live, copy);
         }
-        ggml_backend_synchronize(backend);
-        if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);
     }
+    ggml_backend_synchronize(backend);
+    if (delta_ctx) ggml_free(delta_ctx);
     s.rows_in_pager = pager;
     s.cur_pos = c.cur_pos;
     s.indexer_blocks = c.indexer_blocks;
@@ -661,6 +619,8 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
         });
         if (!covered) return false;
     }
+    ggml_context * views = ggml_init({2 * target.size() * ggml_tensor_overhead(), nullptr, true});
+    if (!views) return false;
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
     if (c.remote_backend) ggml_backend_synchronize(c.remote_backend);
     clear_position_bound_graphs(c);
@@ -668,79 +628,30 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
     // states are not in c.buf; the snapshot rewrites this slot's slabs in full.
     // Only a donor's leading rows are copied, so the rows past them are zero as after a whole restore.
     // Pager-held rows: drop the live positions past the snapshot instead; the point state is overwritten below.
-    auto clear_rows_range = [](ggml_tensor * t, int64_t from_row, int64_t to_row) {
-        if (!t) return;
-        from_row = std::max<int64_t>(0, from_row);
-        to_row = std::min<int64_t>(to_row, t->ne[1]);
-        if (from_row >= to_row) return;
-        const size_t row_bytes = (size_t) (to_row - from_row) * t->nb[1];
-        for (int64_t h = 0; h < t->ne[2]; ++h) {
-            ggml_backend_tensor_memset(
-                t, 0, (size_t) h * t->nb[2] + (size_t) from_row * t->nb[1], row_bytes);
-        }
-    };
     if (s.rows_in_pager) {
         c.kvflash->truncate(s.cur_pos);
-    } else {
-        // Rows at or above the high-water dirty bounds are already zero from
-        // initial buffer clear; zero only the written suffix past the snapshot
-        // instead of clearing the entire max_ctx buffer (several GiB at 256K).
-        const int64_t dirty_rows = std::max(c.kv_dirty_rows, c.cur_pos);
-        const int64_t dirty_kv_end = (dirty_rows + 3) & ~int64_t(3);
-        const int64_t dirty_blocks = std::max(c.indexer_dirty_blocks, c.indexer_blocks);
-        for (auto * t : c.attn_k) clear_rows_range(t, s.cur_pos, dirty_kv_end);
-        for (auto * t : c.attn_v) clear_rows_range(t, s.cur_pos, dirty_kv_end);
-        for (auto * t : c.indexer_raw) clear_rows_range(t, s.cur_pos, dirty_rows);
-        for (auto * t : c.indexer_k) {
-            if (!t) continue;
-            clear_rows_range(t, s.indexer_blocks, std::min<int64_t>(dirty_blocks, t->ne[1] - 1));
-            if (dirty_rows > 0 || dirty_blocks > 0) {
-                clear_rows_range(t, t->ne[1] - 1, t->ne[1]);  // permanent decode scratch row
+    } else if (skip_live_kv) {
+        auto clear_tail = [](ggml_tensor * t, int64_t from_row) {
+            if (!t || from_row < 0 || from_row >= t->ne[1]) return;
+            const size_t row_bytes = (size_t) (t->ne[1] - from_row) * t->nb[1];
+            for (int64_t h = 0; h < t->ne[2]; ++h) {
+                ggml_backend_tensor_memset(t, 0, (size_t) h * t->nb[2] + (size_t) from_row * t->nb[1], row_bytes);
             }
+        };
+        for (auto * t : c.attn_k) clear_tail(t, s.cur_pos);
+        for (auto * t : c.attn_v) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_raw) clear_tail(t, s.cur_pos);
+        for (auto * t : c.indexer_k) clear_tail(t, s.indexer_blocks);
+        if (mtp) {
+            clear_tail(c.mtp_k, std::max(0, s.cur_pos - 1));
+            clear_tail(c.mtp_v, std::max(0, s.cur_pos - 1));
         }
-        const int64_t mtp_from = mtp ? std::max(0, s.cur_pos - 1) : 0;
-        clear_rows_range(c.mtp_k, mtp_from, dirty_kv_end);
-        clear_rows_range(c.mtp_v, mtp_from, dirty_kv_end);
-        if (!mtp && c.mtp_prev_hidden) {
-            ggml_backend_tensor_memset(c.mtp_prev_hidden, 0, 0, ggml_nbytes(c.mtp_prev_hidden));
-        }
+    } else {
+        ggml_backend_buffer_clear(c.buf, 0);
+        if (c.remote_buf) ggml_backend_buffer_clear(c.remote_buf, 0);
     }
-
-    bool used_local_xfer = false;
-    bool used_remote_xfer = false;
-    bool used_async_local = false;
-    bool used_async_remote = false;
-    ggml_context * views = nullptr;
-
     for (const RestoreStrip & strip : target) {
         if (skip_live_kv && strip.rows) continue;
-        const bool remote = on_remote_buf(c, strip.t);
-        const bool src_is_host = strip.src && strip.src->buffer &&
-                                 ggml_backend_buffer_is_host(strip.src->buffer);
-        if (src_is_host) {
-            if (remote) {
-                if (!used_remote_xfer) {
-                    c.remote_transfer.begin(c.remote_backend);
-                    used_remote_xfer = true;
-                }
-                c.remote_transfer.h2d(strip.t, strip.off, strip.src->data, strip.bytes);
-            } else {
-                if (!used_local_xfer) {
-                    c.local_transfer.begin(backend);
-                    used_local_xfer = true;
-                }
-                c.local_transfer.h2d(strip.t, strip.off, strip.src->data, strip.bytes);
-            }
-            continue;
-        }
-        if (!views) {
-            views = ggml_init({2 * target.size() * ggml_tensor_overhead(), nullptr, true});
-            if (!views) {
-                if (used_local_xfer) c.local_transfer.finish();
-                if (used_remote_xfer) c.remote_transfer.finish();
-                return false;
-            }
-        }
         const int64_t n = (int64_t) (strip.bytes / ggml_type_size(strip.t->type)) * ggml_blck_size(strip.t->type);
         ggml_tensor * live = ggml_view_1d(views, strip.t, n, strip.off);
         ggml_backend_view_init(live);
@@ -749,24 +660,12 @@ bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & 
             src = ggml_view_1d(views, strip.src, n, 0);
             ggml_backend_view_init(src);
         }
-        ggml_backend_t dst_backend = remote ? c.remote_backend : backend;
-        ggml_backend_tensor_copy_async(backend, dst_backend, src, live);
-        if (remote) used_async_remote = true;
-        else        used_async_local = true;
+        ggml_backend_tensor_copy_async(backend, backend, src, live);
     }
-    if (used_local_xfer) c.local_transfer.finish();
-    if (used_remote_xfer) c.remote_transfer.finish();
-    if (used_async_local) ggml_backend_synchronize(backend);
-    if (used_async_remote) ggml_backend_synchronize(c.remote_backend);
-    if (views) ggml_free(views);
+    ggml_backend_synchronize(backend);
+    ggml_free(views);
     c.cur_pos = s.cur_pos;
     c.indexer_blocks = s.indexer_blocks;
-    // The dirty tail was cleared above. A pager-held restore clears nothing:
-    // the pager drops its rows, the indexer and draft rows stay written.
-    if (!s.rows_in_pager) {
-        c.kv_dirty_rows = s.cur_pos;
-        c.indexer_dirty_blocks = s.indexer_blocks;
-    }
     c.mtp_prev_pos = mtp ? s.mtp_prev_pos : -1;   // no draft state: its request decodes without drafts
     c.kv_bucket_base = s.kv_bucket_base;
     c.ple_prev = s.ple_prev;
