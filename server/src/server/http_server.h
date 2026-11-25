@@ -470,6 +470,13 @@ struct PflashChatTurnSpan {
     bool valid() const {
         return content_begin >= 0 && content_end > content_begin;
     }
+    // The prompt ends at its last turn's closing marker with no generation
+    // prompt after it (Inkling 2), so ``generation_begin`` is the prompt end.
+    bool ends_at_closed_turn(int prompt_end) const {
+        return valid() && generation_begin == prompt_end && !turns.empty() &&
+               turns.back().turn_end == prompt_end && turns.back().content_end > 0 &&
+               turns.back().content_end < prompt_end;
+    }
 };
 
 PflashChatTurnSpan pflash_chat_query_turn(

@@ -1825,12 +1825,20 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         bargs.draft_device, model.draft_device_set, bargs.device,
         model.target_device_auto);
 
-    // PFlash beside Qwen3.8-Flash (qwen4exp): the drafter scores each prompt
-    // beside the resident model, which sizes its context and prompt chunk with
-    // the drafter's room kept free on the drafter's GPU: its weights and the
-    // scoring workspace per prompt token measured for concurrent Qwen3.5 (the
-    // same drafter, whatever the target).
-    if (sconfig.pflash && inspect_gguf_model_info(bargs.model_path.c_str()).arch == "qwen4exp") {
+    // PFlash beside Qwen3.8-Flash (qwen4exp) or Inkling 2 (inkling2_loop /
+    // inkling2, when sizing context automatically or explicitly skipping park):
+    // the drafter scores each prompt beside the resident model, which sizes its
+    // context and prompt chunk with the drafter's room kept free on the
+    // drafter's GPU: its weights and the scoring workspace per prompt token
+    // measured for concurrent Qwen3.5 (the same drafter, whatever the target).
+    const std::string pflash_arch = sconfig.pflash
+        ? inspect_gguf_model_info(bargs.model_path.c_str()).arch
+        : std::string();
+    const bool pflash_resident_reserve =
+        pflash_arch == "qwen4exp" ||
+        (luce::common::arch_is_inkling2_family(pflash_arch) &&
+         (bargs.device.fit_ctx || sconfig.pflash_skip_park));
+    if (pflash_resident_reserve) {
         std::error_code size_error;
         const auto drafter_bytes =
             std::filesystem::file_size(sconfig.pflash_drafter_path, size_error);

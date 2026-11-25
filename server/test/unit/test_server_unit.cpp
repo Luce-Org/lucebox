@@ -1510,6 +1510,12 @@ TEST_CASE(ServerUnitFixture,
          {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
           "<｜Assistant｜>"},
          "<｜User｜>"},
+        {"inkling2", "inkling2",
+         {"<|message_system|>", "<|message_user|>", "<|message_model|>",
+          "<|message_tool|>", "<|content_text|>", "<|content_thinking|>",
+          "<|content_xml|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+          "<|content_model_end_sampling|>"},
+         "<|message_user|><|content_text|>"},
         {"laguna", "laguna",
          {"<system>", "</system>", "<user>", "</user>", "<assistant>",
           "</assistant>"},
@@ -1563,6 +1569,21 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(deepseek.valid);
     TEST_ASSERT_MSG(deepseek.content == "What is the answer?",
                     deepseek.content);
+
+    const auto inkling2 = pflash_rendered_query_turn(
+        messages, "inkling2", true,
+        {"<|message_system|>", "<|message_user|>", "<|message_model|>",
+         "<|message_tool|>", "<|content_text|>", "<|content_thinking|>",
+         "<|content_xml|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+         "<|content_model_end_sampling|>"});
+    TEST_ASSERT(inkling2.valid);
+    TEST_ASSERT(inkling2.family == "inkling2");
+    TEST_ASSERT_MSG(inkling2.content == "What is the answer?", inkling2.content);
+    TEST_ASSERT_MSG(inkling2.header == "<|message_user|><|content_text|>", inkling2.header);
+    TEST_ASSERT(inkling2.later_turns);
+    TEST_ASSERT(inkling2.roles == std::vector<std::string>({"system", "user", "model", "tool"}));
+    TEST_ASSERT_MSG(inkling2.closing == "<|end_message|>", inkling2.closing);
+    TEST_ASSERT_MSG(inkling2.generation.empty(), inkling2.generation);
 }
 
 // Request probe: the human user messages' content spans, by message ROLE,
@@ -19431,6 +19452,8 @@ struct UnifiedOptions {
     std::vector<std::vector<std::string>> required;   // per turn, pflash_required
     std::vector<char> tool_checks_note;         // per turn, an internal tool-checks note pass
     std::function<void(size_t)> before_turn;    // runs before each turn (after a restart)
+    std::string codec = "qwen3.5";              // chat codec used to render and parse the session
+    std::vector<std::string> control_tokens;    // target tokenizer control tokens (empty = default Qwen)
 };
 
 // One server with the unified view, the turns in order. By default one fixture tokenizer is target and drafter, so
@@ -19454,7 +19477,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     for (const auto & messages : turns) {
         ToolMemory tool_memory;
         const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-        rendered.push_back(codec_text("qwen3.5", chat, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
+        rendered.push_back(codec_text(options.codec, chat, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
             tools.is_array() && !tools.empty() ? tools.dump() : ""));
         cover += rendered.back();
     }
@@ -19464,7 +19487,9 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         out.insert(out.end(), words.begin(), words.end());
         return out;
     };
-    const std::string path = write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover);
+    const std::string path = options.control_tokens.empty()
+        ? write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover)
+        : write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover, options.control_tokens);
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
     std::string drafter_path;
@@ -19522,6 +19547,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     config.pflash_curve = options.pflash_curve;
     config.pflash_adaptive_keep = options.adaptive_keep;
     config.max_ctx = max_ctx;
+    if (options.codec != "qwen3.5") config.chat_codec = options.codec;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     if (!options.disk_dir.empty()) {
@@ -21590,4 +21616,119 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_inkling2_chat_boundaries_and_pflash_unified_session) {
+    const std::vector<std::string> inkling_controls = {
+        "<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>",
+        "<|content_text|>", "<|content_thinking|>", "<|content_xml|>",
+        "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>",
+    };
+
+    // 1. Chat boundary detection across Inkling 2 turns (including
+    //    <|content_model_end_sampling|> between a model turn and the next turn).
+    const std::vector<ChatMessage> sample_msgs = {
+        {"system", "You are helpful.", ""},
+        {"user", "First question", ""},
+        {"assistant", "First answer", ""},
+        {"user", "Second question", ""},
+    };
+    const std::string sample_rendered =
+        codec_text("inkling2", sample_msgs, /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    const std::string tok_path = write_pflash_bpe_tokenizer_fixture(
+        {"You", " are", " helpful", ".", "First", " Second", " question", " answer"},
+        sample_rendered, inkling_controls);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(tok_path.c_str()));
+    unlink(tok_path.c_str());
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    TEST_ASSERT(markers.family == "inkling2");
+    const auto sample_ids = tok.encode(sample_rendered);
+    const auto bounds = find_all_boundaries(sample_ids, markers);
+    // Boundaries after: system->effort, effort->user1, user1->model1, model1(+end_sampling)->user2.
+    TEST_ASSERT_MSG(bounds.size() == 4, "expected 4 Inkling 2 turn boundaries");
+
+    // 2. Full end-to-end PFlash unified view on Inkling 2 with a distinct
+    //    Qwen-style drafter tokenizer: Turn 1 pages a long user paste, Turn 2
+    //    continues the view and recalls the dropped mango line, Turn 3 repeats.
+    //    Like Qwen3.5's, the drafter spells the markers as text and merges
+    //    "|>" with the next marker's "<|", so a prompt's closing "|>" is not
+    //    a token prefix of the next turn's prompt.
+    UnifiedOptions opts;
+    opts.codec = "inkling2";
+    opts.control_tokens = inkling_controls;
+    opts.distinct_drafter = true;
+    opts.drafter_words = {"|>", "|><|"};
+
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session(
+        {turn1, turn2, turn2}, nullptr, nullptr, 64, unified_fruit_score,
+        /*chunk=*/0, /*keep_ratio=*/0.3f, /*recall=*/nullptr, /*max_ctx=*/65536, opts);
+
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT(p1.compressed);
+    TEST_ASSERT_MSG(p1.pflash_stats["unified"].value("decision", "") == "region", p1.pflash_stats.dump());
+    const std::string & s1 = run.served_text[0];
+    TEST_ASSERT(s1.find("You are helpful.") != std::string::npos);
+    TEST_ASSERT(s1.find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(s1.find("mango") == std::string::npos);
+    // No generation prompt: the served prompt ends with the question and its closing marker, kept verbatim.
+    const auto ends_with = [] (const std::string & text, const std::string & tail) {
+        return text.size() >= tail.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    TEST_ASSERT(ends_with(s1, "Which line mentions KIWI?<|end_message|>"));
+    TEST_ASSERT(p1.tokens.size() < run.ids[0].size());
+
+    // Turn 2 continues Turn 1's view (prefix reused verbatim) and recalls mango.
+    const auto & p2 = run.prepared[1];
+    TEST_ASSERT(p2.compressed);
+    TEST_ASSERT_MSG(p2.pflash_stats["unified"].value("decision", "") == "recall", p2.pflash_stats.dump());
+    TEST_ASSERT(p2.pflash_stats["unified"].value("continued", false));
+    TEST_ASSERT(p2.tokens.size() >= p1.tokens.size());
+    TEST_ASSERT(std::equal(p1.tokens.begin(), p1.tokens.end(), p2.tokens.begin()));
+    const std::string & s2 = run.served_text[1];
+    TEST_ASSERT(s2.find("Line 60: plain filler text here mango\n") != std::string::npos);
+    TEST_ASSERT(ends_with(s2, "Which line mentions MANGO?<|end_message|>"));
+
+    // Turn 3 repeats Turn 2 without re-running the drafter.
+    const auto & p3 = run.prepared[2];
+    TEST_ASSERT_MSG(p3.pflash_stats["unified"].value("decision", "") == "repeat", p3.pflash_stats.dump());
+    TEST_ASSERT(p3.tokens == p2.tokens);
+    TEST_ASSERT(run.calls_after[2] == run.calls_after[1]);
+
+    // 3. Tool-output paging on Inkling 2 (agent loop ending with <|message_tool|>...<|end_message|>).
+    const json tools = json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read_file"},
+             {"description", "Read file"},
+             {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}},
+         }}},
+    });
+    const json tool_turn = json::array({
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "notes.txt"}})
+        })}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", doc}},
+    });
+    const auto tool_run = run_unified_session(
+        {tool_turn}, tools, "read_file", 64, unified_fruit_score,
+        /*chunk=*/0, /*keep_ratio=*/0.3f, /*recall=*/nullptr, /*max_ctx=*/65536, opts);
+    const auto & tp = tool_run.prepared[0];
+    TEST_ASSERT(tp.compressed);
+    TEST_ASSERT_MSG(tp.pflash_stats["unified"].value("decision", "") == "region", tp.pflash_stats.dump());
+    TEST_ASSERT(tool_run.served_text[0].find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(tool_run.served_text[0].find("mango") == std::string::npos);
+    TEST_ASSERT(tool_run.served_text[0].find("<|message_tool|>read_file<|content_text|>") != std::string::npos);
+    TEST_ASSERT(ends_with(tool_run.served_text[0], "<|end_message|>"));
+    TEST_ASSERT(tp.tokens.size() < tool_run.ids[0].size());
 }

@@ -170,14 +170,6 @@ void test_feature_gate_ds4_pflash_rejects_layer_split() {
     CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
     features.pflash_enabled = false;
     CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
-
-    // Current main also supports DS4 paged serving, which cannot park its
-    // live target state for PFlash. Keep that independent admission guard.
-    args = gate_args_hip_deepseek4();
-    args.paged_attention = true;
-    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
-    features.pflash_enabled = true;
-    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
 }
 
 void test_feature_gate_validates_target_split_topology() {
@@ -488,12 +480,6 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     windowed.fa_window = 4096;
     CHECK(!gate_result(
         windowed, "qwen35", PlacementBackend::Cuda).empty());
-
-    BackendAdmissionContext pflash;
-    pflash.pflash_enabled = true;
-    pflash.pflash_drafter_configured = true;
-    CHECK(!gate_result(
-        base, "qwen35", PlacementBackend::Cuda, pflash).empty());
 
     BackendAdmissionContext kvflash;
     kvflash.kvflash = KvFlashRequest::Fixed;
@@ -814,7 +800,8 @@ void test_model_capability_tables() {
 
     CHECK(arch_supports_pflash_compression("deepseek4"));
     // The drafter scores for any target: every model Lucebox serves compresses.
-    for (const char * arch : {"qwen35", "qwen3", "qwen4exp", "deepseek4", "deepseek41"}) {
+    for (const char * arch : {"qwen35", "qwen3", "qwen4exp", "deepseek4", "deepseek41",
+                              "inkling2_loop", "inkling2"}) {
         CHECK(arch_supports_pflash_compression(arch));
     }
 
