@@ -104,6 +104,26 @@ public:
     uint32_t free_block_count() const {
         return static_cast<uint32_t>(free_blocks_.size());
     }
+    // Physical blocks held solely by prefix-cache pins (no active sequence
+    // currently references them), immediately reclaimable on unpin.
+    uint32_t pinned_only_block_count() const {
+        return pinned_only_blocks_;
+    }
+    // How many blocks in `blocks` would immediately become free if one pin
+    // reference were released from each (no active sequence ref, pin ref == 1).
+    uint32_t reclaimable_on_unpin(const std::vector<uint32_t> & blocks) const;
+    // How many blocks in `blocks` are currently pinned-only (no active
+    // sequence ref, pin ref >= 1). Exceeds reclaimable_on_unpin when another
+    // pin also references the same blocks.
+    uint32_t pinned_only_in(const std::vector<uint32_t> & blocks) const;
+    // Total references (active sequences + prefix pins) holding `block`.
+    uint32_t block_refcount(uint32_t block) const {
+        return block < physical_block_count_
+            ? seq_refcounts_[block] + pin_refcounts_[block] : 0;
+    }
+    bool is_block_shared(uint32_t block) const {
+        return block_refcount(block) > 1;
+    }
 
     // Claim a free sequence slot for `request_id`. The new sequence starts
     // empty; no blocks are allocated until append().
@@ -167,6 +187,26 @@ public:
     PagedKvStatus owned_block_count(PagedKvSequenceHandle handle,
                                     uint32_t & out_count) const;
 
+    // Pin the leading `full_block_count` complete blocks of an active sequence
+    // (must satisfy full_block_count <= kv_seq_len / block_size) so their
+    // physical KV pages stay immutable and resident for zero-copy sharing.
+    PagedKvStatus pin_prefix_blocks(PagedKvSequenceHandle handle,
+                                    uint32_t full_block_count,
+                                    std::vector<uint32_t> & out_blocks);
+
+    // Release one pin reference from each physical block in `blocks`, returning
+    // any block whose total refcount reaches zero to the free list.
+    PagedKvStatus unpin_prefix_blocks(const std::vector<uint32_t> & blocks);
+
+    // Seed an empty sequence with `token_count` prefix tokens whose leading
+    // `shared_block_count` full physical blocks are shared zero-copy from
+    // `shared_blocks` (each must already be live/pinned). Any partial tail
+    // block receives a private physical block (copy-on-write isolation).
+    PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle handle,
+                                     const uint32_t * shared_blocks,
+                                     uint32_t shared_block_count,
+                                     uint32_t token_count);
+
 private:
     // Bookkeeping for one sequence slot. `generation` survives release so
     // the next acquire on this slot invalidates old handles.
@@ -203,6 +243,13 @@ private:
     void take_reserved_blocks(SequenceState & sequence,
                               uint32_t additional_blocks);
 
+    // Allocate one lowest-index free physical block with seq refcount = 1.
+    uint32_t take_free_block();
+    void add_seq_ref(uint32_t block);
+    void release_seq_ref(uint32_t block);
+    void add_pin_ref(uint32_t block);
+    void release_pin_ref(uint32_t block);
+
     // Take the lowest free index off `free_list`, which must be non-empty.
     static uint32_t take_lowest(std::vector<uint32_t> & free_list);
     // Return one index to `free_list`.
@@ -223,7 +270,24 @@ private:
     // dense-prefill endpoint check.
     std::vector<uint32_t> free_sequence_slots_;
     std::vector<uint32_t> free_blocks_;
+    // Per-physical-block reference counts split by active sequences vs.
+    // external prefix-cache pins. A block is in `free_blocks_` iff both are 0.
+    std::vector<uint32_t> seq_refcounts_;
+    std::vector<uint32_t> pin_refcounts_;
+    uint32_t pinned_only_blocks_ = 0;
     std::unordered_map<PagedKvRequestId, uint32_t> request_to_slot_;
 };
+
+// The number of consecutive physical blocks in `blocks` starting at index
+// `first` (each one past the previous), at most `block_count - first`.
+inline size_t contiguous_block_run(const std::vector<uint32_t> & blocks,
+                                   size_t first, size_t block_count) {
+    size_t run = 1;
+    while (first + run < block_count &&
+           (uint64_t)blocks[first + run] == (uint64_t)blocks[first + run - 1] + 1) {
+        ++run;
+    }
+    return run;
+}
 
 }  // namespace luce::common

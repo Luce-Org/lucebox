@@ -8,8 +8,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #ifdef LUCE_HAVE_GPU_SAMPLER
@@ -115,7 +113,8 @@ int draw_from_weights(const std::vector<std::pair<float, int>> & cand, double r_
 // computed the input probabilities, so skipping the CPU-side exp() pass here
 // is a net win (measured ~1.4x faster end-to-end at vocab=151936).
 int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uniform) {
-    std::vector<std::pair<float, int>> cand(probs.size());
+    thread_local std::vector<std::pair<float, int>> cand;
+    cand.resize(probs.size());
     for (size_t i = 0; i < probs.size(); i++) cand[i] = {probs[i], (int)i};
 
     double Z = 0.0;
@@ -133,31 +132,42 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uni
 // sampler_distribution both use it, so the speculative verifier's rows see
 // exactly the logits the AR draw does.
 template <typename LogitAt>
-void apply_sampler_penalties(const SamplerCfg & cfg, const std::vector<int32_t> & history,
-                             int vocab, LogitAt logit_at) {
-    if (history.empty()) return;
-    const int win  = std::min((int)history.size(), cfg.rep_window);
-    const int from = (int)history.size() - win;
-    // Multiplicative repetition penalty (HuggingFace-style).
-    if (cfg.rep_pen > 1.0f) {
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (int t : seen) {
-            if (t < 0 || t >= vocab) continue;
-            float & l = logit_at(t);
+void apply_sampler_penalties(const SamplerCfg & cfg, const int32_t * history,
+                             size_t history_len, int vocab, LogitAt logit_at) {
+    if (!history || history_len == 0 || cfg.rep_window <= 0) return;
+    const bool do_rep = cfg.rep_pen > 1.0f;
+    const bool do_add = cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f;
+    if (!do_rep && !do_add) return;
+
+    const size_t win = std::min<size_t>(history_len, static_cast<size_t>(cfg.rep_window));
+    const int32_t * src = history + (history_len - win);
+
+    // Sort the window's valid tokens to count occurrences in one pass; the
+    // thread-local buffer stops allocating once it has seen the longest window.
+    thread_local std::vector<int32_t> buf_storage;
+    if (buf_storage.size() < win) buf_storage.resize(win);
+    int32_t * buf = buf_storage.data();
+    size_t n = 0;
+    for (size_t i = 0; i < win; ++i) {
+        const int32_t t = src[i];
+        if (t >= 0 && t < vocab) buf[n++] = t;
+    }
+    if (n == 0) return;
+    std::sort(buf, buf + n);
+    for (size_t i = 0; i < n;) {
+        const int32_t t = buf[i];
+        size_t j = i + 1;
+        while (j < n && buf[j] == t) ++j;
+        const int count = static_cast<int>(j - i);
+        float & l = logit_at(t);
+        if (do_rep) {
             l = (l > 0.0f) ? l / cfg.rep_pen : l * cfg.rep_pen;
         }
-    }
-    // OpenAI-style additive frequency and presence penalties.
-    if (cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) {
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
-        for (auto & kv : counts) {
-            if (kv.first < 0 || kv.first >= vocab) continue;
-            float & l = logit_at(kv.first);
-            l -= cfg.freq_pen * kv.second;
+        if (do_add) {
+            l -= cfg.freq_pen * count;
             l -= cfg.pres_pen;
         }
+        i = j;
     }
 }
 
@@ -167,13 +177,14 @@ int draw_after_cut(std::vector<std::pair<float, int>> & cand, const SamplerCfg &
 int sample_logits_chain(const float * logits_in,
                         int vocab,
                         const SamplerCfg & cfg,
-                        const std::vector<int32_t> & history,
+                        const int32_t * history,
+                        size_t history_len,
                         std::mt19937_64 & rng) {
     // Greedy with no penalty to apply: the highest logit, the lowest id on ties (as the CPU chain below and the
     // GPU kernel pick). The row is already on the host, so one scan beats both the candidate copy below and the
     // GPU path, which uploads the whole row again (a vocab-wide copy per sampled row, over PCIe on a discrete
     // card) to scan it there.
-    if (vocab > 0 && (greedy_scan(cfg) || (cfg.temp <= 0.0f && history.empty()))) {
+    if (vocab > 0 && (greedy_scan(cfg) || (cfg.temp <= 0.0f && history_len == 0))) {
         int best = 0;
         for (int i = 1; i < vocab; ++i) {
             if (logits_in[i] > logits_in[best]) best = i;
@@ -194,11 +205,20 @@ int sample_logits_chain(const float * logits_in,
     }
 
 #ifdef LUCE_HAVE_GPU_SAMPLER
+    auto fill_gpu_hist = [&](std::vector<int32_t> & out) {
+        out.clear();
+        const bool has_pen = cfg.rep_pen > 1.0f || cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f;
+        if (!history || history_len == 0 || !has_pen || cfg.rep_window <= 0) return;
+        const size_t win = std::min<size_t>(history_len, static_cast<size_t>(cfg.rep_window));
+        out.assign(history + (history_len - win), history + history_len);
+    };
     // GPU path (on by default; set LUCE_GPU_SAMPLE=0 to disable). top_k>0,
     // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
     // and any CUDA error return -1 and fall through to the CPU chain below.
     if (gpu_full_sample_path(cfg)) {
-        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r_uniform,
+        thread_local std::vector<int32_t> gpu_hist;
+        fill_gpu_hist(gpu_hist);
+        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, gpu_hist, r_uniform,
                                          /*logits_on_device=*/false);
         if (g >= 0) return g;
     }
@@ -217,8 +237,11 @@ int sample_logits_chain(const float * logits_in,
     // scales with k, not vocab), so the GPU round trip would make it slower,
     // not faster (measured regression, not just "no win").
     if (gpu_probs_path(cfg, vocab)) {
-        std::vector<float> gpu_probs(vocab);
-        if (geometric_compute_probs_cuda(logits_in, vocab, cfg, history,
+        thread_local std::vector<float> gpu_probs;
+        gpu_probs.resize((size_t) vocab);
+        thread_local std::vector<int32_t> gpu_hist;
+        fill_gpu_hist(gpu_hist);
+        if (geometric_compute_probs_cuda(logits_in, vocab, cfg, gpu_hist,
                                          gpu_probs.data(), /*logits_on_device=*/false)) {
             return sample_from_gpu_probs(gpu_probs, cfg.top_p, r_uniform);
         }
@@ -226,21 +249,25 @@ int sample_logits_chain(const float * logits_in,
     }
 #endif
 
-    std::vector<std::pair<float, int>> cand(vocab);
-    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
+    // temp=0 → deterministic argmax (after penalties have been applied).
+    // Independent of top_k/top_p: copy only the float logits (half the bytes of
+    // (float, int) pairs) into a thread-local buffer, apply penalties, and scan.
+    // Ties go to the lowest token id (max_element returns the first maximum).
+    if (cfg.temp <= 0.0f) {
+        thread_local std::vector<float> z;
+        z.assign(logits_in, logits_in + vocab);
+        apply_sampler_penalties(cfg, history, history_len, vocab,
+                                [&](int t) -> float & { return z[(size_t) t]; });
+        return static_cast<int>(std::max_element(z.begin(), z.end()) - z.begin());
+    }
+
+    thread_local std::vector<std::pair<float, int>> cand;
+    cand.resize((size_t) vocab);
+    for (int i = 0; i < vocab; i++) cand[(size_t) i] = {logits_in[i], i};
 
     // cand[i] is still token i here.
-    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return cand[(size_t) t].first; });
-
-    // temp=0 → deterministic argmax (after penalties have been applied above).
-    // Independent of top_k/top_p (the single highest-logit token is always the
-    // answer), so this skips sorting/truncation entirely: an O(vocab) max scan
-    // beats the O(vocab log vocab) sort below. Ties go to the lowest token id
-    // (max_element returns the first of equal maxima), matching the GPU kernel.
-    if (cfg.temp <= 0.0f) {
-        return std::max_element(cand.begin(), cand.end(),
-                                [](auto & a, auto & b){ return a.first < b.first; })->second;
-    }
+    apply_sampler_penalties(cfg, history, history_len, vocab,
+                            [&](int t) -> float & { return cand[(size_t) t].first; });
 
     // Only sort/truncate when top_k or top_p actually need it. Softmax and the
     // inverse-CDF draw below are order-independent, so the common case (plain
@@ -277,7 +304,8 @@ int draw_after_cut(std::vector<std::pair<float, int>> & cand, const SamplerCfg &
     }
 
     double Z = 0.0;
-    std::vector<float> probs(cand.size());
+    thread_local std::vector<float> probs;
+    probs.resize(cand.size());
     for (size_t i = 0; i < cand.size(); i++) {
         probs[i] = std::exp(cand[i].first * inv_t - maxv);
         Z       += probs[i];
@@ -335,7 +363,7 @@ int sample_logits_top_n(const SamplerCfg & cfg, int vocab) {
 }
 
 int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab, const SamplerCfg & cfg,
-                      const std::vector<int32_t> & history, std::mt19937_64 & rng) {
+                      const int32_t * history, size_t history_len, std::mt19937_64 & rng) {
     const int need = sample_logits_top_n(cfg, vocab);
     if (need == 0 || n < need || n >= vocab) return -1;
     thread_local std::vector<std::pair<float, int>> cand;
@@ -347,7 +375,7 @@ int sample_logits_top(const float * vals, const int32_t * ids, int n, int vocab,
         floor = std::min(floor, vals[i]);
     }
     float outside = 0.0f;   // a token outside the candidates: its penalized logit stays at or below floor
-    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & {
+    apply_sampler_penalties(cfg, history, history_len, vocab, [&](int t) -> float & {
         for (auto & c : cand) {
             if (c.second == t) return c.first;
         }
@@ -378,9 +406,10 @@ bool sample_logits_host_only(const SamplerCfg & cfg, int vocab) {
 int sample_logits(const float * logits_in,
                   int vocab,
                   const SamplerCfg & cfg,
-                  const std::vector<int32_t> & history,
+                  const int32_t * history,
+                  size_t history_len,
                   std::mt19937_64 & rng) {
-    const int token = sample_logits_chain(logits_in, vocab, cfg, history, rng);
+    const int token = sample_logits_chain(logits_in, vocab, cfg, history, history_len, rng);
     OutputConstraint * constraint = cfg.constraint.get();
     if (!constraint || !constraint->engaged() || constraint->allows(token)) return token;
     // The grammar rejects the draw: draw again from the tokens it allows
@@ -397,13 +426,14 @@ int sample_logits(const float * logits_in,
         masked.assign(logits_in, logits_in + vocab);
         if (constraint->mask(masked.data(), vocab) == 0) return token;
     }
-    return sample_logits_chain(masked.data(), vocab, cfg, history, rng);
+    return sample_logits_chain(masked.data(), vocab, cfg, history, history_len, rng);
 }
 
 void sampler_distribution(const float * logits_in,
                           int vocab,
                           const SamplerCfg & cfg,
-                          const std::vector<int32_t> & history,
+                          const int32_t * history,
+                          size_t history_len,
                           std::vector<std::pair<float, int>> & cand) {
     // Same chain as sample_logits (penalties, top_k, temperature, top_p). The
     // no-top_k path computes each exponential once in double, as
@@ -415,7 +445,7 @@ void sampler_distribution(const float * logits_in,
     thread_local std::vector<double> zd;
     z.assign(logits_in, logits_in + vocab);
     if (cfg.constraint && cfg.constraint->engaged()) cfg.constraint->mask(z.data(), vocab);
-    apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return z[(size_t) t]; });
+    apply_sampler_penalties(cfg, history, history_len, vocab, [&](int t) -> float & { return z[(size_t) t]; });
     if (cfg.temp <= 0.0f) {
         const int best = (int) (std::max_element(z.begin(), z.end()) - z.begin());
         cand.assign(1, {1.0f, best});
@@ -477,7 +507,8 @@ void sampler_distribution(const float * logits_in,
     }
     // top_k path: softmax over the kept candidates, then top_p within them.
     const float maxv = cand.front().first * inv_t;
-    std::vector<float> probs(cand.size());
+    thread_local std::vector<float> probs;
+    probs.resize(cand.size());
     double Z = 0.0;
     for (size_t i = 0; i < cand.size(); i++) {
         probs[i] = std::exp(cand[i].first * inv_t - maxv);

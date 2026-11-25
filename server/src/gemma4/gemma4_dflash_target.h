@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "common/dflash_target.h"
+#include "common/dflash/dflash_target.h"
 #include "gemma4_internal.h"
 
 #include "ggml.h"

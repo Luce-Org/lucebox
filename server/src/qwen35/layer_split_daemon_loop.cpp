@@ -4,7 +4,7 @@
 #include "layer_split_types.h"
 #include "layer_split_daemon.h"  // run_qwen35_layer_split_request
 #include "layer_split_forward.h" // free_qwen35_layer_split_shards
-#include "dflash_feature_ring.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "common/io_utils.h"
 #include "common/chain_rollback_policy.h"
 #include "common/sampler.h"

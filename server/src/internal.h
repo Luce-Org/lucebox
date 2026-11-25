@@ -4,6 +4,7 @@
 #pragma once
 #define LUCE_INTERNAL_H_INCLUDED
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,6 +27,7 @@
 
 #include "luce.h"
 #include "common/paged_attention_config.h"
+#include "common/pinned_transfer.h"
 
 namespace luce::common {
 
@@ -605,6 +607,9 @@ struct TargetCache {
     // sequence slot s; single-sequence caches have exactly one column.
     ggml_tensor * paged_block_table = nullptr;   // I32 [max_blocks_per_seq, n_seq_slots]
     ggml_tensor * paged_kv_seq_lens = nullptr;   // I32 [n_seq_slots]
+    // Reusable double-buffered pinned bounce staging for paged prefix
+    // snapshot gather/scatter transfers; released in free_target_cache().
+    mutable PinnedTransfer pinned_transfer;
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
@@ -613,6 +618,12 @@ bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend);
 bool restore_ssm_state(TargetCache & c, ggml_backend_t backend);
 // Allocate rollback snapshot tensors mirroring live ssm/conv state (MoE path).
 bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend);
+
+// A value no snapshot payload had before; see PrefixSnapshot::generation.
+inline uint64_t next_prefix_snapshot_generation() {
+    static std::atomic<uint64_t> next{0};
+    return ++next;
+}
 
 // ─── Cross-request prefix snapshot (Phase A) ──────────────────────
 //
@@ -634,6 +645,11 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend);
 // owns its own ggml_context + backend buffer (allocated lazily on first
 // snapshot_target_cache call to a given PrefixSnapshot).
 struct PrefixSnapshot {
+    // Changes whenever free_prefix_snapshot() drops the payload, so state
+    // derived from one payload (the continuous-batching engine's GPU prefix
+    // pins) can tell that the checkpoint slot now holds another, whichever
+    // path replaced it (a disk restore adopts into a slot behind the engine).
+    uint64_t  generation      = next_prefix_snapshot_generation();
     int       cur_pos         = 0;
     int       last_tok        = -1;                // post-prefill argmax (decode seed)
     ggml_type kv_k_type       = GGML_TYPE_COUNT;   // for hash-key validation
@@ -785,14 +801,16 @@ bool replace_paged_target_cache(
 // recurrent-state slab. `block_table` describes the destination sequence and
 // must cover snap.cur_pos logical tokens.
 // A state-only `snap` takes its attention rows from `kv_from`, a deeper whole
-// checkpoint.
+// checkpoint. When `shared_prefix_blocks > 0`, the leading physical blocks in
+// `block_table` already hold the prefix KV zero-copy on device and are skipped.
 bool restore_paged_target_cache(
     const PrefixSnapshot & snap,
     TargetCache & cache,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
     int block_size,
-    const PrefixSnapshot * kv_from = nullptr);
+    const PrefixSnapshot * kv_from = nullptr,
+    size_t shared_prefix_blocks = 0);
 // Bytes a state-only paged checkpoint holds (any length); 0 when the cache
 // cannot take one.
 size_t estimate_paged_target_cache_state_bytes(const TargetCache & cache);

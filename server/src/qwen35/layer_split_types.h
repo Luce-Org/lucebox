@@ -9,7 +9,7 @@
 #include "internal.h"
 #include "step_graph.h"
 #include "common/layer_split_utils.h"
-#include "dflash_layer_split_runtime.h"
+#include "common/dflash/dflash_layer_split_runtime.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"

@@ -1,6 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
-#include "../../src/common/dflash_feature_ring.h"
+#include "../../src/common/dflash/dflash_feature_ring.h"
 
 namespace {
 struct DflashWindowFixture {};

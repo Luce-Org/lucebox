@@ -5,7 +5,7 @@
 #include "common/backend_precision.h"
 #include "common/chain_rollback_policy.h"
 #include "common/draft_swa.h"
-#include "common/dflash_spec_decode.h"
+#include "common/dflash/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/sampler.h"
