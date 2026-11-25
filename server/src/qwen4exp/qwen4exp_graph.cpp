@@ -2167,10 +2167,13 @@ struct Qwen4ExpRowTensors {
     int top_n = 0;
 };
 
-// One whole-tensor read into host memory sized for it.
+// One whole-tensor or sub-range read into host memory sized for it (`size == 0` reads the whole tensor).
 struct Qwen4ExpRead {
     const ggml_tensor * t;
     void * dst;
+    size_t offset = 0;
+    size_t size = 0;
+    size_t bytes() const { return size ? size : ggml_nbytes(t); }
 };
 
 // With out_rows and a graph that built its row outputs (t.greedy): the rows' top candidates when asked for, their
@@ -2201,7 +2204,7 @@ static std::vector<Qwen4ExpRead> plan_forward_outputs(const Qwen4ExpRowTensors &
 static void read_forward_outputs(const Qwen4ExpRowTensors & t, std::vector<float> & out_logits,
                                  Qwen4ExpRowOutputs * out_rows) {
     for (const Qwen4ExpRead & r : plan_forward_outputs(t, out_logits, out_rows)) {
-        ggml_backend_tensor_get(r.t, r.dst, 0, ggml_nbytes(r.t));
+        ggml_backend_tensor_get(r.t, r.dst, r.offset, r.bytes());
     }
 }
 
@@ -2215,27 +2218,29 @@ struct Qwen4ExpPinnedReads {
     void queue(ggml_backend_t backend, ggml_backend_buffer_t & buf, std::vector<Qwen4ExpRead> rs) {
         reads = std::move(rs);
         size_t need = 0;
-        for (const Qwen4ExpRead & r : reads) need += qwen4exp_stage_bytes(ggml_nbytes(r.t));
+        for (const Qwen4ExpRead & r : reads) need += qwen4exp_stage_bytes(r.bytes());
         char * base = qwen4exp_pinned(backend, buf, need);
         ggml_backend_buffer_type_t device = ggml_backend_get_default_buffer_type(backend);
         size_t off = 0;
         staged.assign(reads.size(), nullptr);
         for (size_t i = 0; i < reads.size(); ++i) {
             const ggml_tensor * t = reads[i].t;
+            const size_t nbytes = reads[i].bytes();
             const ggml_backend_buffer_t tb = t->view_src ? t->view_src->buffer : t->buffer;
             if (!base || !tb || ggml_backend_buffer_get_type(tb) != device) continue;
-            ggml_backend_tensor_get_async(backend, t, base + off, 0, ggml_nbytes(t));
+            ggml_backend_tensor_get_async(backend, t, base + off, reads[i].offset, nbytes);
             staged[i] = base + off;
-            off += qwen4exp_stage_bytes(ggml_nbytes(t));
+            off += qwen4exp_stage_bytes(nbytes);
         }
     }
 
     void finish() {
         for (size_t i = 0; i < reads.size(); ++i) {
+            const size_t nbytes = reads[i].bytes();
             if (staged[i]) {
-                std::memcpy(reads[i].dst, staged[i], ggml_nbytes(reads[i].t));
+                std::memcpy(reads[i].dst, staged[i], nbytes);
             } else {
-                ggml_backend_tensor_get(reads[i].t, reads[i].dst, 0, ggml_nbytes(reads[i].t));
+                ggml_backend_tensor_get(reads[i].t, reads[i].dst, reads[i].offset, nbytes);
             }
         }
         reads.clear();
@@ -2245,6 +2250,31 @@ struct Qwen4ExpPinnedReads {
 // The longest an expert device's idle hold after a split forward lasts (ggml_backend_cuda_hold). The next forward's
 // first use of the device ends it, about 5 ms later (below); the bound only ends a hold that no forward soon follows.
 constexpr int kIdleHoldUs = 8000;
+
+// Run `gf` split across `sched` (null: on `backend` alone), queue `rs` for readback behind it, and wait for the
+// devices. The expert devices idle from their last layer through the LM head, the host's step and the next draft
+// (~5 ms); after that long an idle device runs its next three layers' expert reads slow (Strix Halo). A held wave
+// keeps it awake until the next forward uses it.
+static ggml_status compute_and_queue_reads(ggml_backend_t backend, ggml_backend_sched_t sched, ggml_cgraph * gf,
+                                           Qwen4ExpPinnedReads & reads, ggml_backend_buffer_t & host_out,
+                                           std::vector<Qwen4ExpRead> rs) {
+    if (!sched) {
+        const ggml_status status = ggml_backend_graph_compute_async(backend, gf);
+        if (status == GGML_STATUS_SUCCESS) reads.queue(backend, host_out, std::move(rs));
+        ggml_backend_synchronize(backend);
+        return status;
+    }
+    const ggml_status status = ggml_backend_sched_graph_compute_async(sched, gf);
+    if (status == GGML_STATUS_SUCCESS) {
+        reads.queue(backend, host_out, std::move(rs));
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (b != backend && ggml_backend_is_cuda(b)) ggml_backend_cuda_hold(b, kIdleHoldUs);
+        }
+    }
+    ggml_backend_sched_synchronize(sched);
+    return status;
+}
 
 // Replay a retained graph with this forward's inputs and read its logits (and hidden rows). A failed compute drops
 // the graph.
@@ -2256,38 +2286,18 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
     in.stage_size = in.stage ? ggml_backend_buffer_get_size(ws.host_in) : 0;
     upload_stable_inputs(in, ws);
     ws.host_in_need = in.stage_need;
+    std::vector<Qwen4ExpRead> rs = plan_forward_outputs({ws.logits, ws.greedy, ws.top_ids, ws.top_vals, ws.top_n},
+                                                        out_logits, out_rows);
+    if (out_hidden && ws.hidden) {
+        out_hidden->resize((size_t) ggml_nelements(ws.hidden));
+        rs.push_back({ws.hidden, out_hidden->data()});
+    }
     ggml_status status;
     Qwen4ExpPinnedReads reads;
-    auto queue_reads = [&] {
-        std::vector<Qwen4ExpRead> rs = plan_forward_outputs({ws.logits, ws.greedy, ws.top_ids, ws.top_vals, ws.top_n},
-                                                            out_logits, out_rows);
-        if (out_hidden && ws.hidden) {
-            out_hidden->resize((size_t) ggml_nelements(ws.hidden));
-            rs.push_back({ws.hidden, out_hidden->data()});
-        }
-        reads.queue(in.backend, ws.host_out, std::move(rs));
-    };
     {   // verify: as built, with batch-invariant matmul columns (see forward_impl)
         ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/verify);
-        if (in.split) {
-            ggml_backend_sched_t sched = ws.sched ? ws.sched : short_sched;
-            status = ggml_backend_sched_graph_compute_async(sched, ws.gf);
-            if (status == GGML_STATUS_SUCCESS) queue_reads();
-            // The expert devices idle from their last layer through the LM head, the host's step and the next
-            // draft (~5 ms); after that long an idle device runs its next three layers' expert reads slow (Strix
-            // Halo). A held wave keeps it awake until the next forward uses it.
-            if (status == GGML_STATUS_SUCCESS) {
-                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-                    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-                    if (b != in.backend && ggml_backend_is_cuda(b)) ggml_backend_cuda_hold(b, kIdleHoldUs);
-                }
-            }
-            ggml_backend_sched_synchronize(sched);
-        } else {
-            status = ggml_backend_graph_compute_async(in.backend, ws.gf);
-            if (status == GGML_STATUS_SUCCESS) queue_reads();
-            ggml_backend_synchronize(in.backend);
-        }
+        ggml_backend_sched_t sched = in.split ? (ws.sched ? ws.sched : short_sched) : nullptr;
+        status = compute_and_queue_reads(in.backend, sched, ws.gf, reads, ws.host_out, std::move(rs));
     }
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] stable graph compute failed\n");
@@ -2302,6 +2312,8 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
 // once, on the device holding each layer's rows (Qwen4ExpCache::remote). The stable graph handles this forward's own
 // blocks.
 static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos0) {
+    // Recorded before any device writes, so a failure on the second device still leaves the pooled rows tracked.
+    if (pos0 / 4 > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = pos0 / 4;
     for (ggml_backend_t device : {backend, cache.remote_backend}) {
         if (!device) continue;
         ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
@@ -2358,6 +2370,7 @@ bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
         tops.push_back(top);
     }
     ggml_gallocr_t ba = tops.empty() ? nullptr : ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (nb > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = nb;   // the pooling may write them even if it fails
     const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) && ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
     out.graph_failed = !ok && !tops.empty();
     if (ok) {
@@ -2794,6 +2807,10 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
         if (split && w.hot) w.hot->tick(backend, w);   // hot expert swaps go live between graphs
+        if ((int) kv_len > cache.kv_dirty_rows) cache.kv_dirty_rows = (int) kv_len;
+        if (stable_qsa && (int) (kv_len / 4) > cache.indexer_dirty_blocks) {
+            cache.indexer_dirty_blocks = (int) (kv_len / 4);
+        }
         if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden,
                               out_rows)) {
             return res;
@@ -3027,6 +3044,11 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         // capture fails on allocating kernels such as the CUB segmented sort).
         ScopedCudaGraphOverrides invariant(split && T > kSplitShortRows, 0, false, 0, /*mmvq_batch_invariant=*/verify);
         if (split && w.hot) w.hot->tick(backend, w, T <= QWEN4EXP_MTP_MAX_VERIFY ? 0 : (int) T);
+        if ((int) kv_len > cache.kv_dirty_rows) cache.kv_dirty_rows = (int) kv_len;
+        if (qsa_ratio(w) > 0) {
+            const int max_blk = (int) ((pos0 + T) / qsa_ratio(w));
+            if (max_blk > cache.indexer_dirty_blocks) cache.indexer_dirty_blocks = max_blk;
+        }
         status = split ? ggml_backend_sched_graph_compute(split_sched, gf) : ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -3045,6 +3067,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     cache.ple_prev = inputs->ple_prev;
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     cache.cur_pos = (int) kv_len;
+    if (cache.cur_pos > cache.kv_dirty_rows) cache.kv_dirty_rows = cache.cur_pos;
     if (mtp_prefill) cache.mtp_prev_pos = pos0 + n_tokens - 1;
     if (verify) { cache.spec_pos = pos0; cache.spec_tokens = n_tokens; cache.spec_log = stable_ws.spec_log; }
     // The all-keys branch did not pool anything. Leaving this prefix at zero
@@ -3054,6 +3077,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     } else if ((qsa != QSA_DENSE || (verify && rows.back().qsa != QSA_DENSE)) &&
         (pos0 + T) / qsa_ratio(w) > w.indexer_top_k / qsa_ratio(w)) {
         cache.indexer_blocks = (int) ((pos0 + T) / qsa_ratio(w));
+    }
+    if (cache.indexer_blocks > cache.indexer_dirty_blocks) {
+        cache.indexer_dirty_blocks = cache.indexer_blocks;
     }
 
     // A pool (T=1 decode, verify) keeps the graph's tensors until its next forward: only then may the rows stay.
@@ -3325,6 +3351,7 @@ bool qwen4exp_mtp_forward(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwe
         return false;
     }
     // Keep the original slices even for K/V-only prefill: matmul dispatch/numerics depend on batch width.
+    if (pos0 + n > cache.kv_dirty_rows) cache.kv_dirty_rows = pos0 + n;
     constexpr int slice = 512;
     const size_t hd = (size_t) w.n_embd * w.n_hc;
     for (int i = 0; i < n; i += slice) {
@@ -3358,6 +3385,7 @@ bool mtp_draft_args_ok(const Qwen4ExpWeights & w, const Qwen4ExpCache & cache, c
 // K/V pair; later ranks read the preceding GPU argmax and HC residual directly. MTP has no PLE.
 bool mtp_draft_launch(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                       const int32_t * tokens, const float * hidden, int n, int pos0, int ranks) {
+    if (pos0 + n + ranks > cache.kv_dirty_rows) cache.kv_dirty_rows = pos0 + n + ranks;
     std::vector<float> unused;
     for (int rank = 0; rank < ranks; ++rank) {
         if (!mtp_forward_batch(backend, w, cache, tokens, hidden, rank ? 1 : n,
@@ -3581,7 +3609,12 @@ bool qwen4exp_mtp_draft_slots(ggml_backend_t backend, const Qwen4ExpWeights & w,
         }
         std::vector<int> pos((size_t) n_slots);
         for (int rank = 1; batched && rank < k; ++rank) {
-            for (int s = 0; s < n_slots; ++s) pos[(size_t) s] = pos0[s] + n[s] + rank - 1;
+            for (int s = 0; s < n_slots; ++s) {
+                pos[(size_t) s] = pos0[s] + n[s] + rank - 1;
+                if (pos[(size_t) s] + 1 > caches[s]->kv_dirty_rows) {
+                    caches[s]->kv_dirty_rows = pos[(size_t) s] + 1;
+                }
+            }
             if (!mtp_rank_slots(backend, w, caches, pos.data(), n_slots, rank, ranks[(size_t) rank])) return false;
         }
     }
@@ -3878,14 +3911,12 @@ static void build_slot_qsa(ggml_context * ctx, const std::vector<int64_t> & span
 
 // The graph's QSA inputs: each QSA slot's for its R rows from positions[s], as its stable graph has them
 // (fill_stable_qsa), and its rows' M-RoPE positions (slot_qsa_views). The inputs are written whole: a slot's views of
-// them need not be in the graph. `in` keeps the host copies, which outlive the uploads.
-static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * const * caches,
+// them need not be in the graph. `in` keeps the host copies, which outlive the uploads, and the caller calls in.finish().
+static void upload_slot_qsa(Qwen4ExpCache * const * caches,
                             const int32_t * positions, const std::vector<int64_t> & spans, int R,
                             const Qwen4ExpBatchedDecodeWorkspace & ws, Qwen4ExpStableInputs & in) {
     if (!ws.qsa_params) return;
     const size_t n_slots = ws.slot_qsa.size();
-    in.backend = backend;
-    in.split = split;
     in.qsa_params.assign((size_t) 10 * R * n_slots, 0);
     in.i32.assign((size_t) 4 * R * n_slots, 0);
     Qwen4ExpStableInputs slot;
@@ -3909,9 +3940,6 @@ static void upload_slot_qsa(ggml_backend_t backend, bool split, Qwen4ExpCache * 
     in.set(ws.qsa_visibility, in.qsa_visibility.data(), in.qsa_visibility.size() * sizeof(float));
     in.set(ws.qsa_params, in.qsa_params.data(), in.qsa_params.size() * sizeof(int32_t));
     in.set(ws.qsa_positions, in.i32.data(), in.i32.size() * sizeof(int32_t));
-    // Split mode queues those uploads on the target stream, and the scheduler's copy of an input to the expert
-    // device (the attention layers placed there) does not wait for it.
-    in.finish();
 }
 
 // The multi-slot decode graph's nodes and inputs, in `ctx` and `ws`; nothing is allocated. Each slot's rows run the
@@ -4188,29 +4216,29 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     const int64_t ple_heads = w.ple_n_heads;
     const int64_t ple_row_size = w.ple_head_dim * ple_heads;
 
-    std::vector<float> emb((size_t) w.n_embd * n_slots);
+    std::vector<float> & emb = workspace.scratch_emb;
+    emb.resize((size_t) w.n_embd * n_slots);
     if (!w.embedder.embed(tokens, n_slots, emb.data())) {
         std::fprintf(stderr, "[qwen4exp] batched CPU embedding failed\n");
         return result;
     }
 
-    std::vector<float> ple_data(has_ple ? (size_t) ple_row_size * n_slots : 0);
+    std::vector<float> & ple_data = workspace.scratch_ple;
+    ple_data.resize(has_ple ? (size_t) ple_row_size * n_slots : 0);
     std::vector<std::vector<int32_t>> next_prev((size_t) n_slots);
     if (has_ple) {
         const int64_t ng = w.ple_ngram_size;
         std::vector<int32_t> ple_rows((size_t) ple_heads * n_slots);
+        std::vector<uint64_t> ctx((size_t) ng);
         for (int s = 0; s < n_slots; ++s) {
             const std::vector<int32_t> & prev = caches[s]->ple_prev;
-            std::vector<int32_t> seq = prev;
-            seq.push_back(tokens[s]);
             const int64_t pos = (int64_t) prev.size();
-            std::vector<uint64_t> ctx((size_t) ng);
             ctx[0] = (uint64_t) tokens[s];
             bool cut = false;
             for (int64_t j = 1; j < ng; ++j) {
                 if (cut || pos - j < 0) { ctx[j] = (uint64_t) w.ple_eos_token_id; cut = true; }
                 else {
-                    const int32_t id = seq[(size_t) (pos - j)];
+                    const int32_t id = prev[(size_t) (pos - j)];
                     if (id < 0 || id == w.ple_eos_token_id) cut = true;
                     ctx[j] = cut ? (uint64_t) w.ple_eos_token_id : (uint64_t) id;
                 }
@@ -4227,6 +4255,7 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             }
             const size_t keep = (size_t) std::min<int64_t>(ng - 1, prev.size() + 1);
             const size_t total = prev.size() + 1;
+            next_prev[s].reserve(keep);
             for (size_t k = total - keep; k < total; ++k)
                 next_prev[s].push_back(k < prev.size() ? prev[k] : tokens[s]);
         }
@@ -4236,7 +4265,8 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
         }
     }
 
-    std::vector<int64_t> spans((size_t) n_slots);
+    std::vector<int64_t> & spans = workspace.scratch_spans;
+    spans.resize((size_t) n_slots);
     for (int s = 0; s < n_slots; ++s) {
         if (!qwen4exp_kvflash_reserve(*caches[s], positions[s], 1)) return result;
         // A QSA slot's graph pools as it goes, from the already-pooled prefix.
@@ -4247,55 +4277,89 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
     const bool with_hidden = out_hidden != nullptr;
     const bool replay = workspace.gf && !stable_workspace_stale(workspace, backend, w, caches[0]->max_ctx) &&
         workspace.spans == spans && (workspace.hidden != nullptr) == with_hidden &&
-        workspace.caches == std::vector<const Qwen4ExpCache *>(caches, caches + n_slots);
+        workspace.caches.size() == (size_t) n_slots &&
+        std::equal(workspace.caches.begin(), workspace.caches.end(), caches);
     if (!replay && !build_batched_decode_graph(backend, w, caches, n_slots, has_ple, w.qsa,
                                                spans, with_hidden, workspace)) return result;
     ++(replay ? workspace.replays : workspace.builds);
 
-    ggml_backend_tensor_set(workspace.inp_emb, emb.data(), 0, emb.size() * sizeof(float));
-    if (workspace.ple_in) ggml_backend_tensor_set(workspace.ple_in, ple_data.data(), 0, ple_data.size() * sizeof(float));
+    // Stage all inputs into pinned host memory so every H2D upload queues
+    // asynchronously on the backend stream without per-tensor host stalls.
+    size_t pos_elems = 0;
+    for (const auto & G : workspace.groups) if (G.positions) pos_elems += (size_t) 4 * G.n;
+    const size_t ids_elems = workspace.slot_ids ? (size_t) n_slots : 0;
+    const size_t kv_elems = workspace.kv_rows.size();
+    workspace.scratch_i32.assign(pos_elems + ids_elems + kv_elems, 0);
+    size_t mask_elems = 0;
+    for (size_t s = 0; s < workspace.kv_rows.size(); ++s) {
+        if (workspace.masks[s]) mask_elems += (size_t) spans[s];
+    }
+    workspace.scratch_mask.resize(mask_elems);
+
+    size_t stage_est = qwen4exp_stage_bytes(emb.size() * sizeof(float));
+    if (workspace.ple_in) stage_est += qwen4exp_stage_bytes(ple_data.size() * sizeof(float));
+    for (const auto & G : workspace.groups) if (G.positions) stage_est += qwen4exp_stage_bytes((size_t) 4 * G.n * sizeof(int32_t));
+    if (workspace.slot_ids) stage_est += qwen4exp_stage_bytes((size_t) n_slots * sizeof(int32_t));
+    for (size_t s = 0; s < workspace.kv_rows.size(); ++s) {
+        stage_est += qwen4exp_stage_bytes(sizeof(int32_t));
+        if (workspace.masks[s]) stage_est += qwen4exp_stage_bytes((size_t) spans[s] * sizeof(ggml_fp16_t));
+    }
+    if (workspace.qsa_params) {
+        stage_est += qwen4exp_stage_bytes(ggml_nbytes(workspace.qsa_visibility)) +
+                     qwen4exp_stage_bytes(ggml_nbytes(workspace.qsa_params)) +
+                     qwen4exp_stage_bytes(ggml_nbytes(workspace.qsa_positions));
+    }
+
+    Qwen4ExpStableInputs in;
+    in.backend = backend;
+    in.split = split;
+    in.stage = qwen4exp_pinned(backend, workspace.host_in, std::max(workspace.host_in_need, stage_est));
+    in.stage_size = in.stage ? ggml_backend_buffer_get_size(workspace.host_in) : 0;
+
+    in.set(workspace.inp_emb, emb.data(), emb.size() * sizeof(float));
+    if (workspace.ple_in) in.set(workspace.ple_in, ple_data.data(), ple_data.size() * sizeof(float));
+    size_t i32_off = 0;
     for (const auto & G : workspace.groups) {
         if (!G.positions) continue;
-        std::vector<int32_t> p((size_t) 4 * G.n, 0);
+        int32_t * p = workspace.scratch_i32.data() + i32_off;
         for (int j = 0; j < G.n; ++j)
             for (int section = 0; section < 3; ++section) p[(size_t) section * G.n + j] = positions[G.s0 + j];
-        ggml_backend_tensor_set(G.positions, p.data(), 0, p.size() * sizeof(int32_t));
+        in.set(G.positions, p, (size_t) 4 * G.n * sizeof(int32_t));
+        i32_off += (size_t) 4 * G.n;
     }
     if (workspace.slot_ids) {
-        std::vector<int32_t> ids((size_t) n_slots);
+        int32_t * ids = workspace.scratch_i32.data() + i32_off;
         for (int s = 0; s < n_slots; ++s) ids[(size_t) s] = caches[s]->state_slot;
-        ggml_backend_tensor_set(workspace.slot_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+        in.set(workspace.slot_ids, ids, (size_t) n_slots * sizeof(int32_t));
+        i32_off += (size_t) n_slots;
     }
+    size_t mask_off = 0;
     for (size_t s = 0; s < workspace.kv_rows.size(); ++s) {
-        const int32_t row = qwen4exp_kv_row(*caches[s], positions[s]);
-        ggml_backend_tensor_set(workspace.kv_rows[s], &row, 0, sizeof(int32_t));
+        int32_t * row_dst = workspace.scratch_i32.data() + i32_off++;
+        *row_dst = qwen4exp_kv_row(*caches[s], positions[s]);
+        in.set(workspace.kv_rows[s], row_dst, sizeof(int32_t));
         if (!workspace.masks[s]) continue;
-        std::vector<ggml_fp16_t> mask((size_t) spans[s]);
-        qwen4exp_causal_mask(*caches[s], mask.data(), spans[s], positions[s]);
-        ggml_backend_tensor_set(workspace.masks[s], mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        ggml_fp16_t * mask_dst = workspace.scratch_mask.data() + mask_off;
+        qwen4exp_causal_mask(*caches[s], mask_dst, spans[s], positions[s]);
+        in.set(workspace.masks[s], mask_dst, (size_t) spans[s] * sizeof(ggml_fp16_t));
+        mask_off += (size_t) spans[s];
     }
-    Qwen4ExpStableInputs qsa_inputs;
-    upload_slot_qsa(backend, split, caches, positions, spans, 1, workspace, qsa_inputs);
-    // Match solo MMVQ arithmetic regardless of the number of active slots.
-    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
-    if (split && w.hot) w.hot->tick(backend, w);
-    const ggml_status status = split ? ggml_backend_sched_graph_compute(workspace.sched, workspace.gf)
-                                     : ggml_backend_graph_compute(backend, workspace.gf);
-    if (status != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[qwen4exp] batched graph compute failed\n");
-        clear_qwen4exp_batched_decode_workspace(workspace);
-        return result;
-    }
+    upload_slot_qsa(caches, positions, spans, 1, workspace, in);
+    in.finish();
+    workspace.host_in_need = in.stage_need;
+
     out_logits.resize((size_t) n_slots);
     const size_t row_bytes = (size_t) w.n_vocab * sizeof(float);
+    std::vector<Qwen4ExpRead> rs;
+    rs.reserve((size_t) n_slots + 2);
     if (out_greedy && workspace.greedy) {
         out_greedy->resize((size_t) n_slots);
-        ggml_backend_tensor_get(workspace.greedy, out_greedy->data(), 0, (size_t) n_slots * sizeof(int32_t));
+        rs.push_back({workspace.greedy, out_greedy->data()});
     }
     for (int s = 0; s < n_slots; ++s) {
         if (out_greedy && !out_greedy->empty() && logits_rows && !logits_rows[s]) continue;
         out_logits[(size_t) s].resize((size_t) w.n_vocab);
-        ggml_backend_tensor_get(workspace.logits, out_logits[(size_t) s].data(), (size_t) s * row_bytes, row_bytes);
+        rs.push_back({workspace.logits, out_logits[(size_t) s].data(), (size_t) s * row_bytes, row_bytes});
     }
     if (out_hidden) {
         const size_t hd = (size_t) w.n_embd * w.n_hc;
@@ -4303,13 +4367,36 @@ Qwen4ExpForwardResult qwen4exp_forward_batched(
             out_hidden->clear();
         } else if (hidden_slot < 0) {   // every slot's row
             out_hidden->resize(hd * (size_t) n_slots);
-            ggml_backend_tensor_get(workspace.hidden, out_hidden->data(), 0, out_hidden->size() * sizeof(float));
+            rs.push_back({workspace.hidden, out_hidden->data()});
         } else {
             out_hidden->resize(hd);
-            ggml_backend_tensor_get(workspace.hidden, out_hidden->data(), (size_t) hidden_slot * hd * sizeof(float),
-                                    hd * sizeof(float));
+            rs.push_back({workspace.hidden, out_hidden->data(),
+                          (size_t) hidden_slot * hd * sizeof(float), hd * sizeof(float)});
         }
     }
+
+    // The rows this graph writes, recorded before it runs: a failed compute may still have written them.
+    for (int s = 0; s < n_slots; ++s) {
+        if (positions[s] + 1 > caches[s]->kv_dirty_rows) caches[s]->kv_dirty_rows = positions[s] + 1;
+        if (qsa_slot[(size_t) s] && (positions[s] + 1) / 4 > caches[s]->indexer_dirty_blocks) {
+            caches[s]->indexer_dirty_blocks = (positions[s] + 1) / 4;
+        }
+    }
+    ggml_status status;
+    Qwen4ExpPinnedReads reads;
+    {
+        // Match solo MMVQ arithmetic regardless of the number of active slots.
+        const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
+        if (split && w.hot) w.hot->tick(backend, w);
+        status = compute_and_queue_reads(backend, split ? workspace.sched : nullptr, workspace.gf, reads,
+                                         workspace.host_out, std::move(rs));
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[qwen4exp] batched graph compute failed\n");
+        clear_qwen4exp_batched_decode_workspace(workspace);
+        return result;
+    }
+    reads.finish();
     if (has_ple) {
         for (int s = 0; s < n_slots; ++s) caches[s]->ple_prev = std::move(next_prev[s]);
     }
@@ -4688,8 +4775,12 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
 
     // Each slot's embeddings and PLE rows (as its solo verify prepares them), and its rows' PLE n-gram tails for the
     // rollback to keep.
-    std::vector<float> emb, ple;
+    std::vector<float> & emb = ws.scratch_emb;
+    std::vector<float> & ple = ws.scratch_ple;
+    emb.clear();
+    ple.clear();
     emb.reserve((size_t) w.n_embd * T);
+    if (has_ple) ple.reserve((size_t) w.ple_head_dim * w.ple_n_heads * T);
     for (int s = 0; s < n_slots; ++s) {
         Qwen4ExpCache & cache = *caches[s];
         const int32_t * tok = tokens + (size_t) s * R;
@@ -4717,7 +4808,8 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     }
     const bool replay = ws.gf && ws.rows == R && ws.top_n == top_n &&
         !stable_workspace_stale(ws, backend, w, caches[0]->max_ctx) &&
-        ws.spans == spans && ws.caches == std::vector<const Qwen4ExpCache *>(caches, caches + n_slots);
+        ws.spans == spans && ws.caches.size() == (size_t) n_slots &&
+        std::equal(ws.caches.begin(), ws.caches.end(), caches);
     if (!replay) {
         ggml_context * ctx = graph_context(&ws, backend, w, caches[0]->max_ctx, /*verify=*/true);
         if (!ctx || !build_batched_verify_nodes(ctx, w, caches, n_slots, R, has_ple, spans, top_n, ws)) {
@@ -4738,65 +4830,116 @@ Qwen4ExpForwardResult qwen4exp_verify_batched(ggml_backend_t backend, const Qwen
     }
     ++(replay ? ws.replays : ws.builds);
 
-    ggml_backend_tensor_set(ws.inp_emb, emb.data(), 0, emb.size() * sizeof(float));
-    if (ws.ple_in) ggml_backend_tensor_set(ws.ple_in, ple.data(), 0, ple.size() * sizeof(float));
+    const size_t hd = (size_t) w.n_embd * w.n_hc;
+    if ((size_t) ggml_nelements(ws.hidden) != hd * (size_t) T) return result;
+
+    // Stage all inputs into pinned host memory so every H2D upload runs asynchronously.
+    size_t pos_elems = 0;
+    for (const auto & G : ws.groups) if (G.positions) pos_elems += (size_t) 4 * G.n;
+    const size_t kv_elems = (size_t) n_slots * R;
+    ws.scratch_i32.assign(pos_elems + kv_elems, 0);
+    size_t mask_elems = 0;
+    for (size_t g = 0; g < ws.groups.size(); ++g) {
+        if (ws.masks[g]) mask_elems += (size_t) (ws.masks[g]->ne[0] * ws.groups[g].n);
+    }
+    ws.scratch_mask.assign(mask_elems, ggml_fp32_to_fp16(-INFINITY));
+
+    size_t stage_est = qwen4exp_stage_bytes(emb.size() * sizeof(float));
+    if (ws.ple_in) stage_est += qwen4exp_stage_bytes(ple.size() * sizeof(float));
+    for (const auto & G : ws.groups) if (G.positions) stage_est += qwen4exp_stage_bytes((size_t) 4 * G.n * sizeof(int32_t));
+    stage_est += (size_t) n_slots * qwen4exp_stage_bytes((size_t) R * sizeof(int32_t));
+    for (size_t g = 0; g < ws.groups.size(); ++g) {
+        if (ws.masks[g]) stage_est += qwen4exp_stage_bytes((size_t) (ws.masks[g]->ne[0] * ws.groups[g].n) * sizeof(ggml_fp16_t));
+    }
+    if (ws.qsa_params) {
+        stage_est += qwen4exp_stage_bytes(ggml_nbytes(ws.qsa_visibility)) +
+                     qwen4exp_stage_bytes(ggml_nbytes(ws.qsa_params)) +
+                     qwen4exp_stage_bytes(ggml_nbytes(ws.qsa_positions));
+    }
+
+    Qwen4ExpStableInputs in;
+    in.backend = backend;
+    in.split = split;
+    in.stage = qwen4exp_pinned(backend, ws.host_in, std::max(ws.host_in_need, stage_est));
+    in.stage_size = in.stage ? ggml_backend_buffer_get_size(ws.host_in) : 0;
+
+    in.set(ws.inp_emb, emb.data(), emb.size() * sizeof(float));
+    if (ws.ple_in) in.set(ws.ple_in, ple.data(), ple.size() * sizeof(float));
+    size_t i32_off = 0;
     for (const auto & G : ws.groups) {
         if (!G.positions) continue;
-        std::vector<int32_t> p((size_t) 4 * G.n, 0);
+        int32_t * p = ws.scratch_i32.data() + i32_off;
         for (int j = 0; j < G.n; ++j) {
             const int r = G.s0 + j;
             for (int section = 0; section < 3; ++section) p[(size_t) section * G.n + j] = positions[r / R] + r % R;
         }
-        ggml_backend_tensor_set(G.positions, p.data(), 0, p.size() * sizeof(int32_t));
+        in.set(G.positions, p, (size_t) 4 * G.n * sizeof(int32_t));
+        i32_off += (size_t) 4 * G.n;
     }
     for (int s = 0; s < n_slots; ++s) {
-        std::vector<int32_t> rows((size_t) R);
-        for (int j = 0; j < R; ++j) rows[(size_t) j] = qwen4exp_kv_row(*caches[s], positions[s] + j);
-        ggml_backend_tensor_set(ws.kv_rows[(size_t) s], rows.data(), 0, rows.size() * sizeof(int32_t));
+        int32_t * rows_dst = ws.scratch_i32.data() + i32_off;
+        for (int j = 0; j < R; ++j) rows_dst[(size_t) j] = qwen4exp_kv_row(*caches[s], positions[s] + j);
+        in.set(ws.kv_rows[(size_t) s], rows_dst, (size_t) R * sizeof(int32_t));
+        i32_off += (size_t) R;
     }
+    size_t mask_off = 0;
     for (size_t g = 0; g < ws.groups.size(); ++g) {
         // Column j: dense row G.s0 + j's causal mask over its span; past the span, and for a QSA row, nothing reads.
         const auto & G = ws.groups[g];
         ggml_tensor * m = ws.masks[g];
         if (!m) continue;
         const int64_t cols = m->ne[0];
-        std::vector<ggml_fp16_t> mask((size_t) (cols * G.n), ggml_fp32_to_fp16(-INFINITY));
+        ggml_fp16_t * mask_dst = ws.scratch_mask.data() + mask_off;
         for (int j = 0; j < G.n; ++j) {
             const int r = G.s0 + j;
             if (spans[(size_t) r] < 0) continue;
-            qwen4exp_causal_mask(*caches[r / R], mask.data() + (size_t) j * cols, spans[(size_t) r],
+            qwen4exp_causal_mask(*caches[r / R], mask_dst + (size_t) j * cols, spans[(size_t) r],
                                  positions[r / R] + r % R);
         }
-        ggml_backend_tensor_set(m, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        in.set(m, mask_dst, (size_t) (cols * G.n) * sizeof(ggml_fp16_t));
+        mask_off += (size_t) (cols * G.n);
     }
-    Qwen4ExpStableInputs qsa_inputs;
-    upload_slot_qsa(backend, split, caches, positions, spans, R, ws, qsa_inputs);
-    const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true,
-                                             /*mmvq_invariant_max_ncols=*/verify_group_rows(split));
-    if (split && w.hot) w.hot->tick(backend, w);
-    const ggml_status status = split ? ggml_backend_sched_graph_compute(ws.sched, ws.gf)
-                                     : ggml_backend_graph_compute(backend, ws.gf);
+    upload_slot_qsa(caches, positions, spans, R, ws, in);
+    in.finish();
+    ws.host_in_need = in.stage_need;
+
+    out.greedy.resize((size_t) T);
+    out.top_vals.resize((size_t) T * top_n);
+    out.top_ids.resize((size_t) T * top_n);
+    hidden.resize(hd * (size_t) T);
+    std::vector<Qwen4ExpRead> rs;
+    rs.reserve(ws.groups.size() * (top_n > 0 ? 3 : 1) + 1);
+    for (const auto & G : ws.groups) {
+        rs.push_back({G.greedy, out.greedy.data() + G.s0});
+        if (top_n == 0) continue;
+        rs.push_back({G.top_vals, out.top_vals.data() + (size_t) G.s0 * top_n});
+        rs.push_back({G.top_ids, out.top_ids.data() + (size_t) G.s0 * top_n});
+    }
+    rs.push_back({ws.hidden, hidden.data()});
+
+    // The rows this graph writes, recorded before it runs: a failed compute may still have written them.
+    for (int s = 0; s < n_slots; ++s) {
+        if (positions[s] + R > caches[s]->kv_dirty_rows) caches[s]->kv_dirty_rows = positions[s] + R;
+        if ((positions[s] + R) / 4 > caches[s]->indexer_dirty_blocks) {
+            caches[s]->indexer_dirty_blocks = (positions[s] + R) / 4;
+        }
+    }
+    ggml_status status;
+    Qwen4ExpPinnedReads reads;
+    {
+        const ScopedCudaGraphOverrides overrides(false, 0, false, 0, /*mmvq_batch_invariant=*/true,
+                                                 /*mmvq_invariant_max_ncols=*/verify_group_rows(split));
+        if (split && w.hot) w.hot->tick(backend, w);
+        status = compute_and_queue_reads(backend, split ? ws.sched : nullptr, ws.gf, reads, ws.host_out,
+                                         std::move(rs));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[qwen4exp] batched verify compute failed\n");
         clear_qwen4exp_batched_decode_workspace(ws);
         return result;
     }
-    out.greedy.resize((size_t) T);
-    out.top_vals.resize((size_t) T * top_n);
-    out.top_ids.resize((size_t) T * top_n);
-    for (const auto & G : ws.groups) {
-        ggml_backend_tensor_get(G.greedy, out.greedy.data() + G.s0, 0, (size_t) G.n * sizeof(int32_t));
-        if (top_n == 0) continue;
-        ggml_backend_tensor_get(G.top_vals, out.top_vals.data() + (size_t) G.s0 * top_n, 0,
-                                (size_t) G.n * top_n * sizeof(float));
-        ggml_backend_tensor_get(G.top_ids, out.top_ids.data() + (size_t) G.s0 * top_n, 0,
-                                (size_t) G.n * top_n * sizeof(int32_t));
-    }
+    reads.finish();
     out.on_device = true;
-    const size_t hd = (size_t) w.n_embd * w.n_hc;
-    if ((size_t) ggml_nelements(ws.hidden) != hd * (size_t) T) return result;
-    hidden.resize(hd * (size_t) T);
-    ggml_backend_tensor_get(ws.hidden, hidden.data(), 0, hidden.size() * sizeof(float));
     const size_t n_linear = caches[0]->linear_layer_ids.size();
     for (int s = 0; s < n_slots; ++s) {
         if (spans[(size_t) s * R + R - 1] < 0) caches[s]->indexer_blocks = (positions[s] + R) / 4;

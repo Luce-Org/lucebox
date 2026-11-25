@@ -10,11 +10,13 @@
 
 #include "common/kvflash_pager.h"
 #include "common/owned_snapshot.h"
+#include "common/pinned_transfer.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <limits>
 #include <memory>
 #include <vector>
 #include <utility>
@@ -124,6 +126,12 @@ struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     ggml_tensor * qsa_positions = nullptr;
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
     std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket); verify: per row
+    // Reused host scratch for batched decode / verify (cleared with the workspace).
+    std::vector<float> scratch_emb;
+    std::vector<float> scratch_ple;
+    std::vector<int32_t> scratch_i32;
+    std::vector<ggml_fp16_t> scratch_mask;
+    std::vector<int64_t> scratch_spans;
 };
 
 // Recurrent state of every concurrency slot, stacked per linear layer, so one
@@ -154,6 +162,18 @@ struct Qwen4ExpCache {
 
     int       max_ctx  = 0;
     int       cur_pos  = 0;
+    // High-water marks of rows written since the cache's KV/indexer buffers
+    // were last zeroed, so restore_qwen4exp_snapshot clears only the dirty
+    // tail instead of the full max_ctx buffer (several GiB at 256K).
+    // create_qwen4exp_cache sets them once it has zeroed the buffers; until
+    // then every row may be dirty.
+    int       kv_dirty_rows        = std::numeric_limits<int>::max();
+    int       indexer_dirty_blocks = std::numeric_limits<int>::max();
+
+    // Reusable double-buffered pinned host DMA pipelines for snapshot save and
+    // restore on the target backend and optional remote expert backend.
+    mutable PinnedTransfer local_transfer;
+    mutable PinnedTransfer remote_transfer;
 
     std::vector<int> full_layer_ids;    // size = 12
     std::vector<int> linear_layer_ids;  // size = 36

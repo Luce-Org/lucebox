@@ -266,7 +266,10 @@ std::vector<float> verify_rows(ggml_backend_t be, const Qwen4ExpWeights & w, Qwe
         ggml_backend_tensor_set(mask, m.data(), 0, ggml_nbytes(mask));
     }
     Qwen4ExpStableInputs qsa_inputs;
-    upload_slot_qsa(be, false, caches, pos0, spans, R, ws, qsa_inputs);
+    qsa_inputs.backend = be;
+    qsa_inputs.split = false;
+    upload_slot_qsa(caches, pos0, spans, R, ws, qsa_inputs);
+    qsa_inputs.finish();
     {
         const ScopedCudaGraphOverrides invariant(false, 0, false, 0, /*mmvq_batch_invariant=*/true);
         CHECK(ggml_backend_graph_compute(be, g.gf) == GGML_STATUS_SUCCESS);
