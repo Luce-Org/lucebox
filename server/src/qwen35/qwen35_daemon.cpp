@@ -38,7 +38,7 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     cfg.kq_stride_pad      = args.kq_stride_pad;
     cfg.draft_swa_window   = args.draft_swa_window;
     cfg.draft_ctx_max      = args.draft_ctx_max;
-    cfg.fast_rollback      = args.fast_rollback;
+    cfg.rollback_mode      = args.fast_rollback ? RollbackMode::Auto : RollbackMode::Exact;
     cfg.seq_verify         = args.seq_verify;
     cfg.ddtree_mode        = args.ddtree_mode;
     cfg.ddtree_budget      = args.ddtree_budget;

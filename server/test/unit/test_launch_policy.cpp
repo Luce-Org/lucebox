@@ -243,12 +243,15 @@ struct LaunchPolicyFixture : CommonFixture {
     // KVFlash pool and no explicit --fast-rollback that is exact restore, the
     // two snapshots only, and those are also there with --no-fast-rollback.
     void test_rollback_charge_follows_the_resolved_rollback_mode() {
+        using luce::common::RollbackMode;
         using luce::common::spec_rollback_checkpoints;
-        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  /*fast_rollback=*/true,  /*explicit_optin=*/false, /*tree=*/false));
-        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  /*fast_rollback=*/true,  /*explicit_optin=*/true,  /*tree=*/false));
-        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/true,  /*explicit_optin=*/false, /*tree=*/false));
-        CHECK(!spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/false, /*explicit_optin=*/false, /*tree=*/false));
-        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, /*fast_rollback=*/false, /*explicit_optin=*/false, /*tree=*/true));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Auto,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Fast,  /*tree=*/false));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Exact, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Auto,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Fast,  /*tree=*/false));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Exact, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Exact, /*tree=*/true));
 
         const RollbackCacheDims dims = qwen38_27b_dims();
         // 48 layers x (128 x 128 x 48 state + 3 x 10240 conv taps) floats.

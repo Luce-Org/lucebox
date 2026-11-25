@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/chain_rollback_policy.h"
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
@@ -99,8 +100,7 @@ struct Qwen35Config {
     int          draft_yarn_orig_ctx  = 4096;
 
     // Speculative decode strategy
-    bool         fast_rollback   = true;
-    bool         fast_rollback_explicit = false;  // opts in to fast rollback under --kvflash
+    RollbackMode rollback_mode   = RollbackMode::Auto;
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
     // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
@@ -267,6 +267,8 @@ protected:
 
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
+    // Resolved in init() from cfg_.rollback_mode and the active KVFlash pager.
+    bool         fast_rollback_ = true;
 
     // ── kvflash (bounded KV residency, FlashMemory-style) ────────────
     // Active when kvflash_tokens_ > 0 (env LUCE_KVFLASH / --kvflash):

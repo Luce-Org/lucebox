@@ -31,21 +31,33 @@ inline bool split_chain_fast_rollback_enabled() {
     return env_flag_enabled("LUCE_SPLIT_FAST_ROLLBACK");
 }
 
-// Speculative fast rollback under the KVFlash pager is measured not
-// token-identical to AR (25/80 outputs differ), so with the pager it needs an
-// explicit --fast-rollback; the default there is exact restore + replay.
-// Without the pager the requested mode stands.
-inline bool spec_fast_rollback_enabled(bool pager_on, bool fast_rollback, bool explicit_optin) {
-    return fast_rollback && (!pager_on || explicit_optin);
+// Caller-requested speculative rollback mode.
+// Under the KVFlash pager fast rollback is measured not token-identical to AR
+// (25/80 outputs differ), so Auto resolves to exact restore + replay when the
+// pager is active and fast rollback otherwise. Fast (--fast-rollback) opts in
+// under the pager too; Exact (--no-fast-rollback) forces exact restore
+// everywhere.
+enum class RollbackMode {
+    Auto,
+    Fast,
+    Exact,
+};
+
+inline bool spec_fast_rollback_enabled(bool pager_on, RollbackMode mode) {
+    switch (mode) {
+        case RollbackMode::Fast:  return true;
+        case RollbackMode::Exact: return false;
+        case RollbackMode::Auto:  return !pager_on;
+    }
+    return false;
 }
 
 // What the Qwen3.5 target attaches for a drafter
 // (Qwen35Backend::attach_rollback_storage): the per-token checkpoints of
 // migrate_prefill_cache() with fast rollback or a tree, else only the two
 // snapshots of ensure_ssm_snapshot() (exact restore + replay).
-inline bool spec_rollback_checkpoints(bool pager_on, bool fast_rollback,
-                                      bool explicit_optin, bool tree) {
-    return tree || spec_fast_rollback_enabled(pager_on, fast_rollback, explicit_optin);
+inline bool spec_rollback_checkpoints(bool pager_on, RollbackMode mode, bool tree) {
+    return tree || spec_fast_rollback_enabled(pager_on, mode);
 }
 
 inline ChainRollbackPolicy resolve_chain_rollback_policy(

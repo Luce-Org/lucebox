@@ -508,10 +508,10 @@ bool Qwen35Backend::init() {
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
     if (!post_kvflash_init_gate()) return false;
-    // After the gate: a subclass that zeroed the pool leaves no pager, and fast
-    // rollback stays on.
-    cfg_.fast_rollback = luce::common::spec_fast_rollback_enabled(
-        kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
+    // After the gate: a subclass that zeroed the pool leaves no pager, and Auto
+    // resolves to fast rollback.
+    fast_rollback_ = luce::common::spec_fast_rollback_enabled(
+        kvflash_tokens_ > 0, cfg_.rollback_mode);
     // KVFlash is resolved from env at init; this is the authoritative
     // paged×KVFlash compatibility check.
     if (cfg_.paged_attention && kvflash_active()) {
@@ -1990,7 +1990,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
         if (kvflash_active()) {
             qt->set_kvflash_pager(&kvflash_pager_);
         }
-        qt->set_fast_rollback(cfg_.fast_rollback);
+        qt->set_fast_rollback(fast_rollback_);
         qt->set_ddtree_mode(cfg_.ddtree_mode);
         qt->set_rope_offset(&rope_delta_);
     }
@@ -2680,7 +2680,7 @@ static int kvflash_read_captured_queries(const TargetCache & cache, const KvFlas
                                         int batch_tokens, std::vector<float> & q_all);
 
 bool Qwen35Backend::attach_rollback_storage(int max_verify_tokens, bool enable_specla) {
-    if (cfg_.fast_rollback || cfg_.ddtree_mode) {
+    if (fast_rollback_ || cfg_.ddtree_mode) {
         return migrate_prefill_cache(w_, cfg_.device.max_ctx, max_verify_tokens,
                                      target_backend_, cache_, enable_specla);
     }
@@ -2822,7 +2822,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
-        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && fast_rollback_ &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!attach_rollback_storage(max_verify_tokens, enable_specla)) {
             std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
@@ -4582,7 +4582,7 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
     if (!cache_.rollback_ctx) {
-        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && fast_rollback_ &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!attach_rollback_storage(max_verify_tokens, enable_specla)) {
             std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",

@@ -118,10 +118,9 @@ void check_spec_matches_ar(bool kvflash, bool resumed = false) {
     args.device.backend = compiled_placement_backend();
     args.device.max_ctx = 20480;
     args.draft_device = args.device;
-    // KVFlash resolves fast rollback off unless it is asked for by name;
-    // the other case turns it off by name (--no-fast-rollback).
-    args.fast_rollback = kvflash;
-    args.fast_rollback_explicit = false;
+    // KVFlash resolves Auto to exact restore unless --fast-rollback (Fast) is asked for;
+    // the non-KVFlash case requests Exact (--no-fast-rollback).
+    args.rollback_mode = kvflash ? luce::common::RollbackMode::Auto : luce::common::RollbackMode::Exact;
     Tokenizer tokenizer;
     if (!tokenizer.load_from_gguf(model.c_str())) throw std::runtime_error("tokenizer load failed");
     const auto sentence = tokenizer.encode("The quick brown fox jumps over the lazy dog. ");
@@ -141,8 +140,7 @@ void check_spec_matches_ar(bool kvflash, bool resumed = false) {
         // not be allocated: only the snapshot pair is. Compare against the
         // same request with fast rollback on.
         BackendArgs with_checkpoints = args;
-        with_checkpoints.fast_rollback = true;
-        with_checkpoints.fast_rollback_explicit = true;
+        with_checkpoints.rollback_mode = luce::common::RollbackMode::Fast;
         size_t used_with_checkpoints = 0;
         run_requests(with_checkpoints, prompt, spec_seq, &used_with_checkpoints);
         const double saved_gib = ((double)used_with_checkpoints - (double)used_without_checkpoints) / (1024.0 * 1024.0 * 1024.0);
