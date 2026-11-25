@@ -631,6 +631,31 @@ private:
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);
+    bool sync_draft_features(int start_pos, int n_tokens);
+
+    struct KvFlashSpecState;
+    enum class KvFlashArHopStatus { Continue, EndRequest, HandoffToAr, Failed };
+    KvFlashArHopStatus run_kvflash_ar_hop(
+        DFlashTarget * target,
+        int & committed,
+        int32_t & last_tok,
+        int & n_generated,
+        int & target_forwards,
+        ThinkingBudget & budget,
+        std::vector<int32_t> & out_tokens,
+        const DaemonIO & io,
+        bool sampled_verify,
+        bool constrained_greedy,
+        int verify_top_n,
+        std::vector<int32_t> & target_tok,
+        std::vector<float> & verify_logits,
+        std::vector<float> & top_vals,
+        std::vector<int32_t> & top_ids,
+        int & top_n_read,
+        int & top_vocab,
+        int & top_draws,
+        int & top_misses,
+        bool * forced_close_out);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);
