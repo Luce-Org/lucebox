@@ -26,25 +26,41 @@ set -uo pipefail
 script=$1
 wait_limit=$(( ${BOX_WAIT_MINUTES:-120} * 60 ))
 step_limit=$(( ${BOX_STEP_MINUTES:-20} * 60 ))
-quiet=120
-kfd=/sys/class/kfd/kfd/proc
-vmstat=/proc/vmstat
+quiet=${BOX_QUIET_SECONDS:-120}
+poll_interval=${BOX_POLL_SECONDS:-1}
+wait_poll=${BOX_WAIT_POLL_SECONDS:-10}
+kfd=${BOX_KFD_PROC:-/sys/class/kfd/kfd/proc}
+proc=${BOX_PROC:-/proc}
+vmstat=${BOX_VMSTAT:-/proc/vmstat}
 job=${RUNNER_TRACKING_ID:-}
 waited_file=${RUNNER_TEMP:-/tmp}/box_waited_${job:-$PPID}
+step=
 
 [[ -d $kfd ]] || { echo "::error::$kfd is missing; is the amdgpu driver loaded?"; exit 1; }
 
+alive() {
+  local stat state
+  [[ -r "$proc/$1/stat" ]] || return 1
+  { stat=$(< "$proc/$1/stat"); } 2>/dev/null || return 1
+  stat=${stat##*) }
+  read -r state _ <<< "$stat"
+  [[ -n $state && $state != Z && $state != X && $state != x ]]
+}
+
 ours() {
-  local pid=$1 environ stat
-  if [[ -n $job ]] && environ=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) &&
+  local pid=$1 environ stat sid
+  if [[ -n $job && -r "$proc/$pid/environ" ]] &&
+     { environ=$(tr '\0' '\n' < "$proc/$pid/environ"); } 2>/dev/null &&
      [[ $'\n'$environ$'\n' == *$'\n'"RUNNER_TRACKING_ID=$job"$'\n'* ]]; then
     return 0
   fi
   while (( pid > 1 )); do
     (( pid == $$ )) && return 0
-    stat=$(< "/proc/$pid/stat") 2>/dev/null || return 1
+    [[ -n $step && $pid == "$step" ]] && return 0
+    { stat=$(< "$proc/$pid/stat"); } 2>/dev/null || return 1
     stat=${stat##*) }               # the fields after the command name
-    read -r _ pid _ <<< "$stat"     # state, parent
+    read -r _ pid _ sid _ <<< "$stat"  # state, ppid, pgrp, session
+    [[ -n $step && $sid == "$step" ]] && return 0
   done
   return 1
 }
@@ -57,17 +73,26 @@ ours() {
 smi='^[^ ]*python[0-9.]* ([^ ]*/)?(rocm-smi|amd-smi|rocm_smi\.py|amdsmi_cli\.py) '
 monitor() {
   local args
-  args=$(tr '\0' ' ' 2>/dev/null < "/proc/$1/cmdline") || return 1
+  [[ -r "$proc/$1/cmdline" ]] || return 1
+  { args=$(tr '\0' ' ' < "$proc/$1/cmdline"); } 2>/dev/null || return 1
   [[ $args =~ $smi ]]
 }
 
-# The PIDs of the other processes using a GPU.
+# The PIDs of the other live processes using a GPU.
+# KFD tears down /sys/class/kfd/kfd/proc/<pid> asynchronously after /proc/<pid>
+# is reaped, so a just-exited child of this step can briefly appear here with no
+# /proc/<pid> left for ours() to identify. Ignore entries that are already gone
+# or zombie both before and after classification so we never preempt ourselves.
 others() {
   local dir pid
   for dir in "$kfd"/*/; do
     [[ -d $dir ]] || continue
     pid=$(basename "$dir")
-    ours "$pid" || monitor "$pid" || echo "$pid"
+    alive "$pid" || continue
+    if ours "$pid" || monitor "$pid"; then
+      continue
+    fi
+    alive "$pid" && echo "$pid"
   done
   return 0
 }
@@ -105,7 +130,7 @@ wait_for_gpus() {
     elif (( SECONDS - free_since >= quiet )); then
       break
     fi
-    sleep 10
+    sleep "$wait_poll"
     pids=$(others)
   done
   echo $(( $(waited) + SECONDS - start )) > "$waited_file"
@@ -114,7 +139,6 @@ wait_for_gpus() {
 
 # The step runs in its own session, so it stops whole, children included,
 # also when its shell has already exited.
-step=
 stop_step() {
   [[ -n $step ]] || return 0
   kill -TERM -- "-$step" 2>/dev/null
@@ -152,7 +176,7 @@ while :; do
       outcome=timed_out
       break
     fi
-    sleep 1
+    sleep "$poll_interval"
   done
   if [[ -n $outcome ]]; then
     stop_step

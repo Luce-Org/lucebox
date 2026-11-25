@@ -35,6 +35,11 @@ help:  ## Show this help message.
 sync:  ## uv sync the workspace (incl. dev extras).
 	uv sync --extra dev
 
+.PHONY: install-hooks
+install-hooks:  ## Enable the fast local pre-push hook (.githooks/pre-push).
+	git config core.hooksPath .githooks
+	@echo "Installed git hooks from .githooks/"
+
 .PHONY: lint
 lint: sync  ## Ruff check + format-check (no auto-fix).
 	uv run ruff check

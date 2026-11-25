@@ -91,17 +91,40 @@ static bool rdna3_or_rdna4(int device) {
 #endif
 }
 
+struct CachedWeights {
+    std::vector<uint8_t> w;
+    std::vector<uint8_t> w2;
+    std::mt19937 post_rng;
+};
+
+struct CachedDenseWeights {
+    std::vector<uint8_t> wq;
+    std::mt19937 post_rng;
+    std::normal_distribution<float> post_gauss;
+};
+
 // masked: every other route is -1, as in a split step where the other device owns those picks (only live routes are
 // compared). glu: gate and up products with SwiGLU, the pair the backend fuses into one expert kernel. grouped: the
 // batch's products are marked with ggml_backend_cuda_mul_mat_id_grouped, with every third route masked.
 static bool check(ggml_backend_t backend, int device, const Case & c, int tokens, int experts, bool invariant,
-                  bool masked = false, bool glu = false, Grouped grouped = Grouped::no) {
+                  bool masked = false, bool glu = false, Grouped grouped = Grouped::no,
+                  const CachedWeights * pre = nullptr) {
     const int used = c.used;
     const size_t row = ggml_row_size(c.type, c.k);
     std::mt19937 rng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
-    std::vector<uint8_t> w(row * size_t(c.n) * experts), w2(glu ? w.size() : 0);
-    fill_blocks(w, c.type, w.size() / ggml_type_size(c.type), rng);
-    if (glu) fill_blocks(w2, c.type, w2.size() / ggml_type_size(c.type), rng);
+    std::vector<uint8_t> owned_w, owned_w2;
+    if (pre) {
+        rng = pre->post_rng;
+    } else {
+        owned_w.resize(row * size_t(c.n) * experts);
+        fill_blocks(owned_w, c.type, owned_w.size() / ggml_type_size(c.type), rng);
+        if (glu) {
+            owned_w2.resize(row * size_t(c.n) * experts);
+            fill_blocks(owned_w2, c.type, owned_w2.size() / ggml_type_size(c.type), rng);
+        }
+    }
+    const std::vector<uint8_t> & w = pre ? pre->w : owned_w;
+    const std::vector<uint8_t> & w2 = glu ? (pre ? pre->w2 : owned_w2) : owned_w2;
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     std::vector<float> x(size_t(c.k) * tokens);
     for (auto & v : x) v = gauss(rng);
@@ -212,11 +235,23 @@ static bool check(ggml_backend_t backend, int device, const Case & c, int tokens
 }
 
 // Dense products the verify batch runs q-wide (GGML_OP_MUL_MAT): T-column batch vs T single columns.
-static bool check_dense(ggml_backend_t backend, int device, ggml_type type, const char * name, int k, int n, int tokens, bool invariant) {
+static bool check_dense(ggml_backend_t backend, int device, ggml_type type, const char * name, int k, int n, int tokens,
+                        bool invariant, const CachedDenseWeights * pre = nullptr) {
     std::mt19937 rng(777u + unsigned(type) * 31u + unsigned(k));
-    std::vector<float> wf(size_t(k) * n), x(size_t(k) * tokens);
+    std::vector<uint8_t> owned_wq;
     std::normal_distribution<float> gauss(0.0f, 0.02f);
-    for (auto & v : wf) v = gauss(rng);
+    if (pre) {
+        rng = pre->post_rng;
+        gauss = pre->post_gauss;
+    } else {
+        std::vector<float> wf(size_t(k) * n);
+        for (auto & v : wf) v = gauss(rng);
+        owned_wq.resize(ggml_row_size(type, k) * n);
+        if (type == GGML_TYPE_F32) std::memcpy(owned_wq.data(), wf.data(), owned_wq.size());
+        else ggml_quantize_chunk(type, wf.data(), owned_wq.data(), 0, n, k, nullptr);
+    }
+    const std::vector<uint8_t> & wq = pre ? pre->wq : owned_wq;
+    std::vector<float> x(size_t(k) * tokens);
     for (auto & v : x) v = gauss(rng) * 50.0f;
     ggml_init_params params{};
     params.mem_size = size_t(4 * tokens + 8) * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(4 * tokens + 8, false);
@@ -236,10 +271,6 @@ static bool check_dense(ggml_backend_t backend, int device, ggml_type type, cons
     ggml_build_forward_expand(g2, yb);
     if (!ggml_backend_supports_op(backend, yb)) { ggml_free(ctx); return true; }
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    // weights: quantize/convert from f32 through ggml's own reference
-    std::vector<uint8_t> wq(ggml_row_size(type, k) * n);
-    if (type == GGML_TYPE_F32) std::memcpy(wq.data(), wf.data(), wq.size());
-    else ggml_quantize_chunk(type, wf.data(), wq.data(), 0, n, k, nullptr);
     ggml_backend_tensor_set(a, wq.data(), 0, wq.size());
     for (int t = 0; t < tokens; ++t) ggml_backend_tensor_set(xs[t], x.data() + size_t(t) * k, 0, size_t(k) * sizeof(float));
     ggml_backend_tensor_set(bb, x.data(), 0, x.size() * sizeof(float));
@@ -287,12 +318,17 @@ int main(int argc, char ** argv) {
             // inv=false is the diagnostic (the multi-token kernels may differ); only the
             // batch-invariant and grouped modes of the contract formats decide the exit status.
             for (const auto & c : cases) {
+                std::mt19937 wrng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
+                CachedWeights cached;
+                cached.w.resize(ggml_row_size(c.type, c.k) * size_t(c.n) * experts);
+                fill_blocks(cached.w, c.type, cached.w.size() / ggml_type_size(c.type), wrng);
+                cached.post_rng = wrng;
                 for (bool inv : {false, true}) {
-                    const bool ok = check(backend, dv, c, tokens, experts, inv);
+                    const bool ok = check(backend, dv, c, tokens, experts, inv, false, false, Grouped::no, &cached);
                     if (inv && t.contract) all = ok && all;
                 }
                 for (Grouped g : {Grouped::distinct, Grouped::shared}) {
-                    const bool ok = check(backend, dv, c, tokens, experts, true, false, false, g);
+                    const bool ok = check(backend, dv, c, tokens, experts, true, false, false, g, &cached);
                     if (t.contract) all = ok && all;
                 }
             }
@@ -300,35 +336,60 @@ int main(int argc, char ** argv) {
         // qwen4exp routed experts (n_embd 2560, expert FFN 640)
         const Case qwen4exp[] = {{GGML_TYPE_Q5_1, "qwen4exp_down", 640, 2560}, {GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640}};
         for (const auto & c : qwen4exp) {
+            std::mt19937 wrng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
+            CachedWeights cached;
+            cached.w.resize(ggml_row_size(c.type, c.k) * size_t(c.n) * experts);
+            fill_blocks(cached.w, c.type, cached.w.size() / ggml_type_size(c.type), wrng);
+            cached.post_rng = wrng;
             for (bool inv : {false, true}) {
-                const bool ok = check(backend, dv, c, tokens, experts, inv);
+                const bool ok = check(backend, dv, c, tokens, experts, inv, false, false, Grouped::no, &cached);
                 if (inv) all = ok && all;
             }
             for (Grouped g : {Grouped::distinct, Grouped::shared})
-                all = check(backend, dv, c, tokens, experts, true, false, false, g) && all;
+                all = check(backend, dv, c, tokens, experts, true, false, false, g, &cached) && all;
         }
         // The split step's expert products (Qwen3.8-Flash on the Strix Halo, 10 routes a token): every verify width,
         // half the routes masked to the other device, gate/up fused with SwiGLU and the Q5_1 / Q8_0 down products.
         const Case qwen4exp_split[] = {{GGML_TYPE_Q4_K, "qwen4exp_gate_up", 2560, 640, 10},
                                        {GGML_TYPE_Q5_1, "qwen4exp_down", 640, 2560, 10},
                                        {GGML_TYPE_Q8_0, "qwen4exp_down_q8", 640, 2560, 10}};
-        for (int w = 2; w <= tokens; ++w)
-            for (const auto & c : qwen4exp_split)
-                for (bool masked : {false, true}) {
-                    const bool glu = c.type == GGML_TYPE_Q4_K;
-                    all = check(backend, dv, c, w, experts, true, masked, glu) && all;
-                }
+        for (const auto & c : qwen4exp_split) {
+            const bool glu = c.type == GGML_TYPE_Q4_K;
+            std::mt19937 wrng(20260930u + unsigned(c.type) * 7919u + unsigned(c.k));
+            CachedWeights cached;
+            cached.w.resize(ggml_row_size(c.type, c.k) * size_t(c.n) * experts);
+            fill_blocks(cached.w, c.type, cached.w.size() / ggml_type_size(c.type), wrng);
+            if (glu) {
+                cached.w2.resize(cached.w.size());
+                fill_blocks(cached.w2, c.type, cached.w2.size() / ggml_type_size(c.type), wrng);
+            }
+            cached.post_rng = wrng;
+            for (int w_tok = 2; w_tok <= tokens; ++w_tok)
+                for (bool masked : {false, true})
+                    all = check(backend, dv, c, w_tok, experts, true, masked, glu, Grouped::no, &cached) && all;
+        }
         // dense verify-batch products of DS4.1: BF16 output head, F16 indexer/compressor, F32 router, MXFP8 attention
         struct D { ggml_type t; const char * name; int k, n; } dense[] = {
             {GGML_TYPE_BF16, "output_head", 5120, 129280}, {GGML_TYPE_F16, "indexer_k", 5120, 2048},
             {GGML_TYPE_F16, "compressor_kv", 5120, 1024}, {GGML_TYPE_F32, "router", 5120, 384},
             {GGML_TYPE_MXFP8, "attn_q_b", 1280, 32768}, {GGML_TYPE_Q8_0, "q8_dense", 5120, 2304},
         };
-        for (const auto & d : dense)
+        for (const auto & d : dense) {
+            std::mt19937 wrng(777u + unsigned(d.t) * 31u + unsigned(d.k));
+            std::normal_distribution<float> gauss(0.0f, 0.02f);
+            std::vector<float> wf(size_t(d.k) * d.n);
+            for (auto & v : wf) v = gauss(wrng);
+            CachedDenseWeights cached;
+            cached.wq.resize(ggml_row_size(d.t, d.k) * d.n);
+            if (d.t == GGML_TYPE_F32) std::memcpy(cached.wq.data(), wf.data(), cached.wq.size());
+            else ggml_quantize_chunk(d.t, wf.data(), cached.wq.data(), 0, d.n, d.k, nullptr);
+            cached.post_rng = wrng;
+            cached.post_gauss = gauss;
             for (bool inv : {false, true}) {
-                const bool ok = check_dense(backend, dv, d.t, d.name, d.k, d.n, tokens, inv);
+                const bool ok = check_dense(backend, dv, d.t, d.name, d.k, d.n, tokens, inv, &cached);
                 if (inv) all = ok && all;
             }
+        }
         ggml_backend_free(backend);
         if (argc > 3) break;                                       // first device only
     }
