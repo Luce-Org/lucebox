@@ -1,4 +1,5 @@
 .harness-work/
 results/
 *.json
+!golden_concurrency/v1/pack.json
 __pycache__/

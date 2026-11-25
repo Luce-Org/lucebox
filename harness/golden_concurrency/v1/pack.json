@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "pack_id": "lucebox-concurrency-golden-v1",
+  "pack_sha256_locked": true,
+  "public_oss_trajectory_contract": {
+    "public_safe_only": true,
+    "private_customer_data_allowed": false,
+    "tier1_fixtures": "synthetic public-safe canaries, multi-turn coding smoke, and tool-call edge cases",
+    "tier2_oss_sources": [
+      "Terminal-Bench 4.0 (Apache-2.0 / MIT)",
+      "SWE-PolyBench / OpenHands public trajectories (Apache-2.0 / MIT)"
+    ],
+    "license": "Apache-2.0 / MIT"
+  },
+  "hardware_profiles": {
+    "r9700_32g": {
+      "hip_arch": "gfx1201",
+      "vram_total_mib": 32624,
+      "vram_hwm_max_mib": 30208,
+      "host_ram_hwm_max_mib": 114688,
+      "disk_cache_max_gib": 32
+    },
+    "strix_halo_98g": {
+      "hip_arch": "gfx1151",
+      "uma_total_mib": 98304,
+      "uma_hwm_max_mib": 92160,
+      "host_ram_hwm_max_mib": 114688,
+      "disk_cache_max_gib": 64
+    }
+  },
+  "models": {
+    "qwen3.8-27b": {
+      "hardware": "r9700_32g",
+      "manage_launcher": "lucebox_dashboard/launchers/run-qwen38-server.sh",
+      "max_supported_concurrency": 8,
+      "capability_contract": {
+        "max_supported_concurrency": 8,
+        "notes": "Tracked launcher cap in run-qwen38-server.sh; bump to 10 when launcher and KV pool are verified."
+      },
+      "features": {
+        "paged_attention": true,
+        "spec_decode": "dflash2",
+        "kvflash": "optional",
+        "pflash": "optional",
+        "prefix_cache": true
+      },
+      "baseline_slo": {
+        "c4_ttft_p95_ms": 2500,
+        "c4_itl_p99_ms": 85,
+        "c4_goodput_min_tok_s": 110.0,
+        "c10_ttft_p95_ms": 6000,
+        "c10_itl_p99_ms": 140,
+        "spec_mean_accepted_min": 2.2
+      }
+    },
+    "qwen3.8-flash-next": {
+      "hardware": "strix_halo_98g",
+      "manage_launcher": "lucebox_dashboard/launchers/run-qwen38-flash-server.sh",
+      "max_supported_concurrency": 4,
+      "capability_contract": {
+        "max_supported_concurrency": 4,
+        "notes": "Tracked cap in qwen4exp_backend.cpp; bump to 10 once lifted."
+      },
+      "features": {
+        "paged_attention": false,
+        "spec_decode": "mtp",
+        "kvflash": "optional",
+        "pflash": "optional",
+        "prefix_cache": true
+      },
+      "baseline_slo": {
+        "c4_ttft_p95_ms": 5500,
+        "c4_itl_p99_ms": 110,
+        "c4_goodput_min_tok_s": 65.0,
+        "spec_mean_accepted_min": 1.8
+      }
+    },
+    "inkling-2-mini": {
+      "hardware": "r9700_32g",
+      "manage_launcher": "lucebox_dashboard/launchers/run-inkling2-mini-server.sh",
+      "max_supported_concurrency": 10,
+      "capability_contract": {
+        "max_supported_concurrency": 10,
+        "notes": "Compact MoE target; raise bailingmoe3_backend runtime cap before live C=10 run."
+      },
+      "features": {
+        "paged_attention": true,
+        "spec_decode": "none",
+        "kvflash": "optional",
+        "pflash": "optional",
+        "prefix_cache": true
+      },
+      "baseline_slo": {
+        "c4_ttft_p95_ms": 1500,
+        "c4_itl_p99_ms": 55,
+        "c10_ttft_p95_ms": 3500,
+        "c10_itl_p99_ms": 90
+      }
+    }
+  },
+  "tiers": {
+    "tier1_pr_smoke": {
+      "timeout_s": 180,
+      "concurrency_levels": [3, 4, 10],
+      "workloads": [
+        {
+          "id": "canary_isolation_4k",
+          "path": "workloads/canary_niah_4k.jsonl",
+          "mode": "distinct_per_lane",
+          "max_tokens": 48,
+          "temperature": 0.0
+        },
+        {
+          "id": "multiturn_prefix_2turn",
+          "path": "workloads/agentic_2turn_smoke.jsonl",
+          "mode": "multi_turn_p1_p2",
+          "max_tokens": 64,
+          "temperature": 0.0
+        },
+        {
+          "id": "tool_call_edge_cases",
+          "path": "workloads/tool_calls_golden.jsonl",
+          "mode": "tool_call_validation",
+          "max_tokens": 96,
+          "temperature": 0.0
+        }
+      ],
+      "chaos": {
+        "cancel_mid_prefill_lanes": 1,
+        "cancel_mid_decode_lanes": 1,
+        "cancel_after_tokens": 6,
+        "oversubscribe_factor": 1.25,
+        "oversized_prompt_check": true
+      },
+      "thresholds": {
+        "own_canary_recall_min": 1.0,
+        "sibling_canary_leak_max": 0,
+        "serial_vs_concurrent_accuracy_drop_max_pp": 0.0,
+        "tool_call_json_valid_min": 1.0,
+        "p2_prefix_cache_hit_min": 0.85,
+        "p2_ttft_ratio_vs_p1_max": 0.45,
+        "http_5xx_max": 0,
+        "post_wave_slot_leak_max": 0,
+        "post_wave_kv_block_leak_max": 0,
+        "post_wave_vram_delta_pct_max": 2.0,
+        "wall_time_regression_vs_baseline_max_pct": 10.0
+      }
+    },
+    "tier2_nightly_agentic": {
+      "timeout_s": 2400,
+      "concurrency_levels": [1, 4, 10],
+      "workloads": [
+        {
+          "id": "oss_agentic_p1_p2",
+          "path": "workloads/agentic_2turn_smoke.jsonl",
+          "oss_trajectory_target": "workloads/oss_tb4_swe_p1_p2.jsonl",
+          "license": "Apache-2.0 / MIT",
+          "mode": "multi_turn_p1_p2",
+          "arrival": "staggered_poisson",
+          "arrival_seed": 202601,
+          "prompt_length_mix_tokens": [2048, 8192, 24576, 49152],
+          "max_tokens": 512,
+          "temperature": 0.0
+        },
+        {
+          "id": "tool_call_edge_cases",
+          "path": "workloads/tool_calls_golden.jsonl",
+          "mode": "tool_call_validation",
+          "max_tokens": 256,
+          "temperature": 0.0
+        },
+        {
+          "id": "niah_long_16k_64k",
+          "path": "workloads/canary_niah_4k.jsonl",
+          "oss_trajectory_target": "workloads/niah_16k_64k.jsonl",
+          "mode": "distinct_per_lane",
+          "max_tokens": 64,
+          "temperature": 0.0
+        }
+      ],
+      "matrix_modes": [
+        {
+          "name": "default_spec_prefix",
+          "extra_server_args": []
+        },
+        {
+          "name": "kvflash_pflash_ssd",
+          "extra_server_args": ["--kvflash", "auto", "--disk-prefix-cache", "auto"]
+        }
+      ],
+      "chaos": {
+        "cancel_mid_prefill_pct": 0.125,
+        "cancel_mid_decode_pct": 0.125,
+        "cancel_after_tokens": 8,
+        "oversubscribe_factor": 1.5,
+        "oversized_prompt_check": true,
+        "kv_pool_pressure_test": true
+      },
+      "thresholds": {
+        "own_canary_recall_min": 0.98,
+        "sibling_canary_leak_max": 0,
+        "serial_vs_concurrent_accuracy_drop_max_pp": 1.0,
+        "pflash_retention_vs_uncompressed_min": 0.95,
+        "tool_call_json_valid_min": 1.0,
+        "p2_prefix_cache_hit_min": 0.9,
+        "ssd_restore_cache_hit_min": 0.85,
+        "p2_ttft_ratio_vs_p1_max": 0.35,
+        "goodput_regression_max_pct": 5.0,
+        "ttft_p95_regression_max_pct": 10.0,
+        "itl_p99_regression_max_pct": 10.0,
+        "http_5xx_max": 0,
+        "post_wave_slot_leak_max": 0,
+        "post_wave_kv_block_leak_max": 0,
+        "post_wave_vram_delta_pct_max": 2.0
+      }
+    },
+    "tier3_release_soak": {
+      "timeout_s": 14400,
+      "concurrency_levels": [1, 4, 10],
+      "aba_repeats": 3,
+      "soak_duration_min": 45,
+      "context_ceiling_tokens": 131072,
+      "require_manage_launcher": true,
+      "workloads": [
+        {
+          "id": "canary_isolation_4k",
+          "path": "workloads/canary_niah_4k.jsonl",
+          "mode": "distinct_per_lane",
+          "max_tokens": 64,
+          "temperature": 0.0
+        },
+        {
+          "id": "multiturn_prefix_2turn",
+          "path": "workloads/agentic_2turn_smoke.jsonl",
+          "mode": "multi_turn_p1_p2",
+          "max_tokens": 256,
+          "temperature": 0.0
+        },
+        {
+          "id": "tool_call_edge_cases",
+          "path": "workloads/tool_calls_golden.jsonl",
+          "mode": "tool_call_validation",
+          "max_tokens": 256,
+          "temperature": 0.0
+        }
+      ],
+      "chaos": {
+        "cancel_mid_prefill_pct": 0.125,
+        "cancel_mid_decode_pct": 0.125,
+        "cancel_after_tokens": 8,
+        "oversubscribe_factor": 1.5,
+        "oversized_prompt_check": true
+      },
+      "thresholds": {
+        "own_canary_recall_min": 0.98,
+        "sibling_canary_leak_max": 0,
+        "serial_vs_concurrent_accuracy_drop_max_pp": 1.0,
+        "tool_call_json_valid_min": 1.0,
+        "p2_prefix_cache_hit_min": 0.9,
+        "p2_ttft_ratio_vs_p1_max": 0.35,
+        "goodput_regression_max_pct": 3.0,
+        "vram_drift_over_soak_max_mib": 256,
+        "host_ram_drift_over_soak_max_mib": 512,
+        "http_5xx_max": 0,
+        "post_wave_slot_leak_max": 0,
+        "post_wave_kv_block_leak_max": 0,
+        "post_wave_vram_delta_pct_max": 2.0,
+        "kfd_resets_max": 0,
+        "oom_events_max": 0
+      }
+    }
+  }
+}
