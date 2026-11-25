@@ -263,6 +263,9 @@ bool draft_kv_begin_step(DraftKvState & st,
                          PinnedStage * stage) {
     if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
         committed <= 0 || width < 0 || width > st.q_len) return false;
+    // Single-lane mode pre-builds st.gf at st.q_len; reject narrower widths
+    // that would leave the tail of the single-lane graph uninitialized.
+    if (st.gf && width > 0 && width != st.q_len) return false;
     const int noise_width = width > 0 ? width : st.q_len;
     const int active_a_step =
         (append_cap > 0 && append_cap < st.a_step) ? append_cap : st.a_step;
@@ -618,7 +621,7 @@ bool draft_kv_batch_reusable(
         const std::vector<DraftKvState *> & lane_states,
         int width,
         int append_cap) {
-    if (lane_states.empty()) return false;
+    if (lane_states.empty() || !lane_states.front()) return false;
     const int q_len = width > 0 ? width : dw.block_size;
     const int a_step = lane_states.front()->a_step;
     const int active_a_step = append_cap > 0 && append_cap < a_step ? append_cap : a_step;

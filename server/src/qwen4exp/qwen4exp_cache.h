@@ -124,12 +124,6 @@ struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     ggml_tensor * qsa_positions = nullptr;
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
     std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket); verify: per row
-    // Reused host scratch for batched decode / verify (cleared with the workspace).
-    std::vector<float> scratch_emb;
-    std::vector<float> scratch_ple;
-    std::vector<int32_t> scratch_i32;
-    std::vector<ggml_fp16_t> scratch_mask;
-    std::vector<int64_t> scratch_spans;
 };
 
 // Recurrent state of every concurrency slot, stacked per linear layer, so one

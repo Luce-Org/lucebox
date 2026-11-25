@@ -9,13 +9,9 @@
 #include "qwen4exp_mtp.h"
 
 #include <algorithm>
-#include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <future>
 #include <memory>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 namespace luce::common {
@@ -147,8 +143,8 @@ private:
     // The rows per slot a batched verify of this plan could run (every decoding slot drafts, nothing prefills, and
     // the graph serves their rows), else 0.
     int batched_verify_width(const StepPlan & plan) const;
-    // `width` (batched_verify_width) when the batched verify is this step's mode (verify_pays), else 0.
-    int batched_verify_rows(const StepPlan & plan, int width) const;
+    // That width when the batched verify is this step's mode (verify_pays), else 0.
+    int batched_verify_rows(const StepPlan & plan) const;
     StepResult batched_verify_step(const StepPlan & plan, int rows);
     // Whether n decoding slots verify their drafts this step or decode a token each: the mode with more tokens per
     // second so far at n slots, the other one every kExploreSteps steps so its rate stays current.
@@ -201,25 +197,7 @@ private:
         std::vector<int32_t> tokens, ple_prev;
         std::future<Qwen4ExpInputs> inputs;
     };
-    struct LookaheadJob {
-        std::vector<int32_t> tokens;
-        std::vector<int32_t> ple_prev;
-        std::promise<Qwen4ExpInputs> promise;
-    };
-    std::future<Qwen4ExpInputs> submit_lookahead(std::vector<int32_t> tokens,
-                                                 std::vector<int32_t> ple_prev);
-    void wait_lookahead_idle();
-    void stop_lookahead_worker();
-    std::mutex lookahead_mu_;
-    std::condition_variable lookahead_cv_;
-    std::condition_variable lookahead_idle_cv_;
-    std::deque<LookaheadJob> lookahead_queue_;
-    bool lookahead_busy_ = false;
-    bool lookahead_stop_ = false;
-    std::thread lookahead_thread_;
-    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs)
-    std::vector<int> reserve_growth_;
-    std::vector<uint8_t> slot_seen_;   // reserve_decode/step: rows seen per slot
+    std::vector<InputGather> next_inputs_;   // per slot (prompt_inputs); joined first by the destructor
 };
 
 } // namespace luce::common

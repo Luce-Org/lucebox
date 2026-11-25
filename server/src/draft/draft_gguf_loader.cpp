@@ -25,7 +25,7 @@
 //   blk.<i>.ffn_down.weight                 [hidden, intermediate]  Q8_0 / F16
 
 #include "internal.h"
-#include "common/dflash2_selector_validation.h"
+#include "common/dflash/dflash2_selector_validation.h"
 #include "common/draft_swa.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_mmap.h"

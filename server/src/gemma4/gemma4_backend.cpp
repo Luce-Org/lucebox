@@ -9,8 +9,8 @@
 #include "pflash/kvflash_drafter_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
-#include "common/dflash_feature_ring.h"
-#include "common/dflash_draft_graph.h"
+#include "common/dflash/dflash_feature_ring.h"
+#include "common/dflash/dflash_draft_graph.h"
 #include "common/adaptive_spec_width.h"
 #include "common/step_graph.h"
 

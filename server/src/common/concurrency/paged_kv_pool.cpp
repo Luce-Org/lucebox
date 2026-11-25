@@ -378,7 +378,7 @@ PagedKvStatus PagedKvPool::seed_shared_prefix(
     }
     for (uint32_t i = 0; i < shared_block_count; ++i) {
         const uint32_t b = shared_blocks[i];
-        if (b >= physical_block_count_ || block_refcount(b) == 0) {
+        if (b >= physical_block_count_ || pin_refcounts_[b] == 0) {
             return PagedKvStatus::InvalidArgument;
         }
     }

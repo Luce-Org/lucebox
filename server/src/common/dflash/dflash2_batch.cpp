@@ -15,7 +15,6 @@
 #include <vector>
 
 namespace luce::common {
-namespace {
 
 constexpr size_t kMaxCachedGraphs = 16;
 
@@ -67,7 +66,7 @@ struct BatchedSelectorGraph {
     }
 };
 
-struct SelectorCache {
+struct DFlash2BatchSelectorCache::Impl {
     uint64_t generation = 0;
     std::vector<std::unique_ptr<ProjectionGraph>> projections;
     std::vector<std::unique_ptr<BatchedSelectorGraph>> selectors;
@@ -79,14 +78,23 @@ struct SelectorCache {
     std::vector<float> successor_codes;
     std::vector<float> predecessor_codes;
 
+    void release() {
+        projections.clear();
+        selectors.clear();
+        stage.release();
+    }
+
     void sync_generation(uint64_t gen) {
         if (generation != gen) {
-            projections.clear();
-            selectors.clear();
+            release();
             generation = gen;
         }
     }
 };
+
+namespace {
+
+using SelectorCache = DFlash2BatchSelectorCache::Impl;
 
 // Allocate a new graph's buffers for `cached`, the cache it joins: past
 // capacity its coldest entry goes first, and while the device cannot hold the
@@ -121,15 +129,9 @@ Graph * find_cached_graph(std::vector<std::unique_ptr<Graph>> & cached, Match ma
     return nullptr;
 }
 
-SelectorCache & selector_cache() {
-    static thread_local SelectorCache cache;
-    return cache;
-}
-
 ProjectionGraph * ensure_projection_graph(
         SelectorCache & cache, const DraftWeights & dw,
         ggml_backend_t backend, ggml_tensor * lm_head, int n_positions) {
-    cache.sync_generation(dflash2_selector_graph_generation());
     if (ProjectionGraph * hit = find_cached_graph(cache.projections, [&](const ProjectionGraph & g) {
             return g.dw == &dw && g.backend == backend && g.lm_head == lm_head &&
                    g.n_positions == n_positions;
@@ -182,7 +184,6 @@ ProjectionGraph * ensure_projection_graph(
 BatchedSelectorGraph * ensure_selector_graph(
         SelectorCache & cache, const DraftWeights & dw,
         ggml_backend_t backend, int n_lanes, int n_cand, int K) {
-    cache.sync_generation(dflash2_selector_graph_generation());
     if (BatchedSelectorGraph * hit = find_cached_graph(cache.selectors, [&](const BatchedSelectorGraph & g) {
             return g.dw == &dw && g.backend == backend && g.n_lanes == n_lanes &&
                    g.n_cand == n_cand && g.K == K;
@@ -429,13 +430,22 @@ bool finish_batched_selection(
 
 }  // namespace
 
-void dflash2_select_chains_release() {
-    SelectorCache & cache = selector_cache();
-    cache.projections.clear();
-    cache.selectors.clear();
+DFlash2BatchSelectorCache::DFlash2BatchSelectorCache() = default;
+DFlash2BatchSelectorCache::~DFlash2BatchSelectorCache() = default;
+DFlash2BatchSelectorCache::DFlash2BatchSelectorCache(DFlash2BatchSelectorCache &&) noexcept = default;
+DFlash2BatchSelectorCache & DFlash2BatchSelectorCache::operator=(DFlash2BatchSelectorCache &&) noexcept = default;
+
+DFlash2BatchSelectorCache::Impl & DFlash2BatchSelectorCache::impl() {
+    if (!impl_) impl_ = std::make_unique<Impl>();
+    return *impl_;
+}
+
+void DFlash2BatchSelectorCache::release() {
+    if (impl_) impl_->release();
 }
 
 bool dflash2_select_chains_batched_device(
+        DFlash2BatchSelectorCache & selector_cache_owner,
         const DraftWeights & dw,
         ggml_backend_t backend,
         ggml_tensor * lm_head,
@@ -458,7 +468,10 @@ bool dflash2_select_chains_batched_device(
     }
 
     const int n_positions = n_lanes * n_cand;
-    SelectorCache & cache = selector_cache();
+    SelectorCache & cache = selector_cache_owner.impl();
+    // Sync invalidation generation once at entry so projection cannot be freed
+    // mid-call while finish_batched_selection holds a reference to it.
+    cache.sync_generation(dflash2_selector_graph_generation());
     ProjectionGraph * projection = ensure_projection_graph(
         cache, dw, backend, lm_head, n_positions);
     if (!projection) return false;
@@ -480,9 +493,11 @@ bool dflash2_select_chains_batched_device(
         ggml_tensor * src = hidden_by_lane[(size_t) lane];
         ggml_tensor * src_view = ggml_view_2d(
             vctx, src, hdim, n_cand, src->nb[1], src->nb[1]);
+        src_view->buffer = src->buffer;
         ggml_tensor * dst_view = ggml_view_2d(
             vctx, projection->inp_hidden, hdim, n_cand,
             projection->inp_hidden->nb[1], (size_t) lane * lane_bytes);
+        dst_view->buffer = projection->inp_hidden->buffer;
         ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
     }
     ggml_free(vctx);

@@ -4,17 +4,39 @@
 #include "internal.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace luce::common {
 
-// Invalidate the cached selector projection graph. MUST be called whenever
-// draft weights are freed (park); the cache is keyed on the DraftWeights
-// address, which is stable across a park/unpark reload of the same backend
-// member, so without this the cached graph would keep pointers to freed
-// selector weight tensors.
+// Invalidate the cached single-lane selector projection graph (dflash2_head.cpp).
+// MUST be called whenever draft weights are freed (park); the batched selector
+// path uses an engine-owned DFlash2BatchSelectorCache instead of TLS state.
 void dflash2_selector_graph_invalidate();
 uint64_t dflash2_selector_graph_generation();
+
+// Engine-owned cache of batched DFlash2 projection/selector GPU graphs and
+// pinned staging buffers. Owned by the seq engine (like DraftKvBatchGraph), so
+// park, scratch release, and engine destruction always free VRAM and pinned
+// host memory automatically without thread_local singletons.
+class DFlash2BatchSelectorCache {
+public:
+    DFlash2BatchSelectorCache();
+    ~DFlash2BatchSelectorCache();
+    DFlash2BatchSelectorCache(DFlash2BatchSelectorCache &&) noexcept;
+    DFlash2BatchSelectorCache & operator=(DFlash2BatchSelectorCache &&) noexcept;
+    DFlash2BatchSelectorCache(const DFlash2BatchSelectorCache &) = delete;
+    DFlash2BatchSelectorCache & operator=(const DFlash2BatchSelectorCache &) = delete;
+
+    // Free all cached projection/selector GPU graphs and pinned host staging.
+    void release();
+
+    struct Impl;
+    Impl & impl();
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
 
 // DFlash 2 candidate selector for greedy chain drafting.
 //
@@ -38,9 +60,9 @@ bool dflash2_select_chain(const DraftWeights & dw,
 // tensor: the lm_head projection covers every (lane, depth) in one graph, GPU
 // top-K runs once, and selector projections/readback are shared. Reads rows
 // 1..q_len-1 of each lane's on-device [n_embd, q_len] f32 hidden_states
-// tensor via async D2D copies. The graphs stay cached per shape on the
-// calling thread until dflash2_select_chains_release() on that thread.
+// tensor via async D2D copies. Graphs and staging live in `cache`.
 bool dflash2_select_chains_batched_device(
+    DFlash2BatchSelectorCache & cache,
     const DraftWeights & dw,
     ggml_backend_t backend,
     ggml_tensor * lm_head,
@@ -48,10 +70,6 @@ bool dflash2_select_chains_batched_device(
     int q_len,
     const std::vector<int32_t> & last_tokens,
     std::vector<std::vector<int32_t>> & draft_tokens);
-
-// Free the calling thread's cached batched-selection graphs and their device
-// buffers (park, idle scratch release).
-void dflash2_select_chains_release();
 
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on

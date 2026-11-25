@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -388,6 +389,7 @@ bool build_target_step(
     bool keep_base_ssm_state,
     ggml_tensor * single_replay_slot_ids,
     bool capture_q_all) {
+    static std::atomic<uint64_t> s_next_step_arena_gen{1};
     static thread_local std::unique_ptr<uint8_t[]> g_step_arena;
     static thread_local size_t g_step_arena_size = 0;
     static thread_local uint64_t g_step_arena_gen = 0;
@@ -397,6 +399,7 @@ bool build_target_step(
     // across steps when g_step_arena has not been overwritten by another call.
     const bool cacheable_paged_decode =
         paged_attention && compact_slots && n_prefill_tokens == 0 &&
+        n_logits_rows == 0 &&
         !with_mask && !capture_delta_intermediate && !capture_moe_router &&
         !kvflash_mask && !capture_qk && !keep_base_ssm_state &&
         !single_replay_slot_ids && !capture_q_all &&
@@ -503,7 +506,7 @@ bool build_target_step(
         g_step_arena.reset(new uint8_t[ip.mem_size]);
         g_step_arena_size = ip.mem_size;
     }
-    ++g_step_arena_gen;
+    g_step_arena_gen = s_next_step_arena_gen.fetch_add(1, std::memory_order_relaxed);
     ip.mem_buffer = g_step_arena.get();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);

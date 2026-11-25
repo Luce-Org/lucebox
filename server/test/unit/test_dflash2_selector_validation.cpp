@@ -1,4 +1,4 @@
-#include "common/dflash2_selector_validation.h"
+#include "common/dflash/dflash2_selector_validation.h"
 #include "host_check.h"
 
 #include <cstdio>

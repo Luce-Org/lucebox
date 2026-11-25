@@ -13,7 +13,7 @@
 #include "prefill_helpers.h"
 #include "common/blocking_row_pool.h"
 #include "common/concurrency/chain_spec_shapes.h"
-#include "common/dflash2_head.h"
+#include "common/dflash/dflash2_head.h"
 #include "common/sampled_verify.h"
 #include "common/sampler.h"
 #include "internal.h"
@@ -246,9 +246,11 @@ Qwen35SeqEngine::~Qwen35SeqEngine() {
 
 void Qwen35SeqEngine::release_target_graphs() {
     step_graph_destroy(paged_tree_sg_);
+    dflash2_selector_cache_.release();
 }
 
 void Qwen35SeqEngine::release_draft_graphs() {
+    dflash2_selector_cache_.release();
     for (std::unique_ptr<DraftKvBatchGraph> & g : batch_draft_graphs_) {
         if (g) draft_kv_batch_free(*g);
     }
@@ -421,6 +423,9 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
 
     auto reset_lanes = [&]() {
+        if (b_.draft_backend_) {
+            ggml_backend_synchronize(b_.draft_backend_);
+        }
         for (const Lane & lane : lanes) {
             if (lane.state) draft_kv_reset(*lane.state);
         }
@@ -590,8 +595,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
         draft_graph->hidden_by_lane.begin() + static_cast<std::ptrdiff_t>(lanes.size()));
     std::vector<std::vector<int32_t>> proposals;
     if (!dflash2_select_chains_batched_device(
-            dw, b_.draft_backend_, b_.w_.output, real_hidden_tensors,
-            draft_width, real_roots, proposals) ||
+            dflash2_selector_cache_, dw, b_.draft_backend_, b_.w_.output,
+            real_hidden_tensors, draft_width, real_roots, proposals) ||
         proposals.size() != lanes.size()) {
         reset_lanes();
         return std::nullopt;
@@ -711,10 +716,10 @@ const Qwen35SeqEngine::GpuPinnedPrefix * Qwen35SeqEngine::live_gpu_prefix(int in
 // Pin the full blocks of `slot`'s first `tokens` positions for checkpoint
 // `index`, whose payload holds those same positions now.
 bool Qwen35SeqEngine::pin_gpu_prefix(int index, int slot, int tokens) {
-    const uint32_t full_blocks = static_cast<uint32_t>(tokens) / pool_.block_size();
-    if (full_blocks == 0 || index < 0 ||
-        static_cast<size_t>(index) >= gpu_prefix_pins_.size()) return false;
+    if (index < 0 || static_cast<size_t>(index) >= gpu_prefix_pins_.size()) return false;
     unpin_gpu_prefix(index);
+    const uint32_t full_blocks = static_cast<uint32_t>(tokens) / pool_.block_size();
+    if (full_blocks == 0) return false;
     GpuPinnedPrefix & pin = gpu_prefix_pins_[static_cast<size_t>(index)];
     if (pool_.pin_prefix_blocks(slots_.slot(slot).handle, full_blocks,
                                 pin.blocks) != PagedKvStatus::Ok) {
@@ -2899,7 +2904,10 @@ bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
     }
     std::vector<int32_t> blocks;
     bool ok = offload_.restore(slot, blocks, error);
-    while (!ok && evict_one_gpu_prefix()) {
+    // Only evict cached prefix pins when restore failed for pool capacity
+    // (offload_.restore leaves `error` empty on BlocksExhausted; non-capacity
+    // failures set `error` and cannot be resolved by unpinning).
+    while (!ok && error.empty() && evict_one_gpu_prefix()) {
         ok = offload_.restore(slot, blocks, error);
     }
     if (!ok) return false;

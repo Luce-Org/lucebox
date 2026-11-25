@@ -162,20 +162,22 @@ bool PagedKvOffload::suspend(int slot, size_t available_bytes,
         std::unique_ptr<uint8_t[]> saved(bytes > 0 ? new uint8_t[bytes] : nullptr);
         const std::vector<uint32_t> & table = sequence.block_table;
         ggml_backend_synchronize(backend_);
-        transfer_.begin(backend_);
-        size_t offset = 0;
-        for (const auto & plane : tensors_) {
-            for (size_t i = 0, run = 0; i < table.size(); i += run) {
-                run = contiguous_block_run(table, i, table.size());
-                const size_t run_bytes = run * plane.block_bytes;
-                transfer_.d2h(
-                    plane.tensor,
-                    plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
-                    saved.get() + offset, run_bytes);
-                offset += run_bytes;
+        {
+            auto xfer = transfer_.scope(backend_);
+            size_t offset = 0;
+            for (const auto & plane : tensors_) {
+                for (size_t i = 0, run = 0; i < table.size(); i += run) {
+                    run = contiguous_block_run(table, i, table.size());
+                    const size_t run_bytes = run * plane.block_bytes;
+                    xfer.d2h(
+                        plane.tensor,
+                        plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
+                        saved.get() + offset, run_bytes);
+                    offset += run_bytes;
+                }
             }
+            xfer.finish();
         }
-        transfer_.finish();
         if (!slots_.detach_kv(slot)) {
             error = "could not release preserved KV blocks";
             return false;
@@ -217,22 +219,24 @@ bool PagedKvOffload::restore(int slot, std::vector<int32_t> & blocks,
         }
         const std::vector<uint32_t> & table = sequence.block_table;
         ggml_backend_synchronize(backend_);
-        transfer_.begin(backend_);
-        size_t offset = 0;
-        const uint8_t * src_data = saved_[(size_t)slot].data.get();
-        for (const auto & plane : tensors_) {
-            for (size_t i = 0, run = 0; i < table.size(); i += run) {
-                run = contiguous_block_run(table, i, table.size());
-                const size_t run_bytes = run * plane.block_bytes;
-                transfer_.h2d(
-                    plane.tensor,
-                    plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
-                    src_data + offset, run_bytes);
-                offset += run_bytes;
+        {
+            auto xfer = transfer_.scope(backend_);
+            size_t offset = 0;
+            const uint8_t * src_data = saved_[(size_t)slot].data.get();
+            for (const auto & plane : tensors_) {
+                for (size_t i = 0, run = 0; i < table.size(); i += run) {
+                    run = contiguous_block_run(table, i, table.size());
+                    const size_t run_bytes = run * plane.block_bytes;
+                    xfer.h2d(
+                        plane.tensor,
+                        plane.offset + static_cast<size_t>(table[i]) * plane.block_bytes,
+                        src_data + offset, run_bytes);
+                    offset += run_bytes;
+                }
             }
+            for (size_t i = 0; i < count; ++i) blocks[i] = (int32_t)sequence.block_table[i];
+            xfer.finish();
         }
-        for (size_t i = 0; i < count; ++i) blocks[i] = (int32_t)sequence.block_table[i];
-        transfer_.finish();
         discard(slot);
         return true;
     } catch (const std::bad_alloc &) {

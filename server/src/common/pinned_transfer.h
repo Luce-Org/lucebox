@@ -60,12 +60,44 @@ public:
         need_final_sync_ = false;
     }
 
+    // RAII guard pairing begin(backend) with finish(), so early returns and
+    // exceptions (e.g. std::bad_alloc) can never leave GPU DMA in flight.
+    class Scope {
+    public:
+        Scope(PinnedTransfer & transfer, ggml_backend_t backend)
+            : transfer_(&transfer) {
+            transfer_->begin(backend);
+        }
+        Scope(const Scope &) = delete;
+        Scope & operator=(const Scope &) = delete;
+        ~Scope() { finish(); }
+
+        void d2h(const ggml_tensor * tensor, size_t dev_offset,
+                 void * host_dst, size_t bytes) {
+            transfer_->d2h(tensor, dev_offset, host_dst, bytes);
+        }
+        void h2d(ggml_tensor * tensor, size_t dev_offset,
+                 const void * host_src, size_t bytes) {
+            transfer_->h2d(tensor, dev_offset, host_src, bytes);
+        }
+        void finish() {
+            if (!finished_) {
+                finished_ = true;
+                transfer_->finish();
+            }
+        }
+
+    private:
+        PinnedTransfer * transfer_;
+        bool finished_ = false;
+    };
+
+    Scope scope(ggml_backend_t backend) { return Scope(*this, backend); }
+
     // Prepare for a sequence of d2h() OR h2d() transfers on `backend`.
     void begin(ggml_backend_t backend) {
         if (!backend) {
-            cur_ = 0;
-            need_final_sync_ = false;
-            staged_ = false;
+            release();
             return;
         }
         if (backend != backend_) {
@@ -123,7 +155,7 @@ public:
             return;
         }
         if (!staged_ || !owned_by_backend(tb)) {
-            if (backend_) {
+            if (backend_ && owned_by_backend(tb)) {
                 ggml_backend_tensor_get_async(backend_, tensor, host_dst, dev_offset, bytes);
                 need_final_sync_ = true;
             } else {
@@ -140,6 +172,9 @@ public:
                 rotate();
             }
             const size_t off = used_[cur_];
+            // Reserve metadata slot before issuing GPU DMA so a bad_alloc
+            // cannot abandon an in-flight copy into base_[cur_].
+            pending_[cur_].reserve(pending_[cur_].size() + 1);
             ggml_backend_tensor_get_async(
                 backend_, tensor, base_[cur_] + off, dev_offset + done, chunk);
             pending_[cur_].push_back({dst + done, base_[cur_] + off, chunk});
@@ -158,7 +193,7 @@ public:
             return;
         }
         if (!staged_ || !owned_by_backend(tb)) {
-            if (backend_) {
+            if (backend_ && owned_by_backend(tb)) {
                 ggml_backend_tensor_set_async(backend_, tensor, host_src, dev_offset, bytes);
                 need_final_sync_ = true;
             } else {

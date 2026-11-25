@@ -10,9 +10,9 @@
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
-#include "dflash_feature_ring.h"
-#include "dflash_capture.h"
-#include "common/dflash_draft_graph.h"
+#include "common/dflash/dflash_feature_ring.h"
+#include "common/dflash/dflash_capture.h"
+#include "common/dflash/dflash_draft_graph.h"
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
@@ -22,7 +22,7 @@
 #include <random>
 #endif
 #include "common/dspark_head.h"
-#include "common/dflash2_head.h"
+#include "common/dflash/dflash2_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
@@ -1108,7 +1108,6 @@ bool Qwen35Backend::park(ParkTarget target) {
         if (seq_engine_) seq_engine_->release_target_graphs();
         step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
-        dflash2_select_chains_release();
         dflash2_selector_graph_invalidate();
         free_target_weights(w_);
         vision_.reset();
@@ -2054,8 +2053,6 @@ void Qwen35Backend::release_scratch() {
         proj_sg_.alloc = nullptr;
     }
     step_graph_free(proj_sg_);
-    // The batched DFlash2 selection graphs, one per cohort shape.
-    dflash2_select_chains_release();
 
     // BSA persistent CUDA buffers (blockmask, head_mask_type, softmax_lse).
 #ifdef LUCE_HAVE_BSA

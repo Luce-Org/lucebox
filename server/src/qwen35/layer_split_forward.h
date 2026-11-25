@@ -7,8 +7,8 @@
 #pragma once
 
 #include "layer_split_types.h"
-#include "dflash_draft_ipc.h"
-#include "dflash_feature_ring.h"
+#include "common/dflash/dflash_draft_ipc.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "step_graph.h"
 #include "qwen35_target_shard_ipc.h"
 

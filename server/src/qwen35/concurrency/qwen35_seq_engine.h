@@ -24,8 +24,9 @@
 #include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/concurrency/paged_kv_offload.h"
-#include "common/dflash_draft_kv.h"
-#include "common/dflash_feature_ring.h"
+#include "common/dflash/dflash2_head.h"
+#include "common/dflash/dflash_draft_kv.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "common/pinned_stage.h"
 #include "common/step_graph.h"
 #include "qwen35_slot_manager.h"
@@ -334,6 +335,7 @@ private:
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
     std::vector<std::unique_ptr<DraftKvBatchGraph>> batch_draft_graphs_;
+    DFlash2BatchSelectorCache dflash2_selector_cache_;
     // Rounds with two or more lanes draft a shorter block than the configured
     // one: a long block pays for itself only when one request decodes alone
     // (verify cost grows with lanes x width, acceptance stays per lane).

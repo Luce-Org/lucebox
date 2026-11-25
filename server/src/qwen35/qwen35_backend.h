@@ -12,8 +12,8 @@
 #pragma once
 
 #include "common/model_backend.h"
-#include "common/dflash_target.h"
-#include "common/dflash_draft_ipc.h"
+#include "common/dflash/dflash_target.h"
+#include "common/dflash/dflash_draft_ipc.h"
 #include "common/specla_mode.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
@@ -23,8 +23,8 @@
 #include <chrono>
 #include <limits>
 #include <map>
-#include "dflash_feature_ring.h"
-#include "common/dflash_draft_kv.h"
+#include "common/dflash/dflash_feature_ring.h"
+#include "common/dflash/dflash_draft_kv.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
