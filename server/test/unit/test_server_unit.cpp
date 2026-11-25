@@ -4644,6 +4644,33 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     remove_test_path(path);
 }
 
+TEST_CASE(ServerUnitFixture, test_resolve_inkling2_chat_markers) {
+    // Inkling 2 opens each role with a distinct control token and closes each
+    // message with <|end_message|>. Cuts sit before <|end_message|> so both
+    // normal continuations and P1->P2 retries hit the saved checkpoint.
+    ChatMarkers markers;
+    markers.family = "inkling2";
+    markers.sys_role_prefix = {1};
+    markers.end_msg_seqs = {{5}};
+    markers.next_role_starts = {{2}, {3}, {1}, {4}};
+    markers.cut_before_end = true;
+
+    // [sys 1, 100, end 5] [usr 2, 101, end 5] [mdl 3, 102, end 5, eos 6] [tool 4, 103, end 5] [usr 2, 104, end 5]
+    const std::vector<int32_t> p1 = {
+        1, 100, 5, 2, 101, 5, 3, 102, 5, 6, 4, 103, 5, 2, 104, 5,
+    };
+    const std::vector<int> bounds = find_all_boundaries(p1, markers);
+    TEST_ASSERT(bounds == std::vector<int>({2, 5, 8, 12}));
+    TEST_ASSERT(select_inline_snapshot_boundary(bounds, 0, true) == 2);
+    TEST_ASSERT(select_inline_snapshot_boundary(bounds, 2, true) == 12);
+
+    // P2 omits the trailing [usr 2, 104, end 5], ending at index 12 (<|end_message|>).
+    // The saved cut at 12 is strictly shorter than P2's length (13), giving a 12/13 hit.
+    const std::vector<int32_t> p2(p1.begin(), p1.begin() + 13);
+    TEST_ASSERT((int) p2.size() == 13);
+    TEST_ASSERT(bounds.back() < (int) p2.size());
+}
+
 TEST_CASE(ServerUnitFixture, test_prefix_cache_reserves_disk_staging_slot) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;

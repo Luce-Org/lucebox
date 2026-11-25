@@ -8,6 +8,7 @@ namespace luce::common {
 
 bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
     out.role_starts_delimit = false;
+    out.cut_before_end = false;
     // DeepSeek V4 uses full-width punctuation in its control tokens. Require
     // each marker to encode as its exact vocabulary token so an unrelated BPE
     // tokenizer cannot be misclassified merely because it can spell the text.
@@ -27,6 +28,22 @@ bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
         out.end_msg_seqs = {{ds_eos}};
         out.next_role_starts = {{ds_user}, {ds_assistant}};
         out.role_starts_delimit = true;
+        return true;
+    }
+
+    // Inkling 2 family: exact control tokens for every role and <|end_message|>.
+    const int32_t i2_sys  = exact_control_token("<|message_system|>");
+    const int32_t i2_usr  = exact_control_token("<|message_user|>");
+    const int32_t i2_mdl  = exact_control_token("<|message_model|>");
+    const int32_t i2_tool = exact_control_token("<|message_tool|>");
+    const int32_t i2_end  = exact_control_token("<|end_message|>");
+    if (i2_sys >= 0 && i2_usr >= 0 && i2_mdl >= 0 && i2_end >= 0) {
+        out.family = "inkling2";
+        out.sys_role_prefix = {i2_sys};
+        out.end_msg_seqs = {{i2_end}};
+        out.next_role_starts = {{i2_usr}, {i2_mdl}, {i2_sys}};
+        if (i2_tool >= 0) out.next_role_starts.push_back({i2_tool});
+        out.cut_before_end = true;
         return true;
     }
 
@@ -176,9 +193,9 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
             cursor = after_end;
             continue;
         }
-        int boundary = next_match + next_len;
+        int boundary = markers.cut_before_end ? end_idx : (next_match + next_len);
         out.push_back(boundary);
-        cursor = boundary;
+        cursor = next_match + next_len;
         stray_skips = 0;
     }
     return out;
