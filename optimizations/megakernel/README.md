@@ -110,10 +110,10 @@ As more models go hybrid (and they will, because linear attention scales better)
 ## Quick start
 
 ```bash
-git clone https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub
+git clone https://github.com/Luce-Org/lucebox.git
+cd lucebox
 uv sync --extra megakernel
-uv run --directory megakernel python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
+uv run --directory optimizations/megakernel python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
 
 The legacy standalone flow still works from inside `optimizations/megakernel/`: create a

@@ -32,7 +32,7 @@ Fused single-kernel decode for Qwen3.5-0.8B, adapted for NVIDIA Pascal GPUs.
 ## Build
 
 ```bash
-cd megakernel
+cd optimizations/megakernel
 python -m venv .venv && source .venv/bin/activate
 pip install torch
 pip install -e . --no-build-isolation

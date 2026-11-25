@@ -60,7 +60,6 @@ PFlash is the algorithm. The implementation lives in [`../../server/`](../../ser
 
 ```bash
 # 1. from the repo root, install Python deps and build the server
-cd lucebox-hub
 uv sync
 git submodule update --init --recursive
 cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release \
