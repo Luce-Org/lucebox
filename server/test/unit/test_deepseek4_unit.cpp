@@ -4596,8 +4596,11 @@ static bool all_snapshot_tensors_named(ggml_context * ctx, size_t * count_out) {
 }
 
 static std::string make_test_disk_cache_dir(const char * tag) {
-    return "/tmp/luce_test_ds4_disk_" + std::string(tag) + "_" +
-           std::to_string((long) getpid());
+    std::error_code ec;
+    std::filesystem::path root = std::filesystem::temp_directory_path(ec);
+    if (ec || root.empty()) root = "/tmp";
+    return (root / ("luce_test_ds4_disk_" + std::string(tag) + "_" +
+                    std::to_string((long) getpid()))).string();
 }
 
 static void remove_test_disk_cache_dir(const std::string & dir) {
@@ -4702,10 +4705,17 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     // Real ondisk cache: write slot 0, then read it back into slot 1.
     const std::string dir = make_test_disk_cache_dir("mono");
     remove_test_disk_cache_dir(dir);
+    struct DirCleanup {
+        std::string path;
+        ~DirCleanup() { remove_test_disk_cache_dir(path); }
+    } dir_cleanup{dir};
     DiskCacheConfig dcfg;
     dcfg.cache_dir = dir;
     dcfg.min_tokens = 1;
     DiskPrefixCache disk(dcfg, backend);
+    // Synthetic snapshots are a few KB; decouple from host /tmp free space
+    // so DiskStore's 16 GiB safety reserve does not clamp the budget to 0.
+    disk.set_free_space_probe([] { return uint64_t(1) << 40; });
     TEST_ASSERT(disk.init());
     TEST_ASSERT(!disk.disabled());
     const std::vector<int32_t> prompt = {11, 12, 13, 14, 15, 16, 17};
@@ -4728,8 +4738,10 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(backend.snapshot_used(1));
     TEST_ASSERT(backend.snapshot_cur_pos(1) == 7);
     TEST_ASSERT(backend.snapshots_[1].layers.size() == 1);
-    TEST_ASSERT(backend.snapshots_[1].layers[0].n_comp == 5);
-    TEST_ASSERT(backend.snapshots_[1].layers[0].n_index_comp == 3);
+    if (backend.snapshots_[1].layers.size() == 1) {
+        TEST_ASSERT(backend.snapshots_[1].layers[0].n_comp == 5);
+        TEST_ASSERT(backend.snapshots_[1].layers[0].n_index_comp == 3);
+    }
     TEST_ASSERT(backend.snapshot_aux_[1].last_logits ==
                 std::vector<float>({1.0f, 4.0f, 2.0f}));
     TEST_ASSERT(backend.snapshot_aux_[1].spec_feat_window ==
@@ -4780,8 +4792,11 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(disk.lookup(prompt3, Checkpoint::of_cache_slot(4)));
     TEST_ASSERT(backend.snapshot_used(4));
     TEST_ASSERT(backend.snapshot_cur_pos(4) == 3);
-    TEST_ASSERT(backend.snapshots_[4].layers[0].n_comp == 0);
-    TEST_ASSERT(backend.snapshots_[4].layers[0].n_index_comp == 0);
+    TEST_ASSERT(backend.snapshots_[4].layers.size() == 1);
+    if (backend.snapshots_[4].layers.size() == 1) {
+        TEST_ASSERT(backend.snapshots_[4].layers[0].n_comp == 0);
+        TEST_ASSERT(backend.snapshots_[4].layers[0].n_index_comp == 0);
+    }
     TEST_ASSERT(backend.snapshot_aux_[4].spec_feat_window.empty());
     TEST_ASSERT(backend.snapshot_aux_[4].last_logits ==
                 std::vector<float>({0.5f, 0.25f, 0.125f}));
@@ -4814,49 +4829,73 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     {
         const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
         TEST_ASSERT(good.ctx != nullptr);
-        ggml_context * bad_ctx = nullptr;
-        ggml_backend_buffer_t bad_buf = nullptr;
-        TEST_ASSERT(clone_snapshot_context_like_disk_reader(
-            good.ctx, &bad_ctx, &bad_buf, "ds4_snap_raw_kv_0", backend.w_.n_swa + 1));
-        TEST_ASSERT(!backend.snapshot_adopt(6, bad_ctx, bad_buf, good.cur_pos, -1));
-        TEST_ASSERT(!backend.snapshot_used(6));
-        ggml_backend_buffer_free(bad_buf);
-        ggml_free(bad_ctx);
+        if (good.ctx != nullptr) {
+            ggml_context * bad_ctx = nullptr;
+            ggml_backend_buffer_t bad_buf = nullptr;
+            const bool cloned = clone_snapshot_context_like_disk_reader(
+                good.ctx, &bad_ctx, &bad_buf, "ds4_snap_raw_kv_0", backend.w_.n_swa + 1);
+            TEST_ASSERT(cloned);
+            if (cloned) {
+                TEST_ASSERT(!backend.snapshot_adopt(6, bad_ctx, bad_buf, good.cur_pos, -1));
+                TEST_ASSERT(!backend.snapshot_used(6));
+                ggml_backend_buffer_free(bad_buf);
+                ggml_free(bad_ctx);
+            }
+        }
     }
     // ... and one whose header position disagrees with the meta.
     {
         const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
-        ggml_context * re_ctx = nullptr;
-        ggml_backend_buffer_t re_buf = nullptr;
-        TEST_ASSERT(clone_snapshot_context_like_disk_reader(good.ctx, &re_ctx, &re_buf));
-        TEST_ASSERT(!backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos + 1, -1));
-        TEST_ASSERT(!backend.snapshot_used(6));
-        // A faithful clone is adopted and owned by the slot afterwards.
-        TEST_ASSERT(backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos, -1));
-        TEST_ASSERT(backend.snapshot_used(6));
-        TEST_ASSERT(backend.snapshots_[6].owns_storage);
+        TEST_ASSERT(good.ctx != nullptr);
+        if (good.ctx != nullptr) {
+            ggml_context * re_ctx = nullptr;
+            ggml_backend_buffer_t re_buf = nullptr;
+            const bool cloned = clone_snapshot_context_like_disk_reader(good.ctx, &re_ctx, &re_buf);
+            TEST_ASSERT(cloned);
+            if (cloned) {
+                TEST_ASSERT(!backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos + 1, -1));
+                TEST_ASSERT(!backend.snapshot_used(6));
+                // A faithful clone is adopted and owned by the slot afterwards.
+                const bool adopted = backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos, -1);
+                TEST_ASSERT(adopted);
+                if (adopted) {
+                    TEST_ASSERT(backend.snapshot_used(6));
+                    TEST_ASSERT(backend.snapshots_[6].owns_storage);
+                } else {
+                    ggml_backend_buffer_free(re_buf);
+                    ggml_free(re_ctx);
+                }
+            }
+        }
     }
     // Snapshots carry the current format version; an older one is refused.
     {
         const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
-        ggml_context * old_ctx = nullptr;
-        ggml_backend_buffer_t old_buf = nullptr;
-        TEST_ASSERT(clone_snapshot_context_like_disk_reader(good.ctx, &old_ctx, &old_buf));
-        ggml_tensor * meta = ggml_get_tensor(old_ctx, kDeepSeek4SnapMetaName);
-        TEST_ASSERT(meta != nullptr);
-        int32_t version = 0;
-        ggml_backend_tensor_get(meta, &version, 0, sizeof(version));
-        TEST_ASSERT(version == kDeepSeek4SnapMetaVersion && version >= 2);
-        version = 1;
-        ggml_backend_tensor_set(meta, &version, 0, sizeof(version));
-        TEST_ASSERT(!backend.snapshot_adopt(7, old_ctx, old_buf, good.cur_pos, -1));
-        TEST_ASSERT(!backend.snapshot_used(7));
-        ggml_backend_buffer_free(old_buf);
-        ggml_free(old_ctx);
+        TEST_ASSERT(good.ctx != nullptr);
+        if (good.ctx != nullptr) {
+            ggml_context * old_ctx = nullptr;
+            ggml_backend_buffer_t old_buf = nullptr;
+            const bool cloned = clone_snapshot_context_like_disk_reader(good.ctx, &old_ctx, &old_buf);
+            TEST_ASSERT(cloned);
+            if (cloned) {
+                ggml_tensor * meta = ggml_get_tensor(old_ctx, kDeepSeek4SnapMetaName);
+                TEST_ASSERT(meta != nullptr);
+                if (meta != nullptr) {
+                    int32_t version = 0;
+                    ggml_backend_tensor_get(meta, &version, 0, sizeof(version));
+                    TEST_ASSERT(version == kDeepSeek4SnapMetaVersion && version >= 2);
+                    version = 1;
+                    ggml_backend_tensor_set(meta, &version, 0, sizeof(version));
+                    TEST_ASSERT(!backend.snapshot_adopt(7, old_ctx, old_buf, good.cur_pos, -1));
+                    TEST_ASSERT(!backend.snapshot_used(7));
+                }
+                ggml_backend_buffer_free(old_buf);
+                ggml_free(old_ctx);
+            }
+        }
     }
 
     for (int i = 0; i < 8; ++i) backend.snapshot_free(i);
-    remove_test_disk_cache_dir(dir);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 

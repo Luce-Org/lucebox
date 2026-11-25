@@ -1979,6 +1979,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     // different model, max_ctx, or chat_template (gemma4 ↔ qwen3.6, etc.).
     if (!disk_cache_.disabled()) {
         disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
+        if (config.disk_cache_free_space_probe) {
+            disk_cache_.set_free_space_probe(config.disk_cache_free_space_probe);
+        }
     }
     disk_cache_.init();
     // Report the effective state after initialization failure or a directory

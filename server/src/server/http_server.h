@@ -316,6 +316,8 @@ struct ServerConfig {
     // eviction) for at most this long; < 0 = no limit.
     double      disk_cache_shutdown_flush_s = 120.0;
     DiskPrefixCachePolicy disk_cache_policy;
+    // Free bytes on the cache's filesystem; empty queries the OS (tests inject one).
+    std::function<uint64_t()> disk_cache_free_space_probe;
 
     // Optional Jinja chat template (overrides the codec or built-in renderer
     // when non-empty).
