@@ -122,7 +122,20 @@ UNKNOWN = "code no rule narrows (shared code, other models, build files)"
 # that breaks their build. A directory rule may still route one to the Python
 # lane (optimizations/, harness/, scripts/), so plan() keeps a build lane for
 # every path with one of these names.
-NATIVE_SUFFIXES = (".c", ".cc", ".cmake", ".cpp", ".cu", ".cuh", ".cxx", ".h", ".hh", ".hpp")
+NATIVE_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cmake",
+    ".cmake.in",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+)
 NATIVE_NAMES = ("CMakeLists.txt",)
 
 
@@ -149,12 +162,15 @@ def plan(paths: list[str] | None) -> tuple[frozenset[str], dict[str, list[str]]]
     for path in paths:
         rule = next((rule for rule in RULES if matches(path, rule[0])), None)
         needs, why = (rule[1], rule[2]) if rule else (ALL, UNKNOWN)
+        # optimizations/ and harness/ select the Python lane alone, and
+        # server/examples/ selects nothing; a native source filed there would run
+        # no compiler at all. Judge every path on its own rule: a build lane that
+        # another path selects does not compile this file.
+        if is_native(path) and needs <= PY:
+            needs |= CPP
+            why = f"{why}; native source, so the C++ build runs"
         jobs |= needs
         reasons.setdefault(why, []).append(path)
-    # optimizations/ and harness/ select the Python lane alone, and server/examples/
-    # selects nothing; a native source filed there would run no compiler at all.
-    if jobs <= PY and any(is_native(path) for path in paths):
-        jobs |= CPP
     return frozenset(jobs), reasons
 
 

@@ -56,9 +56,10 @@ REPO = Path(__file__).resolve().parents[2]
         # optimizations/ selects the Python lane alone; a native source keeps a build lane.
         (["optimizations/pflash/csrc/kernel.cu"], PY_CPP),
         (["optimizations/rocm_ext/CMakeLists.txt"], PY_CPP),
+        (["optimizations/new/types.hxx", "optimizations/new/config.cmake.in"], PY_CPP),
         # server/examples/ selects nothing; a native file there still gets a build.
         (["server/examples/bench.cpp"], CPP),
-        # The megakernel lane compiles its own CUDA sources: no engine build as well.
+        # The megakernel lane compiles optimizations/megakernel's own CUDA sources.
         (["optimizations/megakernel/kernel.cu"], PY_MK),
         (["uv.lock"], PY_MK),
         # Both models run all C++/GPU/serve jobs.
@@ -92,9 +93,20 @@ def test_a_native_change_is_never_only_the_python_lane() -> None:
     # lane alone, which compiles nothing native.
     assert plan(["optimizations/pflash/csrc/attention.cu"])[0] == PY_CPP
     assert plan(["README.md", "optimizations/pflash/csrc/attention.cu"])[0] == PY_CPP
-    # Path order must not decide whether the build lane is added.
-    assert plan(["optimizations/new/uint8.cuh", "optimizations/megakernel/setup.py"])[0] == PY_MK
-    assert plan(["optimizations/megakernel/setup.py", "optimizations/new/uint8.cuh"])[0] == PY_MK
+    # A build lane another path selects does not compile this file: the megakernel
+    # job builds only optimizations/megakernel.
+    both = ["optimizations/new/uint8.cuh", "optimizations/megakernel/setup.py"]
+    assert plan(both)[0] == PY_MK | CPP
+    assert plan(list(reversed(both)))[0] == PY_MK | CPP
+
+
+def test_a_forced_build_lane_says_why_in_the_summary() -> None:
+    # The summary groups changed files by what decided their jobs, so a native
+    # file under a Python-only rule must not be described as Python-only.
+    _, reasons = plan(["optimizations/pflash/csrc/attention.cu"])
+    ((why, files),) = reasons.items()
+    assert files == ["optimizations/pflash/csrc/attention.cu"]
+    assert "native source" in why
 
 
 NATIVE_PATTERNS = (
@@ -107,7 +119,9 @@ NATIVE_PATTERNS = (
     "*.h",
     "*.hh",
     "*.hpp",
+    "*.hxx",
     "*.cmake",
+    "*.cmake.in",
     "*CMakeLists.txt",
 )
 
