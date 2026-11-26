@@ -827,6 +827,48 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
     }
 }
 
+// A SentencePiece vocabulary (Gemma 4's) writes a character it has no token for as
+// <0xNN> tokens, one per UTF-8 byte, as Hugging Face's byte_fallback does: "a b"
+// (no-break space) is a | <0xC2> | <0xA0> | b. The engine wrote the first byte only.
+TEST_CASE(ServerUnitFixture, test_tokenizer_sentencepiece_byte_fallback_writes_every_byte) {
+    std::vector<std::string> tokens = {"<pad>", "<eos>", "<bos>", "a", "b", "\xE2\x96\x81"};
+    std::vector<uint32_t> types = {3, 3, 3, 1, 1, 1};
+    for (int byte = 0; byte < 256; ++byte) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", byte);
+        tokens.push_back(buf);
+        types.push_back(6);  // byte
+    }
+    std::vector<const char *> token_ptrs;
+    for (const auto & token : tokens) token_ptrs.push_back(token.c_str());
+    gguf_context * g = gguf_init_empty();
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", token_ptrs.data(), (int32_t) tokens.size());
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      types.data(), (int32_t) types.size());
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gemma4");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 2);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    const std::string path = test_tmp_path("luce_test_sentencepiece_bytes.gguf").string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    const auto ids = [&](const std::vector<std::string> & strs) {
+        std::vector<int32_t> out;
+        for (const auto & s : strs) out.push_back(tok.token_to_id(s));
+        return out;
+    };
+    // U+00A0 is two bytes in UTF-8, U+3000 three and U+1F600 four.
+    TEST_ASSERT(tok.encode("a\xC2\xA0" "b") == ids({"a", "<0xC2>", "<0xA0>", "b"}));
+    TEST_ASSERT(tok.encode("a\xE3\x80\x80" "b") == ids({"a", "<0xE3>", "<0x80>", "<0x80>", "b"}));
+    TEST_ASSERT(tok.encode("\xF0\x9F\x98\x80") == ids({"<0xF0>", "<0x9F>", "<0x98>", "<0x80>"}));
+    for (const std::string text : {"a\xC2\xA0" "b", "a\xE3\x80\x80" "b", "\xF0\x9F\x98\x80"}) {
+        TEST_ASSERT(tok.decode(tok.encode(text)) == text);
+    }
+}
+
 TEST_CASE(ServerUnitFixture,
         test_pflash_decoded_span_covers_bpe_merged_first_token) {
     const std::string content =

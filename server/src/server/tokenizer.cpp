@@ -522,10 +522,12 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
             if (sit != token_to_id_.end()) {
                 symbols.push_back(sym);
             } else {
-                // Byte-fallback: <0xNN>
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "<0x%02X>", (unsigned)(uint8_t)*p);
-                symbols.push_back(buf);
+                // Byte-fallback: one <0xNN> per UTF-8 byte of the character.
+                for (int b = 0; b < cplen; ++b) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "<0x%02X>", (unsigned)(uint8_t)p[b]);
+                    symbols.push_back(buf);
+                }
             }
             p += cplen;
         }
