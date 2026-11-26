@@ -1,5 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 
+#include "common/sha256.h"
 #include "pflash/pflash_selection.h"
 #include "pflash/pflash_compress.h"
 #include "pflash/pflash_drafter.h"
@@ -1304,74 +1305,88 @@ TEST_CASE(PFlashSelectionFixture, startup_gguf_contract_validator_rejects_stubs)
     std::filesystem::remove_all(dir);
 }
 
+// A 1-layer, d_model=4 `pflash_seg_reranker_v1` GGUF bound to drafter "drafter" and head "head-a".
+struct TinyRerankerFile {
+    ggml_type matmul_type = GGML_TYPE_F32;   // 2D matmul weights
+    bool small_matmul_f32 = false;           // keep s_in and the [D,1] heads F32, as the published file does
+    ggml_type vector_type = GGML_TYPE_F32;   // 1D norms and biases
+    float score_head_bias = 0.05f;
+};
+
+static std::string write_tiny_reranker(const std::filesystem::path & path, const TinyRerankerFile & f) {
+    const int I = 4, S = 12, D = 4, F = 4;
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "pflash_seg_reranker");
+    gguf_set_val_str(g, "reranker.schema", "pflash_seg_reranker_v1");
+    gguf_set_val_str(g, "reranker.feature_mode", "kbar");
+    gguf_set_val_str(g, "reranker.runtime_gguf_sha256", "drafter");
+    gguf_set_val_str(g, "reranker.scoring_head_sha256", "head-a");
+    gguf_set_val_u32(g, "reranker.in_dim", I);
+    gguf_set_val_u32(g, "reranker.n_scalars", S);
+    gguf_set_val_u32(g, "reranker.d_model", D);
+    gguf_set_val_u32(g, "reranker.n_heads", 1);
+    gguf_set_val_u32(g, "reranker.n_layers", 1);
+    gguf_set_val_u32(g, "reranker.d_ff", F);
+    gguf_set_val_f32(g, "reranker.rope_theta", 10000.0f);
+    gguf_set_val_f32(g, "reranker.norm_eps", 1e-6f);
+    ggml_init_params gp{64 * ggml_tensor_overhead() + 65536, nullptr, false};
+    ggml_context * gctx = ggml_init(gp);
+    // Each tensor holds seed plus a small ripple, so the parity check sees distinct weights.
+    const auto add = [&](const char * name, ggml_type type, int64_t ne0, int64_t ne1, float seed) {
+        ggml_tensor * t = ne1 == 0 ? ggml_new_tensor_1d(gctx, type, ne0) : ggml_new_tensor_2d(gctx, type, ne0, ne1);
+        ggml_set_name(t, name);
+        const int64_t n = ggml_nelements(t);
+        std::vector<float> vals((size_t) n);
+        for (int64_t i = 0; i < n; ++i) vals[(size_t) i] = seed + 0.03f * (float) ((i * 7) % 11 - 5);
+        if (type == GGML_TYPE_F32) {
+            std::memcpy(t->data, vals.data(), (size_t) n * sizeof(float));
+        } else {
+            ggml_fp32_to_fp16_row(vals.data(), (ggml_fp16_t *) t->data, n);
+        }
+        gguf_add_tensor(g, t);
+    };
+    const auto add1 = [&](const char * name, int64_t ne0, float seed) { add(name, f.vector_type, ne0, 0, seed); };
+    const auto add2 = [&](const char * name, int64_t ne0, int64_t ne1, float seed, bool small = false) {
+        add(name, (small && f.small_matmul_f32) ? GGML_TYPE_F32 : f.matmul_type, ne0, ne1, seed);
+    };
+    add2("reranker.k_in.weight", I, D, 0.12f);
+    add1("reranker.k_in.bias", D, 0.01f);
+    add2("reranker.q_in.weight", I, D, -0.09f);
+    add1("reranker.q_in.bias", D, -0.02f);
+    add2("reranker.s_in.weight", S, D, 0.08f, true);
+    add1("reranker.s_in.bias", D, 0.03f);
+    add2("reranker.int_in.weight", D, D, 0.11f);
+    add1("reranker.in_norm.weight", D, 1.0f);
+    add1("reranker.out_norm.weight", D, 1.0f);
+    add2("reranker.score_head.weight", D, 1, 0.15f, true);
+    add1("reranker.score_head.bias", 1, f.score_head_bias);
+    add2("reranker.pool_gate.weight", D, 1, -0.07f, true);
+    add1("reranker.pool_gate.bias", 1, 0.02f);
+    add2("reranker.budget_head.weight", D, 1, 0.13f, true);
+    add1("reranker.budget_head.bias", 1, -0.04f);
+    add1("reranker.blocks.0.norm1.weight", D, 1.0f);
+    add2("reranker.blocks.0.q_proj.weight", D, D, 0.09f);
+    add2("reranker.blocks.0.k_proj.weight", D, D, -0.08f);
+    add2("reranker.blocks.0.v_proj.weight", D, D, 0.07f);
+    add2("reranker.blocks.0.o_proj.weight", D, D, -0.06f);
+    add1("reranker.blocks.0.norm2.weight", D, 1.0f);
+    add2("reranker.blocks.0.gate_proj.weight", D, F, 0.10f);
+    add2("reranker.blocks.0.up_proj.weight", D, F, -0.05f);
+    add2("reranker.blocks.0.down_proj.weight", F, D, 0.06f);
+    gguf_write_to_file(g, path.string().c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    ggml_free(gctx);
+    return path.string();
+}
+
 TEST_CASE(PFlashSelectionFixture, seg_reranker_rejects_truncated_file_and_nonfinite_output) {
     const auto dir = std::filesystem::temp_directory_path() / "luce_pflash_seg_reranker_run_test";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
-    const auto write_tiny = [&](const char * name, float score_head_bias) {
-        const std::string out_path = (dir / name).string();
-        const int I = 4, S = 12, D = 4, F = 4;
-        gguf_context * g = gguf_init_empty();
-        gguf_set_val_str(g, "general.architecture", "pflash_seg_reranker");
-        gguf_set_val_str(g, "reranker.schema", "pflash_seg_reranker_v1");
-        gguf_set_val_str(g, "reranker.feature_mode", "kbar");
-        gguf_set_val_str(g, "reranker.runtime_gguf_sha256", "drafter");
-        gguf_set_val_str(g, "reranker.scoring_head_sha256", "head-a");
-        gguf_set_val_u32(g, "reranker.in_dim", I);
-        gguf_set_val_u32(g, "reranker.n_scalars", S);
-        gguf_set_val_u32(g, "reranker.d_model", D);
-        gguf_set_val_u32(g, "reranker.n_heads", 1);
-        gguf_set_val_u32(g, "reranker.n_layers", 1);
-        gguf_set_val_u32(g, "reranker.d_ff", F);
-        gguf_set_val_f32(g, "reranker.rope_theta", 10000.0f);
-        gguf_set_val_f32(g, "reranker.norm_eps", 1e-6f);
-        ggml_init_params gp{64 * ggml_tensor_overhead() + 65536, nullptr, false};
-        ggml_context * gctx = ggml_init(gp);
-        auto add1 = [&](const char * tname, int64_t ne0, float v) {
-            ggml_tensor * t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, ne0);
-            ggml_set_name(t, tname);
-            float * p = (float *) t->data;
-            for (int64_t i = 0; i < ne0; ++i) p[i] = v;
-            gguf_add_tensor(g, t);
-        };
-        auto add2 = [&](const char * tname, int64_t ne0, int64_t ne1, float v) {
-            ggml_tensor * t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, ne0, ne1);
-            ggml_set_name(t, tname);
-            float * p = (float *) t->data;
-            for (int64_t i = 0; i < ne0 * ne1; ++i) p[i] = v;
-            gguf_add_tensor(g, t);
-        };
-        add2("reranker.k_in.weight", I, D, 0.1f);
-        add1("reranker.k_in.bias", D, 0.0f);
-        add2("reranker.q_in.weight", I, D, 0.1f);
-        add1("reranker.q_in.bias", D, 0.0f);
-        add2("reranker.s_in.weight", S, D, 0.1f);
-        add1("reranker.s_in.bias", D, 0.0f);
-        add2("reranker.int_in.weight", D, D, 0.1f);
-        add1("reranker.in_norm.weight", D, 1.0f);
-        add1("reranker.out_norm.weight", D, 1.0f);
-        add2("reranker.score_head.weight", D, 1, 0.1f);
-        add1("reranker.score_head.bias", 1, score_head_bias);
-        add2("reranker.pool_gate.weight", D, 1, 0.1f);
-        add1("reranker.pool_gate.bias", 1, 0.0f);
-        add2("reranker.budget_head.weight", D, 1, 0.1f);
-        add1("reranker.budget_head.bias", 1, 0.0f);
-        add1("reranker.blocks.0.norm1.weight", D, 1.0f);
-        add2("reranker.blocks.0.q_proj.weight", D, D, 0.1f);
-        add2("reranker.blocks.0.k_proj.weight", D, D, 0.1f);
-        add2("reranker.blocks.0.v_proj.weight", D, D, 0.1f);
-        add2("reranker.blocks.0.o_proj.weight", D, D, 0.1f);
-        add1("reranker.blocks.0.norm2.weight", D, 1.0f);
-        add2("reranker.blocks.0.gate_proj.weight", D, F, 0.1f);
-        add2("reranker.blocks.0.up_proj.weight", D, F, 0.1f);
-        add2("reranker.blocks.0.down_proj.weight", F, D, 0.1f);
-        gguf_write_to_file(g, out_path.c_str(), /*only_meta=*/false);
-        gguf_free(g);
-        ggml_free(gctx);
-        return out_path;
-    };
-    const std::string valid_path = write_tiny("tiny_rr.gguf", 0.0f);
-    const std::string nan_head_path = write_tiny("nan_head_rr.gguf", std::numeric_limits<float>::quiet_NaN());
+    const std::string valid_path = write_tiny_reranker(dir / "tiny_rr.gguf", {});
+    TinyRerankerFile nan_head;
+    nan_head.score_head_bias = std::numeric_limits<float>::quiet_NaN();
+    const std::string nan_head_path = write_tiny_reranker(dir / "nan_head_rr.gguf", nan_head);
 
     // 1. Truncated payload (even just 1 byte of trailing alignment padding) must be rejected.
     const std::string trunc_path = (dir / "trunc_rr.gguf").string();
@@ -1414,6 +1429,151 @@ TEST_CASE(PFlashSelectionFixture, seg_reranker_rejects_truncated_file_and_nonfin
 
     luce::common::free_pflash_seg_reranker(st);
     ggml_backend_free(cpu);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE(PFlashSelectionFixture, seg_reranker_fp16_weights_load_and_parity) {
+    const auto dir = std::filesystem::temp_directory_path() / "luce_pflash_seg_reranker_fp16_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+
+    TinyRerankerFile f16_all, f16_mix, bad_1d_f16;
+    f16_all.matmul_type = f16_mix.matmul_type = bad_1d_f16.matmul_type = GGML_TYPE_F16;
+    f16_mix.small_matmul_f32 = true;
+    bad_1d_f16.vector_type = GGML_TYPE_F16;
+    const std::string f32_path = write_tiny_reranker(dir / "rr_f32.gguf", {});
+    const std::string f16_all_path = write_tiny_reranker(dir / "rr_f16_all.gguf", f16_all);
+    const std::string f16_mix_path = write_tiny_reranker(dir / "rr_f16_mix.gguf", f16_mix);
+    const std::string bad_1d_f16_path = write_tiny_reranker(dir / "rr_bad_1d_f16.gguf", bad_1d_f16);
+
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    REQUIRE(cpu != nullptr);
+    luce::common::PFlashSegRerankerState st_f32, st_f16;
+    std::string err;
+
+    REQUIRE(luce::common::validate_pflash_seg_reranker_gguf(f32_path, "drafter", "head-a", 4, err));
+    REQUIRE(luce::common::load_pflash_seg_reranker(f32_path, cpu, "drafter", "head-a", st_f32, err));
+
+    const std::vector<float> seg_vec{0.2f, -0.3f, 0.5f, 0.1f, -0.4f, 0.25f, 0.15f, -0.2f, 0.35f, 0.1f, -0.15f, 0.45f};
+    const std::vector<float> q_vec{0.3f, -0.1f, 0.2f, 0.4f};
+    std::vector<float> scalars(3 * 12, 0.0f);
+    for (size_t i = 0; i < scalars.size(); ++i) scalars[i] = -0.5f + 0.07f * (float) (i % 13);
+    const std::vector<float> log_dens{-2.1f, -3.4f, -1.5f};
+
+    std::vector<float> scores_f32, delta_f32;
+    float m_f32 = 0.0f;
+    REQUIRE(luce::common::pflash_seg_reranker_run(
+        st_f32, cpu, 3, seg_vec.data(), q_vec.data(), scalars.data(), log_dens.data(),
+        scores_f32, &delta_f32, &m_f32, &err));
+
+    for (const auto & [path, expect_sin_f32] : std::vector<std::pair<std::string, bool>>{
+             {f16_all_path, false}, {f16_mix_path, true}}) {
+        REQUIRE(luce::common::validate_pflash_seg_reranker_gguf(path, "drafter", "head-a", 4, err));
+        REQUIRE(luce::common::load_pflash_seg_reranker(path, cpu, "drafter", "head-a", st_f16, err));
+        CHECK(st_f16.k_in_w->type == GGML_TYPE_F16);
+        CHECK(st_f16.s_in_w->type == (expect_sin_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16));
+
+        std::vector<float> scores_f16, delta_f16;
+        float m_f16 = 0.0f;
+        REQUIRE(luce::common::pflash_seg_reranker_run(
+            st_f16, cpu, 3, seg_vec.data(), q_vec.data(), scalars.data(), log_dens.data(),
+            scores_f16, &delta_f16, &m_f16, &err));
+        REQUIRE(scores_f16.size() == 3u);
+        for (size_t i = 0; i < 3; ++i) {
+            CHECK(std::fabs(delta_f16[i] - delta_f32[i]) < 5e-3f);
+            CHECK(std::fabs(scores_f16[i] - scores_f32[i]) < 5e-3f);
+        }
+        CHECK(std::fabs(m_f16 - m_f32) < 5e-3f);
+    }
+
+    // 1D norms/biases stored as FP16 must be rejected (ggml_add/mul require F32).
+    CHECK(!luce::common::validate_pflash_seg_reranker_gguf(bad_1d_f16_path, "drafter", "head-a", 4, err));
+    CHECK(err.find("tensor mismatch") != std::string::npos);
+
+    luce::common::free_pflash_seg_reranker(st_f32);
+    luce::common::free_pflash_seg_reranker(st_f16);
+    ggml_backend_free(cpu);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE(PFlashSelectionFixture, scoring_head_fp16_weights_pass_validation) {
+    const auto dir = std::filesystem::temp_directory_path() / "luce_pflash_scoring_head_fp16_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const std::string drafter = (dir / "drafter.gguf").string();
+    {
+        gguf_context * g = gguf_init_empty();
+        gguf_set_val_str(g, "general.architecture", "qwen35");
+        gguf_set_val_u32(g, "qwen35.embedding_length", 16u);
+        gguf_set_val_u32(g, "qwen35.attention.head_count", 2u);
+        gguf_set_val_u32(g, "qwen35.attention.head_count_kv", 1u);
+        gguf_set_val_u32(g, "qwen35.attention.key_length", 8u);
+        gguf_set_val_u32(g, "qwen35.block_count", 16u);
+        gguf_set_val_u32(g, "qwen35.full_attention_interval", 4u);
+        ggml_init_params gp{4 * ggml_tensor_overhead() + 4096, nullptr, false};
+        ggml_context * gctx = ggml_init(gp);
+        ggml_tensor * t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 32);
+        ggml_set_name(t, "token_embd.weight");
+        gguf_add_tensor(g, t);
+        gguf_write_to_file(g, drafter.c_str(), /*only_meta=*/false);
+        gguf_free(g);
+        ggml_free(gctx);
+    }
+    std::string drafter_sha;
+    {
+        std::ifstream ifs(drafter, std::ios::binary);
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(ifs)), {});
+        luce::common::Sha256Ctx c;
+        luce::common::sha256_init(c);
+        luce::common::sha256_update(c, bytes.data(), bytes.size());
+        drafter_sha = luce::common::sha256_final(c);
+    }
+
+    const auto write_head = [&](const char * name, ggml_type wtype) {
+        const std::string path = (dir / name).string();
+        gguf_context * g = gguf_init_empty();
+        gguf_set_val_str(g, "general.architecture", "pflash_scoring_head");
+        gguf_set_val_str(g, "scoringhead.schema", "qwen3_5_0_8b_nope_qk_mass_v1");
+        gguf_set_val_str(g, "scoringhead.base_model", "Qwen/Qwen3.5-0.8B");
+        gguf_set_val_str(g, "scoringhead.runtime_gguf_sha256", drafter_sha.c_str());
+        gguf_set_val_str(g, "scoringhead.feature_tap", "post_block14_residual_before_block15");
+        ggml_init_params gp{8 * ggml_tensor_overhead() + 8192, nullptr, false};
+        ggml_context * gctx = ggml_init(gp);
+        ggml_tensor * wq = ggml_new_tensor_2d(gctx, wtype, 16, 16);
+        ggml_set_name(wq, "scoringhead.attn_q.weight");
+        ggml_tensor * wk = ggml_new_tensor_2d(gctx, wtype, 16, 8);
+        ggml_set_name(wk, "scoringhead.attn_k.weight");
+        gguf_add_tensor(g, wq);
+        gguf_add_tensor(g, wk);
+        gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+        gguf_free(g);
+        ggml_free(gctx);
+        return path;
+    };
+
+    const std::string head_f16 = write_head("head_f16.gguf", GGML_TYPE_F16);
+    const std::string head_bf16 = write_head("head_bf16.gguf", GGML_TYPE_BF16);
+    const std::string stub = (dir / "stub.gguf").string();
+    std::ofstream(stub) << "not-a-gguf";
+
+    // FP16 scoring head passes head validation and proceeds to segment-probe validation.
+    std::string err;
+    CHECK(!luce::common::validate_pflash_component_ggufs(drafter, head_f16, stub, stub, stub, err));
+    CHECK(err.find("segment probe GGUF could not be opened") != std::string::npos);
+
+    // Truncated FP16 scoring head is rejected before moving past head validation.
+    const std::string trunc_f16 = (dir / "head_f16_trunc.gguf").string();
+    std::filesystem::copy_file(head_f16, trunc_f16);
+    std::filesystem::resize_file(trunc_f16, std::filesystem::file_size(trunc_f16) - 1);
+    CHECK(!luce::common::validate_pflash_component_ggufs(drafter, trunc_f16, stub, stub, stub, err));
+    CHECK(err.find("scoring head GGUF truncated data section") != std::string::npos);
+
+    // Unsupported weight type (BF16) is rejected cleanly.
+    CHECK(!luce::common::validate_pflash_component_ggufs(drafter, head_bf16, stub, stub, stub, err));
+    CHECK(err.find("scoring head tensor contract mismatch") != std::string::npos);
+
     std::filesystem::remove_all(dir);
 }
 
