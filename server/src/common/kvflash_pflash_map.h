@@ -101,19 +101,14 @@ inline int kvflash_message_query_end(const PFlashRequestMessages & m) {
     return m.all_spans.empty() ? 0 : m.all_spans.back().end;
 }
 
-// Mode 5 runs the PFlash release profile; "" when the environment holds it, else the first
-// setting that is missing or wrong, named. Drafter sessions (default 2) must cover the slots.
+// Mode 5 needs the PFlash model files loaded and enough drafter sessions (default 2) to cover the slots.
 inline std::string kvflash_pflash2_config_error(const std::function<std::string(const char *)> & get, int slots) {
-    static const char * const kExact[][2] = {   // value "" = any non-empty
-        {"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
-        {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PARSER", "latest_user"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
-        {"PFLASH_SCORING_HEAD_GGUF", ""}, {"PFLASH_SEGMENT_PROBE_GGUF", ""}, {"PFLASH_REQUEST_PROBE_GGUF", ""},
-        {"PFLASH_QUERY_CANDIDATES", "1"}, {"PFLASH_QUERY_PIN", ""}};
-    for (const auto & kv : kExact) {
-        const std::string v = get(kv[0]);
-        if (v.empty() || (*kv[1] && v != kv[1]))
-            return std::string("mode 5 needs ") + kv[0] + (*kv[1] ? std::string("=") + kv[1] : std::string(" set")) +
-                   " (got " + (v.empty() ? "unset" : v) + ")";
+    static const char * const kRequired[] = {
+        "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"};
+    for (const char * name : kRequired) {
+        const std::string v = get(name);
+        if (v.empty())
+            return std::string("mode 5 needs ") + name + " set (got unset)";
     }
     const std::string s = get("PFLASH_DRAFTER_SESSIONS");
     int sessions = 2;

@@ -1,7 +1,5 @@
 #include "pflash_request_probe.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -325,85 +323,6 @@ PFlashRequestQuerySet pflash_request_query_set_v5(
     return set;
 }
 
-int pflash_stage2_widened_budget(int budget, int n_prompt, bool & raw_fits) {
-    const long wide = std::min<long>((long) n_prompt, (long) budget + (long) budget / 2);
-    raw_fits = wide >= (long) n_prompt;
-    return (int) wide;
-}
-
-PFlashStage2Assembly pflash_stage2_assemble(
-        const std::vector<PFlashRequestMessage> & messages,
-        const std::vector<float> & s1,
-        const std::vector<float> & s2,
-        float lookback_logit,
-        float vague_logit,
-        float tau1, float tau2, float tau_lb, float tau_fb,
-        int budget, int n_prompt,
-        int cap,
-        int promoted_cap,
-        int reserve) {
-    PFlashStage2Assembly out;
-    out.budget = budget;
-    const int latest = pflash_request_latest_user(messages);
-    out.latest = latest;
-    if (latest < 0) {
-        // Stage 2 inactive: the cand_v5 rule alone, no widening.
-        out.reason = "no_user_message";
-        out.query = pflash_request_query_set_v5(s1, messages, tau1, cap, reserve).tokens;
-        return out;
-    }
-    out.active = true;
-    std::vector<int> post_cands;
-    out.seed = pflash_request_capped_seed(s1, tau1, messages, cap, reserve, out.reserve, post_cands,
-                                          &out.seed_capped);
-    std::vector<int> taken = out.seed;   // ascending
-    const auto is_taken = [&taken](int t) { return std::binary_search(taken.begin(), taken.end(), t); };
-    bool any_earlier = false;
-    for (int i = 0; i < latest; ++i) {
-        const auto & m = messages[(size_t) i];
-        if (m.role != PFlashRequestRole::System && m.span.end > m.span.begin) any_earlier = true;
-    }
-    if (lookback_logit >= tau_lb && any_earlier) {     // F32 compare; NaN -> false
-        out.lookback = true;
-        std::vector<int> cands;
-        for (int i = 0; i < latest; ++i) {
-            const auto & m = messages[(size_t) i];
-            if (m.role == PFlashRequestRole::System || m.span.end <= m.span.begin) continue;
-            const auto runs = pflash_request_runs(s2, m.span, tau2);
-            out.promoted_runs += (int) runs.size();
-            for (const int t : pflash_request_run_tokens(runs)) cands.push_back(t);
-        }
-        std::vector<int> ranked;
-        for (const int t : pflash_request_by_score(cands, s2)) {
-            if (!is_taken(t)) ranked.push_back(t);
-        }
-        const size_t room = (size_t) std::max(0, std::min(promoted_cap,
-                                                          cap - out.reserve - (int) out.seed.size()));
-        out.promoted.assign(ranked.begin(), ranked.begin() + (long) std::min(room, ranked.size()));
-        out.promoted_capped = out.promoted.size() < ranked.size();
-        std::sort(out.promoted.begin(), out.promoted.end());
-        taken.insert(taken.end(), out.promoted.begin(), out.promoted.end());
-        std::sort(taken.begin(), taken.end());
-    }
-    std::vector<int> post;
-    for (const int t : pflash_request_by_score(post_cands, s1)) {
-        if (!is_taken(t)) post.push_back(t);
-    }
-    const size_t room = (size_t) std::max(0, cap - (int) taken.size());
-    if (post.size() > room) post.resize(room);
-    std::sort(post.begin(), post.end());
-    out.post = post;
-    taken.insert(taken.end(), post.begin(), post.end());
-    std::sort(taken.begin(), taken.end());
-    if (vague_logit >= tau_fb) {
-        out.widened = true;
-        out.budget = pflash_stage2_widened_budget(budget, n_prompt, out.raw_fits);
-    }
-    out.query = taken;
-    if (out.query.empty()) out.reason = "no_request_runs";
-    return out;
-}
-
 PFlashRequestQuerySet pflash_request_query_set(
         const std::vector<float> & logits,
         const std::vector<PFlashTokenSpan> & human_messages,
@@ -459,45 +378,6 @@ bool pflash_request_policy_valid(const PFlashRequestPolicy & p, std::string & er
     if (std::isnan(p.min_mean_margin) || std::isnan(p.min_max_margin)) {
         error = "request-probe policy: NaN margin"; return false;
     }
-    return true;
-}
-
-bool pflash_request_policy_apply_json(const std::string & text, PFlashRequestPolicy & policy, std::string & error) {
-    nlohmann::json j;
-    try {
-        j = nlohmann::json::parse(text);
-    } catch (const std::exception & e) {
-        error = std::string("request-probe policy: invalid JSON: ") + e.what(); return false;
-    }
-    if (!j.is_object()) { error = "request-probe policy: not a JSON object"; return false; }
-    PFlashRequestPolicy p = policy;
-    for (const auto & [key, value] : j.items()) {
-        const auto as_int = [&](int & dst) {
-            if (!value.is_number_integer()) return false;
-            dst = value.get<int>(); return true;
-        };
-        const auto as_float = [&](float & dst) {
-            if (value.is_number()) { dst = value.get<float>(); return true; }
-            if (value.is_string() && (value == "-inf" || value == "inf")) {
-                dst = value == "-inf" ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
-                return true;
-            }
-            return false;
-        };
-        bool ok = false;
-        if (key == "min_prompt_tokens") ok = as_int(p.min_prompt_tokens);
-        else if (key == "max_prompt_tokens") ok = as_int(p.max_prompt_tokens);
-        else if (key == "min_mean_margin") ok = as_float(p.min_mean_margin);
-        else if (key == "min_max_margin") ok = as_float(p.min_max_margin);
-        else if (key == "min_latest_share") ok = as_float(p.min_latest_share);
-        else if (key == "max_latest_share") ok = as_float(p.max_latest_share);
-        else if (key == "max_runs") ok = as_int(p.max_runs);
-        else if (key == "recency_pin_tokens") ok = as_int(p.recency_pin_tokens);
-        else { error = "request-probe policy: unknown key " + key; return false; }
-        if (!ok) { error = "request-probe policy: wrong type for " + key; return false; }
-    }
-    if (!pflash_request_policy_valid(p, error)) return false;
-    policy = p;
     return true;
 }
 

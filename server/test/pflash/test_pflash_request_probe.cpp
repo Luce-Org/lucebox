@@ -246,58 +246,6 @@ TEST_CASE(PFlashRequestProbeFixture, row_store_invalidates_past_a_divergence_or_
     REQUIRE(store.tokens() == 0);
 }
 
-TEST_CASE(PFlashRequestProbeFixture, flag_parses_and_needs_strict_head_selection) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", nullptr};
-    luce_test::ScopedEnvVar head{"PFLASH_SELECT_QUERY_HEAD", nullptr};
-    {
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", nullptr};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(!config.query_probe);
-        REQUIRE(!pflash_query_probe_requested());
-    }
-    {
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", "1"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(config.query_probe);
-        REQUIRE(pflash_query_probe_requested());
-    }
-    {
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", "0"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(!config.query_probe);
-    }
-    {
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", "yes"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(!resolve_pflash_selection(1000, 32, config, error));
-    }
-    {
-        // The served u314 config: query head + latest_user parser.
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", "1"};
-        luce_test::ScopedEnvVar head_on{"PFLASH_SELECT_QUERY_HEAD", "1"};
-        luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", "latest_user"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(config.query_probe && config.query_head);
-    }
-    {
-        luce_test::ScopedEnvVar flag{"PFLASH_SELECT_QUERY_PROBE", "1"};
-        luce_test::ScopedEnvVar split{"PFLASH_SELECT_SCORER", "split"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(!resolve_pflash_selection(1000, 32, config, error));
-    }
-}
-
 // ---- v2 policy (PLAN-V2 W4): calibrated abstention and the bounded recency pin --------------------------------
 
 TEST_CASE(PFlashRequestProbeFixture, default_policy_never_abstains_and_pins_nothing) {
@@ -355,25 +303,16 @@ TEST_CASE(PFlashRequestProbeFixture, recency_pin_is_the_latest_message_tail) {
     REQUIRE(pflash_request_recency_pin({0, 0}, 8).begin == -1);                            // empty message
 }
 
-TEST_CASE(PFlashRequestProbeFixture, policy_json_overrides_validate_and_fail_closed) {
+TEST_CASE(PFlashRequestProbeFixture, policy_validation_checks_bounds) {
     PFlashRequestPolicy p;
     std::string error;
-    REQUIRE(pflash_request_policy_apply_json(
-        R"({"min_mean_margin": 0.25, "min_max_margin": "-inf", "max_runs": 6, "recency_pin_tokens": 32,
-            "min_latest_share": 0.01, "max_latest_share": 0.9, "max_prompt_tokens": 131072})", p, error));
-    REQUIRE(p.min_mean_margin == 0.25f);
-    REQUIRE(std::isinf(p.min_max_margin));
-    REQUIRE(p.max_runs == 6);
-    REQUIRE(p.recency_pin_tokens == 32);
-    REQUIRE(p.max_prompt_tokens == 131072);
-    const PFlashRequestPolicy before = p;
-    REQUIRE(!pflash_request_policy_apply_json(R"({"min_mean_margn": 1})", p, error));      // unknown key
-    REQUIRE(!pflash_request_policy_apply_json(R"({"max_runs": 1.5})", p, error));          // wrong type
-    REQUIRE(!pflash_request_policy_apply_json(R"({"min_latest_share": 0.8, "max_latest_share": 0.2})", p, error));
-    REQUIRE(!pflash_request_policy_apply_json(R"({"recency_pin_tokens": -1})", p, error));
-    REQUIRE(!pflash_request_policy_apply_json(R"([1, 2])", p, error));
-    REQUIRE(!pflash_request_policy_apply_json("{", p, error));
-    REQUIRE(p.max_runs == before.max_runs && p.recency_pin_tokens == before.recency_pin_tokens);   // unchanged on failure
+    REQUIRE(pflash_request_policy_valid(p, error));
+    p.min_latest_share = 0.8f;
+    p.max_latest_share = 0.2f;
+    REQUIRE(!pflash_request_policy_valid(p, error));
+    p = {};
+    p.recency_pin_tokens = -1;
+    REQUIRE(!pflash_request_policy_valid(p, error));
 }
 
 // V2-A3 candidate rule = the trainer's rule.probe_query_v2. Candidates are

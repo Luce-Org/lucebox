@@ -93,24 +93,24 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
-| `--pflash` | `auto` / `on` / `off` | `auto` | Page long messages of at least `--prefill-threshold` droppable tokens. `auto` is on when `--prefill-drafter` and `PFLASH_SCORING_HEAD_GGUF` are set; `on` refuses to start without them. |
-| `--prefill-threshold` | int (tokens) | `16384` | Droppable tokens a message needs to be paged; `0` pages every message. |
-| `--prefill-keep-ratio` | float `(0, 1]` | release curve | Fraction of source tokens to keep. Without a ratio flag the release curve `16384:0.315 32768:0.270 65536:0.270 120000:0.225` applies. |
+| `--pflash` | `auto` / `on` / `off` | `auto` | Page long messages of at least `--prefill-threshold` droppable tokens. `auto` is on when `--prefill-drafter` and all four PFlash files (below) are given; `on` refuses to start without them. |
+| `--prefill-threshold` | int (tokens) | `8192` | Droppable tokens a message needs to be paged; `0` pages every message. |
+| `--prefill-keep-ratio` | float `(0, 1]` | release curve | Fraction of source tokens to keep. Without a ratio flag the release curve `8192:0.450 16384:0.350 32768:0.270 65536:0.260 120000:0.240` with the adaptive keep ratio applies. |
 | `--prefill-drafter` | path to `.gguf` | required for PFlash | Drafter weights (Qwen3.5-0.8B BF16 GGUF). |
-| `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3.5-0.8B` | HF tokenizer for the drafter vocab. |
 
-PFlash needs `PFLASH_SCORING_HEAD_GGUF`; the segment and request probes (`PFLASH_SEGMENT_PROBE_GGUF`, `PFLASH_REQUEST_PROBE_GGUF`) turn on their release-profile features. Every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#release-profile).
+PFlash needs four files, all from [`Lucebox/pflash`](https://huggingface.co/Lucebox/pflash): the scoring head (`PFLASH_SCORING_HEAD_GGUF`), the segment and request probes (`PFLASH_SEGMENT_PROBE_GGUF`, `PFLASH_REQUEST_PROBE_GGUF`) and the segment reranker (`PFLASH_SEG_RERANKER_GGUF`); an unset probe or reranker path is looked up beside the head. Every unset PFlash setting takes the measured release profile; see [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md#quick-launch).
 
 ```bash
 PFLASH_SCORING_HEAD_GGUF=server/models/pflash/head.gguf \
 PFLASH_SEGMENT_PROBE_GGUF=server/models/pflash/segment-probe.gguf \
 PFLASH_REQUEST_PROBE_GGUF=server/models/pflash/request-probe.gguf \
+PFLASH_SEG_RERANKER_GGUF=server/models/pflash/seg-reranker.gguf \
 ./server/build/luce_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
   --prefill-drafter server/models/Qwen3.5-0.8B-BF16.gguf
 ```
 
-PFlash is on because the drafter and the head are given. A user message or tool output with fewer droppable tokens than the threshold is served as is; a longer one is paged, and the system prompt and tool definitions are always served whole. See the [server README](../../server/README.md#pflash) for how the view pages, recalls and continues a conversation.
+PFlash is on because the drafter and the four files are given. A user message or tool output with fewer droppable tokens than the threshold is served as is; a longer one is paged, and the system prompt and tool definitions are always served whole. See the [server README](../../server/README.md#pflash) for how the view pages, recalls and continues a conversation.
 
 Validated end-to-end at 64K and 128K source on RTX 3090 (Qwen3.6-27B Q4_K_M target + Qwen3.5-DFlash draft + Qwen3-0.6B BF16 drafter).
 
@@ -132,7 +132,7 @@ Typical flow at 128K on a 24 GB card: `park target` → `compress` → `free dra
 
 ## Runtime tunables
 
-PFlash's selection, query, chat-view and evaluation switches are listed in [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md). On the daemon process:
+PFlash's required assets and operational settings are listed in [PFlash configuration](../../server/docs/PFLASH_CONFIGURATION.md). On the daemon process:
 
 | Env var | Default | Purpose |
 |---|:---:|---|
@@ -171,7 +171,7 @@ prompt (≤ 128K tokens)
 └──────────────────────────────────────────────┘
 ```
 
-**Drafter forward.** The Qwen3.5-0.8B drafter (`src/pflash/qwen35_drafter.cpp` on the qwen35 target graph) runs the model's first fifteen blocks and scores the context with block 15's NoPE Q/K attention-mass head; `PFLASH_QWEN35_LEGACY_SCORER=1` selects the all-layer running-max scorer instead.
+**Drafter forward.** The Qwen3.5-0.8B drafter (`src/pflash/qwen35_drafter.cpp` on the qwen35 target graph) runs blocks 0–15 and scores the context with block 15's NoPE Q/K attention-mass head.
 
 **Scoring + selection.** Each token's score is the attention mass the query window puts on it at block 15 (or the trained head's score). Chunks are taken by relevance until the keep-ratio budget is spent, after the structurally required spans (instructions, the query, the generation prompt). The budget comes from `--prefill-keep-ratio` or the `--prefill-curve` keep-ratio curve.
 

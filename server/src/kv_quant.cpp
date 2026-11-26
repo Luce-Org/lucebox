@@ -172,9 +172,9 @@ void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who) {
 
 void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
                       ggml_type k_override, ggml_type v_override,
-                      bool tq3_shorthand) {
-    ggml_type k = GGML_TYPE_Q4_0;
-    ggml_type v = GGML_TYPE_Q4_0;
+                      bool tq3_shorthand, ggml_type default_type) {
+    ggml_type k = default_type;
+    ggml_type v = default_type;
 
     // Layer 2: legacy shorthand (last wins, mirrors qwen35_target_graph.cpp:96-108)
     if (const char * s = std::getenv("LUCE_KV_F16")) {

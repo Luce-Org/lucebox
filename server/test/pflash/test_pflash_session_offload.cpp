@@ -98,25 +98,6 @@ std::vector<int32_t> seq(int n, int salt = 0) {
 
 } // namespace
 
-TEST_CASE(PFlashSessionOffloadFixture, plain_host_memory_is_the_default) {
-    const char * saved = std::getenv("PFLASH_SESSION_OFFLOAD_PINNED");
-    const std::string saved_value = saved ? saved : "";
-    unsetenv("PFLASH_SESSION_OFFLOAD_PINNED");
-    CHECK(!pflash_session_offload_pinned_enabled());
-    // Only "1" opts into pinned memory.
-    for (const char * off : {"", "0", "true", "on", "1 ", "01"}) {
-        setenv("PFLASH_SESSION_OFFLOAD_PINNED", off, 1);
-        CHECK(!pflash_session_offload_pinned_enabled());
-    }
-    setenv("PFLASH_SESSION_OFFLOAD_PINNED", "1", 1);
-    CHECK(pflash_session_offload_pinned_enabled());
-    if (saved) {
-        setenv("PFLASH_SESSION_OFFLOAD_PINNED", saved_value.c_str(), 1);
-    } else {
-        unsetenv("PFLASH_SESSION_OFFLOAD_PINNED");
-    }
-}
-
 TEST_CASE(PFlashSessionOffloadFixture, owned_tensors_skip_views_and_keep_creation_order) {
     Layout a(256);
     REQUIRE(a.buf != nullptr);

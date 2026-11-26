@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write a PFlash request-probe GGUF (PFLASH_REQUEST_PROBE_GGUF, PFLASH_SELECT_QUERY_PROBE=1).
+"""Write a PFlash request-probe GGUF (PFLASH_REQUEST_PROBE_GGUF).
 
 The runtime contract (server/src/pflash/pflash_request_probe.h): general.architecture "requestprobe", schema
 "qwen3_5_0_8b_request_probe_v1", F32 tensors requestprobe.{norm,fc1,fc2}.{weight,bias} and F32 metadata
