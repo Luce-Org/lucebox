@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 using quantize_fn = size_t (*)(const float *, void *, int64_t, int64_t, const float *);
@@ -197,15 +199,44 @@ static std::vector<float> reference_mul_mat(
     quant.dequantize(weights_data.data(), weights_f32.data(), shape.k * shape.m);
 
     std::vector<float> output((size_t) shape.m * shape.n, 0.0f);
-    for (int64_t column = 0; column < shape.n; ++column) {
-        for (int64_t row = 0; row < shape.m; ++row) {
-            float sum = 0.0f;
-            for (int64_t i = 0; i < shape.k; ++i) {
-                sum += weights_f32[(size_t) row * shape.k + i] *
-                       input_data[(size_t) column * shape.k + i];
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned n_threads = (unsigned) std::min<int64_t>((int64_t) hw, std::max<int64_t>(1, shape.m));
+    const int64_t ops = shape.k * shape.m * shape.n;
+    auto worker = [&](int64_t row_begin, int64_t row_end) {
+        for (int64_t column = 0; column < shape.n; ++column) {
+            const float * x = input_data.data() + (size_t) column * shape.k;
+            float * y = output.data() + (size_t) column * shape.m;
+            for (int64_t row = row_begin; row < row_end; ++row) {
+                const float * w = weights_f32.data() + (size_t) row * shape.k;
+                float sum = 0.0f;
+                for (int64_t i = 0; i < shape.k; ++i) {
+                    sum += w[i] * x[i];
+                }
+                y[row] = sum;
             }
-            output[(size_t) column * shape.m + row] = sum;
         }
+    };
+    // Keep small shapes (e.g. full/tail) serial so thread startup never outweighs compute.
+    if (n_threads <= 1 || ops < 8000000LL) {
+        worker(0, shape.m);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
+        unsigned launched = 0;
+        for (; launched < n_threads; ++launched) {
+            const int64_t r0 = shape.m * launched / n_threads;
+            const int64_t r1 = shape.m * (launched + 1) / n_threads;
+            try {
+                threads.emplace_back(worker, r0, r1);
+            } catch (const std::system_error &) {
+                break;
+            }
+        }
+        if (launched < n_threads) {
+            const int64_t rem_begin = shape.m * launched / n_threads;
+            worker(rem_begin, shape.m);
+        }
+        for (auto & th : threads) th.join();
     }
     return output;
 }

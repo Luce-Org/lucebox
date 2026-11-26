@@ -734,7 +734,8 @@ static std::string write_pflash_bpe_tokenizer_fixture(
         const std::string & byte_cover,
         const std::vector<std::string> & control_tokens =
             {"<|im_start|>", "<|im_end|>"},
-        const std::vector<std::string> & user_defined_tokens = {}) {
+        const std::vector<std::string> & user_defined_tokens = {},
+        const char * pre = "qwen35") {
     std::vector<std::string> tokens = control_tokens;
     std::vector<uint32_t> types(tokens.size(), 3);
     tokens.insert(tokens.end(), user_defined_tokens.begin(), user_defined_tokens.end());
@@ -756,7 +757,7 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
                       types.data(), (int32_t) types.size());
     gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", pre);
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
     // A case may build several (test_tmp_path is per process).
@@ -805,6 +806,45 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline)
     TEST_ASSERT(tok.encode(a).size() == 3);
     TEST_ASSERT(tok.encode(x).size() == 3);
     TEST_ASSERT(tok.decode(tok.encode(x)) == x);
+}
+
+// DeepSeek V3/V4 (`deepseek-v3`, `joyai-llm` pre) isolates \p{N}{1,3} and
+// [一-龥぀-ゟ゠-ヿ]+ before its main split, so a whitespace run in front of a
+// number or CJK text ends its segment and stays one piece: HF splits "a  1" as
+// a | "  " | 1. The engine split it as Qwen does: a | " " | " " | 1.
+TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
+    const std::string text = "a  1\t\t42  中文x 12345 10² ①②③④";
+    for (const char * pre : {"joyai-llm", "deepseek-v3", "qwen35"}) {
+        const std::string path = write_pflash_bpe_tokenizer_fixture(
+            {"  ", "\t\t", "42", "中文", " 中文", "123", "45", "²", "10²", "①②③", "④"},
+            text, {}, {}, pre);
+        Tokenizer tok;
+        TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+        unlink(path.c_str());
+        const auto id = [&](const std::string & raw) {
+            return tok.token_to_id(test_gpt2_encode(raw));
+        };
+        const auto ids = [&](const std::vector<std::string> & raws) {
+            std::vector<int32_t> out;
+            for (const auto & raw : raws) out.push_back(id(raw));
+            return out;
+        };
+        if (std::strcmp(pre, "qwen35") == 0) {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", " ", " ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t4") == ids({"\t", "\t", "4"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({" ", " 中文"}));
+        } else {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", "  ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t42") == ids({"\t\t", "42"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({"  ", "中文"}));
+            TEST_ASSERT(tok.encode("x 12345") == ids({"x", " ", "123", "45"}));
+            // \p{N} is the whole Number category, not only decimal digits.
+            TEST_ASSERT(tok.encode("a  ²") == ids({"a", "  ", "²"}));
+            TEST_ASSERT(tok.encode("x 10²") == ids({"x", " ", "10²"}));
+            TEST_ASSERT(tok.encode("①②③④") == ids({"①②③", "④"}));
+        }
+        TEST_ASSERT(tok.decode(tok.encode(text)) == text);
+    }
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -5182,7 +5222,115 @@ TEST_CASE(ServerUnitFixture, test_codec_only_archs_have_no_builtin_renderer) {
     TEST_ASSERT(default_chat_codec_for_arch("deepseek4") == "deepseek4");
     TEST_ASSERT(default_chat_codec_for_arch("qwen35") == "qwen3.5");
     TEST_ASSERT(default_chat_codec_for_arch("qwen35moe") == "qwen3.5");
+    TEST_ASSERT(default_chat_codec_for_arch("inkling2_loop") == "inkling2");
+    TEST_ASSERT(default_chat_codec_for_arch("inkling2") == "inkling2");
     TEST_ASSERT(default_chat_codec_for_arch("gemma4").empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_inkling2_codec_and_sse_protocol) {
+    auto codec = make_chat_codec("inkling2");
+    TEST_ASSERT(codec != nullptr);
+    TEST_ASSERT(codec->id() == "inkling2/1");
+
+    nlohmann::ordered_json tools = nlohmann::ordered_json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "get_weather"},
+             {"description", "Fetch weather"},
+             {"parameters", {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}}},
+         }}},
+    });
+
+    std::vector<ChatMessage> msgs = {
+        {"system", "You are helpful.", ""},
+        {"user", "Weather in Rome?", ""},
+        {"assistant", "", ""},
+        {"tool", "{\"temp\":22}", "call_1"},
+        {"user", "Thanks!", ""},
+    };
+    msgs[2].reasoning_content = "Need weather tool.";
+    msgs[2].tool_calls = {{"call_1", "get_weather", nlohmann::ordered_json({{"city", "Rome"}})}};
+
+    ChatCodecInput in;
+    in.messages = &msgs;
+    in.tools = &tools;
+    in.enable_thinking = true;
+    in.reasoning_effort = "high";
+    RenderedPrompt rendered;
+    std::string err;
+    TEST_ASSERT(codec->render(in, rendered, err));
+    const std::string text = rendered.text();
+    TEST_ASSERT(text.find("<|message_system|>tool_declare<|content_xml|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_model|><|content_thinking|>Need weather tool.<|end_message|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_tool|>get_weather<|content_text|>{\"temp\":22}<|end_message|>") != std::string::npos);
+
+    // Non-thinking renders effort 0.
+    in.enable_thinking = false;
+    RenderedPrompt nothink;
+    TEST_ASSERT(codec->render(in, nothink, err));
+    TEST_ASSERT(nothink.text().find("Thinking effort level: 0<|end_message|>") != std::string::npos);
+
+    // parse_turn round-trip (thinking + content + tool call).
+    const std::string raw_turn =
+        "<|message_model|><|content_thinking|>Step 1</think> still thinking<|end_message|>"
+        "<|message_model|><|content_text|>Checking now.<|end_message|>"
+        "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|>"
+        "<|content_model_end_sampling|>";
+    ChatMessage parsed_msg;
+    TEST_ASSERT(codec->parse_turn(raw_turn, json::parse(tools.dump()), parsed_msg));
+    TEST_ASSERT(parsed_msg.reasoning_content == "Step 1</think> still thinking");
+    TEST_ASSERT(parsed_msg.content == "Checking now.");
+    TEST_ASSERT(parsed_msg.tool_calls.size() == 1);
+    TEST_ASSERT(parsed_msg.tool_calls[0].name == "get_weather");
+    TEST_ASSERT(parsed_msg.tool_calls[0].arguments["city"] == "Rome");
+
+    // SseEmitter protocol streaming: thinking with literal "</think>" -> text -> 2 tool calls.
+    SseEmitter emitter(ApiFormat::OPENAI_CHAT, "req-ink", "inkling-2-mini", 42,
+                       json::parse(tools.dump()), nullptr, {}, false, true);
+    emitter.set_chat_codec(codec.get());
+    emitter.set_think_tags_are_tokens(true);
+    emitter.emit_start();
+
+    const std::vector<std::pair<std::string, std::string>> stream_toks = {
+        {"<|message_model|>", "<|message_model|>"},
+        {"<|content_thinking|>", "<|content_thinking|>"},
+        {"Let's check ", "Let's check "},
+        {"</think>", "</think>"},
+        {" safely.", " safely."},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"<|content_text|>", "<|content_text|>"},
+        {"Calling tool.", "Calling tool."},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"get_weather", "get_weather"},
+        {"<|content_invoke_tool_json|>", "<|content_invoke_tool_json|>"},
+        {"{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}", "{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}"},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"get_weather", "get_weather"},
+        {"<|content_invoke_tool_json|>", "<|content_invoke_tool_json|>"},
+        {"{\"name\":\"get_weather\",\"args\":{\"city\":\"Milan\"}}", "{\"name\":\"get_weather\",\"args\":{\"city\":\"Milan\"}}"},
+        {"<|end_message|>", "<|end_message|>"},
+    };
+    for (const auto & [raw, piece] : stream_toks) {
+        std::string out_text;
+        const int r = emitter.consume_inkling_protocol_token(raw, piece, out_text);
+        if (r == 1) continue;
+        if (r == 2) emitter.emit_token(out_text, false);
+        else if (r == 3) emitter.emit_token(out_text, true);
+        else emitter.emit_token(piece, false);
+    }
+    emitter.emit_finish(20, nullptr, 256, true);
+    TEST_ASSERT(emitter.reasoning_text() == "Let's check </think> safely.");
+    TEST_ASSERT(emitter.accumulated_text() == "Calling tool.");
+    TEST_ASSERT(emitter.tool_calls().size() == 2);
+    TEST_ASSERT(emitter.tool_calls()[0].name == "get_weather");
+    TEST_ASSERT(json::parse(emitter.tool_calls()[0].arguments)["city"] == "Rome");
+    TEST_ASSERT(json::parse(emitter.tool_calls()[1].arguments)["city"] == "Milan");
+    TEST_ASSERT(emitter.finish_reason() == "tool_calls");
 }
 
 TEST_CASE(ServerUnitFixture, test_deepseek_layout_puts_tool_results_in_call_order) {
