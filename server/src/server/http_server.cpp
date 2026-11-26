@@ -483,10 +483,12 @@ PflashChatTurnSpan pflash_chat_query_turn(
               [] (const Mark & a, const Mark & b) { return a.at < b.at; });
 
     // Families whose markers name the role (DeepSeek "<｜User｜>", Laguna
-    // "<user>") start content at the marker; generic markers (Qwen
-    // "<|im_start|>", Gemma "<|turn>") are followed by a "name\n" line.
+    // "<user>", Inkling 2 "<|message_user|>") carry the role in the marker;
+    // generic markers (Qwen "<|im_start|>", Gemma "<|turn>") are followed by
+    // a "name\n" line.
     const bool marker_carries_role =
-        markers.role_starts_delimit || markers.family == "laguna";
+        markers.role_starts_delimit || markers.family == "laguna" ||
+        markers.family == "inkling2";
     const auto role_from_marker = [] (const std::string & marker) {
         std::string role;
         for (const char c : marker) {
@@ -520,6 +522,10 @@ PflashChatTurnSpan pflash_chat_query_turn(
         size_t content_at = mark.at + mark.len;
         if (marker_carries_role) {
             turn.role = role_from_marker(mark.text);
+            if (markers.family == "inkling2" &&
+                turn.role.rfind("message", 0) == 0) {
+                turn.role.erase(0, 7);
+            }
         } else {
             size_t name_end = content_at;
             while (name_end < text.size() && name_end - content_at < 16 &&
@@ -541,6 +547,20 @@ PflashChatTurnSpan pflash_chat_query_turn(
             content_end = next.at;
             turn.closed = !next.role || markers.role_starts_delimit;
             turn.close_end = next.role ? next.at : next.at + next.len;
+        }
+        // Inkling 2 opens every message with
+        // "<|message_<role>|>[<name>]<|content_<kind>|>", so the content tag
+        // terminates the role header before the message body.
+        if (markers.family == "inkling2") {
+            const size_t tag = text.find("<|content_", content_at);
+            if (tag != std::string::npos && tag < content_end &&
+                tag - content_at <= 128 &&
+                text.find('\n', content_at) >= tag) {
+                const size_t tag_end = text.find("|>", tag + 10);
+                if (tag_end != std::string::npos && tag_end + 2 <= content_end) {
+                    content_at = tag_end + 2;
+                }
+            }
         }
         // Content ignores the whitespace the template wraps it in.
         while (content_at < content_end && is_space(text[content_at])) {
@@ -1880,7 +1900,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         // PFlash pages with the trained head's per-candidate scores, from a drafter in this process.
         if (!backend_.pflash_gives_candidate_scores()) {
             fail("--pflash on needs a target whose drafter pass returns the trained head's per-candidate scores "
-                 "(Qwen3, Qwen3.5/3.6/3.8, Qwen3.8-Flash and DeepSeek V4/V4.1); this model's does not");
+                 "(Qwen3, Qwen3.5/3.6/3.8, Qwen3.8-Flash, DeepSeek V4/V4.1 and Inkling 2); this model's does not");
         }
         if (config_.pflash_remote_drafter) {
             fail("--pflash on needs the PFlash drafter in this process (an IPC drafter is not supported)");
@@ -4250,9 +4270,13 @@ std::string HttpServer::apply_pflash_compression(
             // prompt without chat markers falls back to its content's tail.
             if (tail_parser && req.pflash_query.empty()) {
                 const int prompt_end = (int) drafter_ids.size();
-                if (chat_turn.valid() &&
-                    chat_turn.generation_begin > 0 &&
-                    chat_turn.generation_begin < prompt_end) {
+                const bool has_generation_prompt =
+                    chat_turn.valid() && chat_turn.generation_begin > 0 &&
+                    chat_turn.generation_begin < prompt_end;
+                // A template that appends no generation prompt (Inkling 2)
+                // still ends at a token that sees the whole request.
+                if (has_generation_prompt ||
+                    chat_turn.ends_at_closed_turn(prompt_end)) {
                     query_span = {prompt_end - 1, prompt_end};
                     query_span_rule = "prompt_end";
                     const auto tail = http_detail::pflash_tail_query_window(
@@ -4347,10 +4371,15 @@ std::string HttpServer::apply_pflash_compression(
                     required_instruction_spans.push_back(query_span);
                 }
                 if (prompt_end_query) {
-                    // The whole generation prompt stays verbatim; the query
-                    // is its last token.
+                    // The whole generation prompt (or the closing marker when
+                    // the template appends no assistant header) stays verbatim;
+                    // the query is its last token.
+                    const int pin_begin =
+                        chat_turn.generation_begin < (int) drafter_ids.size()
+                            ? chat_turn.generation_begin
+                            : chat_turn.turns.back().content_end;
                     required_instruction_spans.push_back(
-                        {chat_turn.generation_begin, (int) drafter_ids.size()});
+                        {pin_begin, (int) drafter_ids.size()});
                 }
                 if (query_role_header.begin >= 0) {
                     required_instruction_spans.push_back(query_role_header);
@@ -4919,11 +4948,23 @@ std::string HttpServer::apply_unified_view(
 
     const std::vector<int32_t> & drafter_ids = request.input_ids;
     const int input = (int) drafter_ids.size();
-    if (turn.generation_begin <= 0 || turn.generation_begin >= input) return serve_raw("no_generation_prompt");
+    // Templates that close the last turn without appending an assistant header
+    // (Inkling 2) end at the closing marker: their generation prompt is empty.
+    const bool empty_generation_prompt =
+        turn.ends_at_closed_turn(input) &&
+        !layout.messages.empty() && layout.messages.back().turn.valid() &&
+        layout.messages.back().turn.end == layout.text().size();
+    if (turn.generation_begin <= 0 ||
+        (turn.generation_begin >= input && !empty_generation_prompt)) {
+        return serve_raw("no_generation_prompt");
+    }
     // The generation prompt, in target tokens: the raw prompt and every served prompt end with it.
-    const auto generation = pflash_generation_tokens(drafter_ids, turn.generation_begin);
-    if (generation.empty() || generation.size() >= raw.size() ||
-        !std::equal(generation.begin(), generation.end(), raw.end() - (long) generation.size())) {
+    const std::vector<int32_t> generation = empty_generation_prompt
+        ? std::vector<int32_t>{}
+        : pflash_generation_tokens(drafter_ids, turn.generation_begin);
+    if (!empty_generation_prompt &&
+        (generation.empty() || generation.size() >= raw.size() ||
+         !std::equal(generation.begin(), generation.end(), raw.end() - (long) generation.size()))) {
         return serve_raw("generation_mismatch");
     }
     const int raw_gen_begin = prompt_tokens - (int) generation.size();
@@ -6123,7 +6164,10 @@ std::string HttpServer::apply_unified_view(
         next.raw_tokens = raw;
         next.raw_gen_begin = raw_gen_begin;
         next.drafter_ids = drafter_ids;
-        next.drafter_gen_begin = turn.generation_begin;
+        // With no generation prompt the drafter prompt ends at the last turn's closing marker, which a drafter that
+        // spells markers as text (Qwen3.5: "|>" + "<|" -> "|><|") tokenizes differently once the next turn follows;
+        // the view's drafter prefix stops at that turn's content so the next request still extends it.
+        next.drafter_gen_begin = empty_generation_prompt ? turn.turns.back().content_end : turn.generation_begin;
         next.view_tokens = served;
         next.view_gen_begin = (int) (served.size() - generation.size());
         next.regions = std::move(held_regions);

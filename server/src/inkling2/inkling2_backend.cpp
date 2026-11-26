@@ -4,6 +4,7 @@
 
 #include "common/peer_access.h"
 #include "common/sampler.h"
+#include "pflash/pflash_window.h"
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
@@ -74,6 +75,14 @@ std::string Inkling2Backend::resolve_dspark_path() const {
     return {};
 }
 
+size_t Inkling2Backend::pflash_reserve(ggml_backend_t device, int ctx) const {
+    if (cfg_.pflash_gpu < 0 || !device ||
+        ggml_backend_cuda_get_device_id(device) != cfg_.pflash_gpu) {
+        return 0;
+    }
+    return cfg_.pflash_bytes + (size_t) std::max(0, ctx) * cfg_.pflash_bytes_per_token;
+}
+
 bool Inkling2Backend::load_all() {
     if (!backend_) {
         backend_ = init_gpu_backend(cfg_.device.gpu);
@@ -123,20 +132,31 @@ bool Inkling2Backend::load_all() {
             max_ctx = weights_.context_length > 0 ? std::min(weights_.context_length, 65536) : 32768;
         }
         if (cfg_.device.fit_ctx) {
-            // Fit context comfortably to available memory (with Split-KV when expert_backend is present).
+            // Fit context comfortably to available memory (with Split-KV when expert_backend is present),
+            // leaving room for a resident PFlash drafter when it shares a GPU with the model.
             size_t tfree = 0, ttotal = 0;
             ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &tfree, &ttotal);
             size_t efree = 0, etotal = 0;
             if (expert_backend_) {
                 ggml_backend_cuda_get_device_memory(cfg_.expert_device->gpu, &efree, &etotal);
             }
+            const bool pflash_on_target =
+                cfg_.pflash_gpu >= 0 && cfg_.pflash_gpu == cfg_.device.gpu;
+            const bool pflash_on_expert =
+                expert_backend_ && cfg_.pflash_gpu >= 0 &&
+                cfg_.pflash_gpu == cfg_.expert_device->gpu && !pflash_on_target;
             const size_t n_global = weights_.global_slots.size();
             const size_t kv_row_b = ggml_row_size(kv_type, weights_.head_dim);
-            const size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b
-                                       + (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
+            size_t bytes_per_tok = n_global * 2 * weights_.n_head_kv * kv_row_b
+                                 + (weights_.dspark.loaded ? (size_t) 3 * 2 * weights_.n_head_kv * weights_.head_dim * 2 : 0);
+            if (pflash_on_target || pflash_on_expert) {
+                bytes_per_tok += cfg_.pflash_bytes_per_token;
+            }
             const size_t reserve = (size_t) 4 << 30;
-            const size_t usable = (tfree > reserve ? tfree - reserve : 0)
-                                + (expert_backend_ && efree > reserve ? efree - reserve : 0);
+            const size_t t_res = reserve + (pflash_on_target ? cfg_.pflash_bytes : 0);
+            const size_t e_res = reserve + (pflash_on_expert ? cfg_.pflash_bytes : 0);
+            const size_t usable = (tfree > t_res ? tfree - t_res : 0)
+                                + (expert_backend_ && efree > e_res ? efree - e_res : 0);
             if (bytes_per_tok > 0) {
                 const int fit = (int) std::min<size_t>((size_t) max_ctx, usable / bytes_per_tok);
                 max_ctx = std::max(4096, (fit / 256) * 256);
@@ -146,7 +166,7 @@ bool Inkling2Backend::load_all() {
     }
 
     if (!create_inkling2_cache(backend_, expert_backend_, weights_, max_ctx, chunk_, kv_type, cache_, err,
-                               fitted_remote_split_pos_)) {
+                               fitted_remote_split_pos_, pflash_reserve(backend_, max_ctx))) {
         std::fprintf(stderr, "[inkling2] %s\n", err.c_str());
         return false;
     }
@@ -159,6 +179,7 @@ bool Inkling2Backend::load_all() {
 
 void Inkling2Backend::release_device_state() {
     last_logits_.clear();
+    free_drafter();
     free_inkling2_cache(cache_);
     free_inkling2_weights(weights_);
     if (backend_) ggml_backend_cuda_trim_pool(backend_);
@@ -203,7 +224,9 @@ bool Inkling2Backend::park(ParkTarget target) {
     if (target != ParkTarget::TargetModel && target != ParkTarget::All) return false;
     if (released_) return false;
     if (parked_) return true;
-    release_all();
+    // Prefix snapshots live in host RAM: they survive a park, as they survive
+    // release_gpus, so a PFlash pass does not drop the prefix cache.
+    release_device_state();
     parked_ = true;
     return true;
 }
@@ -263,8 +286,15 @@ bool Inkling2Backend::release_gpus(const std::vector<int> & gpus, std::string & 
     };
     const bool hit_target = touches(cfg_.device.gpu);
     const bool hit_expert = cfg_.expert_device.has_value() && touches(cfg_.expert_device->gpu);
-    if (!hit_target && !hit_expert) return true;
-    if (released_) return true;
+    const bool hit_drafter = drafter_loaded_ && touches(drafter_ctx_.gpu);
+    if (!hit_target && !hit_expert) {
+        if (hit_drafter) free_drafter();
+        return true;
+    }
+    if (released_) {
+        if (hit_drafter) free_drafter();
+        return true;
+    }
     release_device_state();
     released_ = true;
     return true;
@@ -280,6 +310,59 @@ bool Inkling2Backend::reinstate(std::string & error) {
     }
     released_ = false;
     return true;
+}
+
+// ─── PFlash Prefill Compression ─────────────────────────────────────────
+
+ModelBackend::CompressResult Inkling2Backend::compress(const CompressRequest & req) {
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
+
+std::vector<ModelBackend::CompressResult> Inkling2Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    bool was_parked = false;
+    PFlashWindow window;
+    window.tag = "inkling2-pflash";
+    window.drain = [this] {
+        if (backend_) ggml_backend_synchronize(backend_);
+        if (expert_backend_) ggml_backend_synchronize(expert_backend_);
+    };
+    window.park = [&] {
+        was_parked = parked_;
+        return park(ParkTarget::TargetModel);
+    };
+    // A parked model reloads at its planned size, and the next park frees the
+    // drafter anyway: free it first so it never holds the memory the model
+    // needs back, whatever the drafter residency.
+    window.unpark = [&] {
+        if (was_parked) return true;
+        free_drafter();
+        return unpark(ParkTarget::TargetModel);
+    };
+    window.release = [this] { free_drafter(); };
+    window.shared_backends = {backend_, expert_backend_};
+    window.engine_max_ctx = cache_.max_ctx > 0 ? cache_.max_ctx : cfg_.device.max_ctx;
+    return pflash_compress_batch(drafter_ctx_, drafter_loaded_, requests, window);
+}
+
+bool Inkling2Backend::handle_compress(const std::string & line, const DaemonIO & io) {
+    CompressRequest req;
+    if (!pflash_parse_compress_line(line, req) || req.drafter_path.empty()) {
+        std::fprintf(stderr, "[inkling2-pflash] bad compress arguments\n");
+        io.emit(-1);
+        return false;
+    }
+    const CompressResult result = compress(req);
+    for (int32_t token : result.compressed_ids) io.emit(token);
+    io.emit(-1);
+    return result.ok;
+}
+
+void Inkling2Backend::free_drafter() {
+    if (!drafter_loaded_ && !drafter_ctx_.backend) return;
+    luce::common::free_drafter(drafter_ctx_);
+    drafter_loaded_ = false;
 }
 
 // ─── Prefix Snapshots (Host RAM) ────────────────────────────────────────
