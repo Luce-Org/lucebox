@@ -399,8 +399,8 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] --verify-width must be 0..%d\n", QWEN4EXP_MTP_MAX_VERIFY);
         return false;
     }
-    if (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 4) {
-        std::fprintf(stderr, "[qwen4exp] --max-concurrency must be between 1 and 4\n");
+    if (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 16) {
+        std::fprintf(stderr, "[qwen4exp] --max-concurrency must be between 1 and 16\n");
         return false;
     }
     // MTP stays on with concurrent slots: the first slot's cache drafts and
@@ -568,10 +568,10 @@ bool Qwen4ExpBackend::load_target() {
     }
     if (cache_.kvflash) {
         std::printf("[kvflash] resident pool %d tokens over %zu full-attn layers per slot (logical max_ctx %d, %d "
-                    "slots, prompt forwards <= %d rows), policy=lru%s\n",
+                    "slots, prompt forwards <= %d rows), policy=%s\n",
                     cache_.kvflash->pool_tokens(), cache_.full_layer_ids.size(), cache_.max_ctx,
                     cfg_.max_concurrency, qwen4exp_max_forward_rows(cache_),
-                    kvflash_policy_is_lru() ? "" : " (qwen4exp has no residency scorer yet)");
+                    recall_mode_ == 2 ? "qsa-recall" : (kvflash_policy_is_lru() ? "lru" : "lru (qwen4exp has no residency scorer yet)"));
     } else if (kvflash_pool_ > 0) {
         std::printf("[kvflash] pool %d holds the whole %d-token context: one row per position\n",
                     kvflash_pool_, cache_.max_ctx);
@@ -673,22 +673,33 @@ bool Qwen4ExpBackend::create_main_cache() {
 // memory). It holds the full-attention layers' F16 K/V; the MTP draft layer keeps one row per position.
 void Qwen4ExpBackend::size_kvflash_pool() {
     const Qwen4ExpWeights & w = weights_;
-    int64_t n_full = 0, recall_bytes = 0;
+    int64_t n_full = 0, recall_bytes_f16 = 0, recall_bytes_f32 = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         n_full += w.layers[il].is_full_attention;
-        if (recall_mode_ > 0 && w.layers[il].is_full_attention)
-            recall_bytes += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size,
-                                                  il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0);
+        if (recall_mode_ > 0 && w.layers[il].is_full_attention) {
+            const int ratio = il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0;
+            recall_bytes_f16 += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size, ratio, /*f16_raw=*/true);
+            recall_bytes_f32 += q4_recall_layer_bytes(cfg_.device.max_ctx, w.indexer_head_size, ratio, /*f16_raw=*/false);
+        }
     }
+    recall_bytes_f16 *= cfg_.max_concurrency;
+    recall_bytes_f32 *= cfg_.max_concurrency;
     KvFlashAutoBudget budget;
     budget.free_bytes = (int64_t) qwen4exp_free_memory(backend_);
     // The decode graphs and a prompt chunk, which the planner sizes after, and a PFlash drafter on this GPU.
     // No cache yet: the drafter's per-token room is counted at the configured context. recall_bytes: the indexer rows
     // a recall mode keeps at the full context beside the pool (settling may still drop them; the pool then just stays smaller).
-    budget.reserve_bytes = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx) + recall_bytes;
+    const int64_t base_reserve = (2ll << 30) + (int64_t) pflash_reserve(backend_, cfg_.device.max_ctx);
+    budget.reserve_bytes = base_reserve + recall_bytes_f16;
     budget.bytes_per_token = cfg_.max_concurrency * n_full * w.n_head_kv *
         (int64_t) (ggml_row_size(GGML_TYPE_F16, w.n_embd_head_k) + ggml_row_size(GGML_TYPE_F16, w.n_embd_head_v));
     kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+    // If auto sized up to full context under F16 raw-key savings, kvflash_pool_for() disables paging and allocates
+    // F32 raw keys; re-size with F32 reserve so auto does not overcommit when full context only fits with F16.
+    if (kvflash_pool_ >= cfg_.device.max_ctx && recall_bytes_f32 > recall_bytes_f16) {
+        budget.reserve_bytes = base_reserve + recall_bytes_f32;
+        kvflash_pool_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}, /*scorer_expected=*/false, budget);
+    }
 }
 
 // LUCE_Q4_INDEXER_RECALL (0 off, 1 score only, 2 recall), LUCE_Q4_RECALL_QUERIES and LUCE_Q4_RECALL_TAIL. An invalid value
@@ -701,22 +712,20 @@ void Qwen4ExpBackend::resolve_indexer_recall() {
             std::fprintf(stderr, "[q4-recall] %s=\"%s\" is not an integer in [%d, %d]; using %d\n", name, v, lo, hi, r.value);
         return r.value;
     };
-    recall_mode_ = env_int("LUCE_Q4_INDEXER_RECALL", 0, 2, 0);
+    const int default_mode = (weights_.qsa && kvflash_pool_requested(std::getenv("LUCE_KVFLASH"))) ? 2 : 0;
+    recall_mode_ = env_int("LUCE_Q4_INDEXER_RECALL", 0, 2, default_mode);
     recall_queries_ = env_int("LUCE_Q4_RECALL_QUERIES", 2, 256, 64);
     recall_tail_ = env_int("LUCE_Q4_RECALL_TAIL", 0, kQ4RecallTailMax, kQ4RecallTailDefault);
     pool_qsa_ = env_int("LUCE_Q4_POOL_QSA", 0, 1, 1) == 1;
-    if (recall_mode_ > 0 && cfg_.max_concurrency > 1) {   // ponytail: serial path only (no seq engine)
-        std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused with --max-concurrency %d (serial engine only); "
-                     "running with 0\n", recall_mode_, cfg_.max_concurrency);
-        recall_mode_ = 0;
-    }
     if (recall_mode_ > 0 && !weights_.qsa) {
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d refused: this model has no QSA indexer; running with 0\n",
                      recall_mode_);
         recall_mode_ = 0;
     }
-    // Before the cache is sized, so the pin equals --verify-width 5. ponytail: a later settle to score only keeps the pin.
+    // Before the cache is sized, so the pin equals --verify-width 5; restored if settling drops recall to 0.
+    recall_pinned_width_from_ = -1;
     if (const int w = q4_recall_verify_width(recall_mode_, cfg_.verify_width); w != cfg_.verify_width) {
+        recall_pinned_width_from_ = cfg_.verify_width;
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=2 pins the MTP verify width to %d (the adaptive width "
                      "varies with step timings, which changes recall's picks run to run; --verify-width overrides)\n", w);
         cfg_.verify_width = w;
@@ -730,6 +739,10 @@ void Qwen4ExpBackend::settle_indexer_recall() {
     if (s.why)
         std::fprintf(stderr, "[q4-recall] LUCE_Q4_INDEXER_RECALL=%d: %s; running with %d\n", recall_mode_, s.why, s.mode);
     recall_mode_ = s.mode;
+    if (recall_mode_ == 0 && recall_pinned_width_from_ >= 0) {
+        cfg_.verify_width = recall_pinned_width_from_;
+        recall_pinned_width_from_ = -1;
+    }
     if (cache_.pool_qsa)
         std::fprintf(stderr, "[q4-recall] prompt chunks, decode and verify attend the KVFlash pool through QSA (resident blocks only; the "
                      "replayed tail densely; LUCE_Q4_POOL_QSA=0: dense over the pool)\n");
@@ -737,59 +750,7 @@ void Qwen4ExpBackend::settle_indexer_recall() {
 
 // After the prompt, before the first decode forward. Pool: chunks are the pager's. No pool (mode 1): virtual 64-token spans.
 void Qwen4ExpBackend::run_indexer_recall(std::optional<ScopedScoreHook> & keep) {
-    const auto t0 = std::chrono::steady_clock::now();
-    KvFlashPager * pager = cache_.kvflash.get();
-    const int n_pos = cache_.cur_pos;
-    const int chunk_tokens = pager ? pager->chunk_tokens() : 64;
-    const int pool_chunks = pager ? pager->pool_tokens() / chunk_tokens : 0;
-    if (pager && !q4_recall_pages(n_pos, pager->pool_tokens())) return;   // nothing paged out: nothing to recall
-    Qwen4ExpRecallPicks picks;
-    if (!qwen4exp_recall_picks(backend_, weights_, cache_, picks)) {
-        if (picks.graph_failed) std::fprintf(stderr, "[q4-recall] FAILED: the pick graph did not allocate or compute (%d positions)\n", n_pos);
-        else std::fprintf(stderr, "[q4-recall] skipped: no captured queries, or %d positions hold no more blocks than the top-k budget\n", n_pos);
-        return;
-    }
-    const int bpc = chunk_tokens / picks.ratio, n_chunks = (n_pos + chunk_tokens - 1) / chunk_tokens;
-    if (chunk_tokens % picks.ratio != 0) {
-        std::fprintf(stderr, "[q4-recall] chunk of %d tokens is not a multiple of the %d-token block; skipping\n",
-                     chunk_tokens, picks.ratio);
-        return;
-    }
-    std::vector<int> visible((size_t) picks.queries);   // query t sees the blocks complete at its own position
-    for (int t = 0; t < picks.queries; ++t) visible[(size_t) t] = (picks.pos0 + t + 1) / picks.ratio;
-    const std::vector<float> votes = q4_recall_chunk_votes(picks.ids, picks.layers, picks.queries, picks.budget, bpc,
-                                                           n_chunks, &visible);
-    const std::vector<float> scores = q4_recall_chunk_scores(votes);
-    double total = 0;
-    for (float v : votes) total += v;
-    const std::vector<int> top = q4_recall_top(scores, pool_chunks > 0 ? pool_chunks : 8);
-    std::string top_s;
-    for (size_t i = 0; i < top.size() && i < 8; ++i) {
-        char b[48];
-        std::snprintf(b, sizeof b, "%s%d:%d", i ? "," : "", top[i], (int) votes[(size_t) top[i]]);
-        top_s += b;
-    }
-    int nonres = 0;
-    for (int c : top) nonres += !(pager && pager->is_resident(c));
-    char resid[48] = "n/a";
-    if (pager) std::snprintf(resid, sizeof resid, "%d/%d", nonres, pool_chunks);
-    const auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
-    std::fprintf(stderr, "[q4-recall] n_chunks=%d pool_chunks=%d top=[%s] nonresident_in_top=%s votes_total=%.0f ms=%.1f\n",
-                 n_chunks, pool_chunks, top_s.c_str(), resid, total, ms());
-    if (recall_mode_ < 2 || !pager) return;
-
-    // Mode 2: rank every chunk (resident or paged out) by votes. Chunks past the prompt (generated ones) outrank every
-    // prompt chunk so the decode's evictions take prompt chunks first. The hook stays for this request's decode.
-    keep.emplace(*pager);
-    pager->score_hook = [scores](int c) { return c < (int) scores.size() ? scores[(size_t) c] : 1e6f + (float) c; };
-    // ponytail: the newest chunks (the last turn) are protected by widening reselect's tail to the captured queries' span.
-    const int tail = std::min(4 + (picks.queries + chunk_tokens - 1) / chunk_tokens, pool_chunks / 2);
-    std::vector<uint8_t> was(n_chunks);
-    for (int c = 0; c < n_chunks; ++c) was[(size_t) c] = pager->is_resident(c);
-    const int events = pager->reselect(tail);
-    int page_ins = 0;
-    for (int c = 0; c < n_chunks; ++c) page_ins += !was[(size_t) c] && pager->is_resident(c);
-    std::fprintf(stderr, "[q4-recall] reselect tail=%d page_ins=%d page_events=%d ms=%.1f\n", tail, page_ins, events, ms());
+    qwen4exp_run_indexer_recall(backend_, weights_, cache_, recall_mode_, keep);
 }
 
 // A pool that holds the whole context pages nothing: such a context keeps one row per position (and QSA).
@@ -825,9 +786,11 @@ bool Qwen4ExpBackend::create_seq_caches() {
         if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache, mtp,
                                    mtp ? std::min(kQwen4ExpBatchedVerifyRows, cache_.mtp_draft + 1) - 1 : 1,
                                    &slot_states_, slot, remote_layers_,
-                                   kvflash_pool_for(cfg_.device.max_ctx), take_kept_remote((size_t) slot))) {
+                                   kvflash_pool_for(cfg_.device.max_ctx), take_kept_remote((size_t) slot),
+                                   recall_mode_ > 0 && remote_layers_ == 0 ? recall_queries_ : 0)) {
             return false;
         }
+        cache.pool_qsa = pool_qsa_ && qwen4exp_pool_qsa_supported(backend_, weights_, cache);
         cache.split_owner = &cache_;
     }
     return true;
@@ -840,7 +803,8 @@ bool Qwen4ExpBackend::start_seq_engine() {
     for (Qwen4ExpCache & cache : seq_caches_) caches.push_back(&cache);
     seq_engine_ = std::make_unique<Qwen4ExpSeqEngine>(
         backend_, weights_, std::move(caches), cfg_.device.max_ctx, chunk_, snapshot_budget_,
-        cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_, prompt_lookup_on() ? &lookup_policy_ : nullptr);
+        cfg_.verify_width, &mtp_width_, &mtp_costs_, snap_backend_, prompt_lookup_on() ? &lookup_policy_ : nullptr,
+        Qwen4ExpSeqEngine::Q4RecallConfig{recall_mode_, recall_queries_, recall_tail_});
     // Its checkpoints are this backend's snapshots, which the disk session cache writes and reads.
     static_assert(Qwen4ExpSeqEngine::kPrefixCheckpoints == kMaxSlots, "one checkpoint per snapshot slot");
     seq_engine_->use_backend_snapshots(snapshots_.data(), displaced_.data());

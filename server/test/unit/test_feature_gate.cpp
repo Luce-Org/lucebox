@@ -539,13 +539,13 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
         BackendArgs qwen = dense;
         for (int ctx : {8192, 32768}) {
             qwen.device.max_ctx = ctx;
-            for (int slots : {1, 2, 3, 4}) {
+            for (int slots : {1, 2, 3, 4, 10, 16}) {
                 qwen.max_concurrency = slots;
                 CHECK(gate_result(qwen, "qwen4exp", backend).empty());
             }
         }
-        qwen.max_concurrency = 5;
-        CHECK(gate_result(qwen, "qwen4exp", backend).find("at most 4") != std::string::npos);
+        qwen.max_concurrency = 17;
+        CHECK(gate_result(qwen, "qwen4exp", backend).find("at most 16") != std::string::npos);
         qwen.max_concurrency = 0;
         CHECK(!gate_result(qwen, "qwen4exp", backend).empty());
         qwen.max_concurrency = 4;

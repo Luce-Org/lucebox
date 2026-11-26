@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace luce::common {
@@ -46,8 +47,8 @@ constexpr int64_t kQwen4ExpStableQsaMaxCtx = 262144;
 // kQwen4ExpStableQsaMaxCtx).
 int64_t qwen4exp_kv_bucket(int64_t max_ctx, int64_t kv_len, bool qsa);
 
-// The multi-slot decode graph's row ceiling: RDNA3 MMID supports at most four batch-invariant decode rows.
-constexpr int kQwen4ExpMaxBatchedSlots = 4;
+// The multi-slot decode graph's row ceiling (supports up to 16 concurrent slots).
+constexpr int kQwen4ExpMaxBatchedSlots = 16;
 // The rows per slot of a batched verify (qwen4exp_verify_batched): a pending token and three drafts. Two slots fill one
 // batch-invariant product (8 rows).
 constexpr int kQwen4ExpBatchedVerifyRows = 4;
@@ -149,6 +150,10 @@ struct Qwen4ExpRecallPicks {
 };
 bool qwen4exp_recall_picks(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                            Qwen4ExpRecallPicks & out);
+// Score KVFlash chunks with the QSA indexer and log (mode 1) or reselect the pool (mode 2, keeping the
+// pager's score hook in `keep` for the request's decode).
+void qwen4exp_run_indexer_recall(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
+                                 int recall_mode, std::optional<ScopedScoreHook> & keep);
 
 // The cache was created with `mtp` (and a loaded sidecar).
 bool qwen4exp_verify_supported(const Qwen4ExpCache & cache);

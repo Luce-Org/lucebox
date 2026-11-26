@@ -92,10 +92,13 @@ inline void q4_pool_qsa_inputs(const Pager & pager, int chunk, int n_chunks, int
     }
 }
 
-// Bytes of one full-attention layer's recall storage (F32 raw indexer keys per position, pooled keys per block of
-// `ratio`), which a pool allocates at the full max_ctx; 0 for a layer without an indexer.
-inline int64_t q4_recall_layer_bytes(int64_t max_ctx, int64_t head_size, int64_t ratio) {
-    return head_size > 0 && ratio > 0 ? head_size * 4 * (max_ctx + (max_ctx + ratio - 1) / ratio + 1) : 0;
+// Bytes of one full-attention layer's recall storage (raw indexer keys per position — F16 when pooled, F32 otherwise —
+// plus F32 pooled keys per block of `ratio`), which a pool allocates at the full max_ctx; 0 for a layer without an indexer.
+inline int64_t q4_recall_layer_bytes(int64_t max_ctx, int64_t head_size, int64_t ratio, bool f16_raw = false) {
+    if (head_size <= 0 || ratio <= 0) return 0;
+    const int64_t raw_bytes = head_size * (f16_raw ? 2 : 4) * max_ctx;
+    const int64_t pool_bytes = head_size * 4 * ((max_ctx + ratio - 1) / ratio + 1);
+    return raw_bytes + pool_bytes;
 }
 
 // Where the two-pass tail starts, or -1 for a single pass. The prompt's last `tail` tokens (no earlier than `pos`, the

@@ -33,7 +33,8 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
         ggml_backend_t backend, const Qwen4ExpWeights & weights,
         std::vector<Qwen4ExpCache *> caches, int max_ctx, int prefill_granule,
         size_t prefix_allowance, int verify_width, AdaptiveSpecWidth * mtp_width,
-        SpecWidthCostMemory * mtp_costs, ggml_backend_t snapshot_store, PromptLookupPolicy * lookup_policy)
+        SpecWidthCostMemory * mtp_costs, ggml_backend_t snapshot_store, PromptLookupPolicy * lookup_policy,
+        Q4RecallConfig recall)
     : backend_(backend), store_(snapshot_store ? snapshot_store : backend), weights_(weights),
       caches_(std::move(caches)),
       pool_(pool_blocks(max_ctx, caches_.size()),
@@ -54,10 +55,13 @@ Qwen4ExpSeqEngine::Qwen4ExpSeqEngine(
       mtp_width_(mtp_width ? mtp_width : &own_mtp_width_),
       mtp_costs_(mtp_costs ? mtp_costs : &own_mtp_costs_),
       lookup_policy_(verify_width == 0 ? lookup_policy : nullptr),
-      next_inputs_(caches_.size()) {}
+      next_inputs_(caches_.size()),
+      recall_(recall),
+      recall_state_(caches_.size()) {}
 
 Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     next_inputs_.clear();   // waits for any lookahead gather still running
+    for (int s = 0; s < (int)recall_state_.size(); ++s) clear_recall(s);
     ggml_backend_synchronize(backend_);
     for (Qwen4ExpSnapshot & checkpoint : own_checkpoints_) free_qwen4exp_snapshot(checkpoint);
     for (Qwen4ExpSnapshot & checkpoint : own_displaced_) free_qwen4exp_snapshot(checkpoint);
@@ -66,11 +70,54 @@ Qwen4ExpSeqEngine::~Qwen4ExpSeqEngine() {
     for (auto & ws : draft_workspace_) clear_qwen4exp_batched_decode_workspace(ws);
 }
 
+void Qwen4ExpSeqEngine::clear_recall(int slot) {
+    if (slot < 0 || slot >= (int)recall_state_.size()) return;
+    RecallState & rs = recall_state_[(size_t)slot];
+    free_qwen4exp_snapshot(rs.tail_snap);
+    rs.hook.reset();
+    rs.recall = false;
+    rs.tail_armed = false;
+    rs.restored_pos = 0;
+    rs.tail_pos = -1;
+    rs.tail_path = Q4TailPath::Off;
+    rs.tail_stage = Q4TailStage::Planned;
+    rs.tail_mtp = {};
+    rs.tail_mtp_live = false;
+    if (slot < (int)caches_.size() && caches_[(size_t)slot]) {
+        caches_[(size_t)slot]->recall_capture = false;
+        caches_[(size_t)slot]->pool_prompt_dense = false;
+        caches_[(size_t)slot]->recall_q_n = 0;
+    }
+}
+
+void Qwen4ExpSeqEngine::arm_recall(int slot) {
+    clear_recall(slot);
+    if (slot < 0 || slot >= (int)caches_.size() || !caches_[(size_t)slot]) return;
+    Qwen4ExpCache & cache = *caches_[(size_t)slot];
+    const SeqSlot & seq = slots_.slot(slot);
+    const bool recall_on = recall_.mode > 0 && cache.recall_queries > 0;
+    const int pool_tokens = cache.kvflash ? cache.kvflash->pool_tokens() : 0;
+    RecallState & rs = recall_state_[(size_t)slot];
+    rs.recall = recall_on && q4_recall_pages(seq.prompt_len, pool_tokens);
+    rs.tail_armed = recall_on && recall_.mode == 2 && cache.kvflash != nullptr;
+    rs.restored_pos = seq.cur_pos;
+    rs.tail_path = rs.tail_armed
+        ? q4_recall_tail_path(seq.cur_pos, seq.prompt_len, recall_.tail, pool_tokens, /*n_gen=*/1)
+        : Q4TailPath::Off;
+    rs.tail_pos = rs.tail_path == Q4TailPath::TwoPass
+        ? q4_recall_tail_pos(seq.cur_pos, seq.prompt_len, recall_.tail, pool_tokens) : -1;
+    std::vector<int> & cuts = prefill_cuts_[(size_t)slot];
+    cuts = q4_prefill_cuts(std::move(cuts), seq.cur_pos, -1,
+                           rs.recall ? seq.prompt_len - recall_.queries : -1, rs.tail_pos);
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+}
+
 void Qwen4ExpSeqEngine::release_device_state() {
     for (InputGather & gather : next_inputs_) {
         if (gather.inputs.valid()) gather.inputs.wait();   // a lookahead gather may still read the PLE table
         gather = InputGather{};
     }
+    for (int s = 0; s < (int)recall_state_.size(); ++s) clear_recall(s);
     ggml_backend_synchronize(backend_);
     clear_qwen4exp_batched_decode_workspace(decode_workspace_);
     clear_qwen4exp_batched_decode_workspace(verify_workspace_);
@@ -142,6 +189,7 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_cold(
             mtp_width_->carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
         }
     }
+    arm_recall(result.slot);
     return result;
 }
 
@@ -240,6 +288,7 @@ SeqEngine::AdmitResult Qwen4ExpSeqEngine::admit_with_prefix(
         slots_.slot(slot).pending_capture = plan.capture;
         result.prefix_store.capture = plan.capture;
     }
+    arm_recall(slot);
     return result;
 }
 
@@ -929,12 +978,34 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (size_t i = plan.decode.size(); i < forward_segments.size(); ++i) {
         const auto & segment = forward_segments[i];
         const int id = plan.prefills[i - plan.decode.size()].slot;
+        Qwen4ExpCache & cache = *segment.cache;
+        RecallState & rs = recall_state_[(size_t)id];
+        const SeqSlot & seq = slots_.slot(id);
+        if (rs.tail_pos >= 0 && segment.pos0 == rs.tail_pos && !rs.tail_snap.buf) {
+            if (save_qwen4exp_snapshot(backend_, store_, cache, rs.tail_snap)) {
+                rs.tail_mtp = mtp_[(size_t)id].pending;
+                rs.tail_mtp_live = mtp_[(size_t)id].live;
+            } else {
+                rs.tail_pos = -1;
+                rs.tail_stage = Q4TailStage::SnapFailed;
+            }
+        }
+        const bool in_tail = rs.recall && !rs.hook && segment.pos0 >= seq.prompt_len - recall_.queries;
+        if (in_tail && q4_recall_run_breaks(segment.n_tokens, segment.pos0 + segment.n_tokens, seq.prompt_len))
+            cache.recall_q_n = 0;
+        cache.recall_capture = in_tail && segment.n_tokens > 1;
+        const bool captured = cache.recall_capture;
         const Qwen4ExpInputs inputs = prompt_inputs(id, segment);
-        if (mtp_[(size_t)id].live
-                ? !mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[i], &inputs)
-                : !qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
-                                    segment.n_tokens, segment.pos0, logits[i], nullptr, false, false, &inputs).ok)
-            return fail("qwen4exp solo prefill forward failed");
+        const bool ok = mtp_[(size_t)id].live
+            ? mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[i], &inputs)
+            : qwen4exp_forward(backend_, weights_, cache, segment.tokens,
+                               segment.n_tokens, segment.pos0, logits[i], nullptr, false, false, &inputs).ok;
+        cache.recall_capture = false;
+        if (!ok) return fail("qwen4exp solo prefill forward failed");
+        if (captured) {
+            if (cache.recall_q_n == 0) cache.recall_q_pos0 = segment.pos0;
+            cache.recall_q_n += segment.n_tokens;
+        }
     }
     for (size_t i = 0; i < logits.size(); ++i) {
         const bool picked = i < plan.decode.size() && !greedy.empty() &&
@@ -974,6 +1045,52 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         }
         if (pending.complete) {
             SeqSlot & slot = slots_.slot(pending.slot);
+            RecallState & rs = recall_state_[(size_t)pending.slot];
+            Qwen4ExpCache & cache = *caches_[(size_t)pending.slot];
+            if (rs.recall && !rs.hook) {
+                qwen4exp_run_indexer_recall(backend_, weights_, cache, recall_.mode, rs.hook);
+                if (rs.tail_snap.buf) {
+                    if (rs.hook.has_value()) {
+                        const bool restored = restore_qwen4exp_snapshot(backend_, rs.tail_snap, cache);
+                        free_qwen4exp_snapshot(rs.tail_snap);
+                        rs.tail_stage = restored ? Q4TailStage::Rewound : Q4TailStage::RewindFailed;
+                        if (restored) {
+                            mtp_[(size_t)pending.slot].pending = rs.tail_mtp;
+                            mtp_[(size_t)pending.slot].live = rs.tail_mtp_live;
+                            cache.recall_q_n = 0;
+                            next_inputs_[(size_t)pending.slot] = InputGather{};
+                            for (int p = rs.tail_pos; p < slot.prompt_len;) {
+                                const int n = std::min(prefill_granule_, slot.prompt_len - p);
+                                const Qwen4ExpInputs replay_in = qwen4exp_prepare_inputs(
+                                    weights_, slot.sample_history.data() + p, n, cache.ple_prev);
+                                if (!replay_in.ok) return fail("qwen4exp recall tail input prepare failed");
+                                cache.pool_prompt_dense = true;
+                                const bool ok = mtp_[(size_t)pending.slot].live
+                                    ? mtp_prefill(pending.slot, slot.sample_history.data() + p, n, p,
+                                                  logits[pending.segment], &replay_in)
+                                    : qwen4exp_forward(backend_, weights_, cache, slot.sample_history.data() + p, n, p,
+                                                       logits[pending.segment], nullptr, false, false, &replay_in).ok;
+                                cache.pool_prompt_dense = false;
+                                if (!ok || logits[pending.segment].size() != (size_t)weights_.n_vocab)
+                                    return fail("qwen4exp recall tail replay failed");
+                                p += n;
+                                cache.cur_pos = p;
+                            }
+                            ggml_backend_synchronize(backend_);
+                        }
+                    } else {
+                        rs.tail_stage = Q4TailStage::NothingRecalled;
+                        free_qwen4exp_snapshot(rs.tail_snap);
+                    }
+                }
+            }
+            if (rs.tail_armed) {
+                const int pool_tokens = cache.kvflash ? cache.kvflash->pool_tokens() : 0;
+                const char * status = rs.tail_stage == Q4TailStage::RewindFailed ? "no-replay" : "ok";
+                std::fprintf(stderr, "[q4-tail] slot=%d %s status=%s recalled=%d (prompt=%d restored=%d pool=%d tail=%d)\n",
+                             pending.slot, q4_tail_outcome(rs.tail_path, rs.tail_stage), status,
+                             (int)rs.hook.has_value(), slot.prompt_len, rs.restored_pos, pool_tokens, recall_.tail);
+            }
             output.status = PrefillOutput::Status::completed;
             const std::vector<float> & row = logits[pending.segment];
             output.token = slot.sampler.needs_logit_processing()
@@ -1037,6 +1154,7 @@ void Qwen4ExpSeqEngine::retire(int slot) {
     }
     if (last) batched_ = {};
     ggml_backend_synchronize(backend_);
+    clear_recall(slot);
     if (slots_.is_active(slot)) slots_.retire(slot);
     prefill_cuts_[(size_t)slot].clear();
     reset_qwen4exp_state(backend_, *caches_[(size_t)slot]);

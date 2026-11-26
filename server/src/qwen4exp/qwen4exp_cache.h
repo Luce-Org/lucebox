@@ -122,6 +122,7 @@ struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
     // turn) and qsa_positions (I32 [4 * rows] per slot).
     std::vector<Qwen4ExpDecodeWorkspace> slot_qsa;
     ggml_tensor * qsa_positions = nullptr;
+    ggml_tensor * qsa_chunk_rows = nullptr;      // pool_qsa: I32 [n_chunks * n_slots], per-slot pager chunk maps
     std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
     std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket); verify: per row
 };
