@@ -129,9 +129,6 @@ void Qwen35SeqEngine::init_slots_() {
     recall_on_ = kvf_ && b_.kvflash_slot_recall_profile();
     uq_queries_ = recall_on_ && b_.kvflash_prefill_reselect_ == 4 ? b_.kvflash_uq_queries_ : 0;
     if (kvf_) {
-        const char * hr = std::getenv("LUCE_KVFLASH_HEADER_RUNG");
-        header_rung_ = hr && hr[0] == '1' && !hr[1];
-        if (header_rung_) std::fprintf(stderr, "[kvflash] slot replay rung at the last cut before the header on recall turns (LUCE_KVFLASH_HEADER_RUNG)\n");
         park_short_on_ = slot_state_stash_alloc(b_.cache_, b_.target_backend_, stash_);
         init_bundles_();
         init_heads_();
@@ -1142,26 +1139,6 @@ void Qwen35SeqEngine::init_bundles_() {
     book_.store().write_index();
 }
 
-// LUCE_KVFLASH_BUNDLE_DIGEST=1 (kvflash_bundle_digest_on): the R3 digest of a session's saved state. The one staging of both sides: the
-// live pager's header, ledger and every materialized chunk (read_chunk) beside the end slab, the history and the rungs it is given,
-// so a save (the slab being staged) and a restore (the slab read back from the slot) digest the same way. Flushed at once.
-// t0: when the caller's own staging began, so a restore's ms includes its slab readback.
-void Qwen35SeqEngine::log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
-                                           const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const std::vector<const KvFlashUqStore *> & uq, std::chrono::steady_clock::time_point t0) {
-    KvFlashSlotPager & p = kvf_kv_->pager(slot);
-    p.synchronize_paging();
-    const std::vector<uint8_t> pk = ck.pos > 0 && ck.slab ? kvflash_slab_pack(ck.slab->ssm, ck.slab->conv) : std::vector<uint8_t>(),
-                               pt = tr.pos > 0 && tr.slab ? kvflash_slab_pack(tr.slab->ssm, tr.slab->conv) : std::vector<uint8_t>(),
-                               pe = ex.pos > 0 && ex.slab ? kvflash_slab_pack(ex.slab->ssm, ex.slab->conv) : std::vector<uint8_t>();
-    const KvFlashDigestRungs rungs = kvflash_digest_rungs(ck.pos, &pk, tr.pos, &pt, ex.pos, ex.pinned, &pe);   // raw, as the session holds them
-    const std::vector<uint8_t> pool = p.pool_layout_blob();   // the live pager's, at save and again after a restore: a restore that lost it shows
-    const KvFlashStateDigest d = kvflash_state_digest(history, kvflash_slab_pack(slab.ssm, slab.conv), p.blob_header(), p.ledger_blob(), rungs, p.chunk_bytes(),
-                                                      [&](int ci, uint8_t * dst) { p.read_chunk(ci, dst); }, uq, &pool);
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "%s\n", kvflash_state_digest_line(tag, key, gen, d, ms).c_str());
-    std::fflush(stderr);
-}
-
 // The session directory sessions/<key>/ into the slot's pager as a parked session: the same restore
 // at start and at a request that names a disk session. "" when adopted, else why it was refused.
 std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bool * refused, bool evict_for_room, bool * busy) {
@@ -1246,7 +1223,6 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
     const KvFlashSlotPager & p = kvf_kv_->pager(slot);
     std::fprintf(stderr, "[kvflash] slot %d bundle restored: gen=%u history=%zu ckpt=%d trunk=%d third=%d resident=%d/%d (%.1f MiB)\n",
                  slot, l.head.gen, l.head.history.size(), ps.ckpt.pos, ps.trunk.pos, ps.extra.pos, p.resident_blocks(), p.n_pool_blocks(), l.pager.size() / 1048576.0);
-    const uint32_t gen = l.head.gen;   // l.head moves into the book below
     kvflash_bundle_clean(sdir, &l.head);   // a park cut short by the last run, a torn tail
     ps.history = book_.adopt(slot, key, std::move(l.head));
     parked_[(size_t)slot] = std::move(ps);
@@ -1259,23 +1235,7 @@ std::string Qwen35SeqEngine::adopt_bundle_(int slot, const std::string & key, bo
         std::fprintf(stderr, "[kvflash] slot %d bundle uq rows not restored: host budget (%d stores)\n", slot, skipped);
     for (const KvFlashUqStore & u : uq_store_[(size_t)slot]) std::fprintf(stderr, "[kvflash] slot %d bundle restored uq rows lo=%d hi=%d n=%d\n", slot, u.lo, u.hi, u.n);
     m4_last_[(size_t)slot] = KvFlashM4Last{};   // a restored session starts without the last request's scores
-    const bool rebind = head_k_max_ > 0;   // the digest below is taken before the rebind: the hard pins came back with the pager's layout, the rebind only adds the head's again
-    if (kvflash_bundle_digest_on()) {   // the installed session, re-read through the save's staging; before the rebind and any reselect
-        ParkedSession & q = parked_[(size_t)slot];
-        if (const std::string & fault = kvflash_digest_fault(); !fault.empty()) {   // R3 negative control (test hook): corrupt one byte of the live restored slot
-            KvFlashSlotPager & fp = kvf_kv_->pager(slot);
-            fp.synchronize_paging();
-            bool hit = false;
-            if (fault == "kv") { const auto lg = fp.ledger_blob(); for (int c = 0; c < (int)(lg.size() / kKvFlashLedgerEntry) && !hit; ++c) if (lg[(size_t)c * kKvFlashLedgerEntry + 1]) hit = fp.corrupt_chunk_byte(c); }
-            else { SlotStateSnapshot f; if (snapshot_slot_state(b_.cache_, slot, f) && !f.ssm.empty() && !f.ssm[0].empty()) { f.ssm[0][0] ^= 1; hit = restore_slot_state(b_.cache_, slot, f); } }
-            if (hit) { std::fprintf(stderr, "%s\n", kvflash_fault_line(fault, key, gen).c_str()); std::fflush(stderr); }
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        SlotStateSnapshot live;
-        if (snapshot_slot_state(b_.cache_, slot, live)) log_bundle_digest_("restore", slot, key, gen, q.history, live, q.ckpt, q.trunk, q.extra, kvflash_uq_saved(uq_store_[(size_t)slot], q.history), t0);
-        else std::fprintf(stderr, "[kvflash-digest] restore sid=%s gen=%u unavailable: slab snapshot failed\n", key.c_str(), gen);
-    }
-    if (rebind) {   // the session pinned a head when it parked: pin it again (its history must still start with that head)
+    if (head_k_max_ > 0) {   // the session pinned a head when it parked: pin it again (its history must still start with that head)
         const KvFlashSessionEntry * me = book_.store().find_key(key);
         if (me && !kvflash_rebind_restored(*kvf_kv_, head_binder_, head_k_max_, {{slot, &parked_[(size_t)slot].history, me->preamble, me->preamble_chunks}}) && !me->preamble.empty() && me->preamble_chunks > 0)
             std::fprintf(stderr, "[kvflash] slot %d session %s: its pinned head does not hold, the slot runs unpinned\n", slot, key.c_str());
@@ -1416,7 +1376,6 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
     const bool fresh = sb.fresh_park(failed);
     sb.rewrite = false;
     const auto end_state = std::make_shared<SlotStateSnapshot>();   // the D2H lands in the buffer the writer packs from
-    const SlotStateSnapshot & end = *end_state;
     if (!snapshot_slot_state(b_.cache_, slot, *end_state)) {   // nothing staged: the next park rewrites the slot from the acknowledged head
         std::fprintf(stderr, "[kvflash] slot %d bundle not saved: slab snapshot failed\n", slot);
         sb.rewrite = true;
@@ -1542,7 +1501,6 @@ void Qwen35SeqEngine::save_bundle_(int slot, ParkedSession & ps) {
     }
     sb.staged = std::move(h);
     sb.pending = true;
-    if (kvflash_bundle_digest_on()) log_bundle_digest_("save", slot, sb.key, c.gen, ps.history, end, ps.ckpt, ps.trunk, ps.extra, uq_rows, std::chrono::steady_clock::now());   // before the writer: a kill after the head commit cannot lose the line
     bundle_writer_->submit({slot, std::move(c)});
 }
 
@@ -1578,8 +1536,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     // the recall budget kvflash_prefill_apply_on plans this turn with: a longer turn replays its tail only
     const int ct = p.chunk_tokens(), usable = luce::common::kvflash_usable_blocks(p.n_pool_blocks(), kvf_->headroom());
     const int max_turn = ct > 0 ? luce::common::kvflash_max_turn_tokens(ct, usable, b_.kvflash_preamble_reserve_ / ct,
-                                                                        luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_,
-                                                                        b_.kvflash_replay_max_) : 0;
+                                                                        luce::common::kKvFlashRecallUnit * b_.kvflash_recall_blocks_) : 0;
     // The latest human question: its end is a cut of every pass and its last queries join the scorer's.
     // A prefill that covers the window captures them (whatever the slot's store holds: the same request
     // runs the same cuts and scores with its own rows); a later turn of the session reads the store.
@@ -1663,8 +1620,6 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
     } else if (rc.m4_track) {
         rc.turn.track_tail = true;   // not a recall turn (the prompt fits): its tail queries are still the next turn's prescore input
     }
-    // L4: after the turn's last cut is in (the UQ cut above), with the replay's cut rule (the park tail of the step loop)
-    if (header_rung_) kvflash_slot_turn_header_rung(rc.turn, kKvFlashCutU, park_short_on_ ? kKvFlashParkTail : 0);
     if (rc.turn.apply_at >= 0 && m4_path[0]) {
         // Mode 4 once: the picks come from the exact scores above, applied at the resume point; no snapshot, no rewind.
         apply_once_(slot, m4_path[0] == 'r' ? "; reused" : "; prescore");
@@ -1672,9 +1627,8 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         std::fprintf(stderr, "[kvflash] slot %d m4 path=full @%d (end %d, %s, re-prefill %d tokens)\n", slot, kv_offset, rc.turn.end,
                      rc.m4_track ? "no reusable record" : "single pass off", rc.turn.end - rc.turn.r);
         if (rc.turn.r == rc.turn.kv_offset) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
-        std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts%s)\n",
-                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.header_rung ? ", replay rung" : "");
-        if (rc.turn.header_rung) std::fprintf(stderr, "[kvflash] slot %d header rung: the replay checkpoints at %d\n", slot, rc.turn.ckpt);
+        std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts)\n",
+                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size());
     } else if (recall_on_) {
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: skip (%d tokens fit %d blocks or no turn)\n",
                      slot, rc.turn.end - rc.turn.kv_offset, p.n_pool_blocks());
@@ -1727,12 +1681,6 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
         }
     }
     const double score_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-    static const bool first_pass_bits = std::getenv("LUCE_KVFLASH_FIRST_PASS_BITS") != nullptr;
-    if (first_pass_bits) {   // diagnostic (L4 pre-condition): the bits the first pass's cuts produce (the captured queries, the scores); FNV-1a 64
-        auto fnv = [](const std::vector<float> & v) { uint64_t h = 1469598103934665603ull; const uint8_t * b = (const uint8_t *)v.data(); for (size_t i = 0; i < v.size() * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull; return h; };
-        std::fprintf(stderr, "[kvflash] slot %d mode4 first-pass bits: q_tail n_q=%d fnv=%016llx scores n=%zu fnv=%016llx\n",
-                     slot, n_q, (unsigned long long)fnv(q_all), rc.scores.size(), (unsigned long long)fnv(rc.scores));
-    }
     if (!scored)
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4 @%d: scoring failed (n_q=%d sealed=%d); LRU replay\n",
                      slot, r, n_q, sealed);

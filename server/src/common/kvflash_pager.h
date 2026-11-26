@@ -193,8 +193,8 @@ public:
     void set_pinned_host_backing(bool pinned) {
         host_backing_ = KvFlashBackingState(pinned ? KvFlashHostBacking::Pinned : KvFlashHostBacking::Pageable);
     }
-    // The production policy (LUCE_KVFLASH_HOST_BACKING, kvflash_host_backing.h): Auto falls back to pageable on
-    // the first refused pinned allocation and logs it. Same timing rule as set_pinned_host_backing.
+    // Host backing policy (default Auto): tries pinned DMA and falls back to pageable on
+    // the first refused pinned allocation. Same timing rule as set_pinned_host_backing.
     void set_host_backing(KvFlashHostBacking mode) { host_backing_ = KvFlashBackingState(mode); }
     const KvFlashBackingState & host_backing_state() const { return host_backing_; }
 #ifdef KVFLASH_HAS_ASYNC_DMA
@@ -1069,28 +1069,6 @@ public:
             std::memcpy(dst, st.host_data.data(), chunk_bytes_);
 #endif
         }
-    }
-    // R3 negative control (LUCE_KVFLASH_DIGEST_FAULT=kv): flips one byte of chunk c where it lives, the first byte read_chunk
-    // returns. After synchronize_paging(). False: the chunk holds no bytes here.
-    bool corrupt_chunk_byte(int c) {
-        if (c < 0 || (size_t)c >= chunks_.size() || !has_tensor_storage()) return false;
-        ChunkState & st = chunks_[(size_t)c];
-        if (st.block >= 0) {
-            ggml_tensor * t = attn_k_[0];
-            const size_t off = block_off_(st.block, t);
-            uint8_t b;
-            ggml_backend_tensor_get(t, &b, off, 1);
-            b ^= 1;
-            ggml_backend_tensor_set(t, &b, off, 1);
-            return true;
-        }
-        if (!st.on_host) return false;
-#ifdef KVFLASH_HAS_ASYNC_DMA
-        ((uint8_t *)st.host_data)[0] ^= 1;
-#else
-        st.host_data[0] ^= 1;
-#endif
-        return true;
     }
     // nc x 8 bytes: u8 was_resident, u8 materialized, 2 pad, f32 score.
     std::vector<uint8_t> ledger_blob(int max_chunks = -1) const {

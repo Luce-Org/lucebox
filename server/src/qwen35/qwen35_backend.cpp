@@ -441,7 +441,6 @@ bool Qwen35Backend::init() {
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_m4_single_ = env_int_or_default("LUCE_KVFLASH_M4_SINGLE", 1) != 0;
         kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
-        kvflash_replay_max_ = std::max(0, env_int_or_default("LUCE_KVFLASH_REPLAY_MAX", 0));
         kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
         kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
     }
@@ -1923,13 +1922,7 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         }
         raw.push_back(kvf_pagers_.back().get());
     }
-    {   // the host backing policy reaches every slot pager before any restore or eviction allocates
-        const KvFlashHostBacking backing = kvflash_host_backing_from_env();
-        kvflash_apply_host_backing(raw, backing);
-        std::fprintf(stderr, "[kvflash] host backing policy: %s (%d slots)\n",
-                     backing == KvFlashHostBacking::Pinned ? "pinned" : backing == KvFlashHostBacking::Pageable ? "pageable" : "auto",
-                     (int)raw.size());
-    }
+    kvflash_apply_host_backing(raw, KvFlashHostBacking::Auto);
     KvFlashSlotKvConfig kc;
     kc.quota_chunks = quota_chunks;
     kc.headroom_blocks = kHeadroom;
@@ -3621,7 +3614,7 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
     if (kvf_reselect) {
         auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id,
             luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
-                                                  luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_, kvflash_replay_max_));
+                                                  luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_));
         p4.r = luce::common::kvflash_uq_snap_rewind(s.uqp, p4.r);
         const auto gate = luce::common::kvflash_recall_gate(
             p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,

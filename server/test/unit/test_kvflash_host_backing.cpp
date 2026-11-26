@@ -1,9 +1,8 @@
-// LUCE_KVFLASH_HOST_BACKING, the host-backing policy of the KVFlash slot pagers (default pinned).
-// Pure parsing and the failure state machine, plus a CPU pager with an injected pinned-allocation failure
+// Host-backing policy of the KVFlash slot pagers (default Auto: tries pinned DMA, falls back to pageable).
+// Pure failure state machine, plus a CPU pager with an injected pinned-allocation failure
 // for the ledger (host_bytes) and the apply-to-every-slot contract. No GPU.
 
 #include "CppUnitTestFramework.hpp"
-#include "scoped_env.h"
 #include "kvflash_pager_test_host.h"
 
 #include "kvflash_host_backing.h"
@@ -51,32 +50,6 @@ KvFlashConfig cfg8() {
     return c;
 }
 }  // namespace
-
-TEST_CASE(KvflashHostBackingFixture, parse_accepts_the_three_values_and_defaults_to_pinned) {
-    bool ok = false;
-    CHECK(kvflash_host_backing_parse(nullptr, &ok) == KvFlashHostBacking::Pinned); CHECK(ok);
-    CHECK(kvflash_host_backing_parse("", &ok) == KvFlashHostBacking::Pinned);      CHECK(ok);
-    CHECK(kvflash_host_backing_parse("auto", &ok) == KvFlashHostBacking::Auto);    CHECK(ok);
-    CHECK(kvflash_host_backing_parse("pinned", &ok) == KvFlashHostBacking::Pinned);   CHECK(ok);
-    CHECK(kvflash_host_backing_parse("pageable", &ok) == KvFlashHostBacking::Pageable); CHECK(ok);
-    CHECK(kvflash_host_backing_parse("PINNED", &ok) == KvFlashHostBacking::Pinned);   CHECK(ok);   // case-insensitive
-    CHECK(kvflash_host_backing_parse("mmap", &ok) == KvFlashHostBacking::Pinned);  CHECK(!ok);     // unknown: pinned, flagged
-}
-
-TEST_CASE(KvflashHostBackingFixture, env_selects_the_mode) {
-    {
-        luce_test::ScopedEnvVar e("LUCE_KVFLASH_HOST_BACKING", "pageable");
-        CHECK(kvflash_host_backing_from_env() == KvFlashHostBacking::Pageable);
-    }
-    {
-        luce_test::ScopedEnvVar e("LUCE_KVFLASH_HOST_BACKING", "auto");
-        CHECK(kvflash_host_backing_from_env() == KvFlashHostBacking::Auto);
-    }
-    {
-        luce_test::ScopedEnvVar e("LUCE_KVFLASH_HOST_BACKING", nullptr);
-        CHECK(kvflash_host_backing_from_env() == KvFlashHostBacking::Pinned);   // unset: today's behaviour
-    }
-}
 
 TEST_CASE(KvflashHostBackingFixture, state_machine_auto_falls_back_once_and_logs_it) {
     KvFlashBackingState s(KvFlashHostBacking::Auto);

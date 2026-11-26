@@ -276,15 +276,6 @@ TEST_CASE(KvflashSlotBundleFixture, the_third_rung_survives_a_commit_a_load_a_va
     kvflash_bundle_remove(dir);
 }
 
-TEST_CASE(KvflashSlotBundleFixture, the_crash_hook_names_a_step_and_a_commit) {
-    CHECK(kvflash_bundle_crash_at(nullptr) == std::make_pair(0, 0));
-    CHECK(kvflash_bundle_crash_at("") == std::make_pair(0, 0));
-    CHECK(kvflash_bundle_crash_at("3") == std::make_pair(3, 1));                            // the first commit
-    CHECK(kvflash_bundle_crash_at("2:5") == std::make_pair(2, 5));
-    CHECK(kvflash_bundle_crash_at("6") == std::make_pair(0, 0));                            // steps are 1-5
-    CHECK(kvflash_bundle_crash_at("1:0") == std::make_pair(0, 0));
-}
-
 TEST_CASE(KvflashSlotBundleFixture, assembly_reads_the_mapped_records_fills_holes_and_ignores_a_torn_tail) {
     const KvFlashSlotHead h = sample_head();
     std::vector<uint8_t> log = sample_log();
@@ -721,13 +712,6 @@ TEST_CASE(KvflashSlotBundleFixture, state_digest_survives_a_commit_and_a_load_an
     kvflash_bundle_remove(dir);
 }
 
-TEST_CASE(KvflashSlotBundleFixture, state_digest_line_has_the_fixed_format) {
-    KvFlashStateDigest d;
-    d.all = 0x0123456789abcdefULL; d.hist = 1; d.slab = 2; d.kv = 3; d.ledger = 4; d.pager = 0xffULL; d.rung = 5; d.uq = 6; d.pool = 7; d.bytes = 4096;
-    CHECK(kvflash_state_digest_line("save", "9f8e7d6c5b4a3921", 7, d, 12.34) ==
-          "[kvflash-digest] save sid=9f8e7d6c5b4a3921 gen=7 all=0123456789abcdef hist=0000000000000001 slab=0000000000000002 kv=0000000000000003 ledger=0000000000000004 pager=00000000000000ff rung=0000000000000005 uq=0000000000000006 pool=0000000000000007 bytes=4096 ms=12.3");
-}
-
 TEST_CASE(KvflashSlotBundleFixture, a_pinned_third_at_the_ckpt_position_is_hashed_raw_and_an_unpinned_one_is_not) {
     DigestState s;
     s.ckpt_pos = 4096;
@@ -756,11 +740,6 @@ TEST_CASE(KvflashSlotBundleFixture, a_pinned_third_at_the_ckpt_position_is_hashe
     const KvFlashStateDigest o0 = own.digest();
     own.extra[9] ^= 1;
     CHECK(own.digest().rung != o0.rung);
-}
-
-TEST_CASE(KvflashSlotBundleFixture, regen_and_fault_lines_have_the_fixed_format) {
-    CHECK(kvflash_regen_line("9f8e7d6c5b4a3921", 12, 9) == "[kvflash-digest] regen sid=9f8e7d6c5b4a3921 gen=12 from=9");
-    CHECK(kvflash_fault_line("kv", "9f8e7d6c5b4a3921", 7) == "[kvflash-digest] fault kv sid=9f8e7d6c5b4a3921 gen=7");
 }
 
 // ---- the slot's user-question query rows (UQ rows) travel with the bundle ------------------------------------------

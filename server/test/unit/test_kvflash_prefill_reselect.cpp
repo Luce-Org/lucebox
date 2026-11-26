@@ -80,11 +80,6 @@ TEST_CASE(KvflashPrefillReselectFixture, max_turn_is_the_longest_turn_the_recall
     CHECK(kvflash_recall_gate(true, 81430 - cap - 1, 81430, 64, 256, 18, 60).skip == KvFlashRecallSkip::PoolTooSmall);
     CHECK(kvflash_max_turn_tokens(64, 80, 18, 60) == 0);   // no room for a replay: uncapped, the gate refuses as before
     CHECK(kvflash_max_turn_tokens(0, 256, 18, 60) == 0);
-    CHECK(kvflash_max_turn_tokens(64, 256, 18, 60, 2048) == 2048);       // replay_max shortens, in whole chunks
-    CHECK(kvflash_max_turn_tokens(64, 256, 18, 60, 2100) == 2048);
-    CHECK(kvflash_max_turn_tokens(64, 256, 18, 60, 10) == 64);           // at least one chunk
-    CHECK(kvflash_max_turn_tokens(64, 256, 18, 60, 1 << 20) == cap);     // never longer than the gate allows
-    CHECK(kvflash_max_turn_tokens(64, 80, 18, 60, 2048) == 0);           // no room stays no room
 }
 
 TEST_CASE(KvflashPrefillReselectFixture, mode4_plan_caps_a_long_turn_to_its_replayable_tail) {

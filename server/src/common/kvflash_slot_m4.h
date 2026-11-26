@@ -27,7 +27,6 @@ inline void kvflash_slot_turn_single(KvFlashSlotTurn & t, int chunk_tokens) {
     t.r = t.kv_offset;
     t.apply_at = t.kv_offset;
     t.cuts.clear();
-    t.header_rung = false;
     t.reserve_chunks = chunk_tokens > 0 ? (t.end - t.kv_offset + chunk_tokens - 1) / chunk_tokens + 1 : 0;
     t.track_tail = true;
 }

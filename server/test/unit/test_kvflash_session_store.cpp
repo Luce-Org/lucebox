@@ -1305,10 +1305,10 @@ TEST_CASE(KvflashSessionStoreFixture, a_restore_that_does_not_happen_gives_its_c
     fs::remove_all(root);
 }
 
-// --kv-sessions: on by default whenever KVFlash and a disk dir are on; the old bundle-dir variable stays one release, with a warning.
+// --kv-sessions: on by default whenever KVFlash and a disk dir are on.
 TEST_CASE(KvflashSessionStoreFixture, sessions_are_on_whenever_kvflash_and_a_disk_dir_are_on_and_the_flag_can_turn_them_off) {
-    auto plan = [](bool kvflash, KvFlashSessionsFlag flag, const std::string & dir, const std::string & env = "") {
-        return kvflash_sessions_plan(kvflash, flag, dir, env);
+    auto plan = [](bool kvflash, KvFlashSessionsFlag flag, const std::string & dir) {
+        return kvflash_sessions_plan(kvflash, flag, dir);
     };
     const auto on = plan(true, KvFlashSessionsFlag::automatic, "/cache");
     CHECK(on.on); CHECK(on.root == "/cache"); CHECK(on.note.empty());
@@ -1321,13 +1321,6 @@ TEST_CASE(KvflashSessionStoreFixture, sessions_are_on_whenever_kvflash_and_a_dis
     CHECK(!nodir.on); CHECK(nodir.note.empty());                                     // the default with no disk cache is quiet
     const auto asked = plan(true, KvFlashSessionsFlag::on, "");
     CHECK(!asked.on); CHECK(asked.note.find("--kv-cache-dir") != std::string::npos); // an explicit ask that cannot be met says why
-    const auto env = plan(true, KvFlashSessionsFlag::automatic, "/cache", "/old/bundles");
-    CHECK(env.on); CHECK(env.root == "/old/bundles");
-    CHECK(env.note.find("LUCE_KVFLASH_SLOT_BUNDLE_DIR") != std::string::npos);     // the warning names the variable and the way out
-    CHECK(env.note.find("--kv-cache-dir") != std::string::npos);
-    CHECK(plan(true, KvFlashSessionsFlag::automatic, "", "/old/bundles").on);       // the override needs no cache dir
-    CHECK(!plan(true, KvFlashSessionsFlag::off, "/cache", "/old/bundles").on);      // an explicit off wins over the variable
-    CHECK(!plan(false, KvFlashSessionsFlag::automatic, "/cache", "/old/bundles").on);
     KvFlashSessionsFlag f = KvFlashSessionsFlag::automatic;
     CHECK(kvflash_sessions_flag_parse("on", f) && f == KvFlashSessionsFlag::on);
     CHECK(kvflash_sessions_flag_parse("off", f) && f == KvFlashSessionsFlag::off);

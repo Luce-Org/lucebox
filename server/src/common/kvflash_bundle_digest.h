@@ -1,4 +1,4 @@
-// Digest of a session's whole saved state (R3 digest mode, LUCE_KVFLASH_BUNDLE_DIGEST=1): one FNV-1a (the slot-state
+// Digest of a session's whole saved state (test helper): one FNV-1a (the slot-state
 // hash) per component and one over the eight, from host bytes alone, so the save (the bytes being staged) and the
 // restore (the live slot, read back through the same staging) are compared on equal terms.
 //
@@ -94,20 +94,6 @@ inline KvFlashStateDigest kvflash_state_digest(const std::vector<int32_t> & hist
     return d;
 }
 
-// LUCE_KVFLASH_BUNDLE_DIGEST=1, read once: the one gate of every digest line (save, restore, regen, fault).
-inline bool kvflash_bundle_digest_on() {
-    static const bool on = [] { const char * e = std::getenv("LUCE_KVFLASH_BUNDLE_DIGEST"); return e && e[0] == '1'; }();
-    return on;
-}
-// R3 negative control (test hook): LUCE_KVFLASH_DIGEST_FAULT=kv|slab, read once, "" unless digest mode is on.
-inline const std::string & kvflash_digest_fault() {
-    static const std::string f = [] {
-        const char * e = kvflash_bundle_digest_on() ? std::getenv("LUCE_KVFLASH_DIGEST_FAULT") : nullptr;
-        return e && (std::string(e) == "kv" || std::string(e) == "slab") ? std::string(e) : std::string();
-    }();
-    return f;
-}
-
 // The rungs as the session holds them, raw: a third at a rung's position is hashed when it is pinned (restore rebuilds it from
 // the rung it names, so a corrupted copy must show). An unpinned one is not rebuilt by restore, yet a branch there prefers it
 // over the rung (kvflash_ladder_resume), so one byte says whether its slab differs from that rung's: folded only when it does.
@@ -122,25 +108,6 @@ inline KvFlashDigestRungs kvflash_digest_rungs(int ck_pos, const std::vector<uin
         g.dup_differs = !ex || !rung || *ex != *rung;
     }
     return g;
-}
-
-// Storage compaction copies a session's records under a new gen without a save: this line, flushed before its head commit,
-// lets D follow a restore of the new gen back to the gen whose content the new head carries.
-inline std::string kvflash_regen_line(const std::string & sid, uint32_t gen, uint32_t from) {
-    return "[kvflash-digest] regen sid=" + sid + " gen=" + std::to_string(gen) + " from=" + std::to_string(from);
-}
-// The negative control's mark: one byte of the live restored slot was flipped before the restore digest.
-inline std::string kvflash_fault_line(const std::string & kind, const std::string & sid, uint32_t gen) {
-    return "[kvflash-digest] fault " + kind + " sid=" + sid + " gen=" + std::to_string(gen);
-}
-
-// The one log line of both sides; tag is "save" or "restore", sid the session's store key.
-inline std::string kvflash_state_digest_line(const char * tag, const std::string & sid, uint32_t gen, const KvFlashStateDigest & d, double ms) {
-    char b[544];
-    std::snprintf(b, sizeof b, "[kvflash-digest] %s sid=%s gen=%u all=%016llx hist=%016llx slab=%016llx kv=%016llx ledger=%016llx pager=%016llx rung=%016llx uq=%016llx pool=%016llx bytes=%llu ms=%.1f",
-                  tag, sid.c_str(), gen, (unsigned long long)d.all, (unsigned long long)d.hist, (unsigned long long)d.slab, (unsigned long long)d.kv,
-                  (unsigned long long)d.ledger, (unsigned long long)d.pager, (unsigned long long)d.rung, (unsigned long long)d.uq, (unsigned long long)d.pool, (unsigned long long)d.bytes, ms);
-    return b;
 }
 
 }  // namespace luce::common

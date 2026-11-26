@@ -2228,9 +2228,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // finds it by directory and attaches the session store as its tenant.
     static std::vector<std::shared_ptr<DiskStore>> sessions_disks;
     {
-        const char * old_dir = std::getenv("LUCE_KVFLASH_SLOT_BUNDLE_DIR");
         const auto plan = luce::common::kvflash_sessions_plan(
-            concurrent_kvflash, model.kv_sessions, sconfig.disk_cache_dir, old_dir ? old_dir : "");
+            concurrent_kvflash, model.kv_sessions, sconfig.disk_cache_dir);
         if (!plan.note.empty()) std::fprintf(stderr, "[kvflash] %s\n", plan.note.c_str());
         if (plan.on) {
             DiskCacheConfig dc;

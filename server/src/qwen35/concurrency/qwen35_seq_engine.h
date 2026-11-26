@@ -29,7 +29,6 @@
 #include "common/kvflash_admit_plan.h"
 #include "common/kvflash_engine_step.h"
 #include "common/kvflash_chain_plan.h"
-#include "common/kvflash_bundle_digest.h"
 #include "common/kvflash_session_store.h"
 #include "common/kvflash_slot_bundle.h"
 #include "common/kvflash_head_snapshot.h"
@@ -370,7 +369,6 @@ private:
     static KvFlashLadder ladder_of_(const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex) { return {ck.pos, tr.pos, ex.pos, ex.pos > 0 && ex.pinned}; }
     // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is shared.
     static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
-    bool header_rung_ = false;                        // LUCE_KVFLASH_HEADER_RUNG=1 (L4): a recall turn's replay checkpoints at its last cut at or before the header; 0 off
     void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)
     void take_ckpt_(int slot, int pos);               // Rule A with the slot's state now (the header rung)
     // Sessions on disk (--kv-sessions, LUCE_KVFLASH_SESSIONS_DIR): each parked session is written under
@@ -410,8 +408,6 @@ private:
     void save_bundle_(int slot, ParkedSession & ps);   // ps is unchanged on return but for the rungs' file ids
     std::string identity_key_() const;                // model, KV types, pager geometry, context, attention route: the bundle identity's text
     size_t slab_bytes_() const;                       // one slot's recurrent slab
-    void log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
-                            const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const std::vector<const KvFlashUqStore *> & uq, std::chrono::steady_clock::time_point t0);
     uint64_t park_tick_ = 0;
     // Park short (kvflash_park_point): a prefill-only turn parks kKvFlashParkTail tokens short (R's replay window is 4).
     static constexpr int kKvFlashParkTail = 4;

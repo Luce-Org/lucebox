@@ -28,7 +28,6 @@ struct KvFlashSlotTurn {
     int  end = 0;                   // prompt end
     int  reserve_chunks = 0;        // pool room kept for the replay (single-slot rule)
     int  ckpt = -1;                 // the prompt-end checkpoint: the last <|im_start|> (the assistant header)
-    bool header_rung = false;       // L4: a recall turn whose replay checkpoints at ckpt = H', its own last cut at or before the header (kvflash_slot_turn_header_rung)
     int  apply_at = -1;             // mode 4 once: the resume point, where the picks scored before the pass are applied; -1: none
     int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
     bool m4 = false;                // a mode-4 turn was found (before the fits / sealed gates): its tail queries are the next turn's
@@ -38,8 +37,8 @@ struct KvFlashSlotTurn {
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
     bool first_pass() const { return phase == KvFlashTurnPhase::FirstPass; }
     bool snapshot_at_r() const { return recall() && r > kv_offset; }
-    // The pass that checkpoints at ckpt: an LRU turn's only pass, or a recall turn's replay with header_rung.
-    bool ckpt_pass() const { return !recall() || (header_rung && phase == KvFlashTurnPhase::Replay); }
+    // The pass that checkpoints at ckpt: an LRU turn's only pass.
+    bool ckpt_pass() const { return !recall(); }
 };
 
 // First-pass cut ends over [kv_offset, end): r is a cut end (the state snapshot
@@ -59,13 +58,6 @@ inline std::vector<int> kvflash_slot_turn_cuts(int kv_offset, int r, int end, in
 
 // Blocks a live slot keeps resident: settle() holds it at the pool minus the step headroom.
 inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { return std::max(0, n_pool_blocks - headroom_blocks); }
-
-// L4 header rung position H': the last of a pass's cut ends at or before the header H, above R. -1: no such cut (H' would be R or below).
-inline int kvflash_header_rung_at(const std::vector<int> & cuts, int h, int r) {
-    int best = -1;
-    for (int c : cuts) if (c <= h && c > r) best = std::max(best, c);
-    return best;
-}
 
 // The slot's turn for a prompt resumed at kv_offset. Mode 4 runs when the recall
 // profile is on and the prompt with the replay's reserve does not fit the slot's
@@ -117,21 +109,6 @@ inline int kvflash_slot_turn_next_cut(const KvFlashSlotTurn & t, int cur_pos, in
     if (t.ckpt_pass() && t.ckpt > cur_pos) n = std::min(n, t.ckpt - cur_pos);
     if (tail > 0 && n > tail && cur_pos + n == t.end) n -= tail;
     return n;
-}
-
-// LUCE_KVFLASH_HEADER_RUNG (L4): call once every cut of the turn is final (after kvflash_slot_turn_force_cut). A recall turn's
-// replay also checkpoints at H' = the last cut end of that replay at or before the header H and above R, so the next turn
-// resumes at H' (ckpt = H'), not R; R stays below it (Rule A). The rung's state and the resident KV rows [R, H') are both the
-// replay's. H' is a cut the knob-off replay already makes (cut_u, tail: the engine's), so no pass gains a cut and the first pass
-// is untouched. No such cut, or the end rung is on (the replay already checkpoints at H itself): the turn is left as planned.
-inline void kvflash_slot_turn_header_rung(KvFlashSlotTurn & t, int cut_u, int tail = 0) {
-    if (!t.first_pass() || t.ckpt <= t.r) return;
-    KvFlashSlotTurn rp = t;
-    rp.phase = KvFlashTurnPhase::Replay;
-    std::vector<int> ends;
-    for (int pos = t.r, n; pos < t.ckpt && (n = kvflash_slot_turn_next_cut(rp, pos, cut_u, tail)) > 0;) ends.push_back(pos += n);
-    const int h = kvflash_header_rung_at(ends, t.ckpt, t.r);
-    if (h > 0) { t.header_rung = true; t.ckpt = h; }
 }
 
 // LUCE_KVFLASH_UQ_QUERIES: the question's end `cut` (kvflash_uq_cut, -1: none) becomes a cut end of every pass

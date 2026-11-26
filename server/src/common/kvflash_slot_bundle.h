@@ -564,7 +564,7 @@ struct KvFlashBundleCommit {
 
 // 1 the log (fsync), 2 the slab files (tmp + fsync + rename), 3 the directory (and its parent for
 // a new one), 4 the head (tmp + fsync + rename + directory): the commit point, 5 the unlinks.
-// Returns false right after step crash_after_step (tests, LUCE_KVFLASH_BUNDLE_CRASH_AT): a
+// Returns false right after step crash_after_step (unit test parameter): a
 // process killed there leaves the previous park (steps 1-3) or this one (4, 5) loadable, and
 // kvflash_bundle_clean removes what the surviving head does not name.
 inline bool kvflash_bundle_commit(const KvFlashBundleCommit & c, int crash_after_step = 0) {
@@ -756,16 +756,6 @@ inline void kvflash_bundle_remove(const std::string & dir) {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
-// LUCE_KVFLASH_BUNDLE_CRASH_AT=<step>[:<commit>]: the writer exits the process right after that
-// commit step (1-5) of its n-th commit (default the first). {0, 0}: off.
-inline std::pair<int, int> kvflash_bundle_crash_at(const char * env) {
-    if (!env || !*env) return {0, 0};
-    const int step = std::atoi(env);
-    const char * colon = std::strchr(env, ':');
-    const int commit = colon ? std::atoi(colon + 1) : 1;
-    if (step < 1 || step > 5 || commit < 1) return {0, 0};
-    return {step, commit};
-}
 
 // ---- the writer thread ------------------------------------------------------------------------
 
@@ -777,7 +767,7 @@ public:
     using Done = std::function<void(const Job &, bool ok, double ms)>;   // on the writer thread
 
     explicit KvFlashBundleWriter(Done done = {})
-        : done_(std::move(done)), crash_(kvflash_bundle_crash_at(std::getenv("LUCE_KVFLASH_BUNDLE_CRASH_AT"))), th_([this] { run_(); }) {}
+        : done_(std::move(done)), th_([this] { run_(); }) {}
     ~KvFlashBundleWriter() {
         drain();
         { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
@@ -824,13 +814,7 @@ private:
             busy_slot_ = j.slot;
             lk.unlock();
             const auto t0 = std::chrono::steady_clock::now();
-            const int crash_step = crash_.first && ++n_commits_ == crash_.second ? crash_.first : 0;
-            const bool ok = kvflash_bundle_commit(j.commit, crash_step);
-            if (crash_step) {   // the crash gate: the process dies here, as a kill would, and the restart adopts what the directory holds
-                std::fprintf(stderr, "[kvflash] LUCE_KVFLASH_BUNDLE_CRASH_AT: exiting after step %d of commit %d (slot %d gen %u)\n", crash_step, n_commits_, j.slot, j.commit.gen);
-                std::fflush(stderr);
-                std::_Exit(70);
-            }
+            const bool ok = kvflash_bundle_commit(j.commit);
             if (done_) done_(j, ok, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             j = Job{};   // the staging goes before the slot is reported idle
             lk.lock();
@@ -841,8 +825,6 @@ private:
     }
 
     Done done_;
-    std::pair<int, int> crash_;            // LUCE_KVFLASH_BUNDLE_CRASH_AT
-    int n_commits_ = 0;
     mutable std::mutex m_;
     std::condition_variable cv_, idle_;
     std::deque<Job> q_;
