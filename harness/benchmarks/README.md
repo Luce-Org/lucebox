@@ -6,7 +6,8 @@ deterministic prompts.
 
 For the paired ragged C1/C4/C8/C16 serving benchmark and the concurrent
 HumanEval/GSM8K/Math500/agent suite runner, see
-[`concurrency/`](concurrency/README.md).
+[`concurrency/`](concurrency/README.md). For long-horizon SWE-bench Pro agent
+runs via Harbor, see [`swebench_pro/`](swebench_pro/README.md).
 
 Use this when you want to know whether a server change affects output quality or
 decode speed. Use `harness/clients/` when you want to know whether Codex,

@@ -1,0 +1,54 @@
+# Curated 24-task long-horizon SWE-bench Pro slice for local agentic serving benchmarks
+# (e.g., KVFlash + PFlash on Qwen3.8-27B).
+#
+# Composition:
+#   - 24 tasks total (divisible by 1, 2, 3, 4, 6, 8 for concurrent trial sweeps)
+#   - Balanced across languages: 8 Python, 8 Go, 8 JS/TS (10 repositories)
+#   - 14 multi-file standard V2 tasks + 10 HARD-51 tasks (1 per repository)
+#   - Every task is in Scale AI's SWE-bench Pro V2 642-task validated set
+#     (642/642 oracle=1.0, 0/642 nop=0.0) and matches exact-case in Harbor's
+#     `scale-ai/swe-bench-pro` registry dataset.
+
+# Python — ansible/ansible (2 standard + 1 HARD-51)
+instance_ansible__ansible-ea04e0048dbb3b63f876aad7020e1de8eee9f362-v1055803c3a812189a1133297f7f5468579283f86
+instance_ansible__ansible-42355d181a11b51ebfc56f6f4b3d9c74e01cb13b-v1055803c3a812189a1133297f7f5468579283f86
+instance_ansible__ansible-d33bedc48fdd933b5abd65a77c081876298e2f07-v0f01c69f1e2528b935359cfe578530722bca2c59
+
+# Python — internetarchive/openlibrary (2 standard + 1 HARD-51)
+instance_internetarchive__openlibrary-09865f5fb549694d969f0a8e49b9d204ef1853ca-ve8c8d62a2b60610a3c4631f5f23ed866bada9818
+instance_internetarchive__openlibrary-e1e502986a3b003899a8347ac8a7ff7b08cbfc39-v08d8e8889ec945ab821fb156c04c7d2e2810debb
+instance_internetarchive__openlibrary-630221ab686c64e75a2ce253c893c033e4814b2e-v93c53c13d5f9b383ebb411ee7750b49dcd1a34c6
+
+# Python — qutebrowser/qutebrowser (1 standard + 1 HARD-51)
+instance_qutebrowser__qutebrowser-66cfa15c372fa9e613ea5a82d3b03e4609399fb6-v363c8a7e5ccdf6968fc7ab84a2053ac78036691d
+instance_qutebrowser__qutebrowser-c09e1439f145c66ee3af574386e277dd2388d094-v2ef375ac784985212b1805e1d0431dc8f1b3c171
+
+# Go — flipt-io/flipt (1 standard + 1 HARD-51)
+instance_flipt-io__flipt-e5fe37c379e1eec2dd3492c5737c0be761050b26
+instance_flipt-io__flipt-cd18e54a0371fa222304742c6312e9ac37ea86c1
+
+# Go — future-architect/vuls (1 standard + 1 HARD-51)
+instance_future-architect__vuls-2923cbc645fbc7a37d50398eb2ab8febda8c3264
+instance_future-architect__vuls-ca3f6b1dbf2cd24d1537bfda43e788443ce03a0c
+
+# Go — gravitational/teleport (1 standard + 1 HARD-51)
+instance_gravitational__teleport-769b4b5eec7286b7b14e179f2cc52e6b15d2d9f3-v626ec2a48416b10a88641359a169d99e935ff037
+instance_gravitational__teleport-65438e6e44b6ce51458d09b7bb028a2797cfb0ea-vce94f93ad1030e3136852817f2423c1b3ac37bc4
+
+# Go — navidrome/navidrome (1 standard + 1 HARD-51)
+instance_navidrome__navidrome-6bd4c0f6bfa653e9b8b27cfdc2955762d371d6e9
+instance_navidrome__navidrome-69e0a266f48bae24a11312e9efbe495a337e4c84
+
+# JS — element-hq/element-web (2 standard + 1 HARD-51)
+instance_element-hq__element-web-a692fe21811f88d92e8f7047fc615e4f1f986b0f-vnan
+instance_element-hq__element-web-9bf77963ee5e036d54b2a3ca202fbf6378464a5e-vnan
+instance_element-hq__element-web-5dfde12c1c1c0b6e48f17e3405468593e39d9492-vnan
+
+# JS — protonmail/webclients (2 standard + 1 HARD-51)
+instance_protonmail__webclients-5d2576632037d655c3b6a28e98cd157f7e9a5ce1
+instance_protonmail__webclients-b9387af4cdf79c2cb2a221dea33d665ef789512e
+instance_protonmail__webclients-08bb09914d0d37b0cd6376d4cab5b77728a43e7b
+
+# TS — tutao/tutanota (1 standard + 1 HARD-51)
+instance_tutao__tutanota-51818218c6ae33de00cbea3a4d30daac8c34142e-vc4e41fd0029957297843cb9dec4a25c7c756f029
+instance_tutao__tutanota-f373ac3808deefce8183dad8d16729839cc330c1-v2939aa9f4356f0dc9f523ee5ce19d09e08ab979b
