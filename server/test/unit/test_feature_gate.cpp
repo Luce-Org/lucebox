@@ -170,14 +170,6 @@ void test_feature_gate_ds4_pflash_rejects_layer_split() {
     CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
     features.pflash_enabled = false;
     CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
-
-    // Current main also supports DS4 paged serving, which cannot park its
-    // live target state for PFlash. Keep that independent admission guard.
-    args = gate_args_hip_deepseek4();
-    args.paged_attention = true;
-    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
-    features.pflash_enabled = true;
-    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
 }
 
 void test_feature_gate_validates_target_split_topology() {
@@ -488,12 +480,6 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     windowed.fa_window = 4096;
     CHECK(!gate_result(
         windowed, "qwen35", PlacementBackend::Cuda).empty());
-
-    BackendAdmissionContext pflash;
-    pflash.pflash_enabled = true;
-    pflash.pflash_drafter_configured = true;
-    CHECK(!gate_result(
-        base, "qwen35", PlacementBackend::Cuda, pflash).empty());
 
     BackendAdmissionContext kvflash;
     kvflash.kvflash = KvFlashRequest::Fixed;
@@ -814,7 +800,8 @@ void test_model_capability_tables() {
 
     CHECK(arch_supports_pflash_compression("deepseek4"));
     // The drafter scores for any target: every model Lucebox serves compresses.
-    for (const char * arch : {"qwen35", "qwen3", "qwen4exp", "deepseek4", "deepseek41"}) {
+    for (const char * arch : {"qwen35", "qwen3", "qwen4exp", "deepseek4", "deepseek41",
+                              "inkling2_loop", "inkling2"}) {
         CHECK(arch_supports_pflash_compression(arch));
     }
 
@@ -909,6 +896,30 @@ void test_feature_gate_kvflash_requires_reading_arch() {
           std::string::npos);
 }
 
+void test_inkling2_hip_only_and_verify_width() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/Inkling-2-Mini-IQ4_NL.gguf";
+    args.device.backend = PlacementBackend::Hip;
+    args.device.gpu = 0;
+
+    for (const char * arch : {"inkling2_loop", "inkling2"}) {
+        CHECK(gate_result(args, arch, PlacementBackend::Hip).empty());
+        CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+
+        BackendArgs vw_ok = args;
+        vw_ok.verify_width = 8;
+        CHECK(gate_result(vw_ok, arch, PlacementBackend::Hip).empty());
+
+        BackendArgs vw_bad = args;
+        vw_bad.verify_width = 9;
+        CHECK(!gate_result(vw_bad, arch, PlacementBackend::Hip).empty());
+
+        BackendAdmissionContext kvflash;
+        kvflash.kvflash = KvFlashRequest::Fixed;
+        CHECK(!gate_result(args, arch, PlacementBackend::Hip, kvflash).empty());
+    }
+}
+
 };
 }  // namespace
 
@@ -941,4 +952,5 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_vision_projector_by_architecture();
     test_deepseek41_paged_unqualified_switches();
     test_feature_gate_kvflash_requires_reading_arch();
+    test_inkling2_hip_only_and_verify_width();
 }

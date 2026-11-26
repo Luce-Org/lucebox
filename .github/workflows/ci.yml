@@ -22,9 +22,14 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded PR runs (opened/synchronize/reopened, attempt 1) so pushes
+# don't pile up on the same PR, while giving main pushes, merge_group, manual
+# dispatches, and reruns their own workflow group. Sharing one workflow group
+# across main pushes blocked hosted sccache-seeding builds for 8-24h whenever
+# lucebox3 had a queue backlog or went offline.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) && format('pr-latest-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
 jobs:
   plan:
@@ -385,29 +390,29 @@ jobs:
             -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_cuda_copy_batch\.|test_cuda_copy_batch_disabled$'
 
       - name: Run GPU sampler and draft top-K tests
+        # Invoke the CppUnit binary directly so all matching cases share one
+        # CUDA context instead of paying ~0.43s cold init per test case.
+        # CppUnit exits non-zero (77) if 0 cases pass.
         run: |
-          ctest --test-dir server/build --output-on-failure \
-            -R '^test_server_unit\.(GpuSamplerCudaFixture|DraftTopkCudaFixture)\.' --no-tests=error
+          ./server/build/test_server_unit GpuSamplerCudaFixture:: DraftTopkCudaFixture::
 
       - name: Run KVFlash GPU scorer and fused chunk-mass kernel tests
         run: |
-          ctest --test-dir server/build --output-on-failure \
-            -R '^test_server_unit\.(KvflashFusedMassFixture|KvflashGpuMassFixture)\.' --no-tests=error
+          ./server/build/test_server_unit KvflashFusedMassFixture:: KvflashGpuMassFixture::
 
       - name: Run capture-safe copy test
-        run: |
-          ctest --test-dir server/build --output-on-failure \
-            -R '^test_capture_safe_copies\.' --no-tests=error
+        run: ./server/build/test_capture_safe_copies
 
       - name: Run Qwen3.8 split fusion parity test
-        run: |
-          ctest --test-dir server/build --output-on-failure \
-            -R '^test_qn_split_fusions\.' --no-tests=error
+        run: ./server/build/test_qn_split_fusions
 
       - name: Run concurrent-serving kernel tests
         run: |
+          ./server/build/test_kernel_qualification_core
+          # Keep PagedAttention in ctest so DirectPath cases get fresh
+          # processes for their process-cached FORCE_PARTITIONS override.
           ctest --test-dir server/build --output-on-failure \
-            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$)' --no-tests=error
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds luce_server and lazy-loads the
@@ -477,7 +482,12 @@ jobs:
       # itself runs only across both GPUs; serve-smoke-amd below serves it).
       LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.8-27B-UD-IQ4_XS.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
+    # Collapse queued main pushes per arch (at most one active + one pending) so
+    # rapid merges don't pile redundant lucebox3 builds, while keeping each PR
+    # run in its own group so PRs never cancel one another on lucebox3.
+    concurrency:
+      group: ${{ github.event_name == 'push' && format('lucebox3-main-{0}', matrix.arch) || format('lucebox3-run-{0}-{1}', github.run_id, matrix.arch) }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -592,11 +602,14 @@ jobs:
           mem_jobs=$(( avail_gib / 3 ))
           if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
           if (( jobs < 2 )); then jobs=2; fi
-          cmake -S server -B "$RUNNER_TEMP/rocmfp-build" "${gen[@]}" \
+          ld_flags=()
+          command -v ld.lld >/dev/null && ld_flags=(-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld)
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-build" "${gen[@]}" "${ld_flags[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
             -DLUCE_SERVER=OFF \
             -DLUCE_TESTS=ON \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DGGML_HIP_GRAPHS=ON \
             -DGGML_CCACHE=OFF \
             -DFETCHCONTENT_SOURCE_DIR_JSON="$LUCE_CI_DEPS_CACHE/nlohmann-json-3.11.3" \
@@ -627,9 +640,29 @@ jobs:
       - name: Test ROCm formats and inference core
         shell: bash .github/ci/box_step.sh {0}
         run: |
-          ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
-            --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_fused_ops_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|KvflashFusedMassFixture|KvflashGpuMassFixture|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_vdot2_route$|test_cuda_copy_batch\.|test_cuda_copy_batch_disabled$|test_ds41_mmid_width_invariance$|test_qwen4exp_qsa_ids$|test_qwen4exp_indexer_score$|test_rope_tail\.|test_mmb_cublas_diff$|test_convert_vec$|test_getrows_scalar$|test_rms_norm_scale$|test_mul_mat_host_input$|test_mmid_regression$|test_qn_split_fusions\.'
+          # Run CppUnit suites directly so cases in each binary share one HIP
+          # context instead of spawning ~130 separate processes. CppUnit exits
+          # non-zero (77) if 0 cases pass.
+          b="$RUNNER_TEMP/rocmfp-build"
+          "$b/test_server_unit" \
+            ChainRollbackPolicyFixture:: KvflashFusedMassFixture:: \
+            KvflashGpuMassFixture:: MmqTileSelection:: \
+            MixedMmqPolicy:: MoeHybridStorageFixture::
+          "$b/test_qn_split_fusions"
+          "$b/test_recurrent_snapshot"
+          "$b/test_kernel_qualification_core"
+          "$b/test_rocmfp3_mix_registry"
+          "$b/test_rocmfp_mix_slice_matvec"
+          "$b/test_rocmfp_mix_gateup_glu"
+          "$b/test_ds4_mix_registry_teardown"
+          "$b/test_ggml_cluster_allreduce"
+          "$b/test_cuda_copy_batch"
+          "$b/test_rope_tail"
+          # Keep PagedAttention in ctest so DirectPath cases get fresh
+          # processes for their process-cached FORCE_PARTITIONS override.
+          ctest --test-dir "$b" \
+            --output-on-failure --no-tests=error \
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_fused_ops_cuda|ds4_maskless_prefill|test_model_smoke\.PagedAttention\.|batched_gdn$|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_vdot2_route$|test_cuda_copy_batch_disabled$|test_ds41_mmid_width_invariance$|test_qwen4exp_qsa_ids$|test_qwen4exp_indexer_score$|test_mmb_cublas_diff$|test_convert_vec$|test_getrows_scalar$|test_rms_norm_scale$|test_mul_mat_host_input$|test_mmid_regression$'
 
       - name: Run GPU draft top-K tests
         shell: bash .github/ci/box_step.sh {0}
@@ -640,8 +673,7 @@ jobs:
       - name: Run capture-safe copy test
         shell: bash .github/ci/box_step.sh {0}
         run: |
-          ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
-            -R '^test_capture_safe_copies\.' --no-tests=error
+          "$RUNNER_TEMP/rocmfp-build/test_capture_safe_copies"
 
       - name: Model files are on the box
         # A model-backed test skips, and the step passes, when its file is missing:
@@ -681,11 +713,14 @@ jobs:
           mem_jobs=$(( avail_gib / 3 ))
           if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
           if (( jobs < 2 )); then jobs=2; fi
-          cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" "${gen[@]}" \
+          ld_flags=()
+          command -v ld.lld >/dev/null && ld_flags=(-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld)
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" "${gen[@]}" "${ld_flags[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
             -DLUCE_SERVER=OFF \
             -DLUCE_TESTS=ON \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DLUCE_ROCMFP2_AFFINE=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DGGML_CCACHE=OFF \
@@ -739,7 +774,8 @@ jobs:
       LUCE_TEST_MODEL_QWEN38_DRAFT: /opt/models/Qwen3.8-27B-DFlash2-Q8_0.gguf
       LUCE_TEST_MODEL_DEEPSEEK41: /opt/models/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf
       LUCE_TEST_MODEL_DEEPSEEK41_DRAFT: /opt/models/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf
-    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs.
+    # No job concurrency group, as in gpu-tests: lucebox3's one runner queues its jobs
+    # (and gpu-tests-amd above already collapses queued main pushes).
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -792,8 +828,12 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build luce_server for the R9700 and the Strix Halo
-        # The build server/docs/DS41.md gives for this recipe.
+        # The build server/docs/DS41.md gives for this recipe. PRs compile with
+        # FA_ALL_QUANTS=OFF for speed; main/merge_group/dispatch keep the default
+        # ON so full mixed-quant HIP FlashAttention retains CI compile coverage.
         shell: bash .github/ci/box_step.sh {0}
+        env:
+          FA_ALL_QUANTS: ${{ github.event_name == 'pull_request' && 'OFF' || 'ON' }}
         run: |
           gen=()
           command -v ninja >/dev/null && gen=(-G Ninja)
@@ -802,10 +842,13 @@ jobs:
           mem_jobs=$(( avail_gib / 3 ))
           if (( mem_jobs < jobs )); then jobs=$mem_jobs; fi
           if (( jobs < 2 )); then jobs=2; fi
-          cmake -S server -B "$RUNNER_TEMP/serve-build" "${gen[@]}" \
+          ld_flags=()
+          command -v ld.lld >/dev/null && ld_flags=(-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld)
+          cmake -S server -B "$RUNNER_TEMP/serve-build" "${gen[@]}" "${ld_flags[@]}" \
             -DLUCE_GPU_BACKEND=hip \
             -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
             -DCMAKE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+            -DLUCE_FA_ALL_QUANTS="$FA_ALL_QUANTS" \
             -DGGML_CCACHE=OFF \
             -DFETCHCONTENT_SOURCE_DIR_JSON="$LUCE_CI_DEPS_CACHE/nlohmann-json-3.11.3" \
             -DLUCE_IMAGE_CODECS_CACHE_DIR="$LUCE_CI_DEPS_CACHE" \

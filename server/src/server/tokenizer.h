@@ -78,6 +78,10 @@ private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
     std::vector<std::string> pre_tokenize(const std::string & text) const;
 
+    // The full pre-tokenizer: the isolating splits of the GGUF's pre type, if
+    // it has any, then pre_tokenize() on each piece they leave.
+    std::vector<std::string> pre_split(const std::string & text) const;
+
     // Apply BPE merges to a single pre-tokenized piece.
     std::vector<int32_t> bpe_encode_piece(const std::string & piece) const;
 
@@ -108,7 +112,9 @@ private:
     int32_t eos_chat_id_ = -1;  // <|im_end|> for Qwen3
 
     // Pre-tokenizer type
-    enum class PreTokenizer { QWEN2, QWEN35 };
+    // DEEPSEEK3 (`deepseek-v3`/`joyai-llm` pre): \p{N}{1,3} and
+    // [一-龥぀-ゟ゠-ヿ]+ are split off before the main pattern.
+    enum class PreTokenizer { QWEN2, QWEN35, DEEPSEEK3 };
     PreTokenizer pre_type_ = PreTokenizer::QWEN35;
 
     // Decode mode: SentencePiece tokens use UTF-8 with ▁ for space;

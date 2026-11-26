@@ -10,8 +10,8 @@
 #include "pflash_drafter.h"
 #include "pflash_selection.h"
 #include "pflash_request_probe.h"
-#include "pflash_request_stage2.h"
 #include "pflash_scoring_resume.h"
+#include "pflash_seg_reranker.h"
 #include "pflash_session_offload.h"
 #include "common/pflash_types.h"
 #include "internal.h"
@@ -51,21 +51,19 @@ struct Qwen35ScoringSession {
     bool                  keys_trained = false;
     std::vector<float>    probe_raw;        // per token, unit logit
     std::vector<float>    subunit_raw;      // per token, when the probe has one
-    // PFLASH_SELECT_QUERY_PROBE=1: the request row's raw logit per token,
-    // and block-14 rows of the human messages' request runs (BF16, keyed by
-    // token position) for later turns, whose activations are gone.
+    std::vector<float>    container_raw;    // per token, when the probe has a container head
+    // Request probe: the request row's raw logit per token, and block-14 rows
+    // of the human messages' request runs (BF16, keyed by token position) for
+    // later turns, whose activations are gone.
     std::vector<float>    request_raw;
     luce::pflash::PFlashRequestRowStore request_rows;
-    // Stage 2 (PFLASH_REQUEST_STAGE2_GGUF): c(t) of every token ([32] F32 each, from the key graph). Stage 2 forces
-    // fresh scoring (no session resume), so this covers the whole prompt of the current call.
-    std::vector<float>    stage2_cand;
     // Block-14 output of recent query windows (the query and earlier
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
     // queries are earlier turns' queries. Most recent last, at most 8.
     // Keyed by the window's token positions.
     luce::pflash::PFlashExactRowSets query_windows;
-    // The query step's (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN) query token sets, F32 rows exact for later
+    // The query step's candidate/pin query token sets, F32 rows exact for later
     // prompts that share them (never the BF16 request_rows).
     luce::pflash::PFlashExactRowSets query_sets;
     uint64_t              last_used = 0;
@@ -103,6 +101,13 @@ struct Qwen35DrafterState {
     TargetWeights weights;
     std::string gguf_path;
     std::string gguf_sha256;
+    std::string drafter_file_id;
+    std::string head_file_id;
+    std::string head_sha256;
+    std::string probe_file_id;
+    std::string request_probe_file_id;
+    std::string reranker_file_id;
+    std::string loaded_assets_identity;
     int ctx_train = 0;           // the drafter GGUF's <arch>.context_length (0: absent)
     // Longest prompt a scoring session is sized for (pflash_session_ctx_limit of ctx_train and the engine's max
     // context, DrafterContext::engine_max_ctx); set at every scoring call. 0 = no limit.
@@ -123,10 +128,14 @@ struct Qwen35DrafterState {
     ggml_tensor *         probe_fc2_b  = nullptr;  // [1]
     ggml_tensor *         probe_sub_fc2_w = nullptr; // optional sub-unit head (oversize split only)
     ggml_tensor *         probe_sub_fc2_b = nullptr;
+    ggml_tensor *         probe_cont_fc2_w = nullptr; // optional container head (context-propagation gate)
+    ggml_tensor *         probe_cont_fc2_b = nullptr;
     std::vector<float>    probe_conv_w;            // taps from the GGUF tensor, applied on the CPU
     float                 probe_conv_b = 0.0f;
     std::vector<float>    probe_sub_conv_w;
     float                 probe_sub_conv_b = 0.0f;
+    std::vector<float>    probe_cont_conv_w;
+    float                 probe_cont_conv_b = 0.0f;
     float                 probe_norm_eps = 1e-5f;
     float                 probe_threshold = 0.9f;
     int                   probe_min_segment = 1;
@@ -136,14 +145,11 @@ struct Qwen35DrafterState {
     // today's split. ``probe_vocab`` (the drafter's own vocabulary) gives the
     // per-token texts the line flags are read from.
     bool                  probe_line_aligned = false;
-    std::unique_ptr<Tokenizer> probe_vocab;
+    std::shared_ptr<const Tokenizer> probe_vocab;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
-    // Request probe (PFLASH_SELECT_QUERY_PROBE=1 only): its own small
-    // trunk on the same block-14 tap, LayerNorm -> fc1 -> GELU(erf) -> fc2,
-    // from PFLASH_REQUEST_PROBE_GGUF (pflash_request_probe.h); the raw
-    // logit is compared with ``request_tau``. Stub
-    // (PFLASH_SELECT_QUERY_PROBE_STUB=1): all zeros and tau = +inf.
+    // Request probe: LayerNorm -> fc1 -> GELU(erf) -> fc2 trunk on the same
+    // block-14 tap, from PFLASH_REQUEST_PROBE_GGUF (pflash_request_probe.h).
     ggml_context *        request_ctx = nullptr;
     ggml_backend_buffer_t request_buf = nullptr;
     ggml_tensor *         request_norm_w = nullptr;  // [hidden]
@@ -157,27 +163,17 @@ struct Qwen35DrafterState {
     // Candidate rule of the loaded GGUF: false = human messages only, true =
     // the V2-A3 rule (requestprobe.candidate_rule == kRequestCandidateRule).
     bool                  request_turns = false;
-    // cand_v5 (requestprobe.candidate_rule == kRequestCandidateRuleV5): seed + score fill; the only rule a
-    // stage-2 GGUF pairs with. ``request_checkpoint_sha256`` = requestprobe.checkpoint_sha256 ("" when absent).
+    // cand_v5 (requestprobe.candidate_rule == kRequestCandidateRuleV5): seed + score fill.
     bool                  request_v5 = false;
     std::string           request_checkpoint_sha256;
     int                   request_width = 0;
     bool                  request_loaded = false;
-    bool                  request_stub = false;
-    // v2 policy (abstention, recency pin): GGUF requestprobe.policy.*, then the PFLASH_REQUEST_PROBE_POLICY JSON
-    // file, then PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN. Defaults never abstain and pin nothing.
+    // v2 policy (abstention, recency pin) from GGUF requestprobe.policy.*.
     luce::pflash::PFlashRequestPolicy request_policy;
-    // Stage 2 (PFLASH_REQUEST_STAGE2_GGUF, with a cand_v5 request probe and the scoring head): host weights,
-    // the device copies the graphs read, and a host copy of blk.15.attn_norm (x̂ of the seed rows on the CPU).
-    bool                  stage2_loaded = false;
-    luce::pflash::PFlashStage2Weights stage2;
-    luce::pflash::PFlashStage2Device  stage2_dev;
-    std::vector<float>    stage2_w_in;
+    // The segment reranker (PFLASH_SEG_RERANKER_GGUF).
+    PFlashSegRerankerState seg_reranker;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
-    // PFLASH_SELECT_STRATEGY=fold: the drafter's own vocabulary, to read
-    // the prompt's structure from its token ids.
-    std::unique_ptr<Tokenizer> fold_vocab;
     std::vector<std::unique_ptr<Qwen35ScoringSession>> sessions;
     uint64_t              session_clock = 0;
 };
@@ -218,10 +214,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     int n_lookahead,
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    std::vector<float> * token_mass_out = nullptr,
-    std::vector<PFlashTokenSpan> * segments_out = nullptr,
-    bool * density_out = nullptr);
+    const std::vector<PFlashTokenSpan> & required_instruction_spans);
 
 // Session offload (DrafterContext::host_sessions). The identity names the
 // drafter file, this build, the loaded head / probes and the session

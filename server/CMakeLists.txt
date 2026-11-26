@@ -573,6 +573,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -590,20 +591,23 @@ add_library(luce_common STATIC
     src/qwen4exp/qwen4exp_seq_engine.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/qwen4exp/qwen4exp_hot.cpp
+    src/inkling2/inkling2_loader.cpp
+    src/inkling2/inkling2_cache.cpp
+    src/inkling2/inkling2_graph.cpp
+    src/inkling2/inkling2_backend.cpp
     src/common/parallel_upload.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
     src/pflash/pflash_selection.cpp
-    src/pflash/pflash_fold.cpp
     src/pflash/pflash_request_probe.cpp
-    src/pflash/pflash_request_stage2.cpp
     src/pflash/pflash_query_candidates.cpp
     src/pflash/pflash_scoring_resume.cpp
     src/pflash/pflash_session_offload.cpp
-    src/pflash/pflash_ident_query.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
+    src/pflash/pflash_seg_kcos.cpp
+    src/pflash/pflash_seg_reranker.cpp
     src/pflash/pflash_window.cpp
     src/pflash/qwen35_drafter.cpp
     src/pflash/qwen35_loader.cpp
@@ -876,10 +880,14 @@ if(LUCE_GPU_BACKEND STREQUAL "hip")
     # Fused exact chunk-mass kernel for the KVFlash GPU scorer (Amendment 10); same shared-.cu pattern.
     target_sources(luce_common PRIVATE src/common/kvflash_fused_mass_cuda.cu)
     set_source_files_properties(src/common/kvflash_fused_mass_cuda.cu PROPERTIES LANGUAGE HIP)
+    # Segment mean-key and adjacent-cosine kernel for the PFlash segment reranker.
+    target_sources(luce_common PRIVATE src/pflash/pflash_seg_kcos_cuda.cu)
+    set_source_files_properties(src/pflash/pflash_seg_kcos_cuda.cu PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_PFLASH_SEG_KCOS=1)
     if(LUCE_HIP_SM80_EQUIV)
         find_path(LUCE_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_luce_rocm_root}/include" /opt/rocm/include
@@ -913,12 +921,14 @@ elseif(LUCE_GPU_BACKEND STREQUAL "cuda")
         src/flashprefill.cpp
         src/common/geometric_draft_topk_cuda.cu
         src/common/specla_commit_cuda.cu
-        src/common/kvflash_fused_mass_cuda.cu)
+        src/common/kvflash_fused_mass_cuda.cu
+        src/pflash/pflash_seg_kcos_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_DRAFT_TOPK=1)
     target_compile_definitions(luce_common PUBLIC LUCE_HAVE_KVFLASH_FUSED_MASS=1)
+    target_compile_definitions(luce_common PUBLIC LUCE_HAVE_PFLASH_SEG_KCOS=1)
     # GPU port of the sample_logits chain. Compiled in by default; the path is
     # then opted into at runtime via the LUCE_GPU_SAMPLE env var. Turn the
     # whole thing off at configure time with -DLUCE_GPU_SAMPLER=OFF.
@@ -2329,6 +2339,18 @@ if(LUCE_TESTS)
         target_include_directories(smoke_qwen4exp_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen4exp_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_inkling2_ops.cpp")
+        add_executable(test_inkling2_ops test/unit/test_inkling2_ops.cpp)
+        target_include_directories(test_inkling2_ops PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_inkling2_ops PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET})
+        add_test(NAME inkling2_ops COMMAND test_inkling2_ops)
+        set_tests_properties(inkling2_ops PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_inkling2_forward.cpp")
+        add_executable(smoke_inkling2_forward test/smoke/smoke_inkling2_forward.cpp)
+        target_include_directories(smoke_inkling2_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_inkling2_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/smoke_qwen4exp_batched.cpp")
         add_executable(smoke_qwen4exp_batched test/smoke/smoke_qwen4exp_batched.cpp)
         target_include_directories(smoke_qwen4exp_batched PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -2564,25 +2586,6 @@ if(LUCE_TESTS)
         else()
             target_link_libraries(test_tokenizer_harness PRIVATE hip::host)
         endif()
-    endif()
-
-    # PFlash fold replay: the runtime's fold selection over recorded traces
-    # (CPU only; the drafter GGUF supplies the vocabulary).
-    add_executable(pflash_fold_replay test/pflash/pflash_fold_replay.cpp)
-    target_include_directories(pflash_fold_replay PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
-    if(LUCE_GPU_BACKEND STREQUAL "hip")
-        target_compile_definitions(pflash_fold_replay PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
-    else()
-        target_compile_definitions(pflash_fold_replay PRIVATE
-            LUCE_BACKEND_CUDA=1
-            LUCE_CUDA_MIN_SM=${_luce_cuda_min_sm})
-    endif()
-    target_link_libraries(pflash_fold_replay PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
-    if(LUCE_GPU_BACKEND STREQUAL "cuda")
-        find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(pflash_fold_replay PRIVATE CUDA::cudart)
-    else()
-        target_link_libraries(pflash_fold_replay PRIVATE hip::host)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
@@ -2828,14 +2831,11 @@ if(LUCE_TESTS)
             test/unit/test_ddtree_tau.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp
-            test/pflash/test_pflash_fold.cpp
             test/pflash/test_pflash_unified.cpp
             test/pflash/test_pflash_request_probe.cpp
-            test/pflash/test_pflash_request_stage2.cpp
             test/pflash/test_pflash_query_candidates.cpp
             test/pflash/test_pflash_scoring_resume.cpp
             test/pflash/test_pflash_session_offload.cpp
-            test/pflash/test_pflash_ident_query.cpp
             test/unit/test_qwen35_causal_mask.cpp
             test/unit/test_gguf_mmap.cpp
             test/unit/test_kv_quant.cpp

@@ -159,5 +159,71 @@ class CompareReportTests(unittest.TestCase):
         self.assertEqual(report["summary"]["candidate_expected_pass"], 0)
 
 
+class GsmFloatPrecisionTests(unittest.TestCase):
+    @staticmethod
+    def _score(gold: Any, text: str) -> bool | None:
+        correct, _ = generation_benchmark.score_gold_answer(
+            {"suite": "gsm", "gold_answer": gold}, text
+        )
+        return correct
+
+    def test_unequal_large_integers_above_2pow53_do_not_pass(self) -> None:
+        self.assertFalse(self._score("9007199254740993", "answer is 9007199254740992"))
+
+    def test_equal_large_integers_pass(self) -> None:
+        for gold in ("9007199254740993", "9007199254740992", "12345678901234567890"):
+            with self.subTest(gold=gold):
+                self.assertTrue(self._score(gold, f"answer is {gold}"))
+
+    def test_off_by_one_in_both_directions(self) -> None:
+        self.assertFalse(self._score("9007199254740992", "answer is 9007199254740993"))
+        self.assertFalse(self._score("42", "answer is 41"))
+        self.assertFalse(self._score("42", "answer is 43"))
+
+    def test_ordinary_integers(self) -> None:
+        self.assertTrue(self._score("42", "answer is 42"))
+        self.assertTrue(self._score("-7", "answer is -7"))
+
+    def test_equivalent_decimals(self) -> None:
+        self.assertTrue(self._score("1.5", "answer is 1.50"))
+        self.assertTrue(self._score("2.50", "answer is 2.5"))
+        self.assertTrue(self._score("42", "answer is 42.0"))
+
+    def test_exponent_forms(self) -> None:
+        self.assertTrue(self._score("1e3", "answer is 1000"))
+        self.assertTrue(self._score("1.5e1", "answer is 15"))
+        self.assertTrue(self._score("1e-3", "answer is 0.001"))
+
+    def test_tolerance_inside_and_outside(self) -> None:
+        self.assertTrue(self._score("1.0", "answer is 1.0000005"))
+        self.assertFalse(self._score("1.0", "answer is 1.000002"))
+
+    def test_numeric_gold(self) -> None:
+        self.assertTrue(self._score(42, "answer is 42"))
+        self.assertTrue(self._score(1.5, "answer is 1.5"))
+        self.assertFalse(self._score(9007199254740993, "answer is 9007199254740992"))
+        self.assertTrue(self._score(9007199254740993, "answer is 9007199254740993"))
+
+    def test_comma_gold_fallback_and_pred_commas(self) -> None:
+        # Gold with commas is not parseable as a number, so the string
+        # fallback applies: pred has its commas stripped, so it never
+        # equals the raw comma gold.
+        self.assertFalse(self._score("1,000", "answer is 1,000"))
+        self.assertFalse(self._score("1,000", "answer is 1000"))
+        # Pred commas are stripped before scoring.
+        self.assertTrue(self._score("1000", "answer is 1,000"))
+
+    def test_invalid_and_nonfinite_golds_return_false(self) -> None:
+        for gold, text in (
+            ("1/0", "answer is 0"),
+            ("1/2", "answer is 0.5"),
+            ("abc", "answer is 42"),
+            (float("inf"), "answer is 42"),
+            (float("nan"), "answer is 42"),
+        ):
+            with self.subTest(gold=gold):
+                self.assertFalse(self._score(gold, text))
+
+
 if __name__ == "__main__":
     unittest.main()

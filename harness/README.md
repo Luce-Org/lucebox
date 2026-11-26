@@ -26,7 +26,7 @@ Each script starts Lucebox, runs one real client, saves logs, then stops the
 server.
 
 ```bash
-cd lucebox-hub
+cd lucebox
 
 harness/clients/run_codex.sh
 harness/clients/run_claude_code.sh

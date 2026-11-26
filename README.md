@@ -17,7 +17,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-e8e8ed?style=for-the-badge&labelColor=090909" alt="Apache 2.0"></a>
 </p>
 
-Lucebox is an open-source inference engine for AMD's R9700 and Ryzen AI MAX+, on their own or together in one machine. It runs Qwen 3.8, DeepSeek V4 and V4.1, and MOSS-Image, and it generates faster than llama.cpp, Strata and DwarfStar on the same hardware. It's the engine inside every [Lucebox](https://www.lucebox.com/).
+Lucebox is an open-source inference engine for AMD's R9700 and Ryzen AI MAX+, on their own or together in one machine. It runs Qwen 3.8, DeepSeek V4 and V4.1, Inkling 2 Mini, and MOSS-Image, and it generates faster than llama.cpp, Strata and DwarfStar on the same hardware. It's the engine inside every [Lucebox](https://www.lucebox.com/).
 
 <p align="center">
   <a href="https://www.lucebox.com/engine"><img src="assets/engine-head-to-head.png" alt="Lucebox against llama.cpp, Strata and DwarfStar: decode, prefill and image generation" width="100%" /></a>
@@ -28,7 +28,7 @@ Lucebox is an open-source inference engine for AMD's R9700 and Ryzen AI MAX+, on
 
 Lucebox is fast with:
 
-- Speculative decoding on every model: DFlash2 for Qwen 3.8 27B, MTP for Flash-Next, DSpark for DeepSeek
+- Speculative decoding on every model: DFlash2 for Qwen 3.8 27B, MTP for Flash-Next, DSpark for DeepSeek and Inkling 2 Mini
 - Two chips as one machine: attention, KV cache and the busiest experts on the R9700, the other experts on the Ryzen AI MAX+
 - Paged attention and continuous batching for several users
 - A prefix cache built for agents, up to 92.2% hit rate on [AgentX](https://github.com/Luce-Org/lucebox/pull/989)
@@ -52,9 +52,10 @@ and easy to use with:
 | [Qwen 3.8 Flash-Next](server/docs/QWEN4EXP.md) | R9700 + Ryzen AI MAX+, or the Ryzen AI MAX+ alone, up to 4 users | 84.8 tok/s | [target](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf), [MTP](https://huggingface.co/Lucebox/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) |
 | [DeepSeek V4.1 Flash](server/docs/DS41.md) | R9700 + Ryzen AI MAX+ | 25.4 tok/s on 128 GB, 54.0 on 192 GB | [target](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-ROCMFP2S-IM1017.gguf), drafter for [128 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-MXFP4-Q8.gguf) or [192 GB](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF/blob/main/DeepSeek-V4.1-Flash-1017-DSpark-draft-Q2K-Q4K.gguf) |
 | [DeepSeek V4 Flash](server/docs/DS4.md) | Ryzen AI MAX+ | 27.9 tok/s | [target](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf), [drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) |
+| [Inkling 2 Mini](share/model_cards/inkling-2-mini.json) | R9700 + Ryzen AI MAX+, R9700, or Ryzen AI MAX+ alone | 136.5 tok/s HTTP (up to 155.4), 3,628 tok/s prefill, 2x faster answers with Fast GGUF | [Fast target](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/Inkling-2-Mini-Fast-IQ4_NL.gguf), [16 GB](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/Inkling-2-Mini-Fast-IQ4_NL-16GB.gguf), [DSpark](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF/blob/main/mtp.safetensors) |
 | [MOSS-Image 5B](optimizations/image_gen/README.md) | R9700 | 2.74 s per 1024x1024 image | [model](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/diffusion_models/moss_image_sft_bf16.safetensors) |
 
-Every model runs on both the 128 GB and the 192 GB Ryzen AI MAX+. All the language models take PFlash, and the Qwen models KVFlash.
+Every model runs on both the 128 GB and the 192 GB Ryzen AI MAX+. The Qwen and DeepSeek models take PFlash, and the Qwen models KVFlash.
 
 ## Hardware
 
@@ -70,6 +71,7 @@ Together, the R9700 runs what every token touches and the iGPU holds what doesn'
 | Qwen 3.8 Flash-Next | attention, KV cache, dense layers, MTP drafter | the routed experts, 72 GiB |
 | DeepSeek V4.1 Flash, 128 GB | dense layers, drafter, about 10 GiB of the busiest experts | the next busiest experts; the rest stream from the SSD |
 | DeepSeek V4.1 Flash, 192 GB | dense layers, drafter, about 12 GiB of the busiest experts | every other expert, about 150 GiB |
+| Inkling 2 Mini | dense layers, KV cache, DSpark drafter, 74% of MoE experts, 79% of output head | 26% of MoE experts and 21% of output head in parallel (or full model alone via `--profile inkling2-halo`) |
 | Qwen 3.8 27B | the whole model and its drafter | free for a second model |
 
 The R9700 can sit in a PCIe slot or an OCuLink dock; a x4 link is enough.
@@ -163,6 +165,13 @@ hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
   --target-device auto --profile ds4-strix
 ```
 
+```bash
+# Inkling 2 Mini Fast: auto-picks R9700 + iGPU, R9700 alone, or iGPU alone; auto-discovers mtp.safetensors beside the GGUF
+hf download Lucebox/Inkling-2-Mini-Fast-GGUF \
+  Inkling-2-Mini-Fast-IQ4_NL.gguf mtp.safetensors --local-dir models/inkling2
+./server/build-hip/luce_server models/inkling2/Inkling-2-Mini-Fast-IQ4_NL.gguf
+```
+
 Try it:
 
 ```bash
@@ -208,14 +217,11 @@ PFlash reads a long prompt with a small model first and gives the main model onl
 
 ```bash
 hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-BF16.gguf --local-dir models/pflash
-hf download Lucebox/pflash-scorer-head seg-scoring-head.gguf --local-dir models/pflash
-hf download Lucebox/pflash-segment-probe segment-probe.gguf --local-dir models/pflash
-hf download Lucebox/pflash-request-probe request-probe.gguf --local-dir models/pflash
+hf download Lucebox/pflash seg-scoring-head.gguf segment-probe.gguf request-probe.gguf seg-reranker.gguf \
+  --local-dir models/pflash
 
-# PFlash: add to any launch above
+# PFlash: add to any launch above (segment-probe, request-probe, seg-reranker auto-discover beside head)
 PFLASH_SCORING_HEAD_GGUF=models/pflash/seg-scoring-head.gguf \
-PFLASH_SEGMENT_PROBE_GGUF=models/pflash/segment-probe.gguf \
-PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
 ./server/build-hip/luce_server <model and flags as above> \
   --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf
 
@@ -224,7 +230,7 @@ PFLASH_REQUEST_PROBE_GGUF=models/pflash/request-probe.gguf \
   --prefill-drafter models/pflash/Qwen3.5-0.8B-BF16.gguf --kvflash auto
 ```
 
-With both chips, `--prefill-drafter-device hip:1` runs the small model on the iGPU. PFlash starts at 16K tokens and `--pflash off` turns it off. Every setting is in the [PFlash reference](server/docs/PFLASH_CONFIGURATION.md).
+With both chips, `--prefill-drafter-device hip:1` runs the small model on the iGPU. PFlash needs all four files; it starts at 8K tokens and `--pflash off` turns it off. Every setting is in the [PFlash reference](server/docs/PFLASH_CONFIGURATION.md).
 
 ## Coding agents
 

@@ -1,5 +1,5 @@
-// Query step 1 (pflash_query_candidates.h): relative candidate ranking, NULL, extents, aggregation, the verbatim
-// pin, the flags (fail closed), the dev-only grid / oracle parsers and the fingerprint. Model-free.
+// Relative query candidates and the verbatim pin (pflash_query_candidates.h): baked-in defaults,
+// relative candidate ranking, NULL, extents, aggregation, the verbatim pin, gap rule, and blend. Model-free.
 
 #include "CppUnitTestFramework.hpp"
 
@@ -11,6 +11,8 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -57,31 +59,12 @@ std::vector<int> range(int b, int e) {
 
 const float kInf = std::numeric_limits<float>::infinity();
 
-const char * kQueryEnvs[] = {"PFLASH_QUERY_CANDIDATES", "PFLASH_QUERY_PIN", "PFLASH_QUERY_UNIT_SCORE",
-                             "PFLASH_QUERY_AGG", "PFLASH_QUERY_TEMP", "PFLASH_QUERY_NULL_MARGIN",
-                             "PFLASH_QUERY_EXTENT", "PFLASH_QUERY_PIN_MARGIN", "PFLASH_QUERY_TW",
-                             "PFLASH_QUERY_END"};
-
 std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> clean_startup_env() {
     std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> vars;
-    for (const char * name : kQueryEnvs) {
-        vars.push_back(std::make_unique<luce_test::ScopedEnvVar>(name, nullptr));
-    }
     for (const char * name : {
-            "PFLASH_SELECT_MODE", "PFLASH_SELECT_CHUNK_SIZE", "PFLASH_SELECT_QUERY_TOKENS",
-            "PFLASH_SELECT_QUERY_PARSER", "PFLASH_SELECT_TOP_P", "PFLASH_SELECT_TOPK",
-            "PFLASH_SELECT_SEGMENTS", "PFLASH_SELECT_SCORE", "PFLASH_SELECT_SCORER",
-            "PFLASH_SELECT_SPLIT", "PFLASH_SELECT_STRATEGY", "PFLASH_SELECT_QUERY_HEAD",
-            "PFLASH_SELECT_QUERY_PROBE", "PFLASH_EVAL_REF_IDENT_QUERY", "PFLASH_FALLBACK_SPREAD",
-            "PFLASH_CHAT_VIEW", "PFLASH_CHAT_RECALL", "PFLASH_SELECT_PARAGRAPH_JOIN",
-            "PFLASH_AGENT_PASTE", "PFLASH_ARRIVE", "PFLASH_FAIL_CLOSED", "PFLASH_ADMISSION",
-            "PFLASH_CHAT_SKELETON_TOKENS", "PFLASH_CHAT_COMPRESS_NEW_TOKENS",
-            "PFLASH_CHAT_HISTORY_QUERIES", "PFLASH_CHAT_REBUILD_MIN_TOKENS",
-            "PFLASH_CHAT_REBUILD_RATIO", "PFLASH_DRAFTER_SESSIONS", "PFLASH_DRAFTER_TRIM_POOL",
-            "PFLASH_SESSION_OFFLOAD_PINNED", "PFLASH_QWEN35_LEGACY_SCORER",
-            "PFLASH_SELECT_QUERY_PROBE_STUB", "PFLASH_QUERY_GRID", "PFLASH_QUERY_GRID_OUT",
-            "PFLASH_REQUEST_STAGE2_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_SCORING_HEAD_GGUF",
-            "PFLASH_REQUEST_PROBE_GGUF"}) {
+            "PFLASH_FAIL_CLOSED", "PFLASH_DRAFTER_SESSIONS",
+            "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF",
+            "PFLASH_REQUEST_PROBE_GGUF", "PFLASH_SEG_RERANKER_GGUF"}) {
         vars.push_back(std::make_unique<luce_test::ScopedEnvVar>(name, nullptr));
     }
     return vars;
@@ -89,261 +72,72 @@ std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> clean_startup_env() {
 
 } // namespace
 
-// ---------------------------------------------------------------- flags
+// ---------------------------------------------------------------- baked-in defaults & startup validation
 
-TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_preserves_defaults_and_measured_profile) {
+TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_and_baked_in_november_defaults) {
     const auto clean = clean_startup_env();
     using namespace luce::common::http_detail;
     std::string error;
     REQUIRE(validate_pflash_environment(error));
-    REQUIRE(pflash_chat_skeleton_tokens() == 256 && pflash_chat_history_queries() == 3);
     REQUIRE(!pflash_fail_closed_from_env());
+
     PFlashSelectionConfig selection;
     REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
-    REQUIRE(selection.mode == PFlashSelectionMode::Legacy && selection.query_tokens == 8);
-    REQUIRE(selection.fallback_spread == 0.0 && !selection.query.any());
-
-    // Release overrides from the measured PFlash configuration remain valid.
-    std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> release;
-    for (const auto & flag : std::vector<std::pair<const char *, const char *>>{
-            {"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
-            {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_QUERY_TOKENS", "128"},
-            {"PFLASH_SELECT_CHUNK_SIZE", "256"}, {"PFLASH_SELECT_QUERY_HEAD", "1"},
-            {"PFLASH_SELECT_QUERY_PROBE", "1"},
-            {"PFLASH_SEGMENT_PROBE_GGUF", "segment.gguf"}, {"PFLASH_QUERY_CANDIDATES", "1"},
-            {"PFLASH_QUERY_PIN", "512"}, {"PFLASH_FALLBACK_SPREAD", "0.11"}}) {
-        release.push_back(std::make_unique<luce_test::ScopedEnvVar>(flag.first, flag.second));
-    }
-    REQUIRE(validate_pflash_environment(error));
-    REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
-    REQUIRE(selection.query_tokens == 128 && selection.chunk_size == 256);
+    REQUIRE(selection.configured && selection.selection_active);
+    REQUIRE(selection.mode == PFlashSelectionMode::BudgetOnly);
+    REQUIRE(selection.query_parser == PFlashQueryParser::ArbitraryTail);
+    REQUIRE(selection.segmentation == PFlashSegmentation::Probe);
+    REQUIRE(selection.candidate_score == PFlashCandidateScore::Density);
+    REQUIRE(selection.chunk_size == 256 && selection.query_tokens == 128);
+    REQUIRE(selection.query_probe);
     REQUIRE(selection.query.candidates == 1 && selection.query.pin_tokens == 512);
-    REQUIRE(selection.query.tw_share == 0.5f && selection.query.end_share == 0.25f);
-    REQUIRE(selection.query.extent_gap && selection.query.pin_gap && selection.fallback_spread == 0.11);
-    // Valid large overrides retain the existing caps.
-    luce_test::ScopedEnvVar history{"PFLASH_CHAT_HISTORY_QUERIES", "32"};
-    REQUIRE(validate_pflash_environment(error));
-    REQUIRE(pflash_chat_history_queries() == 8);
-    // Fold and replay / oracle tooling are still accepted.
-    luce_test::ScopedEnvVar fold{"PFLASH_SELECT_STRATEGY", "fold"};
-    luce_test::ScopedEnvVar grid{"PFLASH_QUERY_GRID", "grid.json"};
-    luce_test::ScopedEnvVar output{"PFLASH_QUERY_GRID_OUT", "grid.jsonl"};
-    luce_test::ScopedEnvVar oracle{"PFLASH_QUERY_ORACLE_DIR", "oracle"};
-    REQUIRE(validate_pflash_environment(error));
+    REQUIRE(selection.query.extent_gap && selection.query.pin_gap);
+    REQUIRE(selection.query.tw_score && selection.query.end_share == 0.25f);
+    REQUIRE(selection.query.unit_score == PFlashUnitScore::Max);
+    REQUIRE(selection.query.aggregate == PFlashQueryAggregate::Softmax);
+    REQUIRE(selection.query.temperature == 1.0f && selection.query.null_margin == 0.0f);
 }
 
-TEST_CASE(PFlashQueryCandidatesFixture, release_profile_is_the_default_with_a_trained_head) {
+TEST_CASE(PFlashQueryCandidatesFixture, release_env_populates_only_sibling_component_paths) {
     const auto clean = clean_startup_env();
-    using namespace luce::common::http_detail;
     using luce::server::pflash_release_env;
-    using Vars = std::vector<std::unique_ptr<luce_test::ScopedEnvVar>>;
-    const auto has = [](const char * name) {
-        for (const auto & env : pflash_release_env()) {
-            if (env.name == name) return true;
-        }
-        return false;
-    };
-    // As the server installs it: a variable that is already set keeps its value.
-    const auto install = [](Vars & vars) {
-        for (const auto & env : pflash_release_env()) {
-            if (!std::getenv(env.name.c_str())) vars.push_back(std::make_unique<luce_test::ScopedEnvVar>(env.name.c_str(), env.value.c_str()));
-        }
-    };
-    std::string error;
-    PFlashSelectionConfig selection;
     REQUIRE(pflash_release_env().empty());
 
-    luce_test::ScopedEnvVar head{"PFLASH_SCORING_HEAD_GGUF", "head.gguf"};
-    REQUIRE(has("PFLASH_SELECT_MODE") && !has("PFLASH_SELECT_SEGMENTS") && !has("PFLASH_SELECT_QUERY_PROBE"));
-    {
-        Vars vars;
-        install(vars);
-        REQUIRE(validate_pflash_environment(error));
-    }
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "luce_pflash_release_profile_test";
+    std::filesystem::create_directories(dir);
+    const auto stub = [&](const char * name) {
+        std::ofstream(dir / name) << "stub";
+        return (dir / name).string();
+    };
+    const std::string head_file = stub("seg-scoring-head.gguf");
+    const std::string segment_file = stub("segment-probe.gguf");
+    const std::string request_file = stub("request-probe.gguf");
+    const std::string reranker_file = stub("seg-reranker.gguf");
 
-    luce_test::ScopedEnvVar segments{"PFLASH_SEGMENT_PROBE_GGUF", "segment.gguf"};
-    luce_test::ScopedEnvVar request{"PFLASH_REQUEST_PROBE_GGUF", "request.gguf"};
-    {
-        Vars vars;
-        install(vars);
-        REQUIRE(validate_pflash_environment(error));
-        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
-        REQUIRE(selection.configured && selection.mode == PFlashSelectionMode::BudgetOnly);
-        REQUIRE(selection.segmentation == PFlashSegmentation::Probe &&
-                selection.candidate_score == PFlashCandidateScore::Density);
-        REQUIRE(selection.chunk_size == 256 && selection.query_tokens == 128);
-        REQUIRE(selection.query_head && selection.query_probe && selection.fallback_spread == 0.0);
-        REQUIRE(selection.query.candidates == 1 && selection.query.pin_tokens == 512);
-        REQUIRE(has_pflash_selection_environment() && pflash_query_probe_requested());
-        // The former chat view's settings and the spread fallback are not part of it.
-        for (const char * retired : {"PFLASH_FALLBACK_SPREAD", "PFLASH_ADMISSION", "PFLASH_ARRIVE",
-                                     "PFLASH_CHAT_REBUILD_MIN_TOKENS", "PFLASH_SELECT_PARAGRAPH_JOIN"}) {
-            REQUIRE(!has(retired));
-        }
-    }
-    // Arms that replace the request-probe query or exclude its candidates still start.
-    for (const auto & arm : std::vector<std::pair<const char *, const char *>>{
-            {"PFLASH_SELECT_SCORER", "legacy"}, {"PFLASH_EVAL_REF_IDENT_QUERY", "heur"},
-            {"PFLASH_REQUEST_STAGE2_GGUF", "stage2.gguf"}, {"PFLASH_SELECT_QUERY_PROBE", "0"}}) {
-        luce_test::ScopedEnvVar flag{arm.first, arm.second};
-        Vars vars;
-        install(vars);
-        REQUIRE(validate_pflash_environment(error));
-        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
-        REQUIRE(!has("PFLASH_QUERY_CANDIDATES") && !selection.query.any());
-    }
+    luce_test::ScopedEnvVar head{"PFLASH_SCORING_HEAD_GGUF", head_file.c_str()};
+    const auto env = pflash_release_env();
+    REQUIRE(env.size() == 3u);
+    REQUIRE(env[0].name == "PFLASH_SEGMENT_PROBE_GGUF" && env[0].value == segment_file);
+    REQUIRE(env[1].name == "PFLASH_REQUEST_PROBE_GGUF" && env[1].value == request_file);
+    REQUIRE(env[2].name == "PFLASH_SEG_RERANKER_GGUF" && env[2].value == reranker_file);
+    std::filesystem::remove_all(dir);
 }
 
-TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_rejects_invalid_and_incompatible_flags) {
+TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_rejects_invalid_flags) {
     const auto clean = clean_startup_env();
     using luce::common::http_detail::validate_pflash_environment;
     std::string error;
     for (const auto & bad : std::vector<std::pair<const char *, const char *>>{
-            {"PFLASH_SELECT_MODE", "budget"}, {"PFLASH_SELECT_QUERY_PROBE", "true"},
             {"PFLASH_FAIL_CLOSED", "yes"}, {"PFLASH_DRAFTER_SESSIONS", "-1"},
-            {"PFLASH_CHAT_SKELETON_TOKENS", "9999999999999999999999999"},
-            {"PFLASH_CHAT_HISTORY_QUERIES", "3oops"}}) {
+            {"PFLASH_DRAFTER_SESSIONS", "2oops"},
+            {"PFLASH_DRAFTER_SESSIONS", "9999999999999999999999999"}}) {
         luce_test::ScopedEnvVar flag{bad.first, bad.second};
         REQUIRE(!validate_pflash_environment(error));
         REQUIRE(error.find(bad.first) != std::string::npos);
     }
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar probe{"PFLASH_SELECT_QUERY_PROBE", "1"};
-    luce_test::ScopedEnvVar candidates{"PFLASH_QUERY_CANDIDATES", "1"};
-    REQUIRE(!validate_pflash_environment(error));
-    REQUIRE(error.find("PFLASH_SEGMENT_PROBE_GGUF") != std::string::npos);
-    luce_test::ScopedEnvVar segments{"PFLASH_SEGMENT_PROBE_GGUF", "segment.gguf"};
-    {
-        luce_test::ScopedEnvVar tiny{"PFLASH_QUERY_NULL_MARGIN", "1e-9999"};
-        REQUIRE(!validate_pflash_environment(error));
-        REQUIRE(error.find("PFLASH_QUERY_NULL_MARGIN") != std::string::npos);
-    }
-    {
-        luce_test::ScopedEnvVar grid{"PFLASH_QUERY_GRID", "grid.json"};
-        REQUIRE(!validate_pflash_environment(error));
-        REQUIRE(error.find("PFLASH_QUERY_GRID_OUT") != std::string::npos);
-    }
-    luce_test::ScopedEnvVar stage2{"PFLASH_REQUEST_STAGE2_GGUF", "stage2.gguf"};
-    REQUIRE(!validate_pflash_environment(error));
-    REQUIRE(error.find("PFLASH_REQUEST_STAGE2_GGUF") != std::string::npos);
-}
-
-TEST_CASE(PFlashQueryCandidatesFixture, dev_chosen_defaults_apply_only_when_switched_on) {
-    // DEFAULTS.md: k1-gap-tw50-end25-soft-pgap knobs; the switches stay off.
-    PFlashQueryConfig c;
-    REQUIRE(c.candidates == 0 && c.pin_tokens == 0 && !c.any());
-    REQUIRE(c.extent_gap && c.pin_gap && c.tw_share == 0.5f && c.end_share == 0.25f && !c.tw_score);
-    REQUIRE(c.unit_score == PFlashUnitScore::Max && c.aggregate == PFlashQueryAggregate::Softmax);
-    // A grid config starts from the neutral knobs, never from these defaults.
-    std::vector<PFlashGridConfig> g;
-    std::string error;
-    REQUIRE(pflash_query_grid_parse(R"({"configs":[{"name":"S1","mode":"s1"},{"name":"k","mode":"cand","k":1}]})", g,
-                                    error));
-    REQUIRE(g[1].query.tw_share == 0.0f && g[1].query.end_share == 0.0f && !g[1].query.extent_gap && !g[0].query.pin_gap);
-    // An explicit numeric extent / pin margin replaces the gap rule.
-    luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "1"};
-    luce_test::ScopedEnvVar e{"PFLASH_QUERY_EXTENT", "2"};
-    luce_test::ScopedEnvVar p{"PFLASH_QUERY_PIN", "512"};
-    luce_test::ScopedEnvVar pm{"PFLASH_QUERY_PIN_MARGIN", "4"};
-    PFlashQueryConfig q;
-    REQUIRE(pflash_query_config_from_env(q, error));
-    REQUIRE(!q.extent_gap && q.extent_margin == 2.0f && !q.pin_gap && q.pin_margin == 4.0f && q.tw_share == 0.5f);
-}
-
-TEST_CASE(PFlashQueryCandidatesFixture, flags_are_off_by_default_and_fail_closed) {
-    std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> clear;
-    for (const char * name : kQueryEnvs) clear.push_back(std::make_unique<luce_test::ScopedEnvVar>(name, nullptr));
-    {
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(pflash_query_config_from_env(c, error));
-        REQUIRE(!c.any());
-        REQUIRE(c.candidates == 0 && c.pin_tokens == 0);
-    }
-    {
-        luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "3"};
-        luce_test::ScopedEnvVar t{"PFLASH_QUERY_TEMP", "0.5"};
-        luce_test::ScopedEnvVar a{"PFLASH_QUERY_AGG", "wmax"};
-        luce_test::ScopedEnvVar u{"PFLASH_QUERY_UNIT_SCORE", "mean"};
-        luce_test::ScopedEnvVar e{"PFLASH_QUERY_EXTENT", "2"};
-        luce_test::ScopedEnvVar n{"PFLASH_QUERY_NULL_MARGIN", "3"};
-        luce_test::ScopedEnvVar pm{"PFLASH_QUERY_PIN_MARGIN", "inf"};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(pflash_query_config_from_env(c, error));
-        REQUIRE(c.candidates == 3 && c.temperature == 0.5f && c.aggregate == PFlashQueryAggregate::WeightedMax);
-        REQUIRE(c.unit_score == PFlashUnitScore::Mean && c.extent_margin == 2.0f && c.null_margin == 3.0f);
-        REQUIRE(std::isinf(c.pin_margin));
-    }
-    {
-        luce_test::ScopedEnvVar p{"PFLASH_QUERY_PIN", "512"};
-        luce_test::ScopedEnvVar pm{"PFLASH_QUERY_PIN_MARGIN", "2.5"};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(pflash_query_config_from_env(c, error));
-        REQUIRE(c.pin_tokens == 512 && c.candidates == 0 && c.pin_margin == 2.5f && c.any());
-    }
-    // A knob without its switch, or an invalid value, fails.
-    for (const auto & bad : std::vector<std::pair<const char *, const char *>>{
-             {"PFLASH_QUERY_TEMP", "1"}, {"PFLASH_QUERY_EXTENT", "1"}, {"PFLASH_QUERY_PIN_MARGIN", "1"}}) {
-        luce_test::ScopedEnvVar v{bad.first, bad.second};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(c, error));
-        REQUIRE(!error.empty());
-    }
-    for (const auto & bad : std::vector<std::pair<const char *, const char *>>{
-             {"PFLASH_QUERY_TEMP", "0"}, {"PFLASH_QUERY_TEMP", "x"}, {"PFLASH_QUERY_AGG", "mean"},
-             {"PFLASH_QUERY_UNIT_SCORE", "sum"}, {"PFLASH_QUERY_NULL_MARGIN", "-1"}, {"PFLASH_QUERY_EXTENT", "-0.5"},
-             {"PFLASH_QUERY_PIN_MARGIN", "-1"}}) {
-        luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "2"};
-        luce_test::ScopedEnvVar v{bad.first, bad.second};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(c, error));
-    }
-    for (const char * bad : {"9", "-1", "two", ""}) {
-        luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", bad};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(c, error));
-    }
-    {
-        luce_test::ScopedEnvVar p{"PFLASH_QUERY_PIN", "5000"};
-        PFlashQueryConfig c;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(c, error));
-    }
-}
-
-TEST_CASE(PFlashQueryCandidatesFixture, selection_needs_the_request_probe) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", nullptr};
-    luce_test::ScopedEnvVar head{"PFLASH_SELECT_QUERY_HEAD", nullptr};
-    luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "3"};
-    {
-        luce_test::ScopedEnvVar probe{"PFLASH_SELECT_QUERY_PROBE", nullptr};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(!resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(error.find("PFLASH_SELECT_QUERY_PROBE") != std::string::npos);
-    }
-    {
-        luce_test::ScopedEnvVar probe{"PFLASH_SELECT_QUERY_PROBE", "1"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(config.query.candidates == 3);
-    }
-    {
-        // Flags off: the config carries nothing (byte-identical default).
-        luce_test::ScopedEnvVar off{"PFLASH_QUERY_CANDIDATES", nullptr};
-        luce_test::ScopedEnvVar probe{"PFLASH_SELECT_QUERY_PROBE", "1"};
-        PFlashSelectionConfig config;
-        std::string error;
-        REQUIRE(resolve_pflash_selection(1000, 32, config, error));
-        REQUIRE(!config.query.any());
-    }
+    luce_test::ScopedEnvVar ok_fc{"PFLASH_FAIL_CLOSED", "1"};
+    luce_test::ScopedEnvVar ok_sess{"PFLASH_DRAFTER_SESSIONS", "4"};
+    REQUIRE(validate_pflash_environment(error));
 }
 
 // ---------------------------------------------------------------- units and ranking
@@ -453,6 +247,65 @@ TEST_CASE(PFlashQueryCandidatesFixture, latest_extent_first_then_other_messages_
     REQUIRE(pflash_query_candidate_set(PFlashQueryUnits{}, {}, c).candidates.empty());
 }
 
+TEST_CASE(PFlashQueryCandidatesFixture, candidate_tokens_drop_negative_request_logits_with_fallback) {
+    // 1. Mixed unit: [0,10) has stray 1-token edge blip [1,2) at s1=+1, leading background,
+    //    question stem [3,5) at s1=+4, interior declarative option [5,7) at s1=-2, closing
+    //    prompt [7,9) at s1=+3, and trailing background [9,10) at s1=-5. Per-component convex
+    //    hull anchored on runs >= 2 trims the stray blip [1,2) and outer margins to [3,9)
+    //    while preserving interior [5,7) and keeping whole-unit extent [0,10) for pinning.
+    std::vector<PFlashRequestMessage> m = {msg(Role::User, 0, 20)};
+    auto s1 = filled(20, -5.0f);
+    set(s1, 1, 2, 1.0f);
+    set(s1, 3, 5, 4.0f);
+    set(s1, 5, 7, -2.0f);
+    set(s1, 7, 9, 3.0f);
+    const auto u = pflash_query_units(cover(20, {10}), m, s1);
+    PFlashQueryConfig c;
+    c.candidates = 1;
+    c.extent_gap = false;
+    c.extent_margin = 0.0f;
+    const auto set_mix = pflash_query_candidate_set(u, s1, c);
+    REQUIRE(set_mix.candidates.size() == 1u);
+    REQUIRE(set_mix.candidates[0].units == std::vector<int>({0}));
+    REQUIRE(set_mix.candidates[0].tokens == range(3, 9));
+    const auto pin = pflash_query_pin(u, 512, PFlashUnitScore::Max, 0.0f, /*gap=*/false);
+    REQUIRE(pin.spans.size() == 1u && pin.spans[0].begin == 0 && pin.spans[0].end == 10);
+
+    // 2. Disjoint prefix + suffix units (e.g. [0,10) and [20,30) with doc body [10,20) in between):
+    //    each connected component trims its own doc-bleed edge independently without bridging.
+    auto s1_disj = filled(30, -5.0f);
+    set(s1_disj, 0, 4, 5.0f);     // prefix instruction [0,4), trailing doc bleed [4,10)
+    set(s1_disj, 25, 30, 5.0f);   // leading doc bleed [20,25), suffix question [25,30)
+    const auto u_disj = pflash_query_units(cover(30, {10, 20}), {msg(Role::User, 0, 30)}, s1_disj);
+    const auto set_disj = pflash_query_candidate_set(u_disj, s1_disj, c);
+    REQUIRE(set_disj.candidates.size() == 1u);
+    std::vector<int> want_disj = {0, 1, 2, 3, 25, 26, 27, 28, 29};
+    REQUIRE(set_disj.candidates[0].tokens == want_disj);
+
+    // 3. Adjacent units [0,10) and [10,20) both selected form one contiguous component:
+    //    interior negative-logit clauses crossing the unit boundary are preserved.
+    auto s1_adj = filled(30, -5.0f);
+    set(s1_adj, 2, 5, 5.0f);
+    set(s1_adj, 14, 17, 5.0f);
+    const auto u_adj = pflash_query_units(cover(30, {10, 20}), {msg(Role::User, 0, 30)}, s1_adj);
+    const auto set_adj = pflash_query_candidate_set(u_adj, s1_adj, c);
+    REQUIRE(set_adj.candidates.size() == 1u);
+    REQUIRE(set_adj.candidates[0].tokens == range(2, 17));
+
+    // 4. Single-token positive fallback: component with only a 1-token hit keeps that token.
+    auto s1_one = filled(10, -5.0f);
+    set(s1_one, 4, 5, 3.0f);
+    const auto u_one = pflash_query_units(cover(10, {}), {msg(Role::User, 0, 10)}, s1_one);
+    const auto set_one = pflash_query_candidate_set(u_one, s1_one, c);
+    REQUIRE(set_one.candidates.size() == 1u && set_one.candidates[0].tokens == range(4, 5));
+
+    // 5. All-negative unit: fallback keeps the full extent [0,10) so scoring never goes empty.
+    auto all_neg = filled(10, -2.0f);
+    const auto u_neg = pflash_query_units(cover(10, {}), {msg(Role::User, 0, 10)}, all_neg);
+    const auto set_neg = pflash_query_candidate_set(u_neg, all_neg, c);
+    REQUIRE(set_neg.candidates.size() == 1u && set_neg.candidates[0].tokens == range(0, 10));
+}
+
 TEST_CASE(PFlashQueryCandidatesFixture, null_only_when_the_top_unit_does_not_stand_out) {
     // Latest user message: 10 units, all paste-like (scores 1.0 .. 1.9): z of the top is small -> NULL at margin 3;
     // the earlier request leads instead.
@@ -542,42 +395,8 @@ TEST_CASE(PFlashQueryCandidatesFixture, pin_takes_whole_latest_units_in_rank_ord
     REQUIRE(pflash_query_pin(none, 512, PFlashUnitScore::Max, kInf).spans.empty());
 }
 
-// ---------------------------------------------------------------- grid, oracle, fingerprint
-
-TEST_CASE(PFlashQueryCandidatesFixture, grid_and_oracle_parse_fail_closed) {
-    std::vector<PFlashGridConfig> g;
-    std::string error;
-    REQUIRE(pflash_query_grid_parse(
-        R"({"configs":[{"name":"S1","mode":"s1"},{"name":"P1","mode":"p1","pin":512},
-            {"name":"c3","mode":"cand","k":3,"unit_score":"mean","agg":"wmax","temp":0.5,"null_margin":3,
-             "extent":2,"pin":256,"pin_margin":"inf"},{"name":"O","mode":"oracle","oracle_pin":false}]})", g, error));
-    REQUIRE(g.size() == 4u);
-    REQUIRE(g[1].mode == PFlashGridMode::P1 && g[1].query.pin_tokens == 512);
-    REQUIRE(g[2].query.candidates == 3 && g[2].query.unit_score == PFlashUnitScore::Mean &&
-            g[2].query.aggregate == PFlashQueryAggregate::WeightedMax && g[2].query.extent_margin == 2.0f &&
-            std::isinf(g[2].query.pin_margin));
-    REQUIRE(g[3].mode == PFlashGridMode::Oracle && !g[3].oracle_pin);
-    for (const char * bad : {
-             R"({"configs":[]})", R"({"configs":[{"name":"a","mode":"cand"}]})",
-             R"({"configs":[{"name":"a","mode":"s1","k":2}]})", R"({"configs":[{"name":"a","mode":"zz"}]})",
-             R"({"configs":[{"name":"a","mode":"s1","typo":1}]})",
-             R"({"configs":[{"name":"a","mode":"s1"},{"name":"a","mode":"p1"}]})",
-             R"({"configs":[{"name":"a","mode":"cand","k":2,"temp":0}]})", "not json"}) {
-        REQUIRE(!pflash_query_grid_parse(bad, g, error));
-    }
-    PFlashQueryOracle o;
-    REQUIRE(pflash_query_oracle_parse(R"({"query":[[5,8],[2,4]],"pin":[[2,4],[3,9]]})", 10, o, error));
-    REQUIRE(o.query == std::vector<int>({2, 3, 5, 6, 7}));
-    REQUIRE(o.pin.size() == 1u && o.pin[0].begin == 2 && o.pin[0].end == 9);
-    REQUIRE(!pflash_query_oracle_parse(R"({"query":[[5,12]],"pin":[]})", 10, o, error));
-    REQUIRE(!pflash_query_oracle_parse(R"({"query":[],"pin":[]})", 10, o, error));
-    REQUIRE(!pflash_query_oracle_parse(R"({"pin":[]})", 10, o, error));
-}
-
-TEST_CASE(PFlashQueryCandidatesFixture, fingerprint_matches_the_server) {
-    const std::vector<int32_t> ids = {248045, 74455, 198, 1, 2, 3, -1, 0};
-    REQUIRE(pflash_ids_fingerprint(ids) == luce::common::http_detail::pflash_token_fingerprint(ids));
-    REQUIRE(pflash_ids_fingerprint({}) == "cbf29ce484222325");
+TEST_CASE(PFlashQueryCandidatesFixture, token_fingerprint_is_stable) {
+    REQUIRE(luce::common::http_detail::pflash_token_fingerprint({}) == "cbf29ce484222325");
     // Fixed encoding of negative and INT_MAX ids (logged as drafter_fingerprint_fnv1a64).
     REQUIRE(luce::common::http_detail::pflash_token_fingerprint({1, -2, 2147483647}) == "45409a0b0f44c5fd");
 }
@@ -607,11 +426,6 @@ TEST_CASE(PFlashQueryCandidatesFixture, gap_rule_cuts_at_the_largest_drop) {
     c.candidates = 1;
     c.extent_gap = true;
     REQUIRE(pflash_query_candidate_set(uf, fs, c).candidates[0].tokens == range(0, 20));
-    std::vector<PFlashGridConfig> g;
-    std::string error;
-    REQUIRE(pflash_query_grid_parse(R"({"configs":[{"name":"a","mode":"cand","k":1,"extent":"gap","pin":512,
-        "pin_margin":"gap"}]})", g, error));
-    REQUIRE(g[0].query.extent_gap && g[0].query.pin_gap);
 }
 
 TEST_CASE(PFlashQueryCandidatesFixture, blend_shares_tw_and_end) {
@@ -621,6 +435,7 @@ TEST_CASE(PFlashQueryCandidatesFixture, blend_shares_tw_and_end) {
     set.candidates[1].score = 2.0f;
     PFlashQueryConfig c;
     c.candidates = 2;
+    c.tw_score = false;
     c.tw_share = 0.0f;
     c.end_share = 0.0f;
     // No TW / END: the softmax alone.
@@ -639,31 +454,4 @@ TEST_CASE(PFlashQueryCandidatesFixture, blend_shares_tw_and_end) {
     // TW by score without a finite score: out of the blend.
     b = pflash_query_blend(set, c, std::numeric_limits<float>::quiet_NaN());
     REQUIRE(b.tw == 0.0 && std::fabs(b.probe[0] - 0.375) < 1e-7);
-    // Flags: TW / END need the candidates; shares < 1.
-    std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> clear;
-    for (const char * name : kQueryEnvs) clear.push_back(std::make_unique<luce_test::ScopedEnvVar>(name, nullptr));
-    {
-        luce_test::ScopedEnvVar p{"PFLASH_QUERY_PIN", "512"};
-        luce_test::ScopedEnvVar t{"PFLASH_QUERY_TW", "0.3"};
-        PFlashQueryConfig q;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(q, error));
-    }
-    {
-        luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "1"};
-        luce_test::ScopedEnvVar t{"PFLASH_QUERY_TW", "0.6"};
-        luce_test::ScopedEnvVar e{"PFLASH_QUERY_END", "0.5"};
-        PFlashQueryConfig q;
-        std::string error;
-        REQUIRE(!pflash_query_config_from_env(q, error));
-    }
-    {
-        luce_test::ScopedEnvVar k{"PFLASH_QUERY_CANDIDATES", "1"};
-        luce_test::ScopedEnvVar t{"PFLASH_QUERY_TW", "score"};
-        luce_test::ScopedEnvVar e{"PFLASH_QUERY_END", "0.2"};
-        PFlashQueryConfig q;
-        std::string error;
-        REQUIRE(pflash_query_config_from_env(q, error));
-        REQUIRE(q.tw_score && q.end_share == 0.2f && q.tw());
-    }
 }

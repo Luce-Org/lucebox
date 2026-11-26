@@ -714,7 +714,8 @@ static std::string write_pflash_bpe_tokenizer_fixture(
         const std::string & byte_cover,
         const std::vector<std::string> & control_tokens =
             {"<|im_start|>", "<|im_end|>"},
-        const std::vector<std::string> & user_defined_tokens = {}) {
+        const std::vector<std::string> & user_defined_tokens = {},
+        const char * pre = "qwen35") {
     std::vector<std::string> tokens = control_tokens;
     std::vector<uint32_t> types(tokens.size(), 3);
     tokens.insert(tokens.end(), user_defined_tokens.begin(), user_defined_tokens.end());
@@ -736,7 +737,7 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
                       types.data(), (int32_t) types.size());
     gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", pre);
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
     // A case may build several (test_tmp_path is per process).
@@ -785,6 +786,45 @@ TEST_CASE(ServerUnitFixture, test_tokenizer_whitespace_run_ends_at_last_newline)
     TEST_ASSERT(tok.encode(a).size() == 3);
     TEST_ASSERT(tok.encode(x).size() == 3);
     TEST_ASSERT(tok.decode(tok.encode(x)) == x);
+}
+
+// DeepSeek V3/V4 (`deepseek-v3`, `joyai-llm` pre) isolates \p{N}{1,3} and
+// [一-龥぀-ゟ゠-ヿ]+ before its main split, so a whitespace run in front of a
+// number or CJK text ends its segment and stays one piece: HF splits "a  1" as
+// a | "  " | 1. The engine split it as Qwen does: a | " " | " " | 1.
+TEST_CASE(ServerUnitFixture, test_tokenizer_deepseek_isolates_digits_and_cjk) {
+    const std::string text = "a  1\t\t42  中文x 12345 10² ①②③④";
+    for (const char * pre : {"joyai-llm", "deepseek-v3", "qwen35"}) {
+        const std::string path = write_pflash_bpe_tokenizer_fixture(
+            {"  ", "\t\t", "42", "中文", " 中文", "123", "45", "²", "10²", "①②③", "④"},
+            text, {}, {}, pre);
+        Tokenizer tok;
+        TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+        unlink(path.c_str());
+        const auto id = [&](const std::string & raw) {
+            return tok.token_to_id(test_gpt2_encode(raw));
+        };
+        const auto ids = [&](const std::vector<std::string> & raws) {
+            std::vector<int32_t> out;
+            for (const auto & raw : raws) out.push_back(id(raw));
+            return out;
+        };
+        if (std::strcmp(pre, "qwen35") == 0) {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", " ", " ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t4") == ids({"\t", "\t", "4"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({" ", " 中文"}));
+        } else {
+            TEST_ASSERT(tok.encode("a  1") == ids({"a", "  ", "1"}));
+            TEST_ASSERT(tok.encode("\t\t42") == ids({"\t\t", "42"}));
+            TEST_ASSERT(tok.encode("  中文") == ids({"  ", "中文"}));
+            TEST_ASSERT(tok.encode("x 12345") == ids({"x", " ", "123", "45"}));
+            // \p{N} is the whole Number category, not only decimal digits.
+            TEST_ASSERT(tok.encode("a  ²") == ids({"a", "  ", "²"}));
+            TEST_ASSERT(tok.encode("x 10²") == ids({"x", " ", "10²"}));
+            TEST_ASSERT(tok.encode("①②③④") == ids({"①②③", "④"}));
+        }
+        TEST_ASSERT(tok.decode(tok.encode(text)) == text);
+    }
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -1470,6 +1510,12 @@ TEST_CASE(ServerUnitFixture,
          {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
           "<｜Assistant｜>"},
          "<｜User｜>"},
+        {"inkling2", "inkling2",
+         {"<|message_system|>", "<|message_user|>", "<|message_model|>",
+          "<|message_tool|>", "<|content_text|>", "<|content_thinking|>",
+          "<|content_xml|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+          "<|content_model_end_sampling|>"},
+         "<|message_user|><|content_text|>"},
         {"laguna", "laguna",
          {"<system>", "</system>", "<user>", "</user>", "<assistant>",
           "</assistant>"},
@@ -1523,6 +1569,21 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(deepseek.valid);
     TEST_ASSERT_MSG(deepseek.content == "What is the answer?",
                     deepseek.content);
+
+    const auto inkling2 = pflash_rendered_query_turn(
+        messages, "inkling2", true,
+        {"<|message_system|>", "<|message_user|>", "<|message_model|>",
+         "<|message_tool|>", "<|content_text|>", "<|content_thinking|>",
+         "<|content_xml|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+         "<|content_model_end_sampling|>"});
+    TEST_ASSERT(inkling2.valid);
+    TEST_ASSERT(inkling2.family == "inkling2");
+    TEST_ASSERT_MSG(inkling2.content == "What is the answer?", inkling2.content);
+    TEST_ASSERT_MSG(inkling2.header == "<|message_user|><|content_text|>", inkling2.header);
+    TEST_ASSERT(inkling2.later_turns);
+    TEST_ASSERT(inkling2.roles == std::vector<std::string>({"system", "user", "model", "tool"}));
+    TEST_ASSERT_MSG(inkling2.closing == "<|end_message|>", inkling2.closing);
+    TEST_ASSERT_MSG(inkling2.generation.empty(), inkling2.generation);
 }
 
 // Request probe: the human user messages' content spans, by message ROLE,
@@ -1770,18 +1831,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_
     TEST_ASSERT(short_window.valid());
     TEST_ASSERT(short_window.tokens == 3);
     TEST_ASSERT(short_window.end == 4);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
-    const float values[]{
-        0.0f,
-        std::numeric_limits<float>::quiet_NaN(),
-        std::numeric_limits<float>::infinity(),
-        -std::numeric_limits<float>::infinity(),
-        1.0f,
-    };
-    TEST_ASSERT(count_nonfinite_scores(values, 5) == 3);
-    TEST_ASSERT(count_nonfinite_scores(values, 1) == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
@@ -4410,16 +4459,6 @@ TEST_CASE(ServerUnitFixture, test_emitter_responses_function_call_item_lifecycle
     TEST_ASSERT(output[0]["content"][0]["text"] == "Listing.\n");
 }
 
-TEST_CASE(ServerUnitFixture, test_emitter_streaming_openai_has_done) {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
-    em.emit_start();
-    em.emit_token("Hello");
-    auto finish = em.emit_finish(3);
-    std::string finish_str = concat(finish);
-
-    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
-}
-
 TEST_CASE(ServerUnitFixture, test_emitter_anthropic_thinking_blocks) {
     auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
@@ -5162,7 +5201,115 @@ TEST_CASE(ServerUnitFixture, test_codec_only_archs_have_no_builtin_renderer) {
     TEST_ASSERT(default_chat_codec_for_arch("deepseek4") == "deepseek4");
     TEST_ASSERT(default_chat_codec_for_arch("qwen35") == "qwen3.5");
     TEST_ASSERT(default_chat_codec_for_arch("qwen35moe") == "qwen3.5");
+    TEST_ASSERT(default_chat_codec_for_arch("inkling2_loop") == "inkling2");
+    TEST_ASSERT(default_chat_codec_for_arch("inkling2") == "inkling2");
     TEST_ASSERT(default_chat_codec_for_arch("gemma4").empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_inkling2_codec_and_sse_protocol) {
+    auto codec = make_chat_codec("inkling2");
+    TEST_ASSERT(codec != nullptr);
+    TEST_ASSERT(codec->id() == "inkling2/1");
+
+    nlohmann::ordered_json tools = nlohmann::ordered_json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "get_weather"},
+             {"description", "Fetch weather"},
+             {"parameters", {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}}},
+         }}},
+    });
+
+    std::vector<ChatMessage> msgs = {
+        {"system", "You are helpful.", ""},
+        {"user", "Weather in Rome?", ""},
+        {"assistant", "", ""},
+        {"tool", "{\"temp\":22}", "call_1"},
+        {"user", "Thanks!", ""},
+    };
+    msgs[2].reasoning_content = "Need weather tool.";
+    msgs[2].tool_calls = {{"call_1", "get_weather", nlohmann::ordered_json({{"city", "Rome"}})}};
+
+    ChatCodecInput in;
+    in.messages = &msgs;
+    in.tools = &tools;
+    in.enable_thinking = true;
+    in.reasoning_effort = "high";
+    RenderedPrompt rendered;
+    std::string err;
+    TEST_ASSERT(codec->render(in, rendered, err));
+    const std::string text = rendered.text();
+    TEST_ASSERT(text.find("<|message_system|>tool_declare<|content_xml|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_model|><|content_thinking|>Need weather tool.<|end_message|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|>") != std::string::npos);
+    TEST_ASSERT(text.find("<|message_tool|>get_weather<|content_text|>{\"temp\":22}<|end_message|>") != std::string::npos);
+
+    // Non-thinking renders effort 0.
+    in.enable_thinking = false;
+    RenderedPrompt nothink;
+    TEST_ASSERT(codec->render(in, nothink, err));
+    TEST_ASSERT(nothink.text().find("Thinking effort level: 0<|end_message|>") != std::string::npos);
+
+    // parse_turn round-trip (thinking + content + tool call).
+    const std::string raw_turn =
+        "<|message_model|><|content_thinking|>Step 1</think> still thinking<|end_message|>"
+        "<|message_model|><|content_text|>Checking now.<|end_message|>"
+        "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|>"
+        "<|content_model_end_sampling|>";
+    ChatMessage parsed_msg;
+    TEST_ASSERT(codec->parse_turn(raw_turn, json::parse(tools.dump()), parsed_msg));
+    TEST_ASSERT(parsed_msg.reasoning_content == "Step 1</think> still thinking");
+    TEST_ASSERT(parsed_msg.content == "Checking now.");
+    TEST_ASSERT(parsed_msg.tool_calls.size() == 1);
+    TEST_ASSERT(parsed_msg.tool_calls[0].name == "get_weather");
+    TEST_ASSERT(parsed_msg.tool_calls[0].arguments["city"] == "Rome");
+
+    // SseEmitter protocol streaming: thinking with literal "</think>" -> text -> 2 tool calls.
+    SseEmitter emitter(ApiFormat::OPENAI_CHAT, "req-ink", "inkling-2-mini", 42,
+                       json::parse(tools.dump()), nullptr, {}, false, true);
+    emitter.set_chat_codec(codec.get());
+    emitter.set_think_tags_are_tokens(true);
+    emitter.emit_start();
+
+    const std::vector<std::pair<std::string, std::string>> stream_toks = {
+        {"<|message_model|>", "<|message_model|>"},
+        {"<|content_thinking|>", "<|content_thinking|>"},
+        {"Let's check ", "Let's check "},
+        {"</think>", "</think>"},
+        {" safely.", " safely."},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"<|content_text|>", "<|content_text|>"},
+        {"Calling tool.", "Calling tool."},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"get_weather", "get_weather"},
+        {"<|content_invoke_tool_json|>", "<|content_invoke_tool_json|>"},
+        {"{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}", "{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}"},
+        {"<|end_message|>", "<|end_message|>"},
+        {"<|message_model|>", "<|message_model|>"},
+        {"get_weather", "get_weather"},
+        {"<|content_invoke_tool_json|>", "<|content_invoke_tool_json|>"},
+        {"{\"name\":\"get_weather\",\"args\":{\"city\":\"Milan\"}}", "{\"name\":\"get_weather\",\"args\":{\"city\":\"Milan\"}}"},
+        {"<|end_message|>", "<|end_message|>"},
+    };
+    for (const auto & [raw, piece] : stream_toks) {
+        std::string out_text;
+        const int r = emitter.consume_inkling_protocol_token(raw, piece, out_text);
+        if (r == 1) continue;
+        if (r == 2) emitter.emit_token(out_text, false);
+        else if (r == 3) emitter.emit_token(out_text, true);
+        else emitter.emit_token(piece, false);
+    }
+    emitter.emit_finish(20, nullptr, 256, true);
+    TEST_ASSERT(emitter.reasoning_text() == "Let's check </think> safely.");
+    TEST_ASSERT(emitter.accumulated_text() == "Calling tool.");
+    TEST_ASSERT(emitter.tool_calls().size() == 2);
+    TEST_ASSERT(emitter.tool_calls()[0].name == "get_weather");
+    TEST_ASSERT(json::parse(emitter.tool_calls()[0].arguments)["city"] == "Rome");
+    TEST_ASSERT(json::parse(emitter.tool_calls()[1].arguments)["city"] == "Milan");
+    TEST_ASSERT(emitter.finish_reason() == "tool_calls");
 }
 
 TEST_CASE(ServerUnitFixture, test_deepseek_layout_puts_tool_results_in_call_order) {
@@ -12651,8 +12798,6 @@ struct MockPflashCompressBackend : MockBackend {
 
 TEST_CASE(ServerUnitFixture,
         test_pflash_strict_chat_query_is_the_prompt_end) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
-
     // The server's own Qwen rendering, generation prompt and its think
     // prefix included.
     const std::string rendered = codec_text("qwen3.5",
@@ -12766,9 +12911,9 @@ static PflashSystemPromptCase pflash_long_system_prompt_case(
         const std::string & instruction_role = "system") {
     std::string system;
     for (int i = 0; i < 30; ++i) system += "You are helpful. ";
-    // Longer than the multi-turn skeleton keeps whole: droppable material.
+    // Longer than the multi-turn skeleton and default 256-token chunk grid keep whole: droppable material.
     std::string history;
-    for (int i = 0; i < 120; ++i) history += "Sure. ";
+    for (int i = 0; i < 200; ++i) history += "Sure. ";
     PflashSystemPromptCase out;
     out.rendered = codec_text("qwen3.5",
         {{instruction_role, system, ""},
@@ -12795,8 +12940,6 @@ TEST_CASE(ServerUnitFixture,
     // A system prompt larger than keep_ratio x prompt used to exhaust the
     // budget (mandatory_query_exceeds_budget). It is kept and the ratio now
     // applies to the rest.
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     const auto prompt = pflash_long_system_prompt_case();
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
@@ -12845,8 +12988,6 @@ TEST_CASE(ServerUnitFixture,
         test_pflash_strict_refuses_system_prompt_that_overflows_context) {
     // The system prompt is never compressed: when it alone does not fit the
     // context the request fails instead of losing part of it.
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     const auto prompt = pflash_long_system_prompt_case();
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
@@ -12879,8 +13020,6 @@ TEST_CASE(ServerUnitFixture,
         test_pflash_auto_threshold_counts_droppable_tokens) {
     // Auto mode: the whole prompt clears the threshold, the droppable part
     // does not -- nothing worth selecting, so the prompt goes through as is.
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     const auto prompt = pflash_long_system_prompt_case();
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
@@ -12939,8 +13078,6 @@ struct PflashFallbackRun {
 
 template <typename Backend>
 static PflashFallbackRun run_pflash_fallback_case(int max_ctx, int max_output) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     char trace_path[] = "/tmp/pflash_fallback_view_XXXXXX";
     const int trace_fd = mkstemp(trace_path);
     TEST_ASSERT(trace_fd >= 0);
@@ -13038,181 +13175,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_fallback_decision_and_reasons) {
                 == "selection_failed");
 }
 
-// PFLASH_FALLBACK_SPREAD (relevance-spread fallback, release2).
-TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
-    using luce::common::pflash_relevance_spread;
-    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
-    // Uniform over 4, two selected: exp(ln 4) / 2.
-    auto r = pflash_relevance_spread({1, 1, 1, 1}, {1, 1, 0, 0}, {0, 0, 0, 0});
-    TEST_ASSERT(r.valid && r.k == 2 && r.candidates == 4 && near(r.spread, 2.0));
-    // One-hot: H = 0.
-    r = pflash_relevance_spread({5, 0, 0, 0}, {1, 0, 0, 0}, {0, 0, 0, 0});
-    TEST_ASSERT(r.valid && r.k == 1 && near(r.entropy, 0.0) && near(r.spread, 1.0));
-    // Mixed, one forced selected chunk not counted; reference = sim_tier2.spread_of.
-    r = pflash_relevance_spread({0.2, 0.5, 0.1, 0.0, 0.2}, {0, 1, 1, 0, 1}, {0, 0, 1, 0, 0});
-    TEST_ASSERT(r.valid && r.k == 2);
-    TEST_ASSERT_MSG(std::fabs(r.spread - 1.6946226386695418) < 1e-9, std::to_string(r.spread));
-    // All-zero scores: sum 0 -> H = 0 -> 1 / max(k, 1).
-    r = pflash_relevance_spread({0, 0, 0}, {1, 1, 0}, {0, 0, 0});
-    TEST_ASSERT(r.valid && r.k == 2 && near(r.spread, 0.5));
-    r = pflash_relevance_spread({0, 0, 0}, {0, 0, 0}, {0, 0, 0});
-    TEST_ASSERT(r.valid && r.k == 0 && near(r.spread, 1.0));
-    // k = 0 (nothing selected): exp(H) / 1.
-    r = pflash_relevance_spread({1, 3}, {0, 0}, {0, 0});
-    TEST_ASSERT(r.valid && r.k == 0);
-    TEST_ASSERT(std::fabs(r.spread - 1.7547653506033232) < 1e-12);
-    // Forced-only selection: k = 0 as well.
-    r = pflash_relevance_spread({1, 3, 2}, {1, 1, 0}, {1, 1, 0});
-    TEST_ASSERT(r.valid && r.k == 0);
-    TEST_ASSERT(near(r.spread, std::exp(-(1.0/6*std::log(1.0/6) + 0.5*std::log(0.5) +
-                                          1.0/3*std::log(1.0/3)))));
-    // Invalid inputs: no decision may be taken.
-    TEST_ASSERT(!pflash_relevance_spread({1, 2}, {1}, {0, 0}).valid);
-    TEST_ASSERT(!pflash_relevance_spread({1, 2}, {1, 0}, {0}).valid);
-    TEST_ASSERT(!pflash_relevance_spread({1, NAN}, {1, 0}, {0, 0}).valid);
-    TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
-}
-
-// The first token (the attention sink) is a unit of its own: the spread does
-// not depend on how long the pinned chunk holding it is.
-TEST_CASE(ServerUnitFixture, test_pflash_selection_spread_scores_the_first_token_alone) {
-    using luce::common::pflash_relevance_spread;
-    using luce::common::pflash_selection_spread;
-    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
-    // Token scores: the sink 9.0, then a pinned header (0.1 each), then three
-    // candidates. Pinned alone, the sink chunk is [0, 1) and the header [1, 3).
-    const auto alone = pflash_relevance_spread({9.0, 0.1, 0.4, 0.3, 0.3},
-        {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
-    TEST_ASSERT(alone.valid && alone.k == 2);
-    // The same tokens with the sink inside one pinned chunk of 3 or 35 tokens
-    // (a system turn), as per-token means and as sums.
-    for (const int pinned : {3, 35}) {
-        const double sum = 9.0 + 0.1 * (pinned - 1);
-        auto r = pflash_selection_spread({sum / pinned, 0.4, 0.3, 0.3},
-            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ true);
-        TEST_ASSERT(r.valid && r.k == 2 && r.candidates == 4);
-        TEST_ASSERT_MSG(near(r.spread, alone.spread),
-                        std::to_string(r.spread) + " vs " + std::to_string(alone.spread));
-        r = pflash_selection_spread({sum, 0.4, 0.3, 0.3},
-            {1, 1, 0, 1}, {1, 0, 0, 0}, pinned, 9.0, /*per_token=*/ false);
-        const auto summed = pflash_relevance_spread({9.0, 0.1 * (pinned - 1), 0.4, 0.3, 0.3},
-            {1, 1, 1, 0, 1}, {1, 1, 0, 0, 0});
-        TEST_ASSERT(r.valid && r.k == 2 && near(r.spread, summed.spread));
-    }
-    // Averaged into its chunk instead, the sink's weight falls with the
-    // chunk's length and the spread rises: what the unit prevents.
-    TEST_ASSERT(pflash_relevance_spread({(9.0 + 3.4) / 35, 0.4, 0.3, 0.3},
-        {1, 1, 0, 1}, {1, 0, 0, 0}).spread > 2 * alone.spread);
-    // A selected candidate chunk 0 keeps counting in k; the sink does not.
-    auto r = pflash_selection_spread({(9.0 + 0.2) / 3, 0.4, 0.3, 0.3},
-        {1, 1, 0, 1}, {0, 0, 0, 0}, 3, 9.0, true);
-    TEST_ASSERT(r.valid && r.k == 3);
-    // A one-token chunk 0, or no chunk, is the plain formula.
-    r = pflash_selection_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}, 1, 9.0, true);
-    TEST_ASSERT(near(r.spread, pflash_relevance_spread({9.0, 0.4, 0.3}, {1, 1, 0}, {1, 0, 0}).spread));
-    TEST_ASSERT(!pflash_selection_spread({1.0, NAN}, {1, 0}, {0, 0}, 4, 0.5, true).valid);
-    // A non-finite chunk-0 score is not hidden by the sink split, in either unit.
-    for (const bool per_token : {false, true}) {
-        TEST_ASSERT(!pflash_selection_spread({NAN, 0.2, 0.1}, {1, 1, 0}, {0, 0, 0}, 4, 0.5, per_token).valid);
-    }
-    TEST_ASSERT(pflash_selection_spread({1.0, 0.2, 0.1}, {1, 1, 0}, {0, 0, 0}, 4, 0.5, false).valid);
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_fallback_spread_env_parse) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce::pflash::PFlashSelectionConfig config;
-    std::string error;
-    {
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", nullptr};
-        TEST_ASSERT(luce::pflash::resolve_pflash_selection(1000, 32, config, error));
-        TEST_ASSERT(config.fallback_spread == 0.0);
-    }
-    for (const char * off : {"0", "off", ""}) {
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", off};
-        TEST_ASSERT_MSG(luce::pflash::resolve_pflash_selection(1000, 32, config, error), error);
-        TEST_ASSERT(config.fallback_spread == 0.0);
-    }
-    {
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
-        TEST_ASSERT_MSG(luce::pflash::resolve_pflash_selection(1000, 32, config, error), error);
-        TEST_ASSERT(config.fallback_spread == 0.11);
-    }
-    for (const char * bad : {"-0.1", "abc", "0.11x", "nan", "inf"}) {
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", bad};
-        TEST_ASSERT_MSG(!luce::pflash::resolve_pflash_selection(1000, 32, config, error), bad);
-        TEST_ASSERT(error.find("PFLASH_FALLBACK_SPREAD") != std::string::npos);
-    }
-    {
-        luce_test::ScopedEnvVar legacy{"PFLASH_SELECT_MODE", nullptr};
-        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
-        TEST_ASSERT(!luce::pflash::resolve_pflash_selection(1000, 32, config, error));
-    }
-}
-
-// The sel-trace carries spread / spread_threshold only with the flag on, and
-// the value is the formula applied to the record's own chunk_scores /
-// selected_chunks / forced_chunks.
-TEST_CASE(ServerUnitFixture, test_pflash_spread_in_selection_trace) {
-    char trace_path[] = "/tmp/pflash_spread_trace_XXXXXX";
-    const int fd = mkstemp(trace_path);
-    TEST_ASSERT(fd >= 0);
-    close(fd);
-    luce_test::ScopedEnvVar trace{"PFLASH_TRACE_PATH", trace_path};
-    std::vector<int32_t> ids(64);
-    for (int i = 0; i < 64; ++i) ids[(size_t) i] = 100 + i;
-    std::vector<float> mass(64, 0.001f);
-    for (int i = 16; i < 24; ++i) mass[(size_t) i] = 0.05f;
-    for (int i = 40; i < 44; ++i) mass[(size_t) i] = 0.03f;
-    luce::pflash::PFlashSelectionConfig config;
-    config.mode = luce::pflash::PFlashSelectionMode::BudgetOnly;
-    config.selection_active = true;
-    config.configured = true;
-    config.chunk_size = 8;
-    const auto run = [&] {
-        return luce::common::select_pflash_chunks(
-            ids, mass, /*keep_ratio=*/0.4f, /*n_lookahead=*/4, /*score_query_end=*/64,
-            /*pool_kernel=*/1, config, {}, /*direct_mass=*/true, /*write_trace=*/true);
-    };
-    TEST_ASSERT(!run().empty());
-    const auto off = luce::common::pflash_last_relevance_spread();
-    config.fallback_spread = 0.11;
-    TEST_ASSERT(!run().empty());
-    const auto on = luce::common::pflash_last_relevance_spread();
-    TEST_ASSERT(off.valid && on.valid && off.spread == on.spread);
-    std::ifstream in(trace_path);
-    std::vector<json> rows;
-    for (std::string line; std::getline(in, line);) {
-        if (!line.empty()) rows.push_back(json::parse(line));
-    }
-    unlink(trace_path);
-    TEST_ASSERT(rows.size() == 2);
-    TEST_ASSERT(!rows[0].contains("spread") && !rows[0].contains("spread_threshold"));
-    TEST_ASSERT(rows[1].value("spread_threshold", 0.0) == 0.11);
-    TEST_ASSERT(rows[1].value("spread", -1.0) == on.spread);
-    // Recompute from the record (what the offline simulation reads).
-    std::vector<double> scores = rows[1]["chunk_scores"].get<std::vector<double>>();
-    std::vector<uint8_t> selected(scores.size(), 0), forced(scores.size(), 0);
-    for (int i : rows[1]["selected_chunks"].get<std::vector<int>>()) selected[(size_t) i] = 1;
-    for (int i : rows[1]["forced_chunks"].get<std::vector<int>>()) forced[(size_t) i] = 1;
-    const auto again = luce::common::pflash_selection_spread(scores, selected, forced,
-        rows[1].value("chunk_size", 0), rows[1].value("spread_first_token_score", -1.0),
-        rows[1].value("spread_per_token", false));
-    TEST_ASSERT(again.valid && again.spread == on.spread);
-    TEST_ASSERT(rows[1].value("spread_first_token_score", -1.0) == (double) mass[0]);
-    // Everything else in the record is identical with the flag on and off.
-    json a = rows[0], b = rows[1];
-    for (const char * key : {"spread", "spread_threshold", "spread_first_token_score",
-                             "spread_per_token"}) {
-        b.erase(key);
-    }
-    TEST_ASSERT(a == b);
-}
-
 TEST_CASE(ServerUnitFixture,
         test_pflash_strict_multi_turn_keeps_skeleton_and_history_queries) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
-
     std::string material;
     for (int i = 0; i < 80; ++i) material += "filler words here. ";
     const std::vector<ChatMessage> messages{
@@ -13288,8 +13252,6 @@ TEST_CASE(ServerUnitFixture,
 
 TEST_CASE(ServerUnitFixture,
         test_pflash_strict_selection_owns_chat_continuations) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
-
     const std::string rendered = codec_text("qwen3.5",
         {{"user", "first", ""},
          {"assistant", "Sure.", ""},
@@ -19268,63 +19230,6 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image
     TEST_ASSERT(normalized.is_null() && images.empty());
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_query_head_plan_windows_and_caps) {
-    // One token per character: token counts equal character counts.
-    std::string question;
-    for (int i = 0; i < 12; ++i) question += "Is setting " + std::to_string(i) + " fine? ";
-    std::string paste = "## Paper\n\n";
-    for (int i = 0; i < 30; ++i) paste += "Body text line " + std::to_string(i) + " of the paper.\n\n";
-    const std::string after = "Which line mentions the number twenty?";
-    const std::string content = question + "\n\n" + paste + after;
-    const std::string rendered = "<|im_start|>user\n" + content + "<|im_end|>\n";
-    const std::string path = write_pflash_bpe_tokenizer_fixture({}, rendered);
-    Tokenizer tok;
-    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
-    unlink(path.c_str());
-    std::vector<int32_t> ids;
-    ids.push_back(tok.token_to_id("<|im_start|>"));
-    for (char ch : std::string("user\n") + content) {
-        ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
-    }
-    const int begin = 6;                       // after "<|im_start|>user\n"
-    const int end = begin + (int) content.size();
-    TEST_ASSERT(tok.decode({ids.begin() + begin, ids.begin() + end}) == content);
-
-    // Caps above both blocks: the head whole, the tail as the query window.
-    auto plan = http_detail::pflash_query_head_plan(tok, ids, begin, end, 512, 512);
-    TEST_ASSERT(plan.structured && plan.head_rule == "paste");
-    TEST_ASSERT(plan.extra.size() == 1);
-    const std::string q = question.substr(0, question.size() - 1);   // trimmed
-    TEST_ASSERT(tok.decode({ids.begin() + plan.extra[0].begin, ids.begin() + plan.extra[0].end}) == q);
-    TEST_ASSERT(tok.decode({ids.begin() + plan.tail.begin, ids.begin() + plan.tail.end}) == after);
-    TEST_ASSERT(plan.tail.end == end);
-
-    // A head over its cap: first and last cap/2 tokens; a tail over its cap:
-    // the query window is its last cap/2 tokens, its first cap/2 an extra.
-    plan = http_detail::pflash_query_head_plan(tok, ids, begin, end, 40, 20);
-    TEST_ASSERT(plan.extra.size() == 3);
-    TEST_ASSERT(plan.extra[0].begin == begin && plan.extra[0].end == begin + 20);
-    TEST_ASSERT(plan.extra[1].end == begin + (int) q.size() &&
-                plan.extra[1].end - plan.extra[1].begin == 20);
-    TEST_ASSERT(plan.tail.end == end && plan.tail.end - plan.tail.begin == 10);
-    TEST_ASSERT(plan.extra[2].begin == end - (int) after.size() &&
-                plan.extra[2].end - plan.extra[2].begin == 10);
-
-    // A stock preamble under 16 tokens is not a question; a plain message
-    // keeps today's window.
-    const std::string stock = "Here it is.\n\n" + paste + after;
-    std::vector<int32_t> stock_ids;
-    for (char ch : stock) stock_ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
-    plan = http_detail::pflash_query_head_plan(tok, stock_ids, 0, (int) stock_ids.size(), 256, 256);
-    TEST_ASSERT(plan.extra.empty() && plan.head_tokens == 0);
-    TEST_ASSERT(plan.tail.begin >= 0);
-    std::vector<int32_t> plain_ids;
-    for (char ch : std::string("just a short plain message without any structure at all"))
-        plain_ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
-    plan = http_detail::pflash_query_head_plan(tok, plain_ids, 0, (int) plain_ids.size(), 256, 256);
-    TEST_ASSERT(!plan.structured && plan.extra.empty() && plan.tail.begin < 0);
-}
-
 // A tool session's tool definitions.
 static json pflash_tool_session_tools() {
     return json::array({
@@ -19425,7 +19330,12 @@ struct MockUnifiedBackendT : Base {
     const Tokenizer * tokenizer = nullptr;
     int chunk = 0;
     bool paragraphs = false;
-    bool widen = false;
+    bool adaptive_valid = false;
+    float adaptive_eff = 0.0f;
+    float adaptive_ratio = 0.0f;
+    bool adaptive_full_bypass = false;
+    std::vector<bool> turn_adaptive_full_bypass;
+    std::string reranker_error;
     bool keep_scored_only = false;   // kept_spans = the candidates scored above 1 (the selection keeps only them)
     std::string probe_pin_text;      // non-empty: the request probe pins its last occurrence in the input
     bool fail = false;               // the drafter pass fails
@@ -19486,7 +19396,14 @@ struct MockUnifiedBackendT : Base {
             }
             result.kept_spans = http_detail::canonicalize_pflash_token_spans(std::move(kept));
         }
-        result.budget_widened = widen;
+        result.adaptive_valid = adaptive_valid;
+        result.adaptive_eff = adaptive_eff;
+        result.adaptive_keep_ratio = adaptive_ratio;
+        const size_t call_idx = (size_t) (compress_calls - 1);
+        result.adaptive_full_bypass = call_idx < turn_adaptive_full_bypass.size()
+            ? turn_adaptive_full_bypass[call_idx]
+            : adaptive_full_bypass;
+        result.reranker_error = reranker_error;
         result.ok = true;
         return result;
     }
@@ -19509,26 +19426,34 @@ using UnifiedScore = std::function<double(const std::string &, const std::string
 
 struct UnifiedOptions {
     std::vector<int> max_outputs;               // per turn; 16 when absent
-    const char * select_mode = "budget_only";   // nullptr: no strict-selection environment
     std::vector<std::string> target_words;      // whole pre-tokeniser pieces the target has as one token
     bool distinct_drafter = false;              // a drafter tokenizer of its own, with ``drafter_words``
     std::vector<std::string> drafter_words;
     bool paragraphs = false;                    // drafter candidates end at blank lines
-    bool widen = false;                         // the drafter pass reports a stage-2 widened budget
+    bool adaptive_keep = false;                 // ServerConfig::pflash_adaptive_keep
+    bool adaptive_valid = false;
+    float adaptive_eff = 0.0f;
+    float adaptive_ratio = 0.0f;
+    bool adaptive_full_bypass = false;
+    std::vector<bool> turn_adaptive_full_bypass;
+    std::string reranker_error;
+    std::vector<std::pair<int, float>> pflash_curve;
     bool allow_errors = false;                  // a turn may be refused (context overflow)
     const char * recall_gate = "off";           // PFLASH_RECALL_GATE (nullptr: unset, the 0.075 default)
-    const char * trace_units = nullptr;         // PFLASH_RECALL_TRACE_UNITS
     bool keep_scored_only = false;              // the drafter selection keeps only candidates scored above 1
     std::string disk_dir;                       // non-empty: the disk session cache in this directory
     bool disk_seed_history = false;             // first, a server restart: turn 0 up to its newest user message on disk
     DiskPrefixCacheMode disk_mode = DiskPrefixCacheMode::Full;   // the disk scope of the requests
     int restart_at = -1;                        // a server restart (shutdown flush, a new process) before this turn
+    std::function<void(ServerConfig &)> before_restart;   // runs after shutdown and before the restarted HttpServer starts
     std::string probe_pin_text;                 // the request probe pins this text's last occurrence
     bool drafter_fails = false;                 // every drafter pass fails
-    const char * scorer = nullptr;              // PFLASH_SELECT_SCORER
     const char * fail_closed = nullptr;         // PFLASH_FAIL_CLOSED
     std::vector<std::vector<std::string>> required;   // per turn, pflash_required
+    std::vector<char> tool_checks_note;         // per turn, an internal tool-checks note pass
     std::function<void(size_t)> before_turn;    // runs before each turn (after a restart)
+    std::string codec = "qwen3.5";              // chat codec used to render and parse the session
+    std::vector<std::string> control_tokens;    // target tokenizer control tokens (empty = default Qwen)
 };
 
 // One server with the unified view, the turns in order. By default one fixture tokenizer is target and drafter, so
@@ -19541,9 +19466,6 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     luce_test::ScopedEnvVar region{"PFLASH_REGION_TOOLS", region_tools ? region_tools : ""};
     luce_test::ScopedEnvVar recall_env{"PFLASH_RECALL", recall};
     luce_test::ScopedEnvVar recall_gate{"PFLASH_RECALL_GATE", options.recall_gate};
-    luce_test::ScopedEnvVar trace_units{"PFLASH_RECALL_TRACE_UNITS", options.trace_units};
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
-    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", options.scorer};
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", options.fail_closed};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
     const int trace_fd = mkstemp(trace_path);
@@ -19555,7 +19477,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     for (const auto & messages : turns) {
         ToolMemory tool_memory;
         const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-        rendered.push_back(codec_text("qwen3.5", chat, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
+        rendered.push_back(codec_text(options.codec, chat, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
             tools.is_array() && !tools.empty() ? tools.dump() : ""));
         cover += rendered.back();
     }
@@ -19565,7 +19487,9 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         out.insert(out.end(), words.begin(), words.end());
         return out;
     };
-    const std::string path = write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover);
+    const std::string path = options.control_tokens.empty()
+        ? write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover)
+        : write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover, options.control_tokens);
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
     std::string drafter_path;
@@ -19597,7 +19521,12 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         backend->tokenizer = &drafter;
         backend->chunk = chunk;
         backend->paragraphs = options.paragraphs;
-        backend->widen = options.widen;
+        backend->adaptive_valid = options.adaptive_valid;
+        backend->adaptive_eff = options.adaptive_eff;
+        backend->adaptive_ratio = options.adaptive_ratio;
+        backend->adaptive_full_bypass = options.adaptive_full_bypass;
+        backend->turn_adaptive_full_bypass = options.turn_adaptive_full_bypass;
+        backend->reranker_error = options.reranker_error;
         backend->keep_scored_only = options.keep_scored_only;
         backend->probe_pin_text = options.probe_pin_text;
         backend->fail = options.drafter_fails;
@@ -19615,7 +19544,10 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     config.pflash = true;
     config.pflash_threshold = threshold;
     config.pflash_keep_ratio = keep_ratio;
+    config.pflash_curve = options.pflash_curve;
+    config.pflash_adaptive_keep = options.adaptive_keep;
     config.max_ctx = max_ctx;
+    if (options.codec != "qwen3.5") config.chat_codec = options.codec;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     if (!options.disk_dir.empty()) {
@@ -19653,6 +19585,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
             if ((int) index == options.restart_at) {
                 SchedulerTestHarness::flush_sessions(*owned);
                 owned.reset();
+                if (options.before_restart) options.before_restart(config);
                 owned = start();
             }
             if (options.before_turn) options.before_turn(index);
@@ -19664,6 +19597,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
             request.prompt_tokens = run.ids[index];
             request.max_output = index < options.max_outputs.size() ? options.max_outputs[index] : 16;
             if (index < options.required.size()) request.pflash_required = options.required[index];
+            request.tool_checks_note = index < options.tool_checks_note.size() && options.tool_checks_note[index];
             request.disk_cache_policy = config.disk_cache_policy;   // as the request parser sets it
             run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
             if (!options.allow_errors) TEST_ASSERT_MSG(run.prepared.back().error.empty(), run.prepared.back().error);
@@ -19816,6 +19750,16 @@ TEST_CASE(ServerUnitFixture, test_unified_raw_fallback_drops_the_conversations_v
     TEST_ASSERT_MSG(run.prepared[2].compressed &&
                     run.prepared[2].unified_view, run.prepared[2].pflash_stats.dump());
     TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 2);
+
+    // The same failure on a tool-checks note pass serves raw but keeps the conversation's view: turn 3 continues it.
+    options.tool_checks_note = {0, 1, 0};
+    const auto note = run_unified_session({turn1, turn2, turn3}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                          nullptr, 65536, options);
+    TEST_ASSERT(!note.prepared[1].compressed && note.prepared[1].tokens == note.ids[1]);
+    TEST_ASSERT_MSG(!note.prepared[1].pflash_stats["pflash_fallback"].contains("unified_lineages_forgotten"),
+                    note.prepared[1].pflash_stats.dump());
+    TEST_ASSERT_MSG(note.prepared[2].pflash_stats["unified"].value("continued", false),
+                    note.prepared[2].pflash_stats.dump());
 }
 
 // The error HttpServer's constructor throws with --pflash on (empty: it started), under the caller's environment.
@@ -19847,10 +19791,7 @@ TEST_CASE(ServerUnitFixture, test_unified_string_input_is_one_user_message) {
     TEST_ASSERT(text.served_text[0].find("Line 7: plain filler text here kiwi") != std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_latest_user_parser_pages_and_continues) {
-    // The benchmark's latest_user query parser does not read the chat markers itself; the view still does, so the
-    // paste is paged and the follow-up continues the view as under the default parser.
-    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", "latest_user"};
+TEST_CASE(ServerUnitFixture, test_unified_chat_and_agent_tool_output_pages_and_continues) {
     const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
     const json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -19892,53 +19833,12 @@ TEST_CASE(ServerUnitFixture, test_unified_latest_user_parser_pages_and_continues
                     admission[0].value("decision", "") == "region", admission.dump());
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_retired_settings_are_named_at_startup) {
-    // The former chat view's settings start the server and are named as no longer read; the spread only records.
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chat_view{"PFLASH_CHAT_VIEW", "1"};
-    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
-    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", "1"};
-    luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
-    StderrCapture capture;
-    const std::string error = pflash_startup_error(false);
-    const std::string log = capture.str();
-    TEST_ASSERT_MSG(error.empty(), error);
-    for (const char * name : {"PFLASH_CHAT_VIEW", "PFLASH_ADMISSION", "PFLASH_ARRIVE"}) {
-        TEST_ASSERT_MSG(log.find(std::string(name) + " is no longer read") != std::string::npos, log);
-    }
-    TEST_ASSERT_MSG(log.find("PFLASH_FALLBACK_SPREAD only records") != std::string::npos, log);
-}
-
-TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
-    using luce::pflash::PFlashScorer;
-    using luce::pflash::PFlashSelectStrategy;
-    luce::pflash::PFlashSelectionConfig selection;
-    TEST_ASSERT(http_detail::pflash_selection_gives_lifts(selection));
-    selection.scorer = PFlashScorer::Legacy;
-    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
-    selection.scorer = PFlashScorer::Split;
-    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
-    selection.scorer = PFlashScorer::Head;
-    selection.strategy = PFlashSelectStrategy::Fold;
-    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
-    selection.strategy = PFlashSelectStrategy::Segments;
-    {
-        luce_test::ScopedEnvVar legacy{"PFLASH_QWEN35_LEGACY_SCORER", "1"};
-        TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
-    }
-
+TEST_CASE(ServerUnitFixture, test_unified_drafter_failure_falls_back_or_fails_closed) {
     const std::string doc = unified_doc(80, {{7, "kiwi"}});
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
         {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
     });
-    // A scorer that gives no candidate scores cannot drive the view: startup refuses it.
-    {
-        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-        luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", "legacy"};
-        const std::string error = pflash_startup_error(false);
-        TEST_ASSERT_MSG(error.find("--pflash on") != std::string::npos, error);
-    }
     // A failed drafter pass: the newest content is served verbatim, or with PFLASH_FAIL_CLOSED=1 refused.
     UnifiedOptions failing;
     failing.drafter_fails = true;
@@ -19951,6 +19851,167 @@ TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
     const auto refused = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
                                              65536, failing);
     TEST_ASSERT_MSG(!refused.prepared[0].error.empty(), refused.prepared[0].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_reranker_failure_falls_back_or_fails_closed) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    // When a loaded reranker fails at runtime, default mode falls back to Stage-1 scores and
+    // records drafter.reranker_failed; PFLASH_FAIL_CLOSED=1 refuses the request.
+    UnifiedOptions rr_fail;
+    rr_fail.reranker_error = "seg reranker graph compute failed";
+    const auto fallback = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                              65536, rr_fail);
+    TEST_ASSERT(fallback.prepared[0].error.empty());
+    TEST_ASSERT(fallback.prepared[0].compressed);
+    TEST_ASSERT(fallback.unified["counts"].value("drafter.reranker_failed", 0) == 1);
+    TEST_ASSERT(fallback.prepared[0].pflash_stats["unified"].value("reranker_error", "") == rr_fail.reranker_error);
+
+    rr_fail.fail_closed = "1";
+    rr_fail.allow_errors = true;
+    const auto refused = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                             65536, rr_fail);
+    TEST_ASSERT_MSG(!refused.prepared[0].error.empty(), refused.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(refused.prepared[0].pflash_failure_detail == rr_fail.reranker_error);
+
+    // A fail-open Stage-1 fallback view saved to disk must NEVER be reused when a subsequent
+    // request runs under PFLASH_FAIL_CLOSED=1.
+    const std::string dir = test_tmp_path("luce_test_unified_failopen_view_no_bypass").string();
+    rm_rf(dir);
+    {
+        UnifiedOptions save_open;
+        save_open.disk_dir = dir;
+        save_open.reranker_error = "seg reranker graph compute failed";
+        const auto saved = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                               nullptr, 65536, save_open);
+        TEST_ASSERT(saved.prepared[0].error.empty() && saved.prepared[0].compressed);
+    }
+    {
+        UnifiedOptions reload_closed;
+        reload_closed.disk_dir = dir;
+        reload_closed.reranker_error = "seg reranker graph compute failed";
+        reload_closed.fail_closed = "1";
+        reload_closed.allow_errors = true;
+        const auto reloaded = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                                  nullptr, 65536, reload_closed);
+        TEST_ASSERT_MSG(!reloaded.prepared[0].error.empty(),
+                        "fail-open disk view must not bypass PFLASH_FAIL_CLOSED=1: " +
+                        reloaded.prepared[0].pflash_stats.dump());
+        TEST_ASSERT(reloaded.calls_after[0] == 1);
+    }
+    // An unmarked pre-v3 (`unified-v2`) disk view written by an older revision must also never
+    // match under unified-v3 + PFLASH_FAIL_CLOSED=1. Rewrite BOTH the indexed header line and
+    // the view body so only the unified-v2 -> unified-v3 version bump rejects it.
+    {
+        int rewritten = 0;
+        const auto downgrade_cfg = [](std::string cfg) {
+            const auto pos = cfg.find("unified-v3|");
+            TEST_ASSERT(pos != std::string::npos);
+            cfg.replace(pos, 11, "unified-v2|");
+            const std::string marker = "|reranker_fallback=1";
+            const auto fpos = cfg.find(marker);
+            TEST_ASSERT(fpos != std::string::npos);
+            cfg.erase(fpos, marker.size());
+            return cfg;
+        };
+        for (const auto & entry : std::filesystem::directory_iterator(dir + "/.pflash-views")) {
+            if (entry.path().extension() != ".view") continue;
+            std::ifstream in(entry.path());
+            std::string header, body;
+            std::getline(in, header);
+            std::getline(in, body);
+            in.close();
+            json hdr = json::parse(header);
+            json view = json::parse(body);
+            hdr["config"] = downgrade_cfg(hdr.value("config", ""));
+            view["config"] = downgrade_cfg(view.value("config", ""));
+            std::ofstream(entry.path(), std::ios::trunc) << hdr.dump() << "\n" << view.dump() << "\n";
+            ++rewritten;
+        }
+        TEST_ASSERT(rewritten >= 1);
+        UnifiedOptions reload_old_fmt;
+        reload_old_fmt.disk_dir = dir;
+        reload_old_fmt.reranker_error = "seg reranker graph compute failed";
+        reload_old_fmt.fail_closed = "1";
+        reload_old_fmt.allow_errors = true;
+        const auto reloaded = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                                  nullptr, 65536, reload_old_fmt);
+        TEST_ASSERT_MSG(!reloaded.prepared[0].error.empty(),
+                        "old unmarked unified-v2 disk view must not bypass PFLASH_FAIL_CLOSED=1: " +
+                        reloaded.prepared[0].pflash_stats.dump());
+        TEST_ASSERT(reloaded.calls_after[0] == 1);
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_disk_view_invalidated_by_asset_replace_or_curve_change) {
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
+    });
+    // 1. Replacing a reranker file in place across restart invalidates the persisted disk view.
+    {
+        const std::string dir = test_tmp_path("luce_test_unified_view_asset_replace").string();
+        rm_rf(dir);
+        std::filesystem::create_directories(dir);
+        const std::string rr_path = dir + "/seg-reranker.gguf";
+        { std::ofstream(rr_path) << "reranker-v1"; }
+        luce_test::ScopedEnvVar rr_env{"PFLASH_SEG_RERANKER_GGUF", rr_path.c_str()};
+        UnifiedOptions disk;
+        disk.disk_dir = dir;
+        disk.restart_at = 1;
+        disk.before_restart = [&](ServerConfig &) {
+            std::ofstream(rr_path, std::ios::trunc) << "reranker-v2-different-size";
+        };
+        const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                             nullptr, 65536, disk);
+        TEST_ASSERT(run.calls_after[0] == 1);
+        TEST_ASSERT_MSG(run.calls_after[1] == 2, "expected rescore after in-place reranker replacement");
+        TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 0);
+        rm_rf(dir);
+    }
+    // 2. Changing a custom curve breakpoint between the old 5 sample points (e.g. at 24000 tokens)
+    //    invalidates the persisted disk view.
+    {
+        const std::string dir = test_tmp_path("luce_test_unified_view_curve_change").string();
+        rm_rf(dir);
+        UnifiedOptions disk;
+        disk.disk_dir = dir;
+        disk.restart_at = 1;
+        disk.pflash_curve = {{8192, 0.45f}, {16384, 0.35f}, {24000, 0.33f}, {32768, 0.27f}, {65536, 0.26f}};
+        disk.before_restart = [&](ServerConfig & cfg) {
+            cfg.pflash_curve = {{8192, 0.45f}, {16384, 0.35f}, {24000, 0.29f}, {32768, 0.27f}, {65536, 0.26f}};
+        };
+        const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                             nullptr, 65536, disk);
+        TEST_ASSERT(run.calls_after[0] == 1);
+        TEST_ASSERT_MSG(run.calls_after[1] == 2, "expected rescore after intermediate curve breakpoint change");
+        TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 0);
+        rm_rf(dir);
+    }
+    // 3. Replacing a reranker file in place WITHOUT restarting the server invalidates the live RAM view.
+    {
+        const std::string dir = test_tmp_path("luce_test_unified_live_asset_replace").string();
+        rm_rf(dir);
+        std::filesystem::create_directories(dir);
+        const std::string rr_path = dir + "/seg-reranker.gguf";
+        { std::ofstream(rr_path) << "reranker-live-v1"; }
+        luce_test::ScopedEnvVar rr_env{"PFLASH_SEG_RERANKER_GGUF", rr_path.c_str()};
+        UnifiedOptions live;
+        live.before_turn = [&](size_t index) {
+            if (index == 1) {
+                std::ofstream(rr_path, std::ios::trunc) << "reranker-live-v2-longer";
+            }
+        };
+        const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                             nullptr, 65536, live);
+        TEST_ASSERT(run.calls_after[0] == 1);
+        TEST_ASSERT_MSG(run.calls_after[1] == 2, "expected rescore after live in-place reranker replacement");
+        rm_rf(dir);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_repeat_with_a_new_pin_serves_it) {
@@ -20098,7 +20159,9 @@ TEST_CASE(ServerUnitFixture, test_unified_line_model_json_string_served) {
     TEST_ASSERT(content.find("\n79|row 79\n80|row 80\n") != std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_recall_user_question_only) {
+TEST_CASE(ServerUnitFixture, test_unified_recall_at_a_gated_tool_turn_and_a_user_question) {
+    // Autonomous tool turns and user follow-up turns both participate in recall while preserving the
+    // served prefix (I1): a tool turn whose output triggers recall splices cleanly after </tool_response>.
     const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
     json turn1 = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -20108,36 +20171,51 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_user_question_only) {
         {{"role", "tool"}, {"tool_call_id", "call_1"},
          {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}})}},
     });
-    // An agent step: another call and a small result. No recall, no drafter pass; the view continues.
+    // An autonomous tool turn referencing MANGO: recalls from the earlier read_file region after </tool_response>.
     json turn2 = turn1;
     turn2.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
         unified_tool_call("call_2", "read_file", {{"path", "note.md"}})})}});
-    turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "short note"}});
-    // The answer, then a new user question: recall at the question.
+    turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "check MANGO in doc.md"}});
+    // A subsequent user turn still continues the view cleanly without breaking prefix reuse.
     json turn3 = turn2;
-    turn3.push_back({{"role", "assistant"}, {"content", "Line 7."}});
-    turn3.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
-    const auto run = run_unified_session({turn1, turn2, turn3}, tools, "read_file", 64, unified_fruit_score);
-    TEST_ASSERT_MSG(run.calls_after == std::vector<int>({1, 1, 2}), run.prepared[0].pflash_stats.dump() + "\n" + run.raw_text[0]);
-    TEST_ASSERT(run.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
-    TEST_ASSERT(run.prepared[2].pflash_stats["unified"].value("decision", "") == "recall");
+    turn3.push_back({{"role", "assistant"}, {"content", "Line 60."}});
+    turn3.push_back({{"role", "user"}, {"content", "Which line mentions KIWI?"}});
+    UnifiedOptions gate;
+    gate.recall_gate = "0.05";
+    const auto sharp_score = [] (const std::string & segment, const std::string & prompt) {
+        double s = 1.0;
+        if (prompt.find("KIWI?") != std::string::npos && segment.find("kiwi") != std::string::npos) s += 100.0;
+        if (prompt.find("MANGO") != std::string::npos && segment.find("mango") != std::string::npos) s += 100.0;
+        return s;
+    };
+    const auto run = run_unified_session({turn1, turn2, turn3}, tools, "read_file", 64, sharp_score,
+                                         0, 0.3f, nullptr, 65536, gate);
+    TEST_ASSERT_MSG(run.prepared[1].pflash_stats["unified"].value("decision", "") == "recall",
+                    run.prepared[1].pflash_stats.dump());
     for (size_t turn = 1; turn < 3; ++turn) {
         const int vg = run.prepared[turn - 1].snapshot_cut;
         TEST_ASSERT(std::equal(run.prepared[turn - 1].tokens.begin(), run.prepared[turn - 1].tokens.begin() + vg,
                                run.prepared[turn].tokens.begin()));
     }
-    const std::string & s3 = run.served_text[2];
-    const size_t block = s3.find("[Earlier in this conversation]\n[From the earlier result of read_file "
+    const std::string & s2 = run.served_text[1];
+    const size_t close_tag = s2.rfind("</tool_response>");
+    const size_t block = s2.find("[Earlier in this conversation]\n[From the earlier result of read_file "
                                  "{\"path\":\"doc.md\"}]\n");
-    TEST_ASSERT_MSG(block != std::string::npos, s3);
-    TEST_ASSERT(s3.find("Line 60: plain filler text here mango\n", block) != std::string::npos);
-    TEST_ASSERT(s3.find("short note") < block);
+    TEST_ASSERT_MSG(close_tag != std::string::npos && block != std::string::npos && block > close_tag, s2);
+    TEST_ASSERT(s2.find("Line 60: plain filler text here mango\n", block) != std::string::npos);
+
+    // With the recall gate off, a tool turn never recalls (no lift floor would bound it): no drafter pass, the
+    // view continues, and the user's question recalls as before.
+    const auto ungated = run_unified_session({turn1, turn2, turn3}, tools, "read_file", 64, sharp_score);
+    TEST_ASSERT_MSG(ungated.calls_after == std::vector<int>({1, 1, 2}), ungated.prepared[1].pflash_stats.dump());
+    TEST_ASSERT(ungated.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
+    TEST_ASSERT(ungated.prepared[2].pflash_stats["unified"].value("decision", "") == "recall");
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_tool_session_cold_history_stays_verbatim) {
-    // A cold agent transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a
-    // short question. An agent session's history is never paged: with nothing new to page the prompt is served raw,
-    // with no drafter pass.
+TEST_CASE(ServerUnitFixture, test_unified_tool_session_cold_history_is_paged) {
+    // A cold agent transcript (e.g. prefix-cache miss or Lucebox Mix model switch): earlier large
+    // user pastes and paired listed tool outputs are paged once into recallable regions while
+    // system/assistant turns and the latest small active tool output stay verbatim.
     const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
     const json turn = json::array({
         {{"role", "system"}, {"content", "You are helpful."}},
@@ -20150,25 +20228,35 @@ TEST_CASE(ServerUnitFixture, test_unified_tool_session_cold_history_stays_verbat
     });
     const auto run = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score);
     const json & stats = run.prepared[0].pflash_stats;
-    TEST_ASSERT_MSG(stats["unified"].value("decision", "") == "raw" &&
-                    stats["unified"].value("reason", "") == "no_region", stats.dump());
-    TEST_ASSERT(stats["unified"]["admission"].size() == 1);   // the newest message alone
-    TEST_ASSERT(!run.prepared[0].compressed);
-    TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
-    TEST_ASSERT(run.calls_after[0] == 0);
+    TEST_ASSERT_MSG(stats["unified"].value("decision", "") == "region" &&
+                    stats["unified"].value("regions", 0) == 2, stats.dump());
+    TEST_ASSERT(run.prepared[0].compressed);
+    TEST_ASSERT(run.calls_after[0] == 1);
 
-    // The same transcript with a new large tool output as its newest turn: that output alone is paged.
+    // With a small active tool output at the end, earlier cold history is paged while the active tool stays verbatim.
     json fresh = turn;
     fresh.back() = {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
         unified_tool_call("call_2", "read_file", {{"path", "more.md"}})})}};
-    fresh.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unified_doc(80, {{9, "kiwi"}}, "R")}});
+    fresh.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "small active tool output"}});
     const auto paged = run_unified_session({fresh}, tools, "read_file", 64, unified_fruit_score);
-    const json & admission = paged.prepared[0].pflash_stats["unified"]["admission"];
-    TEST_ASSERT_MSG(paged.prepared[0].compressed && admission.size() == 1 &&
-                    admission[0].value("kind", "") == "tool_output" && admission[0].value("decision", "") == "region",
+    TEST_ASSERT_MSG(paged.prepared[0].compressed &&
+                    paged.prepared[0].pflash_stats["unified"].value("regions", 0) == 2,
                     paged.prepared[0].pflash_stats.dump());
-    TEST_ASSERT(paged.served_text[0].find(unified_doc(80, {{7, "kiwi"}}) + "Summarise this.") != std::string::npos);
+    TEST_ASSERT(paged.served_text[0].find("small active tool output") != std::string::npos);
     TEST_ASSERT(paged.calls_after[0] == 1);
+
+    // Aggregate admission: each history message is under a 4096 threshold, but both hold at least 2048 droppable
+    // tokens and together pass it, so both are paged; under 8192 they do not, and the prompt is served raw.
+    const auto aggregate = run_unified_session({fresh}, tools, "read_file", 4096, unified_fruit_score);
+    const json & batch = aggregate.prepared[0].pflash_stats["unified"];
+    TEST_ASSERT_MSG(aggregate.prepared[0].compressed && batch.value("regions", 0) == 2, batch.dump());
+    for (const auto & entry : batch["admission"]) {
+        if (entry.value("decision", "") == "region") {
+            TEST_ASSERT_MSG(entry.value("droppable", 0) >= 2048 && entry.value("droppable", 0) < 4096, batch.dump());
+        }
+    }
+    const auto below = run_unified_session({fresh}, tools, "read_file", 8192, unified_fruit_score);
+    TEST_ASSERT_MSG(!below.prepared[0].compressed && below.calls_after[0] == 0, below.prepared[0].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_is_paged_once_and_recallable) {
@@ -20738,24 +20826,16 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_leaves_newly_dropped_conte
     const auto turns = unified_fruit_turns((fresh_doc + "Which line mentions MANGO?").c_str());
     UnifiedOptions gate;
     gate.recall_gate = "0.01";
-    gate.trace_units = "1";
     const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
                                          65536, gate);
     const json & u = run.prepared[1].pflash_stats["unified"];
     TEST_ASSERT_MSG(u.value("decision", "") == "region_recall", u.dump());
     const json & g = u["recall_gate"];
-    const json & q = u["recall_units"];
     const double dropped = g.value("new_dropped_mass", 0.0);
     TEST_ASSERT_MSG(dropped > 0.0, g.dump());
-    TEST_ASSERT(q.value("new_dropped_mass", 0.0) == dropped);
-    const double s = q.value("context_mass", 0.0) - dropped;
-    TEST_ASSERT(std::fabs(g.value("context_mass", 0.0) - s) < 1e-12);
-    double missing = 0.0;
-    const json & r = q["regions"][0];
-    for (size_t k = 0; k < r["held"].size(); ++k) {
-        if (!r["held"][k].get<int>()) missing += r["mass"][k].get<double>();
-    }
-    TEST_ASSERT_MSG(std::fabs(g.value("deficit_before", 0.0) - missing / s) < 1e-9, g.dump());
+    TEST_ASSERT_MSG(g.value("context_mass", 0.0) > 0.0, g.dump());
+    TEST_ASSERT_MSG(g.value("deficit_before", 0.0) >= 0.01, g.dump());
+    TEST_ASSERT_MSG(g.value("deficit_after", 1.0) < g.value("deficit_before", 0.0), g.dump());
     // The old region's mango line comes back at the start of the question.
     TEST_ASSERT(g.value("decision", "") == "admitted");
     TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
@@ -20790,32 +20870,6 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_skips_the_drafter_once_eve
     TEST_ASSERT(last["recall_gate"].value("decision", "") == "complete");
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_recall_trace_units_records_without_changing_bytes) {
-    UnifiedOptions traced;
-    traced.trace_units = "1";
-    const auto turns = unified_fruit_turns("Which line mentions MANGO?");
-    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
-                                         65536, traced);
-    const auto plain = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score);
-    for (size_t i = 0; i < run.prepared.size(); ++i) TEST_ASSERT(run.prepared[i].tokens == plain.prepared[i].tokens);
-    // Paging: the region's cuts relative to its content, and the units it kept.
-    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0]["trace_units"];
-    const int units = run.prepared[0].pflash_stats["unified"]["admission"][0].value("units", 0);
-    TEST_ASSERT(paged["cuts"].size() == (size_t) units + 1);
-    TEST_ASSERT(paged["kept"].size() == (size_t) units);
-    // A question: every unit's held flag, mass, cost and score, and the context mass.
-    const json & q = run.prepared[1].pflash_stats["unified"]["recall_units"];
-    TEST_ASSERT(q.value("context_mass", 0.0) > 0.0);
-    const json & r = q["regions"][0];
-    TEST_ASSERT(r["held"] == paged["kept"]);
-    TEST_ASSERT(r["mass"].size() == (size_t) units && r["cost"].size() == (size_t) units);
-    double total = 0.0;
-    for (const auto & m : r["mass"]) total += m.get<double>();
-    TEST_ASSERT(total > 0.0 && total <= q.value("context_mass", 0.0) + 1e-9);
-    TEST_ASSERT(plain.prepared[1].pflash_stats["unified"].find("recall_units") ==
-                plain.prepared[1].pflash_stats["unified"].end());
-}
-
 TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_values) {
     const std::string path = write_pflash_bpe_tokenizer_fixture({"a"}, "abc");
     Tokenizer tokenizer;
@@ -20824,10 +20878,8 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     config.pflash = true;
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    const auto refused = [&] (const char * gate, const char * source, const char * recall) {
+    const auto refused = [&] (const char * gate, const char * recall) {
         luce_test::ScopedEnvVar g{"PFLASH_RECALL_GATE", gate};
-        luce_test::ScopedEnvVar s{"PFLASH_RECALL_SOURCE", source};
         luce_test::ScopedEnvVar r{"PFLASH_RECALL", recall};
         LuceEngine engine(std::make_unique<MockBackend>());
         try {
@@ -20837,25 +20889,18 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_
         }
         return false;
     };
-    TEST_ASSERT(refused("0", nullptr, nullptr));
-    TEST_ASSERT(refused("1", nullptr, nullptr));
-    TEST_ASSERT(refused("1.5", nullptr, nullptr));
-    TEST_ASSERT(refused("0.1x", nullptr, nullptr));
-    TEST_ASSERT(refused("nan", nullptr, nullptr));
-    TEST_ASSERT(refused("Off", nullptr, nullptr));
-    TEST_ASSERT(refused("0.1", nullptr, "0"));
-    // PFLASH_RECALL_SOURCE was removed: any value refuses to start.
-    TEST_ASSERT(refused(nullptr, "fresh", nullptr));
-    TEST_ASSERT(refused(nullptr, "kept", nullptr));
-    {
-        luce_test::ScopedEnvVar trace{"PFLASH_RECALL_TRACE_UNITS", "yes"};
-        TEST_ASSERT(refused(nullptr, nullptr, nullptr));
-    }
-    TEST_ASSERT(!refused("0.1", nullptr, nullptr));
-    TEST_ASSERT(!refused("off", nullptr, nullptr));
-    TEST_ASSERT(!refused("off", nullptr, "0"));
-    TEST_ASSERT(!refused(nullptr, nullptr, "0"));
-    TEST_ASSERT(!refused(nullptr, nullptr, nullptr));
+    TEST_ASSERT(refused("0", nullptr));
+    TEST_ASSERT(refused("1", nullptr));
+    TEST_ASSERT(refused("1.5", nullptr));
+    TEST_ASSERT(refused("0.1x", nullptr));
+    TEST_ASSERT(refused("nan", nullptr));
+    TEST_ASSERT(refused("Off", nullptr));
+    TEST_ASSERT(refused("0.1", "0"));
+    TEST_ASSERT(!refused("0.1", nullptr));
+    TEST_ASSERT(!refused("off", nullptr));
+    TEST_ASSERT(!refused("off", "0"));
+    TEST_ASSERT(!refused(nullptr, "0"));
+    TEST_ASSERT(!refused(nullptr, nullptr));
     unlink(path.c_str());
 }
 
@@ -20869,7 +20914,6 @@ TEST_CASE(ServerUnitFixture, test_unified_defaults_gate_and_every_tool) {
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     config.pflash = true;
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     const auto settings = [&] (const char * gate, const char * tools, const char * recall) {
         luce_test::ScopedEnvVar g{"PFLASH_RECALL_GATE", gate};
         luce_test::ScopedEnvVar t{"PFLASH_REGION_TOOLS", tools};
@@ -20890,7 +20934,80 @@ TEST_CASE(ServerUnitFixture, test_unified_defaults_gate_and_every_tool) {
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture, test_unified_experimental_flags_fail_startup) {
+TEST_CASE(ServerUnitFixture, test_unified_adaptive_keep_scales_cap_and_bypasses_diffuse) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    // 1. Adaptive scaling: configured static keep_ratio is 0.20, but adaptive signal widens it to 0.50.
+    UnifiedOptions wide;
+    wide.adaptive_keep = true;
+    wide.adaptive_valid = true;
+    wide.adaptive_eff = 0.48f;
+    wide.adaptive_ratio = 0.50f;
+    const auto fixed = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.20f);
+    const auto adapted = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.20f,
+                                             nullptr, 65536, wide);
+    TEST_ASSERT(fixed.prepared[0].compressed && adapted.prepared[0].compressed);
+    const int fixed_cap = fixed.prepared[0].pflash_stats["unified"]["admission"][0].value("cap", 0);
+    const int adapted_cap = adapted.prepared[0].pflash_stats["unified"]["admission"][0].value("cap", 0);
+    TEST_ASSERT_MSG(adapted_cap > fixed_cap * 2,
+                    "fixed_cap=" + std::to_string(fixed_cap) + " adapted_cap=" + std::to_string(adapted_cap));
+    TEST_ASSERT(adapted.prepared[0].tokens.size() > fixed.prepared[0].tokens.size());
+
+    // 2. Full-prefill bypass: diffuse prompt (eff >= 0.58) serves raw prompt verbatim (lossless).
+    UnifiedOptions bypass;
+    bypass.adaptive_keep = true;
+    bypass.adaptive_valid = true;
+    bypass.adaptive_eff = 0.65f;
+    bypass.adaptive_ratio = 1.0f;
+    bypass.adaptive_full_bypass = true;
+    const auto full = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.20f,
+                                          nullptr, 65536, bypass);
+    TEST_ASSERT_MSG(!full.prepared[0].compressed, full.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(full.prepared[0].tokens == full.ids[0]);
+    TEST_ASSERT(full.served_text[0].find("Line 60: plain filler text here mango\n") != std::string::npos);
+    TEST_ASSERT(full.served_text[0].find("not shown") == std::string::npos);
+    TEST_ASSERT_MSG(full.prepared[0].pflash_stats.contains("adaptive") &&
+                    full.prepared[0].pflash_stats["adaptive"].value("bypass_full", false) == true &&
+                    full.prepared[0].pflash_stats["adaptive"].value("bypass_new_regions", false) == true &&
+                    std::fabs(full.prepared[0].pflash_stats["adaptive"].value("widen_ratio", 0.0) - 1.0) < 1e-6,
+                    full.prepared[0].pflash_stats.dump());
+
+    // 3. The same diffuse prompt when the raw prompt does not fit the context: paged at the bypass share instead.
+    const auto tight = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.20f,
+                                           nullptr, (int) full.ids[0].size(), bypass);
+    TEST_ASSERT_MSG(tight.prepared[0].compressed, tight.prepared[0].pflash_stats.dump());
+    const int tight_cap = tight.prepared[0].pflash_stats["unified"]["admission"][0].value("cap", 0);
+    TEST_ASSERT_MSG(tight_cap > fixed_cap * 2,
+                    "fixed_cap=" + std::to_string(fixed_cap) + " tight_cap=" + std::to_string(tight_cap));
+
+    // 4. Continuing view: turn 1 is paged, turn 2 triggers adaptive bypass on a second long user message.
+    //    The earlier paged history stays compressed while the new turn is served verbatim; telemetry
+    //    reports bypass_new_regions=true and bypass_full=false (since served != raw).
+    const std::string doc2 = unified_doc(80, {{42, "mango"}}, "Second ");
+    json turn2 = turn;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7 mentions kiwi."}});
+    turn2.push_back({{"role", "user"}, {"content", doc2 + "Summarize everything in the second block."}});
+    UnifiedOptions cont;
+    cont.adaptive_keep = true;
+    cont.adaptive_valid = true;
+    cont.adaptive_eff = 0.65f;
+    cont.adaptive_ratio = 1.0f;
+    cont.turn_adaptive_full_bypass = {false, true};
+    const auto cont_run = run_unified_session({turn, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.20f,
+                                              nullptr, 65536, cont);
+    TEST_ASSERT(cont_run.prepared[0].compressed);
+    TEST_ASSERT_MSG(cont_run.prepared[1].compressed, cont_run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT(cont_run.served_text[1].find("Second 42: plain filler text here mango\n") != std::string::npos);
+    TEST_ASSERT_MSG(cont_run.prepared[1].pflash_stats.contains("adaptive") &&
+                    cont_run.prepared[1].pflash_stats["adaptive"].value("bypass_new_regions", false) == true &&
+                    cont_run.prepared[1].pflash_stats["adaptive"].value("bypass_full", true) == false,
+                    cont_run.prepared[1].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_invalid_region_tools_fails_startup) {
     const std::string path = write_pflash_bpe_tokenizer_fixture({"a"}, "abc");
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -20898,18 +21015,6 @@ TEST_CASE(ServerUnitFixture, test_unified_experimental_flags_fail_startup) {
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     config.pflash = true;
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    {
-        luce_test::ScopedEnvVar arm{"PFLASH_UNIFIED_DEFRAG", "1"};
-        LuceEngine engine(std::make_unique<MockBackend>());
-        bool threw = false;
-        try {
-            HttpServer server(engine, tokenizer, config);
-        } catch (const std::runtime_error &) {
-            threw = true;
-        }
-        TEST_ASSERT(threw);
-    }
     {
         luce_test::ScopedEnvVar tools{"PFLASH_REGION_TOOLS", "read_file,,grep"};
         LuceEngine engine(std::make_unique<MockBackend>());
@@ -21013,23 +21118,14 @@ static std::string unified_rendered_content(const std::string & text, const std:
     return end == std::string::npos ? "" : text.substr(begin, end - begin);
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_on_refuses_to_start_without_the_head_or_with_an_ipc_drafter) {
-    // PFlash pages with the trained head's per-candidate scores from a drafter in this process. Without a selection
-    // environment, with an IPC drafter, or with a target whose drafter pass gives no candidate scores (Qwen3,
-    // Laguna, Gemma 4), startup fails instead of serving a different mode.
-    {
-        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", nullptr};
-        const std::string error = pflash_startup_error(false);
-        TEST_ASSERT_MSG(error.find("trained scoring head") != std::string::npos, error);
-    }
-    {
-        luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-        const std::string error = pflash_startup_error(true);
-        TEST_ASSERT_MSG(error.find("drafter in this process") != std::string::npos, error);
-        TEST_ASSERT_MSG(pflash_startup_error(false).empty(), pflash_startup_error(false));
-        const std::string unscored = pflash_startup_error(false, /*candidate_scores=*/false);
-        TEST_ASSERT_MSG(unscored.find("per-candidate scores") != std::string::npos, unscored);
-    }
+TEST_CASE(ServerUnitFixture, test_pflash_on_refuses_ipc_drafter_and_unscored_backend) {
+    // PFlash pages with the trained head's per-candidate scores from a drafter in this process. With an IPC
+    // drafter or with a target whose drafter pass gives no candidate scores, startup fails.
+    const std::string error = pflash_startup_error(true);
+    TEST_ASSERT_MSG(error.find("drafter in this process") != std::string::npos, error);
+    TEST_ASSERT_MSG(pflash_startup_error(false).empty(), pflash_startup_error(false));
+    const std::string unscored = pflash_startup_error(false, /*candidate_scores=*/false);
+    TEST_ASSERT_MSG(unscored.find("per-candidate scores") != std::string::npos, unscored);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_reread_holds_unit_ending_in_blank_line) {
@@ -21147,31 +21243,6 @@ TEST_CASE(ServerUnitFixture, test_unified_reset_pages_the_history_again) {
     TEST_ASSERT(!retried.prepared[over].error.empty());
     TEST_ASSERT_MSG(retried.prepared[over + 1].unified_view,
                     retried.prepared[over + 1].pflash_stats.dump());
-}
-
-TEST_CASE(ServerUnitFixture, test_unified_widened_cap_applies_once) {
-    // A stage-2 widened pass widens a region's cap by half, once: at paging and again at a later recall, never
-    // compounded.
-    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
-    const json turn1 = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
-    });
-    json turn2 = turn1;
-    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
-    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
-    UnifiedOptions options;
-    options.widen = true;
-    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
-                                         nullptr, 65536, options);
-    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0];
-    const int unwidened = paged.value("unwidened_cap", 0);
-    TEST_ASSERT_MSG(unwidened > 0 && paged.value("cap", 0) == unwidened + unwidened / 2, paged.dump());
-    const json & recall = run.prepared[1].pflash_stats["unified"]["recall"];
-    TEST_ASSERT_MSG(recall.is_array() && recall.size() == 1, run.prepared[1].pflash_stats.dump());
-    TEST_ASSERT(recall[0].value("cap", 0) == paged.value("cap", 0));
-    TEST_ASSERT(recall[0].value("wrapper", 0) > 0);
-    TEST_ASSERT(recall[0].value("tokens", 0) <= paged.value("cap", 0) - recall[0].value("wrapper", 0));
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_distinct_tokenizers_keep_lines_whole) {
@@ -21359,8 +21430,6 @@ struct PflashStageRun {
 // Routed long prompts report their admission to a model router.
 static PflashStageRun run_pflash_stage_case(int chats, int long_prompts,
                                             bool routed = false) {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     const auto prompt = pflash_long_system_prompt_case();
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
@@ -21547,4 +21616,119 @@ TEST_CASE(ServerUnitFixture, test_dropped_note_names_declared_tools) {
     const std::string bare_note = tool_checks::dropped_call_note(bare);
     TEST_ASSERT(!bare_note.empty());
     TEST_ASSERT(bare_note.find("The tools you can call here are") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_inkling2_chat_boundaries_and_pflash_unified_session) {
+    const std::vector<std::string> inkling_controls = {
+        "<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>",
+        "<|content_text|>", "<|content_thinking|>", "<|content_xml|>",
+        "<|content_invoke_tool_json|>", "<|end_message|>", "<|content_model_end_sampling|>",
+    };
+
+    // 1. Chat boundary detection across Inkling 2 turns (including
+    //    <|content_model_end_sampling|> between a model turn and the next turn).
+    const std::vector<ChatMessage> sample_msgs = {
+        {"system", "You are helpful.", ""},
+        {"user", "First question", ""},
+        {"assistant", "First answer", ""},
+        {"user", "Second question", ""},
+    };
+    const std::string sample_rendered =
+        codec_text("inkling2", sample_msgs, /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    const std::string tok_path = write_pflash_bpe_tokenizer_fixture(
+        {"You", " are", " helpful", ".", "First", " Second", " question", " answer"},
+        sample_rendered, inkling_controls);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(tok_path.c_str()));
+    unlink(tok_path.c_str());
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    TEST_ASSERT(markers.family == "inkling2");
+    const auto sample_ids = tok.encode(sample_rendered);
+    const auto bounds = find_all_boundaries(sample_ids, markers);
+    // Boundaries after: system->effort, effort->user1, user1->model1, model1(+end_sampling)->user2.
+    TEST_ASSERT_MSG(bounds.size() == 4, "expected 4 Inkling 2 turn boundaries");
+
+    // 2. Full end-to-end PFlash unified view on Inkling 2 with a distinct
+    //    Qwen-style drafter tokenizer: Turn 1 pages a long user paste, Turn 2
+    //    continues the view and recalls the dropped mango line, Turn 3 repeats.
+    //    Like Qwen3.5's, the drafter spells the markers as text and merges
+    //    "|>" with the next marker's "<|", so a prompt's closing "|>" is not
+    //    a token prefix of the next turn's prompt.
+    UnifiedOptions opts;
+    opts.codec = "inkling2";
+    opts.control_tokens = inkling_controls;
+    opts.distinct_drafter = true;
+    opts.drafter_words = {"|>", "|><|"};
+
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session(
+        {turn1, turn2, turn2}, nullptr, nullptr, 64, unified_fruit_score,
+        /*chunk=*/0, /*keep_ratio=*/0.3f, /*recall=*/nullptr, /*max_ctx=*/65536, opts);
+
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT(p1.compressed);
+    TEST_ASSERT_MSG(p1.pflash_stats["unified"].value("decision", "") == "region", p1.pflash_stats.dump());
+    const std::string & s1 = run.served_text[0];
+    TEST_ASSERT(s1.find("You are helpful.") != std::string::npos);
+    TEST_ASSERT(s1.find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(s1.find("mango") == std::string::npos);
+    // No generation prompt: the served prompt ends with the question and its closing marker, kept verbatim.
+    const auto ends_with = [] (const std::string & text, const std::string & tail) {
+        return text.size() >= tail.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    TEST_ASSERT(ends_with(s1, "Which line mentions KIWI?<|end_message|>"));
+    TEST_ASSERT(p1.tokens.size() < run.ids[0].size());
+
+    // Turn 2 continues Turn 1's view (prefix reused verbatim) and recalls mango.
+    const auto & p2 = run.prepared[1];
+    TEST_ASSERT(p2.compressed);
+    TEST_ASSERT_MSG(p2.pflash_stats["unified"].value("decision", "") == "recall", p2.pflash_stats.dump());
+    TEST_ASSERT(p2.pflash_stats["unified"].value("continued", false));
+    TEST_ASSERT(p2.tokens.size() >= p1.tokens.size());
+    TEST_ASSERT(std::equal(p1.tokens.begin(), p1.tokens.end(), p2.tokens.begin()));
+    const std::string & s2 = run.served_text[1];
+    TEST_ASSERT(s2.find("Line 60: plain filler text here mango\n") != std::string::npos);
+    TEST_ASSERT(ends_with(s2, "Which line mentions MANGO?<|end_message|>"));
+
+    // Turn 3 repeats Turn 2 without re-running the drafter.
+    const auto & p3 = run.prepared[2];
+    TEST_ASSERT_MSG(p3.pflash_stats["unified"].value("decision", "") == "repeat", p3.pflash_stats.dump());
+    TEST_ASSERT(p3.tokens == p2.tokens);
+    TEST_ASSERT(run.calls_after[2] == run.calls_after[1]);
+
+    // 3. Tool-output paging on Inkling 2 (agent loop ending with <|message_tool|>...<|end_message|>).
+    const json tools = json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read_file"},
+             {"description", "Read file"},
+             {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}},
+         }}},
+    });
+    const json tool_turn = json::array({
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "notes.txt"}})
+        })}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", doc}},
+    });
+    const auto tool_run = run_unified_session(
+        {tool_turn}, tools, "read_file", 64, unified_fruit_score,
+        /*chunk=*/0, /*keep_ratio=*/0.3f, /*recall=*/nullptr, /*max_ctx=*/65536, opts);
+    const auto & tp = tool_run.prepared[0];
+    TEST_ASSERT(tp.compressed);
+    TEST_ASSERT_MSG(tp.pflash_stats["unified"].value("decision", "") == "region", tp.pflash_stats.dump());
+    TEST_ASSERT(tool_run.served_text[0].find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(tool_run.served_text[0].find("mango") == std::string::npos);
+    TEST_ASSERT(tool_run.served_text[0].find("<|message_tool|>read_file<|content_text|>") != std::string::npos);
+    TEST_ASSERT(ends_with(tool_run.served_text[0], "<|end_message|>"));
+    TEST_ASSERT(tp.tokens.size() < tool_run.ids[0].size());
 }

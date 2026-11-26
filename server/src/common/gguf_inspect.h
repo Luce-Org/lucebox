@@ -74,4 +74,8 @@ struct GgufMetadata {
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256);
 
+// Lowercase hex SHA-256 of a file, read in full with no sidecar; empty when it
+// cannot be read.
+std::string sha256_of_file(const std::string & path);
+
 }  // namespace luce::common
