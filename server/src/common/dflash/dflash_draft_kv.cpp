@@ -151,6 +151,9 @@ bool draft_kv_init_batched(DraftKvState & st,
 void draft_kv_reset(DraftKvState & st) {
     std::fill(st.slot_pos.begin(), st.slot_pos.end(), -1);
     st.next_pos = 0;
+    st.mask_full_lo = st.mask_full_hi = -1;
+    st.mask_full_noise_width = -1;
+    st.mask_swa_lo = st.mask_swa_hi = -1;
 }
 
 void draft_kv_free(DraftKvState & st) {
@@ -165,6 +168,11 @@ void draft_kv_free(DraftKvState & st) {
     st.cache.k.clear();
     st.cache.v.clear();
     st.slot_pos.clear();
+    st.mask_full_row0.clear();
+    st.mask_swa_row0.clear();
+    st.mask_full_lo = st.mask_full_hi = -1;
+    st.mask_full_noise_width = -1;
+    st.mask_swa_lo = st.mask_swa_hi = -1;
     st.next_pos = 0;
     st.built_for = nullptr;
 }
@@ -249,10 +257,18 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed,
-                         int width) {
+                         int width,
+                         int append_cap,
+                         bool defer_sync,
+                         PinnedStage * stage) {
     if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
         committed <= 0 || width < 0 || width > st.q_len) return false;
+    // Single-lane mode pre-builds st.gf at st.q_len; reject narrower widths
+    // that would leave the tail of the single-lane graph uninitialized.
+    if (st.gf && width > 0 && width != st.q_len) return false;
     const int noise_width = width > 0 ? width : st.q_len;
+    const int active_a_step =
+        (append_cap > 0 && append_cap < st.a_step) ? append_cap : st.a_step;
     // Rewind (prefix-cache restore / new shorter request): stale slots would
     // shadow live window positions, so rebuild from scratch.
     if (st.next_pos > committed) draft_kv_reset(st);
@@ -261,7 +277,7 @@ bool draft_kv_begin_step(DraftKvState & st,
     const int lo  = committed - win;
     int64_t start = std::max<int64_t>(st.next_pos, lo);
     int n_new = (int)(committed - start);
-    if (n_new > st.a_step) {
+    if (n_new > active_a_step) {
         if (!draft_kv_bulk_append(st, dw, backend, ring, (int)start, n_new)) {
             std::fprintf(stderr, "[draft-kv] bulk append failed\n");
             return false;
@@ -270,11 +286,13 @@ bool draft_kv_begin_step(DraftKvState & st,
         n_new = 0;
     }
 
-    // fold-in append inputs: real rows then trash-slot pads
-    st.i32_hbuf.assign((size_t)st.a_step * 2, 0);
+    // fold-in append inputs: real rows then trash-slot pads; then the noise
+    // positions
+    st.i32_hbuf.resize((size_t)active_a_step * 2 + (size_t)noise_width);
     int32_t * ap_pos  = st.i32_hbuf.data();
-    int32_t * ap_rows = st.i32_hbuf.data() + st.a_step;
-    for (int i = 0; i < st.a_step; i++) {
+    int32_t * ap_rows = st.i32_hbuf.data() + active_a_step;
+    int32_t * pq      = st.i32_hbuf.data() + 2 * active_a_step;
+    for (int i = 0; i < active_a_step; i++) {
         if (i < n_new) {
             const int p = (int)start + i;
             ap_pos[i]  = p;
@@ -286,35 +304,85 @@ bool draft_kv_begin_step(DraftKvState & st,
         }
     }
     if (n_new > 0 &&
-        !copy_feature_ring_range_to_tensor(ring, st.ap_feat, (int)start, n_new)) {
+        !copy_feature_ring_range_to_tensor(
+            ring, st.ap_feat, (int)start, n_new, /*sync=*/!defer_sync)) {
         std::fprintf(stderr, "[draft-kv] feature copy failed\n");
         return false;
     }
-    ggml_backend_tensor_set(st.ap_pos, ap_pos, 0, sizeof(int32_t) * (size_t)st.a_step);
-    ggml_backend_tensor_set(st.ap_rows, ap_rows, 0, sizeof(int32_t) * (size_t)st.a_step);
+    auto upload = [&](ggml_tensor * t, const void * src, size_t bytes) {
+        if (stage) {
+            stage->set(backend, t, src, 0, bytes);
+        } else {
+            ggml_backend_tensor_set(t, src, 0, bytes);
+        }
+    };
+    upload(st.ap_pos, ap_pos, sizeof(int32_t) * (size_t)active_a_step);
+    upload(st.ap_rows, ap_rows, sizeof(int32_t) * (size_t)active_a_step);
     st.next_pos = committed;
 
-    // noise positions (absolute)
-    std::vector<int32_t> pq((size_t)st.q_len);
-    for (int i = 0; i < st.q_len; i++) pq[(size_t)i] = committed + i;
-    ggml_backend_tensor_set(st.pos_q, pq.data(), 0, sizeof(int32_t) * pq.size());
+    // noise positions (absolute); only leading noise_width entries are read
+    // when the step runs narrower than st.q_len.
+    for (int i = 0; i < noise_width; i++) pq[i] = committed + i;
+    upload(st.pos_q, pq, sizeof(int32_t) * (size_t)noise_width);
 
-    // masks: ctx columns share one row template; noise columns differ only
-    // in causality (full = block-visible, SWA = causal).
-    const size_t mask_elems = (size_t)st.kv_total * st.q_len;
+    // masks: maintain row-0 templates incrementally and upload only the active
+    // noise_width rows.
+    const size_t mask_elems = (size_t)st.kv_total * (size_t)noise_width;
+    const size_t mask_bytes = sizeof(uint16_t) * mask_elems;
+    const size_t row_bytes  = sizeof(uint16_t) * (size_t)st.kv_total;
     if (st.mask_full) {
-        st.mask_hbuf.assign(mask_elems, F16_NEG_INF);
-        for (int s = 0; s < st.cap; s++) {
-            const int32_t p = st.slot_pos[(size_t)s];
-            if (p >= lo && p < committed) st.mask_hbuf[(size_t)s] = F16_ZERO;
+        const bool incremental =
+            st.mask_full_row0.size() == (size_t)st.kv_total &&
+            st.mask_full_lo >= 0 && lo >= st.mask_full_lo &&
+            committed >= st.mask_full_hi &&
+            (lo - st.mask_full_lo) + (committed - st.mask_full_hi) < st.cap / 2;
+        if (incremental) {
+            for (int64_t p = st.mask_full_lo; p < lo; ++p) {
+                const int s = (int)(p % st.cap);
+                const int32_t cur = st.slot_pos[(size_t)s];
+                if (cur < lo || cur >= committed) st.mask_full_row0[(size_t)s] = F16_NEG_INF;
+            }
+            for (int64_t p = st.mask_full_hi; p < committed; ++p) {
+                const int s = (int)(p % st.cap);
+                const int32_t cur = st.slot_pos[(size_t)s];
+                if (cur >= lo && cur < committed) st.mask_full_row0[(size_t)s] = F16_ZERO;
+            }
+            if (st.mask_full_noise_width != noise_width) {
+                for (int j = 0; j < st.q_len; ++j) {
+                    st.mask_full_row0[(size_t)(st.cap + j)] =
+                        j < noise_width ? F16_ZERO : F16_NEG_INF;
+                }
+            }
+        } else {
+            st.mask_full_row0.assign((size_t)st.kv_total, F16_NEG_INF);
+            for (int s = 0; s < st.cap; s++) {
+                const int32_t p = st.slot_pos[(size_t)s];
+                if (p >= lo && p < committed) st.mask_full_row0[(size_t)s] = F16_ZERO;
+            }
+            for (int j = 0; j < noise_width; j++) {
+                st.mask_full_row0[(size_t)(st.cap + j)] = F16_ZERO;
+            }
         }
-        for (int j = 0; j < noise_width; j++)
-            st.mask_hbuf[(size_t)(st.cap + j)] = F16_ZERO;
-        for (int q = 1; q < st.q_len; q++)
-            std::memcpy(st.mask_hbuf.data() + (size_t)q * st.kv_total,
-                        st.mask_hbuf.data(), sizeof(uint16_t) * (size_t)st.kv_total);
-        ggml_backend_tensor_set(st.mask_full, st.mask_hbuf.data(), 0,
-                                sizeof(uint16_t) * mask_elems);
+        st.mask_full_lo = lo;
+        st.mask_full_hi = committed;
+        st.mask_full_noise_width = noise_width;
+
+        void * pinned = stage ? stage->take(mask_bytes) : nullptr;
+        if (pinned) {
+            uint16_t * dst = static_cast<uint16_t *>(pinned);
+            for (int q = 0; q < noise_width; ++q) {
+                std::memcpy(dst + (size_t)q * (size_t)st.kv_total,
+                            st.mask_full_row0.data(), row_bytes);
+            }
+            ggml_backend_tensor_set_async(backend, st.mask_full, pinned, 0, mask_bytes);
+        } else {
+            st.mask_hbuf.resize(mask_elems);
+            for (int q = 0; q < noise_width; ++q) {
+                std::memcpy(st.mask_hbuf.data() + (size_t)q * (size_t)st.kv_total,
+                            st.mask_full_row0.data(), row_bytes);
+            }
+            ggml_backend_tensor_set(st.mask_full, st.mask_hbuf.data(), 0, mask_bytes);
+        }
     }
     if (st.mask_swa) {
         // The window is anchored at `committed` for ALL noise rows on purpose:
@@ -325,19 +393,46 @@ bool draft_kv_begin_step(DraftKvState & st,
         const int eff_win = (dw.swa_window > 0 && win > dw.swa_window)
                                 ? dw.swa_window : win;
         const int swa_lo = committed - eff_win;
-        st.mask_hbuf.assign(mask_elems, F16_NEG_INF);
-        for (int s = 0; s < st.cap; s++) {
-            const int32_t p = st.slot_pos[(size_t)s];
-            if (p >= swa_lo && p < committed) st.mask_hbuf[(size_t)s] = F16_ZERO;
+        const bool incremental =
+            st.mask_swa_row0.size() == (size_t)st.kv_total &&
+            st.mask_swa_lo >= 0 && swa_lo >= st.mask_swa_lo &&
+            committed >= st.mask_swa_hi &&
+            (swa_lo - st.mask_swa_lo) + (committed - st.mask_swa_hi) < st.cap / 2;
+        if (incremental) {
+            for (int64_t p = st.mask_swa_lo; p < swa_lo; ++p) {
+                const int s = (int)(p % st.cap);
+                const int32_t cur = st.slot_pos[(size_t)s];
+                if (cur < swa_lo || cur >= committed) st.mask_swa_row0[(size_t)s] = F16_NEG_INF;
+            }
+            for (int64_t p = st.mask_swa_hi; p < committed; ++p) {
+                const int s = (int)(p % st.cap);
+                const int32_t cur = st.slot_pos[(size_t)s];
+                if (cur >= swa_lo && cur < committed) st.mask_swa_row0[(size_t)s] = F16_ZERO;
+            }
+        } else {
+            st.mask_swa_row0.assign((size_t)st.kv_total, F16_NEG_INF);
+            for (int s = 0; s < st.cap; s++) {
+                const int32_t p = st.slot_pos[(size_t)s];
+                if (p >= swa_lo && p < committed) st.mask_swa_row0[(size_t)s] = F16_ZERO;
+            }
         }
-        for (int q = 1; q < st.q_len; q++)
-            std::memcpy(st.mask_hbuf.data() + (size_t)q * st.kv_total,
-                        st.mask_hbuf.data(), sizeof(uint16_t) * (size_t)st.kv_total);
-        for (int q = 0; q < st.q_len; q++)
-            for (int j = 0; j <= q; j++)
-                st.mask_hbuf[(size_t)q * st.kv_total + (size_t)(st.cap + j)] = F16_ZERO;
-        ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
-                                sizeof(uint16_t) * mask_elems);
+        st.mask_swa_lo = swa_lo;
+        st.mask_swa_hi = committed;
+
+        void * pinned = stage ? stage->take(mask_bytes) : nullptr;
+        uint16_t * dst = pinned
+            ? static_cast<uint16_t *>(pinned)
+            : (st.mask_hbuf.resize(mask_elems), st.mask_hbuf.data());
+        for (int q = 0; q < noise_width; ++q) {
+            uint16_t * row = dst + (size_t)q * (size_t)st.kv_total;
+            std::memcpy(row, st.mask_swa_row0.data(), row_bytes);
+            for (int j = 0; j <= q; ++j) row[st.cap + j] = F16_ZERO;
+        }
+        if (pinned) {
+            ggml_backend_tensor_set_async(backend, st.mask_swa, pinned, 0, mask_bytes);
+        } else {
+            ggml_backend_tensor_set(st.mask_swa, dst, 0, mask_bytes);
+        }
     }
     return true;
 }
@@ -357,6 +452,7 @@ void draft_kv_batch_free(DraftKvBatchGraph & batch) {
     batch.meta_arena.clear();
     batch.n_lanes = 0;
     batch.q_len = 0;
+    batch.a_step = 0;
     batch.backend = nullptr;
     batch.built_for = nullptr;
 }
@@ -366,16 +462,23 @@ static bool draft_kv_batch_build(
         const DraftWeights & dw,
         ggml_backend_t backend,
         const std::vector<DraftKvState *> & lane_states,
-        int width) {
+        int width,
+        int append_cap) {
     if (!backend || lane_states.empty() || width <= 1 ||
         width > dw.block_size) {
         return false;
     }
+    int active_a_step = 0;
     for (DraftKvState * state : lane_states) {
-        if (!state || !state->mem_buf || state->q_len != dw.block_size ||
+        if (!state || !state->mem_buf || width > state->q_len ||
             state->built_for != static_cast<const void *>(&dw)) {
             return false;
         }
+        const int lane_a =
+            (append_cap > 0 && append_cap < state->a_step)
+                ? append_cap : state->a_step;
+        if (active_a_step == 0) active_a_step = lane_a;
+        else if (lane_a != active_a_step) return false;
     }
 
     draft_kv_batch_free(batch);
@@ -428,8 +531,17 @@ static bool draft_kv_batch_build(
     std::vector<DraftKvLaneInputs> lanes;
     lanes.reserve(n_lanes_size);
     for (DraftKvState * state : lane_states) {
-        append_lanes.push_back(
-            {&state->cache, state->ap_feat, state->ap_pos, state->ap_rows});
+        ggml_tensor * ap_feat = state->ap_feat;
+        ggml_tensor * ap_pos  = state->ap_pos;
+        ggml_tensor * ap_rows = state->ap_rows;
+        if (active_a_step < state->a_step) {
+            ap_feat = ggml_view_2d(batch.g_ctx, state->ap_feat,
+                                   state->ap_feat->ne[0], active_a_step,
+                                   state->ap_feat->nb[1], 0);
+            ap_pos  = ggml_view_1d(batch.g_ctx, state->ap_pos, active_a_step, 0);
+            ap_rows = ggml_view_1d(batch.g_ctx, state->ap_rows, active_a_step, 0);
+        }
+        append_lanes.push_back({&state->cache, ap_feat, ap_pos, ap_rows});
 
         DraftKvStepInputs step{};
         step.noise_embed = state->inp_embed;
@@ -487,17 +599,58 @@ static bool draft_kv_batch_build(
 
     batch.n_lanes = n_lanes;
     batch.q_len = width;
+    batch.a_step = active_a_step;
     batch.built_for = &dw;
     batch.backend = backend;
     batch.lane_states = lane_states;
     std::fprintf(stderr,
-        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
+        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d a_step=%d "
         "metadata=%.1f MiB compute=%.1f MiB\n",
-        n_lanes, width,
+        n_lanes, width, active_a_step,
         static_cast<double>(batch.meta_arena.size()) /
             (1024.0 * 1024.0),
         static_cast<double>(ggml_gallocr_get_buffer_size(batch.galloc, 0)) /
             (1024.0 * 1024.0));
+    return true;
+}
+
+bool draft_kv_batch_reusable(
+        const DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        int width,
+        int append_cap) {
+    if (lane_states.empty() || !lane_states.front()) return false;
+    const int q_len = width > 0 ? width : dw.block_size;
+    const int a_step = lane_states.front()->a_step;
+    const int active_a_step = append_cap > 0 && append_cap < a_step ? append_cap : a_step;
+    return batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
+           batch.backend == backend && batch.lane_states == lane_states &&
+           batch.q_len == q_len && batch.a_step == active_a_step;
+}
+
+bool draft_kv_batch_compute_device(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        int width,
+        int append_cap) {
+    if (lane_states.empty()) return false;
+    const int q_len = width > 0 ? width : dw.block_size;
+    if (!draft_kv_batch_reusable(batch, dw, backend, lane_states, width, append_cap) &&
+        !draft_kv_batch_build(
+            batch, dw, backend, lane_states, q_len, append_cap)) {
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, batch.gf) !=
+        GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph compute failed lanes=%d\n",
+            batch.n_lanes);
+        return false;
+    }
     return true;
 }
 
@@ -507,25 +660,11 @@ bool draft_kv_batch_compute(
         ggml_backend_t backend,
         const std::vector<DraftKvState *> & lane_states,
         std::vector<std::vector<float>> & hidden_by_lane,
-        int width) {
+        int width,
+        int append_cap) {
     hidden_by_lane.clear();
-    if (lane_states.empty()) return false;
-    const int q_len = width > 0 ? width : dw.block_size;
-
-    const bool reusable =
-        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
-        batch.backend == backend && batch.lane_states == lane_states &&
-        batch.q_len == q_len;
-    if (!reusable &&
-        !draft_kv_batch_build(
-            batch, dw, backend, lane_states, q_len)) {
-        return false;
-    }
-    if (ggml_backend_graph_compute(backend, batch.gf) !=
-        GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr,
-            "[draft-kv-batch] graph compute failed lanes=%d\n",
-            batch.n_lanes);
+    if (!draft_kv_batch_compute_device(
+            batch, dw, backend, lane_states, width, append_cap)) {
         return false;
     }
 

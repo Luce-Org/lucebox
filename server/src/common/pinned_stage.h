@@ -58,6 +58,14 @@ public:
 
     void reset() { used_ = 0; }
 
+    void release() {
+        if (buf_) ggml_backend_buffer_free(buf_);
+        buf_ = nullptr;
+        base_ = nullptr;
+        size_ = used_ = 0;
+        backend_ = nullptr;
+    }
+
     // A 64-byte aligned slice, or nullptr when the stage is missing or full
     // (the caller then takes its synchronous path).
     void * take(size_t bytes) {
@@ -110,14 +118,6 @@ private:
         other.base_ = nullptr;
         other.size_ = other.used_ = 0;
         other.backend_ = nullptr;
-    }
-
-    void release() {
-        if (buf_) ggml_backend_buffer_free(buf_);
-        buf_ = nullptr;
-        base_ = nullptr;
-        size_ = used_ = 0;
-        backend_ = nullptr;
     }
 
     ggml_backend_buffer_t buf_ = nullptr;
