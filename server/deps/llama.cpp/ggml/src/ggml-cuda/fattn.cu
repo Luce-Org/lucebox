@@ -4199,6 +4199,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
 
 #endif // defined(GGML_USE_HIP)
 
+#ifndef GGML_CUDA_NO_FA
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -4499,6 +4500,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     GGML_ABORT("fatal error");
 }
+#endif // !defined(GGML_CUDA_NO_FA)
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
@@ -4846,6 +4848,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
+#ifndef GGML_CUDA_NO_FA
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
@@ -4858,6 +4861,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+#else
+        case BEST_FATTN_KERNEL_TILE:
+        case BEST_FATTN_KERNEL_VEC:
+        case BEST_FATTN_KERNEL_WMMA_F16:
+        case BEST_FATTN_KERNEL_MMA_F16:
+            GGML_ABORT("FlashAttention disabled (GGML_CUDA_FA=OFF)");
+#endif // !defined(GGML_CUDA_NO_FA)
         case BEST_FATTN_KERNEL_CHUNKED:
             ggml_cuda_flash_attn_ext_chunked(ctx, dst);
             break;

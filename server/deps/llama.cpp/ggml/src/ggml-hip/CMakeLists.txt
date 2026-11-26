@@ -62,26 +62,33 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
-file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
-list(APPEND GGML_SOURCES_ROCM ${SRCS})
-file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
-list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
+if (GGML_CUDA_FA)
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+    if (GGML_CUDA_FA_ALL_QUANTS)
+        file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
+        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+    else()
+        list(APPEND GGML_SOURCES_ROCM
+            ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
+            ../ggml-cuda/template-instances/fattn-vec-instance-tq3_0-tq3_0.cu)
+    endif()
 else()
-    list(APPEND GGML_SOURCES_ROCM
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-tq3_0-tq3_0.cu)
+    list(REMOVE_ITEM GGML_SOURCES_ROCM
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/fattn-tile.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/fattn-wmma-f16.cu")
 endif()
 
 ggml_add_backend_library(ggml-hip
