@@ -11177,18 +11177,7 @@ bool deepseek4_step_layer_range(
             // primary VRAM to make the next 2K-token attention arena fail,
             // especially when the full cold verifier stack is duplicated.
             moe_hybrid->release_graph_caches();
-            if (moe_hybrid->prefill_route_alloc) {
-                ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
-                moe_hybrid->prefill_route_alloc = nullptr;
-            }
-            if (moe_hybrid->prefill_hot_alloc) {
-                ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
-                moe_hybrid->prefill_hot_alloc = nullptr;
-            }
-            if (moe_hybrid->prefill_cold_alloc) {
-                ggml_gallocr_free(moe_hybrid->prefill_cold_alloc);
-                moe_hybrid->prefill_cold_alloc = nullptr;
-            }
+            moe_hybrid->release_prefill_arenas();
         }
         // Gallocr teardown does not return cached operator temporaries to
         // the driver. Retire backend captures/memos and trim free pool blocks
@@ -13213,20 +13202,7 @@ void deepseek4_release_prefill_scratch(
         ds4_layer_major_meta_arena.shrink_to_fit();
         ds4_layer_major_meta_owner = nullptr;
     }
-    if (moe_hybrid) {
-        if (moe_hybrid->prefill_route_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_route_alloc);
-            moe_hybrid->prefill_route_alloc = nullptr;
-        }
-        if (moe_hybrid->prefill_hot_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_hot_alloc);
-            moe_hybrid->prefill_hot_alloc = nullptr;
-        }
-        if (moe_hybrid->prefill_cold_alloc) {
-            ggml_gallocr_free(moe_hybrid->prefill_cold_alloc);
-            moe_hybrid->prefill_cold_alloc = nullptr;
-        }
-    }
+    if (moe_hybrid) moe_hybrid->release_prefill_arenas();
 
     static const bool report_release = [] {
         const char * value = std::getenv("LUCE_DS4_TIMING");

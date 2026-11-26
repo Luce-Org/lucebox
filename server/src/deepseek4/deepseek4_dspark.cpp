@@ -11,6 +11,7 @@
 
 #include "common/gguf_bounds.h"
 #include "common/gguf_mmap.h"
+#include "common/tensor_file_reader.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -354,9 +355,12 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // ── Stream tensor bytes from the read-only mapping ─────────────────
-    std::vector<char> staging;
-    for (int64_t ti = 0; ti < n_tensors && ok; ti++) {
+    // ── Upload tensor bytes ─────────────────────────────────────────────
+    // Each tensor is one range of the file: read on several threads, or copied
+    // out of the mapping when the page cache holds it (tensor_file_reader.h).
+    std::vector<TensorFileSpan> spans;
+    spans.reserve((size_t) n_tensors);
+    for (int64_t ti = 0; ti < n_tensors; ti++) {
         const char * tname = gguf_get_tensor_name(g, ti);
         ggml_tensor * t = ggml_get_tensor(meta, tname);
         const size_t tensor_off = gguf_get_tensor_offset(g, ti);
@@ -366,9 +370,12 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
             off += (size_t) expert_first * t->nb[2];
             size = ggml_nbytes(t);
         }
-        staging.resize(size);
-        std::memcpy(staging.data(), file_bytes + off, size);
-        ggml_backend_tensor_set(t, staging.data(), 0, size);
+        spans.push_back({t, 0, off, size});
+    }
+    std::string read_err;
+    if (!load_tensor_spans(path, file_bytes, file_size, spans, &read_err)) {
+        set_err("DSpark drafter read failed: " + read_err);
+        ok = false;
     }
     if (!ok) {
         ggml_backend_buffer_free(buf);

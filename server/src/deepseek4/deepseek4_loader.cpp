@@ -2804,6 +2804,12 @@ static MoeLayerDesc make_ds4_moe_layer_desc(const DeepSeek4Layer & L) {
     return desc;
 }
 
+static std::vector<MoeLayerDesc> make_ds4_moe_layer_descs(const DeepSeek4Weights & w) {
+    std::vector<MoeLayerDesc> descs((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) descs[(size_t) il] = make_ds4_moe_layer_desc(w.layers[(size_t) il]);
+    return descs;
+}
+
 }  // namespace
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
@@ -2870,10 +2876,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
         }
     }
 
-    std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
-    for (int il = 0; il < w.n_layer; ++il) {
-        layer_descs[(size_t)il] = make_ds4_moe_layer_desc(w.layers[(size_t)il]);
-    }
+    const std::vector<MoeLayerDesc> layer_descs = make_ds4_moe_layer_descs(w);
 
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file(
@@ -2953,10 +2956,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         }
     }
 
-    std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
-    for (int il = 0; il < w.n_layer; ++il) {
-        layer_descs[(size_t)il] = make_ds4_moe_layer_desc(w.layers[(size_t)il]);
-    }
+    const std::vector<MoeLayerDesc> layer_descs = make_ds4_moe_layer_descs(w);
 
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     TensorFileReader reader;
@@ -2981,6 +2981,19 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     gguf_free(gctx);
     if (expert_meta) ggml_free(expert_meta);
     return ok;
+}
+
+bool rematerialize_deepseek4_moe_hybrid_hot_experts(
+        const std::string & path,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        MoeHybridStorage & storage,
+        std::string * err) {
+    const std::vector<MoeLayerDesc> layer_descs = make_ds4_moe_layer_descs(w);
+    TensorFileReader reader;
+    const bool read_file = reader.open(path);
+    return rematerialize_moe_hybrid_hot_experts(backend, layer_descs, storage, err,
+                                                read_file ? &reader : nullptr);
 }
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
