@@ -5276,13 +5276,40 @@ static void test_target_shard_daemon_validation() {
 }
 
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static ggml_backend_t g_shared_gpu_backend = nullptr;
+static bool g_shared_gpu_initialized = false;
+
+static ggml_backend_t get_shared_gpu_backend() {
+    if (!g_shared_gpu_initialized) {
+        g_shared_gpu_initialized = true;
+        g_shared_gpu_backend = ggml_backend_cuda_init(0);
+    } else if (g_shared_gpu_backend) {
+        // Release cached pool blocks and legacy-pool graph caches between
+        // independent test functions so peak VRAM stays bounded and no test
+        // inherits stale graph state. Graph-replay tests keep their own
+        // dedicated backends.
+        ggml_backend_cuda_trim_pool(g_shared_gpu_backend);
+    }
+    return g_shared_gpu_backend;
+}
+
+struct SharedGpuBackendGuard {
+    ~SharedGpuBackendGuard() {
+        if (g_shared_gpu_backend) {
+            ggml_backend_free(g_shared_gpu_backend);
+            g_shared_gpu_backend = nullptr;
+        }
+        g_shared_gpu_initialized = false;
+    }
+};
+
 static void test_ds4_flash_attention_keep_cap_gpu() {
     std::fprintf(stderr, "  test_ds4_flash_attention_keep_cap_gpu ...");
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -5299,7 +5326,6 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
     ggml_context * ctx = make_test_context(2u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -5358,7 +5384,6 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -5369,7 +5394,7 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu(int selected_rows) 
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -5388,7 +5413,6 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu(int selected_rows) 
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -5566,7 +5590,6 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu(int selected_rows) 
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -5785,6 +5808,8 @@ static bool run_ds4_preserved_raw_rows_case(
     }
     if (!ok) std::fprintf(stderr, " saved-row FAIL q=%d comp=%d visible=%d kv=%s direct=%d\n",
                           width, compressed_rows, visible_suffix, ggml_type_name(kv_type), direct);
+    ggml_backend_cuda_graph_invalidate_range(
+        backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     return ok;
@@ -5831,7 +5856,7 @@ static void test_ds4_flash_attention_segmented_kv_gpu(bool benchmark = false) {
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -5853,7 +5878,6 @@ static void test_ds4_flash_attention_segmented_kv_gpu(bool benchmark = false) {
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -6018,7 +6042,6 @@ static void test_ds4_flash_attention_segmented_kv_gpu(bool benchmark = false) {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -6165,7 +6188,7 @@ static void test_ds4_flash_attention_lane_rows_gpu() {
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -6193,7 +6216,6 @@ static void test_ds4_flash_attention_lane_rows_gpu() {
     }
     std::fprintf(stderr, " %d/%d cases", passed, cases);
     TEST_ASSERT_MSG(passed == cases, "lane-row attention differs from per-lane attention");
-    ggml_backend_free(backend);
     std::fprintf(stderr, passed == cases ? " ok\n" : " FAIL\n");
 }
 
@@ -6204,7 +6226,7 @@ static void test_ds4_flash_attention_ratio4_maskless_gpu() {
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -6228,7 +6250,6 @@ static void test_ds4_flash_attention_ratio4_maskless_gpu() {
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -6575,7 +6596,6 @@ static void test_ds4_flash_attention_ratio4_maskless_gpu() {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -6587,7 +6607,7 @@ static void test_ds4_flash_attention_sparse_value_skip_gpu(
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -6612,7 +6632,6 @@ static void test_ds4_flash_attention_sparse_value_skip_gpu(
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -6778,11 +6797,11 @@ static void test_ds4_flash_attention_sparse_value_skip_gpu(
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_ds4_flash_attention_streaming_topk_gpu() {
+static void test_ds4_flash_attention_streaming_topk_gpu(
+        bool benchmark = false) {
     std::fprintf(stderr,
                  "  test_ds4_flash_attention_streaming_topk_gpu ...");
 #if !defined(GGML_USE_HIP)
@@ -6795,7 +6814,7 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         return;
     }
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -6814,7 +6833,6 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -6960,75 +6978,80 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         const double fast_exp_nmse = fast_exp_squared_error /
             std::max(f32_stage_power, 1.0e-30);
 
-        auto measure_us = [&](bool streaming, int f32_stage, bool fast_exp) {
-            setenv("GGML_CUDA_MLA_STREAM_TOPK", streaming ? "1" : "0", 1);
-            if (f32_stage < 0) {
-                unsetenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
-            } else {
-                setenv("GGML_CUDA_MLA_STREAM_F32_STAGE",
-                       f32_stage ? "1" : "0", 1);
+        if (benchmark) {
+            auto measure_us = [&](bool streaming, int f32_stage, bool fast_exp) {
+                setenv("GGML_CUDA_MLA_STREAM_TOPK", streaming ? "1" : "0", 1);
+                if (f32_stage < 0) {
+                    unsetenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
+                } else {
+                    setenv("GGML_CUDA_MLA_STREAM_F32_STAGE",
+                           f32_stage ? "1" : "0", 1);
+                }
+                setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", fast_exp ? "1" : "0", 1);
+                constexpr int warmups = 3;
+                constexpr int iterations = 20;
+                for (int i = 0; i < warmups; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto begin = std::chrono::steady_clock::now();
+                for (int i = 0; i < iterations; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto end = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::micro>(end - begin).count() /
+                    iterations;
+            };
+            const double grouped_us = measure_us(false, false, false);
+            constexpr int timing_rounds = 4;
+            double streaming_f16_us = 0.0;
+            double streaming_f32_us = 0.0;
+            double streaming_default_us = 0.0;
+            double fast_exp_us = 0.0;
+            for (int round = 0; round < timing_rounds; ++round) {
+                if ((round & 1) == 0) {
+                    streaming_f16_us += measure_us(true, false, false);
+                    streaming_f32_us += measure_us(true, true, false);
+                    streaming_default_us += measure_us(true, -1, false);
+                    fast_exp_us += measure_us(true, true, true);
+                } else {
+                    fast_exp_us += measure_us(true, true, true);
+                    streaming_default_us += measure_us(true, -1, false);
+                    streaming_f32_us += measure_us(true, true, false);
+                    streaming_f16_us += measure_us(true, false, false);
+                }
             }
-            setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", fast_exp ? "1" : "0", 1);
-            constexpr int warmups = 3;
-            constexpr int iterations = 20;
-            for (int i = 0; i < warmups; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto begin = std::chrono::steady_clock::now();
-            for (int i = 0; i < iterations; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto end = std::chrono::steady_clock::now();
-            return std::chrono::duration<double, std::micro>(end - begin).count() /
-                iterations;
-        };
-        const double grouped_us = measure_us(false, false, false);
-        constexpr int timing_rounds = 4;
-        double streaming_f16_us = 0.0;
-        double streaming_f32_us = 0.0;
-        double streaming_default_us = 0.0;
-        double fast_exp_us = 0.0;
-        for (int round = 0; round < timing_rounds; ++round) {
-            if ((round & 1) == 0) {
-                streaming_f16_us += measure_us(true, false, false);
-                streaming_f32_us += measure_us(true, true, false);
-                streaming_default_us += measure_us(true, -1, false);
-                fast_exp_us += measure_us(true, true, true);
-            } else {
-                fast_exp_us += measure_us(true, true, true);
-                streaming_default_us += measure_us(true, -1, false);
-                streaming_f32_us += measure_us(true, true, false);
-                streaming_f16_us += measure_us(true, false, false);
-            }
+            streaming_f16_us /= timing_rounds;
+            streaming_f32_us /= timing_rounds;
+            streaming_default_us /= timing_rounds;
+            fast_exp_us /= timing_rounds;
+            std::fprintf(stderr,
+                         " tokens=%d comp=%d selected=%d"
+                         " grouped=%.1fus streaming_f16=%.1fus"
+                         " streaming_f32=%.1fus default=%.1fus"
+                         " fast_exp=%.1fus speedup=%.2fx"
+                         " fast_nmse=%.3g fast_max_abs=%.3g",
+                         n_tokens, n_comp_rows, selected_rows,
+                         grouped_us, streaming_f16_us, streaming_f32_us,
+                         streaming_default_us, fast_exp_us,
+                         grouped_us / fast_exp_us,
+                         fast_exp_nmse, fast_exp_max_abs);
+        } else {
+            (void) fast_exp_nmse;
+            (void) fast_exp_max_abs;
         }
-        streaming_f16_us /= timing_rounds;
-        streaming_f32_us /= timing_rounds;
-        streaming_default_us /= timing_rounds;
-        fast_exp_us /= timing_rounds;
-        std::fprintf(stderr,
-                     " tokens=%d comp=%d selected=%d"
-                     " grouped=%.1fus streaming_f16=%.1fus"
-                     " streaming_f32=%.1fus default=%.1fus"
-                     " fast_exp=%.1fus speedup=%.2fx"
-                     " fast_nmse=%.3g fast_max_abs=%.3g",
-                     n_tokens, n_comp_rows, selected_rows,
-                     grouped_us, streaming_f16_us, streaming_f32_us,
-                     streaming_default_us, fast_exp_us,
-                     grouped_us / fast_exp_us,
-                     fast_exp_nmse, fast_exp_max_abs);
     }
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static void run_ds4_indexer_score_m32_case(
         ggml_backend_t backend, int n_tokens, int n_comp = 4160,
-        int timing_iterations = 30, bool f16_q = false) {
+        int timing_iterations = 30, bool f16_q = false,
+        bool benchmark = false) {
     constexpr int dim = 128;
     constexpr int n_heads = 64;
     constexpr int ratio = 4;
@@ -7150,60 +7173,62 @@ static void run_ds4_indexer_score_m32_case(
                   "cached direct-B M32 indexer changed score bits");
         check_m32(nullptr, nullptr, "automatic M32 indexer changed score bits");
 
-        auto measure_us = [&](bool m32, bool cache_b) {
-            // The scalar F16 fallback intentionally accumulates differently
-            // from WMMA and is not a useful timing oracle. For an F16 query,
-            // use the staged M32 specialization as the baseline and compare
-            // all direct/cached variants bit-for-bit against it above.
-            setenv("GGML_DS4_INDEXER_M32",
-                   (m32 || f16_q) ? "1" : "0", 1);
-            setenv("GGML_DS4_INDEXER_M32_PREFILL", "1", 1);
-            unsetenv("GGML_DS4_INDEXER_M32_DIRECT_B");
-            setenv("GGML_DS4_INDEXER_M32_CACHE_B",
-                   cache_b ? "1" : "0", 1);
-            constexpr int warmups = 3;
-            for (int i = 0; i < warmups; ++i) {
-                ggml_backend_graph_compute(backend, graph);
+        if (benchmark && timing_iterations > 0) {
+            auto measure_us = [&](bool m32, bool cache_b) {
+                // The scalar F16 fallback intentionally accumulates differently
+                // from WMMA and is not a useful timing oracle. For an F16 query,
+                // use the staged M32 specialization as the baseline and compare
+                // all direct/cached variants bit-for-bit against it above.
+                setenv("GGML_DS4_INDEXER_M32",
+                       (m32 || f16_q) ? "1" : "0", 1);
+                setenv("GGML_DS4_INDEXER_M32_PREFILL", "1", 1);
+                unsetenv("GGML_DS4_INDEXER_M32_DIRECT_B");
+                setenv("GGML_DS4_INDEXER_M32_CACHE_B",
+                       cache_b ? "1" : "0", 1);
+                constexpr int warmups = 3;
+                for (int i = 0; i < warmups; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto begin = std::chrono::steady_clock::now();
+                for (int i = 0; i < timing_iterations; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto end = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::micro>(end - begin).count() /
+                    timing_iterations;
+            };
+            double reference_us = 0.0;
+            double m32_us = 0.0;
+            double cached_m32_us = 0.0;
+            constexpr int timing_rounds = 4;
+            for (int round = 0; round < timing_rounds; ++round) {
+                if (round % 3 == 0) {
+                    reference_us += measure_us(false, false);
+                    m32_us += measure_us(true, false);
+                    cached_m32_us += measure_us(true, true);
+                } else if (round % 3 == 1) {
+                    m32_us += measure_us(true, false);
+                    cached_m32_us += measure_us(true, true);
+                    reference_us += measure_us(false, false);
+                } else {
+                    cached_m32_us += measure_us(true, true);
+                    reference_us += measure_us(false, false);
+                    m32_us += measure_us(true, false);
+                }
             }
-            ggml_backend_synchronize(backend);
-            const auto begin = std::chrono::steady_clock::now();
-            for (int i = 0; i < timing_iterations; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto end = std::chrono::steady_clock::now();
-            return std::chrono::duration<double, std::micro>(end - begin).count() /
-                timing_iterations;
-        };
-        double reference_us = 0.0;
-        double m32_us = 0.0;
-        double cached_m32_us = 0.0;
-        constexpr int timing_rounds = 4;
-        for (int round = 0; round < timing_rounds; ++round) {
-            if (round % 3 == 0) {
-                reference_us += measure_us(false, false);
-                m32_us += measure_us(true, false);
-                cached_m32_us += measure_us(true, true);
-            } else if (round % 3 == 1) {
-                m32_us += measure_us(true, false);
-                cached_m32_us += measure_us(true, true);
-                reference_us += measure_us(false, false);
-            } else {
-                cached_m32_us += measure_us(true, true);
-                reference_us += measure_us(false, false);
-                m32_us += measure_us(true, false);
-            }
+            reference_us /= timing_rounds;
+            m32_us /= timing_rounds;
+            cached_m32_us /= timing_rounds;
+            std::fprintf(stderr,
+                         " q%d%s@%d old=%.1fus m32=%.1fus cached=%.1fus"
+                         " speedup=%.2fx cache_gain=%.2fx",
+                         n_tokens, f16_q ? "h" : "", n_comp,
+                         reference_us, m32_us, cached_m32_us,
+                         reference_us / cached_m32_us,
+                         m32_us / cached_m32_us);
         }
-        reference_us /= timing_rounds;
-        m32_us /= timing_rounds;
-        cached_m32_us /= timing_rounds;
-        std::fprintf(stderr,
-                     " q%d%s@%d old=%.1fus m32=%.1fus cached=%.1fus"
-                     " speedup=%.2fx cache_gain=%.2fx",
-                     n_tokens, f16_q ? "h" : "", n_comp,
-                     reference_us, m32_us, cached_m32_us,
-                     reference_us / cached_m32_us,
-                     m32_us / cached_m32_us);
     }
 
     ggml_gallocr_free(alloc);
@@ -7211,7 +7236,7 @@ static void run_ds4_indexer_score_m32_case(
 }
 
 static void run_ds4_indexer_score_packed_small_case(
-        ggml_backend_t backend, int n_tokens) {
+        ggml_backend_t backend, int n_tokens, bool benchmark = false) {
     constexpr int dim = 128;
     constexpr int n_heads = 64;
     constexpr int n_comp = 4160;
@@ -7287,63 +7312,64 @@ static void run_ds4_indexer_score_packed_small_case(
                         reference.size() * sizeof(float)) == 0,
             "packed small-CM indexer changed score bits");
 
-        auto measure_us = [&](bool packed) {
-            if (packed) {
-                setenv("GGML_DS4_INDEXER_PACK_SMALL", "1", 1);
-            } else {
-                setenv("GGML_DS4_INDEXER_PACK_SMALL", "0", 1);
-            }
-            constexpr int warmups = 3;
-            constexpr int iterations = 30;
-            for (int i = 0; i < warmups; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto begin = std::chrono::steady_clock::now();
-            for (int i = 0; i < iterations; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto end = std::chrono::steady_clock::now();
-            return std::chrono::duration<double, std::micro>(end - begin).count() /
-                iterations;
-        };
-        const double reference_us = measure_us(false);
-        const double packed_us = measure_us(true);
-        std::fprintf(stderr, " q%d=%.1f->%.1fus", n_tokens,
-                     reference_us, packed_us);
+        if (benchmark) {
+            auto measure_us = [&](bool packed) {
+                if (packed) {
+                    setenv("GGML_DS4_INDEXER_PACK_SMALL", "1", 1);
+                } else {
+                    setenv("GGML_DS4_INDEXER_PACK_SMALL", "0", 1);
+                }
+                constexpr int warmups = 3;
+                constexpr int iterations = 30;
+                for (int i = 0; i < warmups; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto begin = std::chrono::steady_clock::now();
+                for (int i = 0; i < iterations; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto end = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::micro>(end - begin).count() /
+                    iterations;
+            };
+            const double reference_us = measure_us(false);
+            const double packed_us = measure_us(true);
+            std::fprintf(stderr, " q%d=%.1f->%.1fus", n_tokens,
+                         reference_us, packed_us);
+        }
     }
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
 }
 
-static void test_ds4_indexer_score_packed_small_gpu() {
+static void test_ds4_indexer_score_packed_small_gpu(bool benchmark = false) {
     std::fprintf(stderr, "  test_ds4_indexer_score_packed_small_gpu ...");
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
     }
     ScopedEnvVar packed_small_guard("GGML_DS4_INDEXER_PACK_SMALL");
     for (int n_tokens = 2; n_tokens <= 5; ++n_tokens) {
-        run_ds4_indexer_score_packed_small_case(backend, n_tokens);
+        run_ds4_indexer_score_packed_small_case(backend, n_tokens, benchmark);
     }
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
-static void test_ds4_indexer_score_m32_gpu() {
+static void test_ds4_indexer_score_m32_gpu(bool benchmark = false) {
     std::fprintf(stderr, "  test_ds4_indexer_score_m32_gpu ...");
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only rocWMMA kernel)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -7355,78 +7381,79 @@ static void test_ds4_indexer_score_m32_gpu() {
     ScopedEnvVar packed_small_guard("GGML_DS4_INDEXER_PACK_SMALL");
     setenv("GGML_DS4_INDEXER_PACK_SMALL", "1", 1);
     for (int n_tokens = 2; n_tokens <= 8; ++n_tokens) {
-        run_ds4_indexer_score_m32_case(backend, n_tokens);
+        run_ds4_indexer_score_m32_case(
+            backend, n_tokens, /*n_comp=*/4160, /*timing_iterations=*/30,
+            /*f16_q=*/false, benchmark);
     }
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/1920,
-        /*timing_iterations=*/20);
+        /*timing_iterations=*/20, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/6144,
-        /*timing_iterations=*/20);
+        /*timing_iterations=*/20, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/6160,
-        /*timing_iterations=*/20);
+        /*timing_iterations=*/20, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/7680,
-        /*timing_iterations=*/20);
+        /*timing_iterations=*/20, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/7696,
-        /*timing_iterations=*/20);
+        /*timing_iterations=*/20, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/15360,
-        /*timing_iterations=*/15);
+        /*timing_iterations=*/15, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/15376,
-        /*timing_iterations=*/15);
+        /*timing_iterations=*/15, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/30720,
-        /*timing_iterations=*/10);
+        /*timing_iterations=*/10, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/5, /*n_comp=*/30720,
-        /*timing_iterations=*/10);
+        /*timing_iterations=*/10, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/5, /*n_comp=*/7680,
-        /*timing_iterations=*/20, /*f16_q=*/true);
+        /*timing_iterations=*/20, /*f16_q=*/true, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/5, /*n_comp=*/30720,
-        /*timing_iterations=*/10, /*f16_q=*/true);
+        /*timing_iterations=*/10, /*f16_q=*/true, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/4, /*n_comp=*/30736,
-        /*timing_iterations=*/10);
+        /*timing_iterations=*/10, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/129, /*n_comp=*/512,
-        /*timing_iterations=*/4);
+        /*timing_iterations=*/4, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/512,
-        /*timing_iterations=*/4);
+        /*timing_iterations=*/4, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/1024,
-        /*timing_iterations=*/4);
+        /*timing_iterations=*/4, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/2048,
-        /*timing_iterations=*/4);
+        /*timing_iterations=*/4, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/4160,
-        /*timing_iterations=*/4);
+        /*timing_iterations=*/4, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/4160,
-        /*timing_iterations=*/4, /*f16_q=*/true);
+        /*timing_iterations=*/4, /*f16_q=*/true, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/7680,
-        /*timing_iterations=*/3, /*f16_q=*/true);
+        /*timing_iterations=*/3, /*f16_q=*/true, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/15360,
-        /*timing_iterations=*/2, /*f16_q=*/true);
+        /*timing_iterations=*/2, /*f16_q=*/true, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/512, /*n_comp=*/1920,
-        /*timing_iterations=*/3);
+        /*timing_iterations=*/3, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/30720,
-        /*timing_iterations=*/2);
+        /*timing_iterations=*/2, /*f16_q=*/false, benchmark);
     run_ds4_indexer_score_m32_case(
         backend, /*n_tokens=*/256, /*n_comp=*/30720,
-        /*timing_iterations=*/2, /*f16_q=*/true);
-    ggml_backend_free(backend);
+        /*timing_iterations=*/2, /*f16_q=*/true, benchmark);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -7559,36 +7586,35 @@ static void test_ds4_flash_rope_replay_gpu() {
                 if (!ok) std::fprintf(stderr, " FAIL width=%d kv=%s forward=%d",
                                       width, ggml_type_name(type), forward);
                 passed += ok;
+                ggml_backend_cuda_graph_invalidate_range(
+                    backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
             }
         }
     }
+    ggml_backend_free(backend);
     std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
     TEST_ASSERT_MSG(passed == cases, "fused RoPE replay used stale token positions");
-    ggml_backend_free(backend);
 }
 
-static void test_ds4_topk_block_radix_gpu(int ncols) {
+static void test_ds4_topk_block_radix_gpu(int ncols, bool benchmark = false) {
     std::fprintf(stderr, "  test_ds4_topk_block_radix_gpu ncols=%d ...", ncols);
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
     }
 
     const int nrows = bench_env_int("GGML_DS4_BENCH_TOPK_ROWS", 4);
-    const int timing_iterations =
-        bench_env_int("GGML_DS4_BENCH_TOPK_ITERS", 100);
     constexpr int k = 512;
     ggml_context * ctx = make_test_context(1u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -7670,41 +7696,45 @@ static void test_ds4_topk_block_radix_gpu(int ncols) {
                 index >= 0 && index < ncols,
                 "block-radix top-k returned a padded column");
         }
-        for (int row = 0; row < nrows; ++row) {
-            for (int col = 0; col < ncols; ++col) {
-                score_data[(size_t) row * ncols + col] =
-                    (float) (((uint32_t) col * 2654435761u +
-                              (uint32_t) row * 2246822519u) & 0x00ffffffu);
+        if (benchmark) {
+            const int timing_iterations =
+                bench_env_int("GGML_DS4_BENCH_TOPK_ITERS", 100);
+            for (int row = 0; row < nrows; ++row) {
+                for (int col = 0; col < ncols; ++col) {
+                    score_data[(size_t) row * ncols + col] =
+                        (float) (((uint32_t) col * 2654435761u +
+                                  (uint32_t) row * 2246822519u) & 0x00ffffffu);
+                }
             }
-        }
-        ggml_backend_tensor_set(scores, score_data.data(), 0,
-                                score_data.size() * sizeof(float));
+            ggml_backend_tensor_set(scores, score_data.data(), 0,
+                                    score_data.size() * sizeof(float));
 
-        auto measure_us = [&](bool block_radix) {
-            if (block_radix) {
-                setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
-            } else {
-                setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
-            }
-            constexpr int warmups = 5;
-            for (int i = 0; i < warmups; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto begin = std::chrono::steady_clock::now();
-            for (int i = 0; i < timing_iterations; ++i) {
-                ggml_backend_graph_compute(backend, graph);
-            }
-            ggml_backend_synchronize(backend);
-            const auto end = std::chrono::steady_clock::now();
-            return std::chrono::duration<double, std::micro>(end - begin).count() /
-                timing_iterations;
-        };
-        const double reference_us = measure_us(false);
-        const double candidate_us = measure_us(true);
-        std::fprintf(stderr,
-                     " rows=%d cols=%d reference=%.1fus block_radix=%.1fus",
-                     nrows, ncols, reference_us, candidate_us);
+            auto measure_us = [&](bool block_radix) {
+                if (block_radix) {
+                    setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
+                } else {
+                    setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
+                }
+                constexpr int warmups = 5;
+                for (int i = 0; i < warmups; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto begin = std::chrono::steady_clock::now();
+                for (int i = 0; i < timing_iterations; ++i) {
+                    ggml_backend_graph_compute(backend, graph);
+                }
+                ggml_backend_synchronize(backend);
+                const auto end = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::micro>(end - begin).count() /
+                    timing_iterations;
+            };
+            const double reference_us = measure_us(false);
+            const double candidate_us = measure_us(true);
+            std::fprintf(stderr,
+                         " rows=%d cols=%d reference=%.1fus block_radix=%.1fus",
+                         nrows, ncols, reference_us, candidate_us);
+        }
 
         if (previous) {
             setenv("GGML_DS4_TOPK_BLOCK_RADIX", previous_value.c_str(), 1);
@@ -7715,7 +7745,6 @@ static void test_ds4_topk_block_radix_gpu(int ncols) {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -7815,6 +7844,8 @@ static void test_ds4_flash_attention_position_replay_gpu(bool require_gpu = fals
                         ++cases;
                     }
                 }
+                ggml_backend_cuda_graph_invalidate_range(
+                    backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
             }
@@ -7832,7 +7863,7 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     std::fprintf(stderr, " skipped (HIP-only contract)\n");
     return;
 #endif
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -7854,7 +7885,6 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     ggml_context * ctx = make_test_context(3u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -7965,13 +7995,12 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static void test_hc_post_strided_split_gpu() {
     std::fprintf(stderr, "  test_hc_post_strided_split_gpu ...");
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -8027,7 +8056,6 @@ static void test_hc_post_strided_split_gpu() {
     ggml_context * ctx = make_test_context(1u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -8094,7 +8122,6 @@ static void test_hc_post_strided_split_gpu() {
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -8205,7 +8232,7 @@ static void test_reference_hc_pre(const std::vector<float> & hc_state,
 
 static void test_hc_pre_kernel_gpu() {
     std::fprintf(stderr, "  test_hc_pre_kernel_gpu ...");
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -8243,7 +8270,6 @@ static void test_hc_pre_kernel_gpu() {
     ggml_context * ctx = make_test_context(1u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
     if (!ctx) {
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -8262,7 +8288,6 @@ static void test_hc_pre_kernel_gpu() {
     TEST_ASSERT_MSG(buf != nullptr, "ggml backend buffer alloc failed");
     if (!buf) {
         ggml_free(ctx);
-        ggml_backend_free(backend);
         std::fprintf(stderr, " FAIL\n");
         return;
     }
@@ -8433,7 +8458,6 @@ static void test_hc_pre_kernel_gpu() {
     ggml_backend_buffer_free(buf);
     ggml_gallocr_free(graph_alloc);
     ggml_free(ctx);
-    ggml_backend_free(backend);
 }
 
 // The stale-boundary guard in deepseek4_step_layer_range must fire before any
@@ -8744,7 +8768,7 @@ static void test_hc_scratch_shape_capacity() {
         std::fprintf(stderr, " skipped (no GPU device)\n");
         return;
     }
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    ggml_backend_t backend = get_shared_gpu_backend();
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
@@ -8825,7 +8849,6 @@ static void test_hc_scratch_shape_capacity() {
         ggml_free(ctx);
     }
 
-    ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 #endif
@@ -9080,6 +9103,7 @@ static void test_paged_cache_allocation(ggml_backend_t backend) {
 
 int main(int argc, char ** argv) {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+    SharedGpuBackendGuard shared_gpu_guard;
     if (argc == 2 && std::strcmp(argv[1], "--test-position-replay") == 0) {
         test_ds4_flash_attention_position_replay_gpu(/*require_gpu=*/true);
         return g_failures == 0 ? 0 : 1;
@@ -9112,16 +9136,17 @@ int main(int argc, char ** argv) {
         return g_failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "--bench-streaming-attn") == 0) {
-        test_ds4_flash_attention_streaming_topk_gpu();
+        test_ds4_flash_attention_streaming_topk_gpu(/*benchmark=*/true);
         return g_failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "--bench-indexer") == 0) {
-        test_ds4_indexer_score_m32_gpu();
+        test_ds4_indexer_score_m32_gpu(/*benchmark=*/true);
         return g_failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::strcmp(argv[1], "--bench-topk") == 0) {
         const char * cols = std::getenv("GGML_DS4_BENCH_TOPK_COLS");
-        test_ds4_topk_block_radix_gpu(cols && *cols ? std::atoi(cols) : 4160);
+        test_ds4_topk_block_radix_gpu(
+            cols && *cols ? std::atoi(cols) : 4160, /*benchmark=*/true);
         return g_failures == 0 ? 0 : 1;
     }
 #endif
@@ -9206,7 +9231,7 @@ int main(int argc, char ** argv) {
     test_target_shard_daemon_validation();
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     {
-        auto gpu = ggml_backend_cuda_init(0);
+        auto gpu = get_shared_gpu_backend();
         if (gpu) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
             test_engram_apply_synthetic(gpu, "gpu");
@@ -9217,7 +9242,6 @@ int main(int argc, char ** argv) {
             test_v41_indexer_candidates(gpu, "gpu");
             test_long_row_top_k(gpu, "gpu");
             test_long_concat(gpu, "gpu");
-            ggml_backend_free(gpu);
         } else {
             std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");
         }
