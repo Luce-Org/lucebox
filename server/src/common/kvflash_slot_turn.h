@@ -28,14 +28,13 @@ struct KvFlashSlotTurn {
     int  end = 0;                   // prompt end
     int  reserve_chunks = 0;        // pool room kept for the replay (single-slot rule)
     int  ckpt = -1;                 // the prompt-end checkpoint: the last <|im_start|> (the assistant header)
-    bool end_rung = false;          // C1.5 F7: a recall turn whose replay stops at ckpt and checkpoints there too
     int  uq_cut = -1;               // the latest human question's end inside this prefill: a cut end of every pass (kvflash_uq_cut); -1: none
     std::vector<int> cuts;          // first-pass cut ends, ascending
     bool recall() const { return phase != KvFlashTurnPhase::Lru; }
     bool first_pass() const { return phase == KvFlashTurnPhase::FirstPass; }
     bool snapshot_at_r() const { return recall() && r > kv_offset; }
-    // The pass that checkpoints at ckpt: an LRU turn's only pass, a recall turn's replay with the end rung.
-    bool ckpt_pass() const { return !recall() || (end_rung && phase == KvFlashTurnPhase::Replay); }
+    // The pass that checkpoints at ckpt: an LRU turn's only pass.
+    bool ckpt_pass() const { return !recall(); }
 };
 
 // First-pass cut ends over [kv_offset, end): r is a cut end (the state snapshot
@@ -59,12 +58,10 @@ inline int kvflash_usable_blocks(int n_pool_blocks, int headroom_blocks) { retur
 // The slot's turn for a prompt resumed at kv_offset. Mode 4 runs when the recall
 // profile is on and the prompt with the replay's reserve does not fit the slot's
 // pool (kvflash_pool_fits, the single-slot rule); otherwise the slot stays LRU.
-// end_rung_min (LUCE_KVFLASH_END_RUNG_MIN): a recall turn also checkpoints at the
-// header when end - r reaches it; < 0: never (the R rung alone, C1.4).
 inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & prompt, int kv_offset,
                                               int32_t im_start, int32_t user, int chunk_tokens,
                                               int n_pool_blocks, int cut_u, int n_queries, bool profile_on,
-                                              int end_rung_min = -1, int max_turn_tokens = 0,
+                                              int max_turn_tokens = 0,
                                               const KvFlashUqPlan & uq = KvFlashUqPlan{}) {
     KvFlashSlotTurn t;
     t.kv_offset = std::clamp(kv_offset, 0, (int)prompt.size());
@@ -82,7 +79,6 @@ inline KvFlashSlotTurn kvflash_slot_turn_plan(const std::vector<int32_t> & promp
     if (kvflash_pool_fits(t.end, chunk_tokens, t.reserve_chunks, n_pool_blocks) || t.r / chunk_tokens == 0) { t.r = -1; t.reserve_chunks = 0; return t; }
     t.phase = KvFlashTurnPhase::FirstPass;
     t.cuts = kvflash_slot_turn_cuts(t.kv_offset, t.r, t.end, cut_u, n_queries);
-    t.end_rung = end_rung_min >= 0 && t.ckpt > t.r && t.end - t.r >= end_rung_min;
     return t;
 }
 
@@ -189,19 +185,6 @@ inline int kvflash_park_point(int len, int stash_pos, int ckpt, int trunk, int t
     return stash_pos > 0 && stash_pos < len && stash_pos >= len - tail && stash_pos >= ckpt && stash_pos >= trunk ? stash_pos : len;
 }
 
-// The park-short switches (env strings, null when unset). LUCE_KVFLASH_PARK_SHORT=0: everything off. The prefill-only
-// tail stash (one copy per turn) is on by default with tail 4 (R's replay window); LUCE_KVFLASH_PARK_DECODE=1 adds the
-// per-step decode stash (a copy before every decode step, ~4-5% decode), off by default.
-struct KvFlashParkCfg { bool tail_on = false; bool decode_on = false; int tail = 4; bool any() const { return tail_on || decode_on; } };
-inline KvFlashParkCfg kvflash_park_cfg(bool sticky, const char * park_short, const char * tail, const char * decode) {
-    KvFlashParkCfg c;
-    const bool off = park_short && park_short[0] == '0' && !park_short[1];
-    c.tail_on = sticky && !off;
-    c.decode_on = c.tail_on && decode && decode[0] == '1' && !decode[1];
-    if (tail && *tail) { const int n = std::atoi(tail); c.tail = n < 1 ? 1 : n > 64 ? 64 : n; }
-    return c;
-}
-
 // Rule B's bookkeeping. The rungs a session keeps when it resumes at L: the rung at L (or the
 // highest below it) is the fallback `ckpt`, a rung below that the `trunk`; rungs above L are gone
 // with their rows. At L == len both stay.
@@ -298,12 +281,6 @@ inline int kvflash_oldest_session(const std::vector<KvFlashParkedSession> & park
     for (const KvFlashParkedSession & s : parked)
         if (s.slot >= 0 && (slot < 0 || s.tick < tick)) { slot = s.slot; tick = s.tick; }
     return slot;
-}
-
-// LUCE_KVFLASH_SLOT_STICKY=0 turns sticky sessions off. Read here only: the host ledger's per-slot charge and the engine must agree.
-inline bool kvflash_slot_sticky_env() {
-    const char * e = std::getenv("LUCE_KVFLASH_SLOT_STICKY");
-    return !(e && e[0] == '0' && e[1] == '\0');
 }
 
 // The ONE early refusal of a sticky admit, asked before the restore gate, the archive of the sid's old instance, any victim eviction

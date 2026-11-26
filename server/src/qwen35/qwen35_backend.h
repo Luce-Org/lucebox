@@ -565,12 +565,10 @@ private:
     int concurrent_slots() const {
         return cfg_.max_concurrency > 1 ? cfg_.max_concurrency : 1;
     }
-    // Whether the seq engine serves requests: N > 1 as before, or an explicit
-    // --max-concurrency (even 1) under paged attention (C1.3-02).
+    // Whether the seq engine serves requests: N > 1 or a KVFlash arena under paged attention.
     bool seq_engine_wanted() const {
         return luce::common::seq_engine_wanted(
-            {cfg_.paged_attention, concurrent_slots(), cfg_.max_concurrency_set, kvflash_active(),
-             luce::common::kvflash_concurrent_test_switch()});
+            {cfg_.paged_attention, concurrent_slots(), kvflash_active()});
     }
 
     // KVFlash slots (C1.3-05): one arena of N slices, a pager per slot, the host

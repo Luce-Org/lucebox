@@ -72,12 +72,12 @@ TEST_CASE(KvflashSlotTurnFixture, plan_recalls_the_tail_of_a_cold_turn_too_long_
     const std::vector<int32_t> prompt = prompt_with_user(81430, 17);
     const int cap = kvflash_max_turn_tokens(kCt, 256, 18, 60);
     CHECK(!kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true).recall());
-    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, cap);
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, cap);
     CHECK(t.first_pass());
     CHECK(t.r == 81430 - cap);
     CHECK(t.reserve_chunks == 256 - 18 - 60 - 2);
     // a turn within the cap keeps its user-turn R
-    CHECK(kvflash_slot_turn_plan(prompt_with_user(20000, 15000), 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, cap).r == 15000);
+    CHECK(kvflash_slot_turn_plan(prompt_with_user(20000, 15000), 0, kImStart, kUser, kCt, 256, kU, kT, true, cap).r == 15000);
 }
 
 TEST_CASE(KvflashSlotTurnFixture, a_capped_r_inside_the_question_window_moves_to_the_window_end) {
@@ -86,13 +86,13 @@ TEST_CASE(KvflashSlotTurnFixture, a_capped_r_inside_the_question_window_moves_to
     const std::vector<int32_t> prompt = prompt_with_user(81430, 17);
     const int cap = kvflash_max_turn_tokens(kCt, 256, 18, 60), r0 = 81430 - cap;
     const KvFlashUqPlan inside = kvflash_uq_plan(KvFlashHumanTurn{r0 - 200, r0 + 30}, 64, 0, 81430);   // window [r0 - 34, r0 + 30)
-    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, cap, inside);
+    const KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, cap, inside);
     CHECK(t.first_pass());
     CHECK(t.r == r0 + 30);
     CHECK(t.reserve_chunks == (81430 - (r0 + 30) + kCt - 1) / kCt + 1);
     // a window that R does not split leaves the cap's R
     const KvFlashUqPlan after = kvflash_uq_plan(KvFlashHumanTurn{r0 + 100, r0 + 400}, 64, 0, 81430);
-    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, -1, cap, after).r == r0);
+    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, 256, kU, kT, true, cap, after).r == r0);
 }
 
 TEST_CASE(KvflashSlotTurnFixture, plan_on_a_resumed_session_rewinds_to_the_new_user_turn_only) {
@@ -299,55 +299,6 @@ TEST_CASE(KvflashSlotTurnFixture, the_rungs_after_a_resume_are_the_one_at_L_and_
     CHECK(r.ckpt == -1); CHECK(r.trunk == -1);
     r = kvflash_rungs_after_resume(4470, 4000, 4200);                    // L between the rungs (not a rung: the engine never does this): the trunk is the fallback
     CHECK(r.ckpt == 4000); CHECK(r.trunk == -1);
-}
-
-// C1.5 F7: on a recall turn the replay stops at the header and checkpoints there when end - R
-// reaches LUCE_KVFLASH_END_RUNG_MIN; the first pass and its capture cut are unchanged.
-TEST_CASE(KvflashSlotTurnFixture, the_end_rung_stops_the_replay_at_the_header_when_the_policy_allows_it) {
-    auto prompt = prompt_with_user(5000, 4800);
-    prompt[4990] = kImStart;                                           // the header inside the last U cut
-    KvFlashSlotTurn t = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, 100);
-    CHECK(t.first_pass());
-    CHECK(t.end_rung);                                                 // end - r = 200 >= 100
-    CHECK(kvflash_slot_turn_next_cut(t, 4800, kU) == 200);            // the first pass keeps its capture cut whole
-    CHECK(!kvflash_slot_turn_step(t, 4800, 200).ckpt);
-    CHECK(kvflash_slot_turn_step(t, 4800, 200).capture);
-    t.phase = KvFlashTurnPhase::Replay;
-    CHECK(kvflash_slot_turn_next_cut(t, 4800, kU) == 190);            // the replay stops at the header
-    CHECK(kvflash_slot_turn_step(t, 4800, 190).ckpt);
-    CHECK(kvflash_slot_turn_next_cut(t, 4990, kU) == 10);
-    CHECK(!kvflash_slot_turn_step(t, 4990, 10).ckpt);
-    CHECK(kvflash_slot_turn_next_cut(t, 4000, kU) == std::min(kvflash_next_cut(4000, 5000, kU), 4990) - 4000);
-    CHECK(!kvflash_slot_turn_step(t, 4000, 512).ckpt);
-    // the same turn with a higher threshold, or with the policy unset: today's replay
-    for (int min : {201, 2048, -1}) {
-        KvFlashSlotTurn off = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, min);
-        off.phase = KvFlashTurnPhase::Replay;
-        CHECK(!off.end_rung);
-        CHECK(kvflash_slot_turn_next_cut(off, 4800, kU) == 200);
-        CHECK(!kvflash_slot_turn_step(off, 4800, 190).ckpt);
-    }
-    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, 0).end_rung);      // 0: always
-    CHECK(kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, true, 200).end_rung);    // at the threshold
-    // no header after R (the question ends the prompt): nothing to rung
-    CHECK(!kvflash_slot_turn_plan(prompt_with_user(5000, 4800), 0, kImStart, kUser, kCt, kQ, kU, kT, true, 0).end_rung);
-    // an LRU turn ignores the policy: its header checkpoint is there anyway
-    const KvFlashSlotTurn lru = kvflash_slot_turn_plan(prompt, 0, kImStart, kUser, kCt, kQ, kU, kT, false, 0);
-    CHECK(!lru.end_rung);
-    CHECK(kvflash_slot_turn_step(lru, 4800, 190).ckpt);
-}
-
-TEST_CASE(KvflashSlotTurnFixture, park_cfg_tail_on_by_default_decode_stash_off_until_asked) {
-    auto c = kvflash_park_cfg(true, nullptr, nullptr, nullptr);
-    CHECK(c.tail_on); CHECK(!c.decode_on); CHECK(c.tail == 4); CHECK(c.any());
-    c = kvflash_park_cfg(true, nullptr, "1", "1");
-    CHECK(c.decode_on); CHECK(c.tail == 1);
-    CHECK(!kvflash_park_cfg(true, nullptr, nullptr, "0").decode_on);
-    CHECK(kvflash_park_cfg(true, nullptr, "999", nullptr).tail == 64);
-    CHECK(kvflash_park_cfg(true, nullptr, "0", nullptr).tail == 1);
-    c = kvflash_park_cfg(true, "0", nullptr, "1");           // PARK_SHORT=0 beats everything
-    CHECK(!c.any());
-    CHECK(!kvflash_park_cfg(false, nullptr, nullptr, "1").any());   // no sticky sessions, no parking
 }
 
 TEST_CASE(KvflashSlotTurnFixture, the_query_tail_accumulates_the_last_64_prompt_queries_across_cuts_like_the_serial_engine) {
