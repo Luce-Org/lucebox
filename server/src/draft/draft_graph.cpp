@@ -166,6 +166,19 @@ DraftGraphOutputs build_draft_graph(
     const DraftWeights &      w,
     const DraftGraphInputs &  in) {
 
+    // The one-shot graph only knows causal SWA over a uniform ctx view. A
+    // non-causal sliding window (upstream DFlash 2) needs the per-query masks of
+    // the draft-KV path; running it here would be silently wrong.
+    for (const DraftLayer & L : w.layers) {
+        if (L.is_swa && !L.is_causal && !std::getenv("LUCE_DISABLE_DRAFT_SWA")) {
+            std::fprintf(stderr,
+                "[draft] DFlash 2 (non-causal sliding-window attention) is not "
+                "supported on the legacy one-shot draft graph; run with the draft "
+                "KV ring enabled (unset LUCE_DRAFT_KV=0)\n");
+            return DraftGraphOutputs{};
+        }
+    }
+
     const int q_len    = w.block_size;
     const int ctx_len  = in.ctx_len;
     const int n_head   = w.n_head;
