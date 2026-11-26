@@ -380,7 +380,6 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
 struct KvflashRecallProfile {
     static constexpr const char * policy         = "qk";
     static constexpr int          prefill_reselect = 4;      // mode 4: exact scorer
-    static constexpr const char * reselect_scorer  = "exact";
     static constexpr int          recall_blocks    = 6;
     static constexpr int          select_unit      = 2;      // chunks per recall unit
     static constexpr int          preamble_rows    = 1152;   // pool rows reserved for the pinned preamble: 18 chunks of 64, out of --kvflash N
@@ -404,7 +403,6 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
     return {
         {"LUCE_KVFLASH_POLICY", P::policy},
         {"LUCE_KVFLASH_PREFILL_RESELECT", std::to_string(P::prefill_reselect)},
-        {"LUCE_KVFLASH_RESELECT_SCORER", P::reselect_scorer},
         {"LUCE_KVFLASH_RECALL_BLOCKS", std::to_string(P::recall_blocks)},
         {"LUCE_KVFLASH_SCORE_POOL_RECENT", std::to_string(P::score_pool_recent)},
         {"LUCE_KVFLASH_SELECT_UNIT", std::to_string(P::select_unit)},
@@ -413,13 +411,14 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
     };
 }
 
-// /props.kvflash.mode: the reselect mode the qwen35 backend resolves from LUCE_KVFLASH_PREFILL_RESELECT,
-// LUCE_KVFLASH_POLICY and LUCE_KVFLASH_RESELECT_SCORER (kvflash_reselect_mode). Empty = recall off.
-// ponytail: tensor parallelism turns recall off later, at load (kvflash_recall_features); this does not see it.
+// /props.kvflash.mode: the reselect mode the qwen35 backend resolves from LUCE_KVFLASH_PREFILL_RESELECT
+// and LUCE_KVFLASH_POLICY (kvflash_reselect_mode), then from its tensor-parallel degree at load
+// (kvflash_recall_features turns recall off above 1). Empty = recall off.
 inline std::string kvflash_recall_mode(std::string_view arch, const std::string & reselect,
-                                       const std::string & policy, const std::string & scorer) {
-    const int mode = arch == "qwen35"
-        ? luce::common::kvflash_reselect_mode(std::atoi(reselect.c_str()), policy == "qk", scorer.c_str(), nullptr) : 0;
+                                       const std::string & policy, int tp_degree) {
+    const int asked = arch == "qwen35"
+        ? luce::common::kvflash_reselect_mode(std::atoi(reselect.c_str()), policy == "qk") : 0;
+    const int mode = luce::common::kvflash_recall_features(tp_degree, {asked, 0}).reselect_mode;
     return mode ? "prefill-reselect=" + std::to_string(mode) : "";
 }
 
