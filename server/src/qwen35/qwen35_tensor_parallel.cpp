@@ -140,7 +140,7 @@ TensorSplit classify_tensor(const ggml_tensor * tensor,
         result.axis = GGML_BACKEND_SPLIT_AXIS_1;
         result.segments = {{key_dim, (uint32_t) (2 + value_head_ratio)}};
         result.granularities = {w.ssm_d_state};
-    } else if (name == "q_cap") {
+    } else if (name == "q_cap" || name == "q_stage") {
         one_segment(GGML_BACKEND_SPLIT_AXIS_1, n_gqa);
     }
 

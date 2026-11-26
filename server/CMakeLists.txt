@@ -2842,6 +2842,7 @@ if(LUCE_TESTS)
             test/unit/test_qwen35_swap_snapshot_cache.cpp
             test/unit/test_qwen35_single_replay_graph.cpp
             test/unit/test_sampled_verify.cpp
+            test/unit/test_kvflash_q_stage.cpp
             test/unit/test_ddtree_tau.cpp
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp
@@ -2873,6 +2874,8 @@ if(LUCE_TESTS)
             test/unit/test_kvflash_prefill_reselect.cpp
             test/unit/test_kvflash_m4_reuse.cpp
             test/unit/test_kvflash_pin_preamble.cpp
+            test/unit/test_kvflash_spec_serial.cpp
+            test/unit/test_spec_rollback_policy.cpp
             test/unit/test_qwen35moe_routing_stats.cpp
             test/unit/test_qwen35moe_expert_placement.cpp
             test/unit/test_qwen35moe_swap_manager.cpp
@@ -2984,7 +2987,8 @@ if(LUCE_TESTS)
             test/smoke/smoke_load_target.cpp
             test/smoke/smoke_load_target_laguna.cpp
             test/unit/test_paged_attention.cpp
-            test/unit/test_decode_kv_offload_gpu.cpp)
+            test/unit/test_decode_kv_offload_gpu.cpp
+            test/unit/test_spec_rollback_storage_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include

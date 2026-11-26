@@ -144,20 +144,11 @@ TEST_CASE(KvflashExactMassFixture, select_scores_take_the_max_over_queries_of_to
     CHECK((kvflash_select_scores(pl) == std::vector<float>{0.3f, 0.5f, 0.0f}));
     CHECK(kvflash_select_scores({}).empty());
 }
-TEST_CASE(KvflashExactMassFixture, stage_rows_exist_only_in_a_kvflash_process) {
-    luce_test::ScopedEnvVar off("LUCE_KVFLASH", nullptr);
-    CHECK(kvflash_q_stage_rows(16) == 0);
-    {
-        luce_test::ScopedEnvVar on("LUCE_KVFLASH", "auto");
-        CHECK(kvflash_q_stage_rows(16) == 16);
-        CHECK(kvflash_q_stage_rows(-3) == 0);
-    }
-    {
-        luce_test::ScopedEnvVar pool("LUCE_KVFLASH", "4096");
-        CHECK(kvflash_q_stage_rows(16) == 16);
-    }
-    luce_test::ScopedEnvVar zero("LUCE_KVFLASH", "0");
-    CHECK(kvflash_q_stage_rows(16) == 0);
+TEST_CASE(KvflashExactMassFixture, stage_rows_exist_only_when_requested) {
+    CHECK(kvflash_q_stage_rows(16, false) == 0);
+    CHECK(kvflash_q_stage_rows(16, true) == 16);
+    CHECK(kvflash_q_stage_rows(-3, true) == 0);
+    CHECK(kvflash_q_stage_rows(0, true) == 0);
 }
 
 TEST_CASE(KvflashExactMassFixture, per_token_query_capture_exists_only_in_a_kvflash_process) {

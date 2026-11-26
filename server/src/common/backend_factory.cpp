@@ -219,7 +219,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.draft_block_size   = speculation.draft_block_size;
         cfg.draft_swa_window   = cache.draft_swa_window;
         cfg.draft_ctx_max      = cache.draft_ctx_max;
-        cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.rollback_mode      = speculation.rollback_mode;
         cfg.seq_verify         = speculation.seq_verify;
         cfg.specla_mode        = speculation.specla_mode;
         cfg.specla_top_k       = speculation.specla_top_k;
@@ -248,7 +248,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.kq_stride_pad      = cache.kq_stride_pad;
         cfg.draft_swa_window   = cache.draft_swa_window;
         cfg.draft_ctx_max      = cache.draft_ctx_max;
-        cfg.fast_rollback      = speculation.fast_rollback;
+        cfg.rollback_mode      = speculation.rollback_mode;
         cfg.seq_verify         = speculation.seq_verify;
         // SpecLA is a qwen35-only path; normalization has already cleared
         // specla_mode for any other arch, so forward the plan value as-is.

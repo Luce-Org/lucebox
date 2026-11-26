@@ -255,7 +255,8 @@ uint32_t gguf_draft_block_size(const std::string & draft_path) {
 }
 
 uint64_t gguf_rollback_cache_bytes(const std::string & model_path, int max_verify_tokens,
-                                   bool checkpoint_f32, bool specla) {
+                                   bool checkpoint_f32, bool specla,
+                                   bool checkpoints) {
     gguf_init_params params{};
     params.no_alloc = true;
     gguf_context * gctx = gguf_init_from_file(model_path.c_str(), params);
@@ -280,7 +281,8 @@ uint64_t gguf_rollback_cache_bytes(const std::string & model_path, int max_verif
             dims.ssm_d_state = (int) gguf_u32(gctx, pre + "ssm.state_size");
             dims.ssm_n_group = (int) gguf_u32(gctx, pre + "ssm.group_count");
             dims.ssm_d_conv = (int) gguf_u32(gctx, pre + "ssm.conv_kernel");
-            bytes = rollback_cache_bytes(dims, max_verify_tokens, checkpoint_f32, specla);
+            bytes = rollback_cache_bytes(dims, max_verify_tokens, checkpoint_f32, specla,
+                                         checkpoints);
         }
     }
     gguf_free(gctx);

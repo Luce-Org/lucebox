@@ -67,7 +67,7 @@ public:
     struct Speculation {
         std::optional<std::string> draft_path;
         int draft_block_size = 0;
-        bool fast_rollback = true;
+        RollbackMode rollback_mode = RollbackMode::Auto;
         bool seq_verify = false;
         bool specla_mode = false;
         int specla_top_k = 4;

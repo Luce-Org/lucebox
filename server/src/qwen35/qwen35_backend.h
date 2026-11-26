@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/chain_rollback_policy.h"
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
@@ -99,7 +100,7 @@ struct Qwen35Config {
     int          draft_yarn_orig_ctx  = 4096;
 
     // Speculative decode strategy
-    bool         fast_rollback   = true;
+    RollbackMode rollback_mode   = RollbackMode::Auto;
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
     // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
@@ -266,6 +267,8 @@ protected:
 
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
+    // Resolved in init() from cfg_.rollback_mode and the active KVFlash pager.
+    bool         fast_rollback_ = true;
 
     // ── kvflash (bounded KV residency, FlashMemory-style) ────────────
     // Active when kvflash_tokens_ > 0 (env LUCE_KVFLASH / --kvflash):
@@ -273,7 +276,9 @@ protected:
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
     // pflash drafter is loaded it becomes the reselect scorer (every
-    // kvflash_tau_ decoded tokens). Forces AR decode (no spec).
+    // kvflash_tau_ decoded tokens). With a draft model the serial path
+    // speculates too: spec steps stay AR-equivalent (see do_spec_decode);
+    // --ddtree with KVFlash is refused at startup.
     // Protected: the MoE subclass routes its pipelined decode loops and
     // hybrid prefill through the same pager/history/reselect state.
     KvFlashPager                   kvflash_pager_;
@@ -407,10 +412,15 @@ protected:
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask(int cur_pos);
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
-    void kvflash_maybe_reselect(int generated);
-    // Spec: copy the staged verify query of position new_committed - 1 into
-    // q_cap, so the next reselection reads AR's query. False when that row is
-    // not staged (q_cap is left as is).
+    // When `query` is non-null (spec decode passing a row read straight from
+    // q_stage), the target-QK scorer uses it directly instead of reading q_cap.
+    void kvflash_maybe_reselect(int generated,
+                                const float * query = nullptr,
+                                size_t query_size = 0);
+    // Spec: read the staged verify query of position new_committed - 1 directly
+    // into `out` (in q_cap [n_fa, n_head, head_dim] float order) via a single
+    // strided 2D transfer. False when that row is not staged.
+    bool kvflash_read_q_stage_row(int new_committed, std::vector<float> & out) const;
     // Attach the drafter scorer if a drafter path is configured and the
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
@@ -552,6 +562,7 @@ private:
     int  layout_ctx_alloc_ = 0;
     int  layout_feat_cap_ = 0;
     bool layout_fixed_chain_ = false;
+    bool layout_allocate_q_stage_ = false;
     bool released_ = false;
     void init_feature_mirror(bool fixed_chain_enabled);
 
@@ -563,6 +574,12 @@ private:
     // A chunk starts at every absolute `restore_points` position (see
     // GenerateRequest::restore_points), so a snapshot at one is exact and a
     // restore from it reproduces a cold prefill.
+    // Gives the prefill-only cache the storage speculative decode rolls back
+    // with. Every speculative step snapshots the recurrent state, so the
+    // snapshot pair is always attached; the per-token checkpoint buffers
+    // (about 2.4 GB on Qwen3.8-27B at block size 16) only when fast rollback
+    // or DDTree capture into them.
+    bool attach_rollback_storage(int max_verify_tokens, bool enable_specla);
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
@@ -602,7 +619,8 @@ private:
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       bool * forced_close_out,
-                      bool * degenerate_close_out);
+                      bool * degenerate_close_out,
+                      size_t reselect_origin = SIZE_MAX);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
     // Allocates the next paged K/V row and uploads this step's block-table /
@@ -613,6 +631,31 @@ private:
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);
+    bool sync_draft_features(int start_pos, int n_tokens);
+
+    struct KvFlashSpecState;
+    enum class KvFlashArHopStatus { Continue, EndRequest, HandoffToAr, Failed };
+    KvFlashArHopStatus run_kvflash_ar_hop(
+        DFlashTarget * target,
+        int & committed,
+        int32_t & last_tok,
+        int & n_generated,
+        int & target_forwards,
+        ThinkingBudget & budget,
+        std::vector<int32_t> & out_tokens,
+        const DaemonIO & io,
+        bool sampled_verify,
+        bool constrained_greedy,
+        int verify_top_n,
+        std::vector<int32_t> & target_tok,
+        std::vector<float> & verify_logits,
+        std::vector<float> & top_vals,
+        std::vector<int32_t> & top_ids,
+        int & top_n_read,
+        int & top_vocab,
+        int & top_draws,
+        int & top_misses,
+        bool * forced_close_out);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

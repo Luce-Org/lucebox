@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 
+#include "chain_rollback_policy.h"
 #include "placement/draft_residency.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
@@ -118,7 +119,7 @@ struct BackendArgs {
     int             draft_block_size = 0;  // 0 = drafter metadata
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
-    bool            fast_rollback    = true;
+    RollbackMode    rollback_mode    = RollbackMode::Auto;
     bool            seq_verify       = false;
     bool            specla_mode      = false;
     int             specla_top_k     = 4;

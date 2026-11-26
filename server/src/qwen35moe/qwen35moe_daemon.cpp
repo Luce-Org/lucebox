@@ -6,6 +6,7 @@
 namespace luce::common {
 
 int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
+    if (const int rc = qwen35_daemon_kvflash_gate(args)) return rc;
     Qwen35Config cfg;
     cfg.target_path        = args.target_path ? args.target_path : "";
     if (args.draft_path) cfg.draft_path = args.draft_path;
@@ -16,7 +17,7 @@ int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
     cfg.kq_stride_pad      = args.kq_stride_pad;
     cfg.draft_swa_window   = args.draft_swa_window;
     cfg.draft_ctx_max      = args.draft_ctx_max;
-    cfg.fast_rollback      = args.fast_rollback;
+    cfg.rollback_mode      = args.fast_rollback ? RollbackMode::Auto : RollbackMode::Exact;
     cfg.seq_verify         = args.seq_verify;
     cfg.ddtree_mode        = args.ddtree_mode;
     cfg.ddtree_budget      = args.ddtree_budget;

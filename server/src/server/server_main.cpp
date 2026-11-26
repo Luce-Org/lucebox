@@ -288,7 +288,9 @@ static void print_usage(const char * prog) {
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
         "                       checks (rules, re-plan, final self-check; default: on)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
-        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on; with --kvflash\n"
+        "                      the default is exact rollback and this flag opts in; greedy\n"
+        "                      output then differs from AR on some prompts)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --specla            Enable speculative linear-attention verification\n"
         "                       when supported (Qwen3.6 uses DDTree automatically)\n"
@@ -582,7 +584,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.draft_path = argv[++i];
         } else if (std::strcmp(argv[i], "--no-draft") == 0) {
             bargs.draft_path = std::nullopt;
-            bargs.fast_rollback = false;
+            bargs.rollback_mode = luce::common::RollbackMode::Exact;
         } else if (std::strcmp(argv[i], "--mmproj") == 0) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "[server] --mmproj needs a projector GGUF path\n");
@@ -946,10 +948,12 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
-            bargs.fast_rollback = true;
+            bargs.rollback_mode = luce::common::RollbackMode::Fast;
         } else if (std::strcmp(argv[i], "--specla") == 0) {
             bargs.specla_mode = true;
-            bargs.fast_rollback = true;
+            if (bargs.rollback_mode == luce::common::RollbackMode::Exact) {
+                bargs.rollback_mode = luce::common::RollbackMode::Auto;
+            }
         } else if (std::strcmp(argv[i], "--specla-top-k") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
@@ -964,13 +968,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.specla_top_k_explicit = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
-            bargs.fast_rollback = true;
+            if (bargs.rollback_mode == luce::common::RollbackMode::Exact) {
+                bargs.rollback_mode = luce::common::RollbackMode::Auto;
+            }
         } else if ((std::strcmp(argv[i], "--ddtree-budget") == 0 ||
                     std::strcmp(argv[i], "--budget") == 0) && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
             if (bargs.ddtree_budget <= 0) {
                 bargs.ddtree_mode = false;
-                bargs.fast_rollback = false;
+                bargs.rollback_mode = luce::common::RollbackMode::Exact;
             }
         } else if (std::strcmp(argv[i], "--ddtree-tau") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
@@ -1010,7 +1016,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
             fast_rollback_forced_off = true;
-            bargs.fast_rollback = false;
+            bargs.rollback_mode = luce::common::RollbackMode::Exact;
         } else if (std::strcmp(argv[i], "--kvflash") == 0 && i + 1 < argc) {
             // Bounded KV residency: attention KV lives in a fixed pool of N
             // tokens; cold 64-token chunks page to host. Works with or
@@ -1432,16 +1438,25 @@ static void auto_drafter_bytes(const ModelOptions & model,
     // block, or a DDTree's nodes.
     // --specla turns DDTree on during backend planning, after this runs.
     const bool tree = args.ddtree_mode || args.specla_mode;
-    if (!args.fast_rollback && !tree) return;
     int block = args.draft_block_size > 0 ? args.draft_block_size
                                           : (int) gguf_draft_block_size(*args.draft_path);
     if (block <= 0) block = LUCE_DRAFT_BLOCK_SIZE;
     const int max_verify_tokens = tree ? std::max(block, args.ddtree_budget + 1) : block;
-    const bool kvflash = !model.kvflash_pool.empty() || std::getenv("LUCE_KVFLASH") != nullptr;
+    const char * env_pool = std::getenv("LUCE_KVFLASH");
+    const bool kvflash = !model.kvflash_pool.empty() || env_pool != nullptr;
+    // Under the pager fast rollback is opt-in (spec_fast_rollback_enabled), and
+    // exact restore attaches the two snapshots only. Only a fixed pool is known
+    // here to give a pager: "auto" can size to none, so it is charged the
+    // checkpoints, the larger of the two.
+    const bool pager = luce::common::kvflash_fixed_pool_requested(
+        model.kvflash_pool.empty() ? env_pool : model.kvflash_pool.c_str());
     rollback_bytes = gguf_rollback_cache_bytes(
         args.model_path, max_verify_tokens,
         luce::common::resolve_chain_rollback_policy().checkpoint_f32,
-        /*specla=*/args.specla_mode && args.fast_rollback && !kvflash);
+        /*specla=*/args.specla_mode &&
+            args.rollback_mode != luce::common::RollbackMode::Exact && !kvflash,
+        /*checkpoints=*/luce::common::spec_rollback_checkpoints(
+            pager, args.rollback_mode, tree));
 }
 
 // --target-device auto: bind the model block to the placement the policy picks.
@@ -1757,7 +1772,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
     auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
     if (fast_rollback_forced_off) {
-        bargs.fast_rollback = false;
+        bargs.rollback_mode = luce::common::RollbackMode::Exact;
         target_split_fast_rollback_cli = false;
         // This is the global rollback kill switch, including an externally
         // supplied layer-split opt-in.
@@ -2514,8 +2529,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n",
                      backend_speculation.ddtree_tau);
     }
-    std::fprintf(stderr, "[server] │  fast_rollback   = %s\n",
-                 backend_speculation.fast_rollback ? "ON" : "off");
+    const char * kvflash_env = std::getenv("LUCE_KVFLASH");
+    const char * fast_rb_banner =
+        backend_speculation.rollback_mode == luce::common::RollbackMode::Fast  ? "ON" :
+        backend_speculation.rollback_mode == luce::common::RollbackMode::Exact ? "off" :
+        luce::common::kvflash_fixed_pool_requested(kvflash_env)                ? "off (kvflash)" :
+        luce::common::kvflash_pool_requested(kvflash_env)                      ? "auto (off if kvflash pages)" :
+                                                                                 "ON";
+    std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", fast_rb_banner);
     if (backend_placement.target.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
                      split_chain_fast_rollback_enabled() ? "ON" : "off");
