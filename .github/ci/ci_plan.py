@@ -4,9 +4,11 @@
 Prints `<job>=true|false` lines for $GITHUB_OUTPUT covering Python checks,
 hosted C++/megakernel/Windows builds, DGX GB10, and the lucebox3 ROCm jobs.
 Each changed path takes the first rule in RULES that matches it, and the pull
-request runs every job any of its paths needs. A path no rule names runs
-everything; so does --full (pushes to main, merge_group, manual runs), and so
-does a failure to list the changed files.
+request runs every job any of its paths needs. A C, C++ or CUDA source, header
+or CMake file always keeps a build lane, even when its directory rule would
+send it to the Python lane alone. A path no rule names runs everything; so does
+--full (pushes to main, merge_group, manual runs), and so does a failure to
+list the changed files.
 
 Usage: ci_plan.py --base HEAD^1 --head HEAD   (a pull request's merge commit)
        ci_plan.py --full
@@ -116,6 +118,32 @@ RULES = [
 ]
 UNKNOWN = "code no rule narrows (shared code, other models, build files)"
 
+# Native sources are compiled, not imported: no Python test would notice a change
+# that breaks their build. A directory rule may still route one to the Python
+# lane (optimizations/, harness/, scripts/), so plan() keeps a build lane for
+# every path with one of these names.
+NATIVE_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cmake",
+    ".cmake.in",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+)
+NATIVE_NAMES = ("CMakeLists.txt",)
+
+
+def is_native(path: str) -> bool:
+    """Whether a C/C++/CUDA toolchain, or CMake, consumes this file."""
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith(NATIVE_SUFFIXES) or name in NATIVE_NAMES
+
 
 def matches(path: str, pattern: str) -> bool:
     if pattern.startswith("*"):
@@ -134,6 +162,13 @@ def plan(paths: list[str] | None) -> tuple[frozenset[str], dict[str, list[str]]]
     for path in paths:
         rule = next((rule for rule in RULES if matches(path, rule[0])), None)
         needs, why = (rule[1], rule[2]) if rule else (ALL, UNKNOWN)
+        # optimizations/ and harness/ select the Python lane alone, and
+        # server/examples/ selects nothing; a native source filed there would run
+        # no compiler at all. Judge every path on its own rule: a build lane that
+        # another path selects does not compile this file.
+        if is_native(path) and needs <= PY:
+            needs |= CPP
+            why = f"{why}; native source, so the C++ build runs"
         jobs |= needs
         reasons.setdefault(why, []).append(path)
     return frozenset(jobs), reasons
