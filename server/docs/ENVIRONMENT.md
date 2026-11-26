@@ -141,6 +141,7 @@ switches are documented in [PFlash configuration](PFLASH_CONFIGURATION.md).
 | `LUCE_KVFLASH_PREAMBLE_ROWS` | 1152 with `--kvflash` on qwen35, else 0 | Pool rows (rounded up to a chunk) reserved inside `--kvflash N` for the pinned system+tools preamble, so the history budget is N minus the reserve and the pool, and the decode cost, stay N. A reserve that leaves no history row (>= N) turns the pin off with a log line. 0 turns the pin off. |
 | `LUCE_KVFLASH_UQ_QUERIES` | 64 with `--kvflash` on qwen35, else 0 | The last N (at most 64) queries of the latest human turn join the selector's queries. 0 off. Serial path only; off under tensor parallelism. |
 | `LUCE_KVFLASH_GPU_SCORE_FUSED` | 1 | KILL SWITCH: mode 4's exact GPU scorer runs the fused chunk-mass kernel and keeps the evicted K it reads on the device between calls (about 1.06 MiB of VRAM per evicted chunk at q8_0, taken only under the scorer's free-memory guard). Used when the KV cache K is q8_0 with a head dim that is a multiple of 32 and at most 256; any other K, a kernel failure, or =0 scores with the logits graph and uploads the evicted K on every call, as before. |
+| `LUCE_KVFLASH_THINK_REWIND` | 0 | Mode 5 Think-then-Rewind-to-R: number of buffered `<think>` tokens captured before verifying residency with fused exact attention mass over `prompt_tail + <think>` queries (e.g. `64`; `0` off). On trigger, restores the bit-exact snapshot at `R`, applies the Mode 5 union exact-mass plan, and re-prefills `[R..prompt_end)`. Requires `LUCE_KVFLASH_PREFILL_RESELECT=5`. |
 
 ## Full inventory (generated)
 
@@ -156,6 +157,7 @@ switches are documented in [PFlash configuration](PFLASH_CONFIGURATION.md).
 - `LUCE_KVFLASH_SCORE_POOL_RECENT` - qwen35_backend.cpp
 - `LUCE_KVFLASH_SELECT_UNIT` - qwen35_backend.cpp
 - `LUCE_KVFLASH_GPU_SCORE_FUSED` - qwen35_backend.cpp
+- `LUCE_KVFLASH_THINK_REWIND` - qwen35_backend.cpp
 - `LUCE_KVFLASH_UQ_QUERIES` - kvflash_query_capture.h
 - `LUCE_KV_F16` - kv_quant.cpp
 - `LUCE_KV_K` - kv_quant.cpp, laguna_backend.cpp

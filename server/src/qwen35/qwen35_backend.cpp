@@ -32,6 +32,7 @@
 #include "pflash/pflash_window.h"
 #include "pflash/kvflash_drafter_scorer.h"
 #include "common/kvflash_prefill_reselect.h"
+#include "common/kvflash_think_rewind.h"
 #include "common/kvflash_exact_mass.h"
 #include "common/kvflash_exact_fast.h"
 #include "common/kvflash_gpu_mass.h"
@@ -2008,6 +2009,7 @@ void Qwen35Backend::shutdown() {
         free_prefix_snapshot(prefix_snapshots_[i]);
         free_prefix_snapshot(displaced_snapshots_[i]);
     }
+    kvflash_think_clear_state();
     state_ladder_clear();
     if (!target_parked_) free_target_weights(w_);
     vision_.reset();  // its buffers belong to target_backend_, freed below
@@ -2164,6 +2166,19 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         }
     }
     const bool has_images = image_rows.prompt != nullptr;
+    struct ThinkRequestGuard {
+        Qwen35Backend * self;
+        bool prev;
+        ThinkRequestGuard(Qwen35Backend * s, bool eligible)
+            : self(s), prev(s->kvflash_think_turn_eligible_) {
+            self->kvflash_think_clear_state();
+            self->kvflash_think_turn_eligible_ = eligible;
+        }
+        ~ThinkRequestGuard() {
+            self->kvflash_think_clear_state();
+            self->kvflash_think_turn_eligible_ = prev;
+        }
+    } think_request_guard(this, req.n_gen > 1 && !has_images);
     int committed;
     if (live_cut > 0) {
         // Prefill only prompt[C:] on the grid, continuing the live pager.
@@ -2530,6 +2545,19 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
+    struct ThinkRequestGuard {
+        Qwen35Backend * self;
+        bool prev;
+        ThinkRequestGuard(Qwen35Backend * s, bool eligible)
+            : self(s), prev(s->kvflash_think_turn_eligible_) {
+            self->kvflash_think_clear_state();
+            self->kvflash_think_turn_eligible_ = eligible;
+        }
+        ~ThinkRequestGuard() {
+            self->kvflash_think_clear_state();
+            self->kvflash_think_turn_eligible_ = prev;
+        }
+    } think_request_guard(this, req.n_gen > 1);
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
     if (full_reprefill) {
@@ -2874,7 +2902,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const std::vector<int> & chunk_points = uq_dense_points.empty() ? restore_points : uq_dense_points;
     // The last q_keep prompt queries, oldest first, in kvflash_q_tail_: selector v2's
     // (SELECT_QUERIES). Every mode-4 prefill keeps them: the next request may score with them before its pass.
-    const int q_keep = rw.run || recall.m4_track ? kvflash_select_queries_ : 0;
+    const int think_rewind_cfg = env_int_or_default("LUCE_KVFLASH_THINK_REWIND", 0);
+    if (!kvflash_think_replaying_) {
+        kvflash_think_clear_state();
+    }
+    const bool think_track_m5 = !kvflash_think_replaying_ && kvflash_think_turn_eligible_ &&
+                                think_rewind_cfg > 0 && kvf_paged &&
+                                m5_r >= 0 && m5_r >= kv_offset &&
+                                (kv_offset + prompt_len - m5_r) > 0 &&
+                                (kv_offset + prompt_len - m5_r) <= 4096;
+    const int q_keep = (rw.run || recall.m4_track) ? kvflash_select_queries_
+                     : (think_track_m5 ? luce::common::kQueryCaptureTokens : 0);
     kvflash_q_tail_.clear();
     // Scratch state snapshot at R (not a ladder rung), freed on every exit by the guard.
     struct M3Scratch {
@@ -2962,10 +3000,20 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool with_mask = kvf_paged ||
             (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
-        // Single-pass mode-4 turn: refill the pool from the exact scores before this batch's
+        // Single-pass mode-4/mode-5 turn: refill the pool from the scores before this batch's
         // slots and mask are computed from the pager state.
-        if (m5_r >= 0 && kv_pos == m5_r)
+        if (m5_r >= 0 && kv_pos == m5_r) {
+            if (think_track_m5 && cache_.cur_pos == kv_pos) {
+                kvflash_think_m5_scores_ = kvflash_scores_;
+                if (snapshot_target_cache(w_, cache_, snap_backend_, kvflash_think_r_snap_,
+                                          /*skip_kv=*/true, /*kvflash_blob=*/nullptr,
+                                          /*skip_target_feat=*/!cfg_.draft_path)) {
+                    kvflash_think_r_pos_ = kv_pos;
+                    kvflash_think_r_tokens_.assign(tokens.begin() + start, tokens.end());
+                }
+            }
             kvflash_prefill_apply(kv_pos, kv_offset + prompt_len, kv_pos - 1, m5_ms, recall.apply_note);
+        }
 
         // Mode 4: the state at R is about to run [R, end) under the old pool;
         // keep a scratch copy so the pass can be rewound.
@@ -3563,7 +3611,7 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
     // The first (scoring) pass must see OFF's plain-LRU pool, not the previous request's recalled blocks:
     // recency-reselect on every pooled request, after every restore path. A mode-4 turn that runs once has no
     // scoring pass: it picks from the pool the last request left, so only the chunks that changed are paged.
-    if (kvf_paged && kvflash_score_pool_recent_ && !m4_single) {
+    if (kvf_paged && kvflash_score_pool_recent_ && !m4_single && !kvflash_think_replaying_) {
         const int64_t ins0 = kvflash_pager_.stats().page_ins;
         const auto t_rr = std::chrono::steady_clock::now();
         const int events = kvflash_pager_.reselect_recent();
@@ -3912,6 +3960,386 @@ void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     }
 }
 
+void Qwen35Backend::kvflash_think_clear_state() {
+    free_prefix_snapshot(kvflash_think_r_snap_);
+    kvflash_think_r_pos_ = -1;
+    kvflash_think_r_tokens_.clear();
+    kvflash_think_m5_scores_.clear();
+}
+
+int Qwen35Backend::kvflash_think_rewind_preamble(int & committed, ThinkingBudget & budget,
+                                                 std::vector<int32_t> & out_tokens,
+                                                 const DaemonIO & io,
+                                                 bool * forced_close_out,
+                                                 bool for_spec) {
+    const int think_rewind_n = env_int_or_default("LUCE_KVFLASH_THINK_REWIND", 0);
+    if (think_rewind_n <= 0 || !kvflash_active() || cfg_.paged_attention ||
+        !out_tokens.empty() || budget.remaining() <= 1 || sampler_.constraint ||
+        kvflash_think_r_pos_ < 0 || kvflash_think_r_tokens_.empty() || !cache_.q_cap) {
+        return 2;
+    }
+    const KvFlashQkDims qd = kvflash_exact_dims();
+    const size_t qsz = (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim;
+    if (qsz == 0 || (size_t)ggml_nelements(cache_.q_cap) != qsz) return 2;
+    // Capture target_feat + sync draft mirror during the think loop when handing off
+    // to spec decode (backed by the snapshot at R so a rewind restores target_feat cleanly).
+    const bool capture_spec = for_spec && !draft_parked_ &&
+        (remote_draft_.active() || (feature_mirror_.target_feat && cache_.target_feat));
+
+    const luce::common::KvFlashThinkRewindCfg think_cfg;
+    const int hidden = w_.n_embd;
+    const int vocab  = w_.n_vocab;
+    const int think_prompt_end = committed;
+    const ThinkingBudget budget_pre_first = budget;
+    const std::mt19937_64 rng_pre_first = sampler_rng_;
+    const size_t history_pre_first = kvflash_history_.size();
+    const bool prev_forced_close = forced_close_out ? *forced_close_out : false;
+
+    std::vector<float> logits_buf(vocab);
+    std::vector<float> embed_buf_vec(hidden);
+    float * embed_buf = embed_buf_vec.data();
+    std::vector<int32_t> buffered_toks;
+    buffered_toks.reserve((size_t)think_rewind_n + 1);
+    std::vector<float> think_q_buf;
+    think_q_buf.reserve((size_t)think_rewind_n * qsz);
+    int think_q_count = 0;
+
+    auto flush_buffer = [&]() {
+        for (int32_t bt : buffered_toks) io.emit(bt);
+        buffered_toks.clear();
+        kvflash_think_r_pos_ = -1;
+    };
+    auto apply_budget = [&](int32_t & tok) {
+        const bool was_forced = budget.forced_close();
+        tok = budget.apply(tok).token;
+        if (budget.forced_close() && !was_forced && forced_close_out) {
+            *forced_close_out = true;
+        }
+    };
+
+    // Sample first token from prefill logits without emitting yet.
+    int32_t first_tok;
+    if (sampler_.needs_logit_processing()) {
+        if (!prefill_last_logits_valid_) return -1;
+        ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
+                                sizeof(float) * vocab);
+        first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                  out_tokens, sampler_rng_);
+    } else {
+        first_tok = cache_.last_tok;
+    }
+    apply_budget(first_tok);
+    out_tokens.push_back(first_tok);
+    buffered_toks.push_back(first_tok);
+    kvflash_history_.push_back(first_tok);
+    if (io.is_cancelled() || IS_EOS_TOK(first_tok, w_) || budget.remaining() <= 0) {
+        flush_buffer();
+        cache_.last_tok = first_tok;
+        return 0;
+    }
+
+    auto try_rewind = [&](bool is_early_eos) -> int {
+        const int ct = kvflash_pager_.chunk_tokens();
+        const int r_pos = kvflash_think_r_pos_;
+        const int sealed = r_pos / ct;
+        std::vector<const float *> qs;
+        const size_t n_prompt_q = (kvflash_q_tail_.size() % qsz == 0)
+                                ? (kvflash_q_tail_.size() / qsz) : 0;
+        for (size_t qi = 0; qi < n_prompt_q; ++qi) {
+            qs.push_back(kvflash_q_tail_.data() + qi * qsz);
+        }
+        for (int qi = 0; qi < think_q_count; ++qi) {
+            qs.push_back(think_q_buf.data() + (size_t)qi * qsz);
+        }
+        const auto ts0 = std::chrono::steady_clock::now();
+        std::vector<std::vector<float>> o;
+        std::vector<luce::common::KvFlashMassPlanes> planes;
+        bool scored = sealed > 0 && !qs.empty() && kvflash_exact_scores_gpu(sealed, qs, o, planes);
+        if (!scored && sealed > 0 && !qs.empty()) {
+            scored = kvflash_exact_scores(sealed, qs, o, &planes);
+        }
+        const double score_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ts0).count();
+        if (!scored) return 0;
+
+        const std::vector<float> m4_scores = luce::common::kvflash_select_scores(planes);
+        luce::common::KvFlashRecallIn rin = kvflash_recall_in(r_pos, think_prompt_end);
+        // Match KvFlashPager::truncate(r_pos): keep = ceil(r_pos / ct), cur_chunk = max(0, keep - 1).
+        rin.cur_chunk = r_pos > 0 ? (r_pos - 1) / ct : 0;
+        const luce::common::KvFlashRecallPlan plan_m5 = kvflash_think_m5_scores_.size() >= (size_t)sealed
+            ? luce::common::kvflash_recall_plan(kvflash_think_m5_scores_, rin)
+            : luce::common::KvFlashRecallPlan{};
+        const int unit = kvflash_select_unit_;
+        const auto trp = luce::common::kvflash_think_rewind_plan(
+            plan_m5.picked, m4_scores, rin, sealed, is_early_eos, think_cfg,
+            [&](int u) {
+                for (int c = u * unit; c < (u + 1) * unit && c < sealed; ++c) {
+                    if (kvflash_pager_.block_of(c) < 0) return true;
+                }
+                return false;
+            });
+
+        std::string m4_ids;
+        for (int b : trp.m4_top) m4_ids += (m4_ids.empty() ? "" : ",") + std::to_string(b);
+
+        double snap_ms = 0.0;
+        bool restored = false;
+        if (trp.should_rewind) {
+            const auto tr0 = std::chrono::steady_clock::now();
+            restored = restore_target_cache(kvflash_think_r_snap_, cache_, /*skip_kv=*/true);
+            snap_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tr0).count();
+        }
+        std::fprintf(stderr,
+            "[kvflash-think-rewind-R] R=%d end=%d eos=%d n_pq=%zu n_tq=%d score=%.1fms "
+            "restore=%.2fms top_ev=%d/%d new_ev=%d/%zu keep_m5=%d trigger=%s m4_top=[%s]\n",
+            r_pos, think_prompt_end, is_early_eos ? 1 : 0, n_prompt_q, think_q_count, score_ms,
+            snap_ms, trp.top_evicted, think_cfg.top_k_check,
+            trp.new_evicted, trp.union_units.size(), trp.keep_m5,
+            (trp.should_rewind && restored) ? "YES" : "NO", m4_ids.c_str());
+
+        if (!trp.should_rewind) return 0;
+        if (!restored) {
+            std::fprintf(stderr, "[kvflash-think-rewind-R] state restore failed @%d\n", r_pos);
+            set_last_error("kvflash: think-rewind state restore failed");
+            return -1;
+        }
+
+        // If snapshot restored cache_.target_feat at r_pos, re-sync the draft
+        // feature mirror for [r_pos - n, r_pos) before re-prefilling [r_pos, end).
+        if (capture_spec && r_pos > 0) {
+            const int ring_cap = remote_draft_.active() ? remote_draft_.ring_cap()
+                                                         : feature_mirror_.cap;
+            const int n_sync = std::min(r_pos, ring_cap);
+            bool sync_ok = true;
+            if (n_sync > 0) {
+                if (remote_draft_.active()) {
+                    sync_ok = sync_remote_draft_features(r_pos - n_sync, n_sync);
+                } else if (feature_mirror_.target_feat && cache_.target_feat) {
+                    sync_ok = sync_local_draft_features(r_pos - n_sync, n_sync);
+                }
+            }
+            if (!sync_ok) {
+                std::fprintf(stderr, "[kvflash-think-rewind-R] draft feature mirror sync failed @%d\n", r_pos);
+                return -1;
+            }
+        }
+
+        std::vector<int32_t> saved_full_prompt;
+        if (kvflash_history_.size() >= (size_t)think_prompt_end) {
+            saved_full_prompt.assign(kvflash_history_.begin(),
+                                     kvflash_history_.begin() + think_prompt_end);
+        }
+        kvflash_pager_.truncate(r_pos);
+        kvflash_apply_preamble_pin(nullptr, false);
+        kvflash_scores_ = trp.union_scores;
+        kvflash_prefill_apply(r_pos, think_prompt_end, think_prompt_end + think_q_count - 1,
+                              score_ms, "; think-rewind-R");
+        cache_.cur_pos = r_pos;
+        kvflash_mask_epoch_ = (uint64_t)-1;
+        if (kvflash_qk_policy_) {
+            kvflash_qk_pooled_upto_ = std::min(kvflash_qk_pooled_upto_, r_pos / ct);
+        }
+
+        const int saved_mode = kvflash_prefill_reselect_;
+        const bool saved_consume = kvflash_consume_restore_;
+        const bool saved_live = kvflash_live_restore_active_;
+        kvflash_prefill_reselect_ = 0;
+        kvflash_consume_restore_ = true;
+        kvflash_live_restore_active_ = true;
+        kvflash_think_replaying_ = true;
+        const int new_committed = do_prefill(
+            kvflash_think_r_tokens_, io,
+            /*snap_pos=*/-1, /*snap_slot=*/-1,
+            /*kv_offset=*/r_pos,
+            /*images=*/nullptr,
+            /*restore_points=*/{},
+            /*full_prompt=*/saved_full_prompt.empty() ? nullptr : &saved_full_prompt);
+        kvflash_think_replaying_ = false;
+        kvflash_prefill_reselect_ = saved_mode;
+        kvflash_consume_restore_ = saved_consume;
+        kvflash_live_restore_active_ = saved_live;
+
+        if (new_committed != think_prompt_end) {
+            std::fprintf(stderr, "[kvflash-think-rewind-R] re-prefill failed (got %d != %d)\n",
+                         new_committed, think_prompt_end);
+            return -1;
+        }
+
+        committed = new_committed;
+        cache_.cur_pos = committed;
+        budget = budget_pre_first;
+        sampler_rng_ = rng_pre_first;
+        if (forced_close_out) *forced_close_out = prev_forced_close;
+        out_tokens.clear();
+        kvflash_history_.resize(history_pre_first);
+        buffered_toks.clear();
+        kvflash_think_r_pos_ = -1;
+        return 1;
+    };
+
+    bool have_spec_pending = false;
+    int32_t spec_pending_tok = -1;
+
+    while (budget.remaining() > 0 && think_q_count < think_rewind_n) {
+        int32_t tok = out_tokens.back();
+        if (!w_.embedder.embed(&tok, 1, embed_buf)) {
+            flush_buffer();
+            return -1;
+        }
+        const int32_t rope_pos = committed + rope_delta_;
+        if (!build_ar_step_with_inputs(sg_, [&] {
+            return build_target_step(sg_, w_, cache_, target_backend_,
+                               /*kv_start=*/committed, /*n_tokens=*/1,
+                               /*with_mask=*/true,
+                               /*capture=*/capture_spec,
+                               /*capture_delta_intermediate=*/false,
+                               /*fa_window=*/0,
+                               /*logits_tail_rows=*/0,
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router(),
+                               /*kvflash_mask=*/true,
+                               /*capture_qk=*/true,
+                               /*paged_attention=*/false);
+        }, embed_buf, hidden, rope_pos)) {
+            flush_buffer();
+            return -1;
+        }
+
+        if (sg_.kv_write_rows) {
+            const int64_t slot = (int64_t)kvflash_pager_.slot_for(committed);
+            if (slot < 0) {
+                std::fprintf(stderr, "[kvflash] no pool slot at pos %d (pool %d exhausted)\n",
+                             committed, kvflash_tokens_);
+                set_last_error("kvflash: no evictable pool block");
+                flush_buffer();
+                return -1;
+            }
+            std::vector<int64_t> row_vals((size_t)w_.n_head_kv, slot);
+            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
+                                    sizeof(int64_t) * row_vals.size());
+        }
+        kvflash_upload_mask(committed);
+
+        if (ggml_backend_graph_compute(target_backend_, sg_.gf) != GGML_STATUS_SUCCESS) {
+            flush_buffer();
+            return -1;
+        }
+        after_target_compute(sg_, committed, 1);
+        if (capture_spec) {
+            bool sync_ok = true;
+            if (remote_draft_.active()) sync_ok = sync_remote_draft_features(committed, 1);
+            else if (feature_mirror_.target_feat && cache_.target_feat)
+                sync_ok = sync_local_draft_features(committed, 1);
+            if (!sync_ok) {
+                flush_buffer();
+                return -1;
+            }
+        }
+
+        const size_t off = think_q_buf.size();
+        think_q_buf.resize(off + qsz);
+        ggml_backend_tensor_get(cache_.q_cap, think_q_buf.data() + off, 0,
+                                qsz * sizeof(float));
+        think_q_count++;
+
+        int32_t next_tok;
+        if (sampler_.needs_logit_processing()) {
+#ifdef LUCE_HAVE_GPU_SAMPLER
+            int g_tok = -1;
+            if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+                sg_.logits && sg_.logits->data &&
+                !ggml_backend_buft_is_meta(
+                    ggml_backend_get_default_buffer_type(target_backend_))) {
+                double r = 0.0;
+                if (sampler_.temp > 0.0f) {
+                    std::mt19937_64 rng_peek = sampler_rng_;
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    r = u(rng_peek);
+                }
+                g_tok = geometric_sample_logits_cuda(
+                    static_cast<const float *>(sg_.logits->data), vocab, sampler_,
+                    out_tokens, r, /*logits_on_device=*/true);
+            }
+            if (g_tok >= 0) {
+                if (sampler_.temp > 0.0f) {
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    (void)u(sampler_rng_);
+                }
+                next_tok = g_tok;
+            } else
+#endif
+            {
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                        sizeof(float) * vocab);
+                next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                          out_tokens, sampler_rng_);
+            }
+        } else if (gpu_argmax_enabled() && sg_.argmax_tokens) {
+            int32_t tok_i = 0;
+            ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
+            next_tok = tok_i;
+        } else {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
+            next_tok = 0;
+            float best = logits_buf[0];
+            for (int j = 1; j < vocab; j++) {
+                if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
+            }
+        }
+        next_tok = apply_min_tokens_floor(next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
+        committed++;
+        cache_.cur_pos = committed;
+        if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
+
+        // On the final step of a spec-enabled preamble, keep non-EOS next_tok
+        // unemitted/unbudgeted so do_spec_decode can take over cleanly on NO rewind.
+        if (capture_spec && think_q_count == think_rewind_n &&
+            !io.is_cancelled() && !IS_EOS_TOK(next_tok, w_)) {
+            have_spec_pending = true;
+            spec_pending_tok = next_tok;
+            break;
+        }
+
+        apply_budget(next_tok);
+        out_tokens.push_back(next_tok);
+        buffered_toks.push_back(next_tok);
+        kvflash_history_.push_back(next_tok);
+
+        if (io.is_cancelled()) {
+            flush_buffer();
+            cache_.last_tok = next_tok;
+            return 0;
+        }
+        if (IS_EOS_TOK(next_tok, w_)) {
+            if (think_q_count >= 4) {
+                const int rc = try_rewind(/*is_early_eos=*/true);
+                if (rc != 0) return rc;
+            }
+            flush_buffer();
+            cache_.last_tok = next_tok;
+            return 0;
+        }
+    }
+
+    if (think_q_count >= think_rewind_n) {
+        const int rc = try_rewind(/*is_early_eos=*/false);
+        if (rc != 0) return rc;
+    }
+    flush_buffer();
+    if (have_spec_pending) {
+        cache_.last_tok = spec_pending_tok;
+        return 4;
+    }
+    cache_.last_tok = out_tokens.empty() ? cache_.last_tok : out_tokens.back();
+    if (io.is_cancelled() || budget.remaining() <= 0 ||
+        (!out_tokens.empty() && IS_EOS_TOK(out_tokens.back(), w_))) {
+        return 0;
+    }
+    return 3;
+}
+
 bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
@@ -3934,6 +4362,19 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
     if (budget.remaining() <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
+    // Optional Mode 5 Think-then-Rewind-to-R preamble (no-op unless armed).
+    const int tr_rc = kvflash_think_rewind_preamble(
+        committed, budget, out_tokens, io, forced_close_out, /*for_spec=*/false);
+    if (tr_rc < 0) return false;
+    if (tr_rc == 0) {
+        auto t_dec1_ar = std::chrono::steady_clock::now();
+        const double ar_decode_s = std::chrono::duration<double>(t_dec1_ar - t_dec0_ar).count();
+        const int ar_tokens = (int)(out_tokens.size() - out_tokens_at_entry);
+        std::fprintf(stderr, "[ar-decode] tokens=%d time=%.3f s speed=%.2f tok/s\n",
+                     ar_tokens, ar_decode_s,
+                     ar_tokens > 0 && ar_decode_s > 0 ? ar_tokens / ar_decode_s : 0.0);
+        return true;
+    }
     static const int _repeat_guard = []{
         const int explicit_guard =
             env_int_or_default("LUCE_DEGENERATE_RUN_TOKENS", -1);
@@ -4419,6 +4860,29 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
         // AR consumes the prefill candidate and retains this controller.
         bool ok = do_ar_decode(committed, budget, out_tokens, io,
                                 forced_close_out, degenerate_close_out);
+        io.emit(-1);
+        return ok;
+    }
+
+    // Mode 5 Think-then-Rewind-to-R preamble: capture N think queries in AR,
+    // either rewind to R and re-prefill [R..prompt_end) (rc==1) or continue
+    // with captured target_feat/mirror (rc==4), then hand off to full spec decode.
+    const int tr_rc = kvflash_think_rewind_preamble(
+        committed, budget, out_tokens, io, forced_close_out, /*for_spec=*/true);
+    if (tr_rc < 0) {
+        io.emit(-1);
+        return false;
+    }
+    if (tr_rc == 0) {
+        io.emit(-1);
+        return true;
+    }
+    if (tr_rc == 1 || tr_rc == 4) {
+        last_tok = cache_.last_tok;
+        if (draft_kv_.gf) draft_kv_reset(draft_kv_);
+    } else if (tr_rc == 3) {
+        bool ok = do_ar_decode(committed, budget, out_tokens, io,
+                               forced_close_out, degenerate_close_out);
         io.emit(-1);
         return ok;
     }

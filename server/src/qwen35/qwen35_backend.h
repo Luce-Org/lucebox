@@ -403,6 +403,27 @@ protected:
     int  kvflash_live_cut_peek(const std::vector<int32_t> & prompt) const;
     bool kvflash_live_restore_active_ = false;   // set around the suffix do_prefill
     int  kvflash_gen_ckpt_pos_ = -1;             // S9: G of the last generation-end rung
+    // Mode 5 + Think-then-Rewind-to-R state (bit-exact snapshot at R).
+    bool                 kvflash_think_turn_eligible_ = false;
+    PrefixSnapshot       kvflash_think_r_snap_;
+    int                  kvflash_think_r_pos_ = -1;
+    std::vector<int32_t> kvflash_think_r_tokens_;
+    std::vector<float>   kvflash_think_m5_scores_;
+    bool                 kvflash_think_replaying_ = false;
+    void kvflash_think_clear_state();
+    // Run the Mode 5 Think-then-Rewind-to-R preamble before AR or speculative decode.
+    // Returns:
+    //   -1 = fatal error
+    //    0 = finished (EOS / cancelled / budget exhausted)
+    //    1 = rewound to R and re-prefilled [R..prompt_end) (out_tokens empty, committed == prompt_end)
+    //    2 = inactive/no-op
+    //    3 = ran preamble, no rewind -> AR continuation (out_tokens.back() pending at committed)
+    //    4 = ran preamble (for_spec), no rewind -> Spec continuation (out_tokens committed, cache_.last_tok unemitted)
+    int  kvflash_think_rewind_preamble(int & committed, ThinkingBudget & budget,
+                                       std::vector<int32_t> & out_tokens,
+                                       const DaemonIO & io,
+                                       bool * forced_close_out = nullptr,
+                                       bool for_spec = false);
     // Upload the slot-validity mask (host rebuild on epoch or decode-position change, device
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask(int cur_pos);
