@@ -145,12 +145,23 @@ private:
     uint32_t stride_ = 0;
     std::vector<int32_t> host_tables_;
     std::vector<int> reserve_growth_;
+    std::vector<uint8_t> slot_seen_;   // step(): rows seen per slot
     // Slots whose KV holds image rows: token history cannot rebuild them.
     std::vector<uint8_t> slot_has_images_;
     std::vector<Checkpoint> checkpoints_;
     // Per slot: the outcome of its capture, reported with the slot's next
     // planned prefill output (a step may only answer planned slots).
     std::vector<PrefixStoreEvent> capture_events_;
+    // Reused per-step scratch buffers to avoid hot-loop heap churn.
+    std::vector<int32_t> lane_tokens_;
+    std::vector<int64_t> lane_positions_;
+    std::vector<int32_t> lane_slots_;
+    std::vector<int> decode_lanes_;
+    std::vector<float> step_embeddings_;
+    std::vector<int32_t> compact_tables_;
+    std::vector<uint8_t> logit_lanes_;
+    std::vector<float> step_logits_;
+    std::vector<int32_t> step_argmax_;
 };
 
 } // namespace luce::common
