@@ -7,7 +7,7 @@ change did not break that tool.
 Run from the repo on the GPU machine:
 
 ```bash
-cd lucebox-hub
+cd lucebox
 harness/clients/run_codex.sh
 ```
 

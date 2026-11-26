@@ -60,7 +60,6 @@ PFlash is the algorithm. The implementation lives in [`../../server/`](../../ser
 
 ```bash
 # 1. from the repo root, install Python deps and build the server
-cd lucebox-hub
 uv sync
 git submodule update --init --recursive
 cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release \
@@ -78,12 +77,12 @@ uv run python server/deps/llama.cpp/convert_hf_to_gguf.py server/models/drafter 
        --outtype bf16 --outfile server/models/Qwen3.5-0.8B-BF16.gguf
 
 # 3. generate NIAH cases + run head-to-head bench against the C++ daemon
-uv run --directory pflash python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
-uv run --directory pflash python tests/bench_niah_cpp.py \
-  --bin    ../server/build/test_dflash \
-  --target ../server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft-spec ../server/models/draft/model.safetensors \
-  --drafter-gguf ../server/models/Qwen3.5-0.8B-BF16.gguf \
+uv run --directory optimizations/pflash python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
+uv run --directory optimizations/pflash python tests/bench_niah_cpp.py \
+  --bin    ../../server/build/test_dflash \
+  --target ../../server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft-spec ../../server/models/draft/model.safetensors \
+  --drafter-gguf ../../server/models/Qwen3.5-0.8B-BF16.gguf \
   --cases  /tmp/niah_128k.jsonl --keep-ratio 0.05 --n-gen 256
 ```
 
