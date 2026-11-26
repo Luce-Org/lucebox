@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,13 @@ REPO = Path(__file__).resolve().parents[2]
         (["server/examples/chat.py"], PY),
         (["optimizations/pflash/tests/test_pflash.py"], PY),
         (["optimizations/megakernel/setup.py"], PY_MK),
+        # optimizations/ selects the Python lane alone; a native source keeps a build lane.
+        (["optimizations/pflash/csrc/kernel.cu"], PY_CPP),
+        (["optimizations/rocm_ext/CMakeLists.txt"], PY_CPP),
+        # server/examples/ selects nothing; a native file there still gets a build.
+        (["server/examples/bench.cpp"], CPP),
+        # The megakernel lane compiles its own CUDA sources: no engine build as well.
+        (["optimizations/megakernel/kernel.cu"], PY_MK),
         (["uv.lock"], PY_MK),
         # Both models run all C++/GPU/serve jobs.
         (["server/src/qwen35/a.cpp", "server/src/deepseek4/b.cpp"], CPP_ALL),
@@ -77,6 +85,47 @@ def test_plan(paths: list[str] | None, expected: frozenset[str]) -> None:
 def test_a_directory_rule_needs_the_whole_name() -> None:
     assert plan(["server/src/qwen35moe/x.cpp"])[0] == ALL
     assert plan(["server/src/deepseek4_extra.cpp"])[0] == ALL
+
+
+def test_a_native_change_is_never_only_the_python_lane() -> None:
+    # A new .cu, .cpp or header under optimizations/ otherwise plans the Python
+    # lane alone, which compiles nothing native.
+    assert plan(["optimizations/pflash/csrc/attention.cu"])[0] == PY_CPP
+    assert plan(["README.md", "optimizations/pflash/csrc/attention.cu"])[0] == PY_CPP
+    # Path order must not decide whether the build lane is added.
+    assert plan(["optimizations/new/uint8.cuh", "optimizations/megakernel/setup.py"])[0] == PY_MK
+    assert plan(["optimizations/megakernel/setup.py", "optimizations/new/uint8.cuh"])[0] == PY_MK
+
+
+NATIVE_PATTERNS = (
+    "*.c",
+    "*.cc",
+    "*.cpp",
+    "*.cu",
+    "*.cuh",
+    "*.cxx",
+    "*.h",
+    "*.hh",
+    "*.hpp",
+    "*.cmake",
+    "*CMakeLists.txt",
+)
+
+
+def test_every_native_file_in_the_tree_selects_a_build_lane() -> None:
+    # A new subsystem (optimizations/<name>/, a scripts/ helper) must not be able
+    # to land C/C++/CUDA or CMake files that CI never compiles.
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", *NATIVE_PATTERNS],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    files = [name for name in listed.split("\0") if name]
+    assert files
+    py_only = [name for name in files if plan([name])[0] <= PY]
+    assert not py_only, f"native files plan the Python lane alone: {py_only}"
 
 
 def test_hidden_shared_change_alongside_docs_still_runs_full_suite() -> None:
