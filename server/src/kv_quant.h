@@ -29,13 +29,15 @@ void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who);
 //   1. LUCE_KV_K=<type> / LUCE_KV_V=<type>  (independent override)
 //   2. LUCE_KV_F16 / _KV_Q4 / _KV_TQ3            (legacy shorthand, K==V;
 //      tq3_shorthand=false ignores LUCE_KV_TQ3)
-//   3. Default: GGML_TYPE_Q4_0 for both (with FWHT K-rotation)
+//   3. Default: default_type for both (GGML_TYPE_Q4_0, with FWHT K-rotation,
+//      unless the caller gives another)
 // On invalid input or unsupported (K,V) pair, prints an explanatory message
 // and calls std::abort(). Returns the resolved pair via out params.
 void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
                       ggml_type k_override = GGML_TYPE_COUNT,
                       ggml_type v_override = GGML_TYPE_COUNT,
-                      bool tq3_shorthand = true);
+                      bool tq3_shorthand = true,
+                      ggml_type default_type = GGML_TYPE_Q4_0);
 
 // KV reservation bytes per token for a hybrid attention/SSM model. Single source
 // of truth for both qwen35 (dense) and qwen35moe expert-placement budgeting.

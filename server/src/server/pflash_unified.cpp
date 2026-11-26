@@ -589,16 +589,20 @@ Admission admit_recall(const std::vector<int> & unit_cost, const std::vector<cha
     return out;
 }
 
-GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta) {
+GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta,
+                               double min_unit_lift) {
     GatedRecall out;
     out.regions.resize(regions.size());
     struct Entry {
         size_t region;
         int unit;
         double score;
+        double lift;
     };
     std::vector<Entry> order;
     double deficit = 0.0;
+    bool has_lift = false;
+    double peak_lift = 0.0;
     for (size_t r = 0; r < regions.size(); ++r) {
         const RecallRegion & region = regions[r];
         const int n = (int) region.unit_cost.size();
@@ -610,13 +614,31 @@ GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double
             const double mass = u < (int) region.mass.size() ? region.mass[(size_t) u] : 0.0;
             if (std::isfinite(mass) && mass > 0.0) deficit += mass;
             const double score = u < (int) region.score.size() ? region.score[(size_t) u] : NAN;
-            order.push_back({r, u, std::isnan(score) ? -INFINITY : score});
+            double lift = NAN;
+            if (u < (int) region.unit_lift.size() && std::isfinite(region.unit_lift[(size_t) u])) {
+                lift = region.unit_lift[(size_t) u];
+                has_lift = true;
+                if (lift > peak_lift) peak_lift = lift;
+            }
+            order.push_back({r, u, std::isnan(score) ? -INFINITY : score, lift});
         }
     }
     out.deficit_before = deficit / context_mass;
+    if (out.deficit_before < theta || (min_unit_lift > 0.0 && has_lift && peak_lift < min_unit_lift)) {
+        out.deficit_after = out.deficit_before;
+        out.gated = true;
+        return out;
+    }
     std::stable_sort(order.begin(), order.end(), [] (const Entry & x, const Entry & y) { return x.score > y.score; });
+    int total_taken = 0;
     for (const Entry & e : order) {
         if (deficit / context_mass < theta) break;
+        // After admitting the top 2 reranked units (preserving reranker-rescued needles even if
+        // Stage-1 lift was mild), skip diffuse low-lift background units to avoid context bloat.
+        if (min_unit_lift > 0.0 && has_lift && total_taken >= 2 &&
+            std::isfinite(e.lift) && e.lift < min_unit_lift) {
+            continue;
+        }
         const RecallRegion & region = regions[e.region];
         Admission & a = out.regions[e.region];
         if (!a.ok) continue;
@@ -626,11 +648,12 @@ GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double
         a.admitted[(size_t) e.unit] = 1;
         a.cost += delta;
         ++a.taken;
+        ++total_taken;
         const double mass = e.unit < (int) region.mass.size() ? region.mass[(size_t) e.unit] : 0.0;
         if (std::isfinite(mass) && mass > 0.0) deficit -= mass;
     }
     out.deficit_after = (std::max)(0.0, deficit) / context_mass;
-    out.gated = out.deficit_before < theta;
+    out.gated = false;
     return out;
 }
 
@@ -759,7 +782,7 @@ bool prefix_of(const std::vector<int32_t> & stored, int gen_begin, const std::ve
 }  // namespace
 
 bool ViewStore::find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
-                     const std::string & config, View & out) {
+                     const std::string & config, View & out, bool touch) {
     std::lock_guard<std::mutex> lock(mutex_);
     int best = -1;
     size_t best_len = 0;
@@ -776,7 +799,7 @@ bool ViewStore::find(const std::vector<int32_t> & raw_tokens, const std::vector<
         }
     }
     if (best < 0) return false;
-    entries_[(size_t) best].used = ++clock_;
+    if (touch) entries_[(size_t) best].used = ++clock_;
     out = entries_[(size_t) best].view;
     return true;
 }
@@ -1193,13 +1216,13 @@ bool ViewDiskStore::save(const View & view) {
 }
 
 bool ViewDiskStore::find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
-                         const std::string & config, size_t longer_than, View & out) {
+                         const std::string & config, size_t longer_than, View & out, bool read_only) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_) return false;
     // The TTL counts from a view's last write. A view read here returns to the RAM store and is written again when
     // it leaves it, so a conversation in use stays on disk.
-    if (ttl_ > 0) {
-        const uint64_t t = now();
+    const uint64_t t = ttl_ > 0 ? now() : 0;
+    if (ttl_ > 0 && !read_only) {
         for (size_t i = metas_.size(); i-- > 0;) {
             if (metas_[i].written + ttl_ * 1000 < t) remove_locked(i);
         }
@@ -1207,6 +1230,7 @@ bool ViewDiskStore::find(const std::vector<int32_t> & raw_tokens, const std::vec
     std::vector<size_t> candidates, raw_lengths, drafter_lengths;
     for (size_t i = 0; i < metas_.size(); ++i) {
         const Meta & m = metas_[i];
+        if (ttl_ > 0 && m.written + ttl_ * 1000 < t) continue;
         if (m.config != config || m.raw_len <= longer_than || m.raw_len > raw_tokens.size() ||
             m.drafter_len > drafter_ids.size()) {
             continue;
@@ -1246,9 +1270,11 @@ bool ViewDiskStore::find(const std::vector<int32_t> & raw_tokens, const std::vec
         ok = ok && v.config == config && prefix_of(v.raw_tokens, v.raw_gen_begin, raw_tokens) &&
              prefix_of(v.drafter_ids, v.drafter_gen_begin, drafter_ids);
         if (!ok) {
-            std::fprintf(stderr, "[pflash-unified] view file %s does not load (%s): deleted\n",
-                         metas_[i].path.c_str(), error.c_str());
-            remove_locked(i);
+            if (!read_only) {
+                std::fprintf(stderr, "[pflash-unified] view file %s does not load (%s): deleted\n",
+                             metas_[i].path.c_str(), error.c_str());
+                remove_locked(i);
+            }
             return false;
         }
         out = std::move(v);

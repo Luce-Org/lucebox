@@ -1,52 +1,12 @@
 #include "pflash/pflash_query_candidates.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <cstddef>
 #include <limits>
 #include <string>
 
 namespace luce::pflash {
-
-namespace {
-
-constexpr const char * kCandidatesEnv = "PFLASH_QUERY_CANDIDATES";
-constexpr const char * kPinEnv = "PFLASH_QUERY_PIN";
-constexpr const char * kUnitScoreEnv = "PFLASH_QUERY_UNIT_SCORE";
-constexpr const char * kAggregateEnv = "PFLASH_QUERY_AGG";
-constexpr const char * kTemperatureEnv = "PFLASH_QUERY_TEMP";
-constexpr const char * kNullMarginEnv = "PFLASH_QUERY_NULL_MARGIN";
-constexpr const char * kExtentEnv = "PFLASH_QUERY_EXTENT";
-constexpr const char * kPinMarginEnv = "PFLASH_QUERY_PIN_MARGIN";
-constexpr const char * kTwEnv = "PFLASH_QUERY_TW";
-constexpr const char * kEndEnv = "PFLASH_QUERY_END";
-
-bool parse_int(const char * raw, int lo, int hi, int & out) {
-    if (!raw || !*raw) return false;
-    errno = 0;
-    char * end = nullptr;
-    const long v = std::strtol(raw, &end, 10);
-    if (errno == ERANGE || end == raw || *end != '\0' || v < lo || v > hi) return false;
-    out = (int) v;
-    return true;
-}
-
-bool parse_float(const char * raw, float & out) {
-    if (!raw || !*raw) return false;
-    errno = 0;
-    char * end = nullptr;
-    const float v = std::strtof(raw, &end);
-    if (errno == ERANGE || end == raw || *end != '\0' || !std::isfinite(v)) return false;
-    out = v;
-    return true;
-}
-
-} // namespace
 
 const char * pflash_unit_score_name(PFlashUnitScore mode) noexcept {
     return mode == PFlashUnitScore::Max ? "max" : "mean";
@@ -54,108 +14,6 @@ const char * pflash_unit_score_name(PFlashUnitScore mode) noexcept {
 
 const char * pflash_query_aggregate_name(PFlashQueryAggregate mode) noexcept {
     return mode == PFlashQueryAggregate::Softmax ? "softmax" : "wmax";
-}
-
-bool pflash_unit_score_from_name(const std::string & name, PFlashUnitScore & out) {
-    if (name == "max") { out = PFlashUnitScore::Max; return true; }
-    if (name == "mean") { out = PFlashUnitScore::Mean; return true; }
-    return false;
-}
-
-bool pflash_query_aggregate_from_name(const std::string & name, PFlashQueryAggregate & out) {
-    if (name == "softmax") { out = PFlashQueryAggregate::Softmax; return true; }
-    if (name == "wmax") { out = PFlashQueryAggregate::WeightedMax; return true; }
-    return false;
-}
-
-bool pflash_query_config_from_env(PFlashQueryConfig & out, std::string & error) {
-    error.clear();
-    PFlashQueryConfig config;
-    const char * k_raw = std::getenv(kCandidatesEnv);
-    const char * pin_raw = std::getenv(kPinEnv);
-    if (k_raw && !parse_int(k_raw, 0, kQueryCandidatesMax, config.candidates)) {
-        error = std::string(kCandidatesEnv) + " must be an integer in [0, " + std::to_string(kQueryCandidatesMax) + "]";
-        return false;
-    }
-    if (pin_raw && !parse_int(pin_raw, 0, kQueryPinMax, config.pin_tokens)) {
-        error = std::string(kPinEnv) + " must be an integer in [0, " + std::to_string(kQueryPinMax) + "]";
-        return false;
-    }
-    const char * unit_raw = std::getenv(kUnitScoreEnv);
-    const char * agg_raw = std::getenv(kAggregateEnv);
-    const char * temp_raw = std::getenv(kTemperatureEnv);
-    const char * margin_raw = std::getenv(kNullMarginEnv);
-    if (!config.any()) {
-        // The knobs alone change nothing: refuse them, so a typo in the switch cannot pass silently.
-        for (const char * name : {kUnitScoreEnv, kAggregateEnv, kTemperatureEnv, kNullMarginEnv, kExtentEnv,
-                                  kPinMarginEnv, kTwEnv, kEndEnv}) {
-            if (std::getenv(name)) {
-                error = std::string(name) + " is set without " + kCandidatesEnv + " or " + kPinEnv;
-                return false;
-            }
-        }
-        out = config;
-        return true;
-    }
-    if (unit_raw && !pflash_unit_score_from_name(unit_raw, config.unit_score)) {
-        error = std::string(kUnitScoreEnv) + " must be max or mean";
-        return false;
-    }
-    if (agg_raw && !pflash_query_aggregate_from_name(agg_raw, config.aggregate)) {
-        error = std::string(kAggregateEnv) + " must be softmax or wmax";
-        return false;
-    }
-    if (temp_raw && (!parse_float(temp_raw, config.temperature) || !(config.temperature > 0.0f))) {
-        error = std::string(kTemperatureEnv) + " must be a finite number > 0";
-        return false;
-    }
-    if (margin_raw && (!parse_float(margin_raw, config.null_margin) || config.null_margin < 0.0f)) {
-        error = std::string(kNullMarginEnv) + " must be a finite number >= 0";
-        return false;
-    }
-    if (const char * raw = std::getenv(kExtentEnv)) {
-        if (std::strcmp(raw, "gap") == 0) {
-            config.extent_gap = true;
-        } else if ((config.extent_gap = false), !parse_float(raw, config.extent_margin) || config.extent_margin < 0.0f) {
-            error = std::string(kExtentEnv) + " must be a finite number >= 0 or gap";
-            return false;
-        }
-    }
-    if (const char * raw = std::getenv(kPinMarginEnv)) {
-        if (std::strcmp(raw, "inf") == 0) {
-            config.pin_gap = false;
-            config.pin_margin = std::numeric_limits<float>::infinity();
-        } else if (std::strcmp(raw, "gap") == 0) {
-            config.pin_gap = true;
-        } else if ((config.pin_gap = false), !parse_float(raw, config.pin_margin) || config.pin_margin < 0.0f) {
-            error = std::string(kPinMarginEnv) + " must be a finite number >= 0, inf or gap";
-            return false;
-        }
-    }
-    if (const char * raw = std::getenv(kTwEnv)) {
-        if (std::strcmp(raw, "score") == 0) {
-            config.tw_score = true;
-        } else if (!parse_float(raw, config.tw_share) || !(config.tw_share > 0.0f) || !(config.tw_share < 1.0f)) {
-            error = std::string(kTwEnv) + " must be a share in (0, 1) or score";
-            return false;
-        }
-    }
-    if (const char * raw = std::getenv(kEndEnv)) {
-        if (!parse_float(raw, config.end_share) || !(config.end_share > 0.0f) || !(config.end_share < 1.0f)) {
-            error = std::string(kEndEnv) + " must be a share in (0, 1)";
-            return false;
-        }
-    }
-    if (!(config.tw_share + config.end_share < 1.0f)) {
-        error = std::string(kTwEnv) + " + " + kEndEnv + " shares must be < 1";
-        return false;
-    }
-    if ((std::getenv(kTwEnv) || std::getenv(kEndEnv)) && config.candidates <= 0) {
-        error = std::string(kTwEnv) + " / " + kEndEnv + " need " + kCandidatesEnv;
-        return false;
-    }
-    out = config;
-    return true;
 }
 
 PFlashQueryUnits pflash_query_units(const std::vector<PFlashTokenSpan> & segments,
@@ -393,7 +251,54 @@ PFlashQueryCandidateSet pflash_query_candidate_set(const PFlashQueryUnits & unit
         PFlashQueryCandidate c;
         c.message = m;
         c.units = extent.units;
-        c.tokens = extent.tokens;
+        // Trim outer negative-logit background margins (leading/trailing doc
+        // bleed with P(request) < 0.5) independently on each contiguous token
+        // component of extent.tokens via the 1D convex hull of s1 >= 0 runs
+        // (anchored on runs of >= 2 consecutive positive tokens to ignore
+        // stray single-token edge blips, falling back to >= 1 if a component
+        // only has single-token hits). Preserves interior declarative clauses,
+        // options, and code blocks across single or adjacent units while
+        // keeping disjoint units (e.g. prefix + suffix) independently trimmed
+        // and full extent units intact for verbatim pinning.
+        std::vector<int> trimmed;
+        trimmed.reserve(extent.tokens.size());
+        auto is_pos = [&](int t) {
+            return t >= 0 && t < (int) s1.size() && std::isfinite(s1[(size_t) t]) && s1[(size_t) t] >= 0.0f;
+        };
+        size_t comp_b = 0;
+        while (comp_b < extent.tokens.size()) {
+            size_t comp_e = comp_b + 1;
+            while (comp_e < extent.tokens.size() && extent.tokens[comp_e] == extent.tokens[comp_e - 1] + 1) {
+                ++comp_e;
+            }
+            size_t first1 = comp_e, last1 = comp_b;
+            size_t first2 = comp_e, last2 = comp_b;
+            size_t i = comp_b;
+            while (i < comp_e) {
+                if (!is_pos(extent.tokens[i])) {
+                    ++i;
+                    continue;
+                }
+                size_t j = i + 1;
+                while (j < comp_e && is_pos(extent.tokens[j])) ++j;
+                if (first1 == comp_e) first1 = i;
+                last1 = j;
+                if (j - i >= 2) {
+                    if (first2 == comp_e) first2 = i;
+                    last2 = j;
+                }
+                i = j;
+            }
+            const size_t hb = (first2 < comp_e) ? first2 : first1;
+            const size_t he = (first2 < comp_e) ? last2 : last1;
+            if (hb < comp_e) {
+                trimmed.insert(trimmed.end(),
+                               extent.tokens.begin() + (ptrdiff_t) hb,
+                               extent.tokens.begin() + (ptrdiff_t) he);
+            }
+            comp_b = comp_e;
+        }
+        c.tokens = trimmed.empty() ? extent.tokens : std::move(trimmed);
         c.score = extent.top;
         scores.push_back(c.score);
         out.candidates.push_back(std::move(c));
@@ -495,165 +400,6 @@ PFlashQueryPin pflash_query_pin(const PFlashQueryUnits & units, int cap, PFlashU
         }
     }
     return pin;
-}
-
-std::string pflash_ids_fingerprint(const std::vector<int32_t> & ids) {
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (const int32_t token : ids) {
-        const uint32_t value = static_cast<uint32_t>(token);
-        for (int shift = 0; shift < 32; shift += 8) {
-            hash ^= static_cast<uint8_t>(value >> shift);
-            hash *= UINT64_C(1099511628211);
-        }
-    }
-    char encoded[17];
-    std::snprintf(encoded, sizeof(encoded), "%016llx", static_cast<unsigned long long>(hash));
-    return encoded;
-}
-
-const char * pflash_grid_mode_name(PFlashGridMode mode) noexcept {
-    switch (mode) {
-        case PFlashGridMode::S1: return "s1";
-        case PFlashGridMode::P1: return "p1";
-        case PFlashGridMode::Candidates: return "cand";
-        case PFlashGridMode::Oracle: return "oracle";
-    }
-    return "?";
-}
-
-bool pflash_query_grid_parse(const std::string & text, std::vector<PFlashGridConfig> & out, std::string & error) {
-    error.clear();
-    out.clear();
-    nlohmann::json j;
-    try {
-        j = nlohmann::json::parse(text);
-    } catch (const std::exception & e) {
-        error = std::string("query grid: invalid JSON: ") + e.what();
-        return false;
-    }
-    if (!j.is_object() || !j.contains("configs") || !j["configs"].is_array() || j["configs"].empty()) {
-        error = "query grid: need {\"configs\": [...]} with at least one config";
-        return false;
-    }
-    for (const auto & c : j["configs"]) {
-        if (!c.is_object()) { error = "query grid: a config is not an object"; return false; }
-        PFlashGridConfig g;
-        // Grid files are explicit: every blend knob starts OFF (not at the runtime defaults).
-        g.query.extent_gap = false;
-        g.query.pin_gap = false;
-        g.query.tw_share = 0.0f;
-        g.query.end_share = 0.0f;
-        try {
-            g.name = c.at("name").get<std::string>();
-            const std::string mode = c.value("mode", std::string("cand"));
-            if (mode == "s1") g.mode = PFlashGridMode::S1;
-            else if (mode == "p1") g.mode = PFlashGridMode::P1;
-            else if (mode == "cand") g.mode = PFlashGridMode::Candidates;
-            else if (mode == "oracle") g.mode = PFlashGridMode::Oracle;
-            else { error = "query grid: unknown mode " + mode; return false; }
-            for (const auto & [key, value] : c.items()) {
-                if (key == "name" || key == "mode") continue;
-                if (key == "k") g.query.candidates = value.get<int>();
-                else if (key == "unit_score") {
-                    if (!pflash_unit_score_from_name(value.get<std::string>(), g.query.unit_score)) {
-                        error = "query grid: unit_score must be max or mean"; return false;
-                    }
-                } else if (key == "agg") {
-                    if (!pflash_query_aggregate_from_name(value.get<std::string>(), g.query.aggregate)) {
-                        error = "query grid: agg must be softmax or wmax"; return false;
-                    }
-                } else if (key == "temp") g.query.temperature = value.get<float>();
-                else if (key == "null_margin") g.query.null_margin = value.get<float>();
-                else if (key == "extent") {
-                    if (value.is_string() && value.get<std::string>() == "gap") g.query.extent_gap = true;
-                    else g.query.extent_margin = value.get<float>();
-                }
-                else if (key == "pin") g.query.pin_tokens = value.get<int>();
-                else if (key == "pin_margin") {
-                    if (value.is_string() && value.get<std::string>() == "inf") {
-                        g.query.pin_margin = std::numeric_limits<float>::infinity();
-                    } else if (value.is_string() && value.get<std::string>() == "gap") {
-                        g.query.pin_gap = true;
-                    } else {
-                        g.query.pin_margin = value.get<float>();
-                    }
-                } else if (key == "tw") {
-                    if (value.is_string() && value.get<std::string>() == "score") g.query.tw_score = true;
-                    else g.query.tw_share = value.get<float>();
-                } else if (key == "end") g.query.end_share = value.get<float>();
-                else if (key == "oracle_pin") g.oracle_pin = value.get<bool>();
-                else { error = "query grid: unknown key " + key + " in config " + g.name; return false; }
-            }
-        } catch (const std::exception & e) {
-            error = std::string("query grid: bad config: ") + e.what();
-            return false;
-        }
-        if (g.name.empty()) { error = "query grid: empty config name"; return false; }
-        for (const auto & other : out) {
-            if (other.name == g.name) { error = "query grid: duplicate config name " + g.name; return false; }
-        }
-        const auto & q = g.query;
-        if ((g.mode == PFlashGridMode::Candidates) != (q.candidates > 0) || q.candidates < 0 ||
-            q.candidates > kQueryCandidatesMax) {
-            error = "query grid: " + g.name + ": k in [1, 8] exactly for mode cand";
-            return false;
-        }
-        if (!(q.temperature > 0.0f) || !std::isfinite(q.temperature) || !(q.null_margin >= 0.0f) ||
-            !(q.extent_margin >= 0.0f) || q.pin_tokens < 0 || q.pin_tokens > kQueryPinMax || !(q.pin_margin >= 0.0f) ||
-            q.tw_share < 0.0f || q.end_share < 0.0f || !(q.tw_share + q.end_share < 1.0f) ||
-            ((q.tw() || q.end_share > 0.0f) && g.mode != PFlashGridMode::Candidates)) {
-            error = "query grid: " + g.name + ": a knob is out of range";
-            return false;
-        }
-        out.push_back(std::move(g));
-    }
-    return true;
-}
-
-bool pflash_query_oracle_parse(const std::string & text, int n_tokens, PFlashQueryOracle & out, std::string & error) {
-    error.clear();
-    out = {};
-    nlohmann::json j;
-    try {
-        j = nlohmann::json::parse(text);
-    } catch (const std::exception & e) {
-        error = std::string("query oracle: invalid JSON: ") + e.what();
-        return false;
-    }
-    const auto spans_of = [&](const char * key, std::vector<PFlashTokenSpan> & spans) -> bool {
-        if (!j.contains(key) || !j[key].is_array()) { error = std::string("query oracle: no ") + key; return false; }
-        for (const auto & s : j[key]) {
-            if (!s.is_array() || s.size() != 2) { error = "query oracle: a span is not [b, e]"; return false; }
-            const int b = s[0].get<int>();
-            const int e = s[1].get<int>();
-            if (b < 0 || e <= b || e > n_tokens) { error = "query oracle: span outside the input"; return false; }
-            spans.push_back({b, e});
-        }
-        std::sort(spans.begin(), spans.end(), [](const PFlashTokenSpan & a, const PFlashTokenSpan & b) {
-            return a.begin < b.begin;
-        });
-        return true;
-    };
-    std::vector<PFlashTokenSpan> query;
-    try {
-        if (!spans_of("query", query) || !spans_of("pin", out.pin)) return false;
-    } catch (const std::exception & e) {
-        error = std::string("query oracle: ") + e.what();
-        return false;
-    }
-    for (const auto & s : query) {
-        for (int t = s.begin; t < s.end; ++t) out.query.push_back(t);
-    }
-    std::sort(out.query.begin(), out.query.end());
-    out.query.erase(std::unique(out.query.begin(), out.query.end()), out.query.end());
-    std::vector<PFlashTokenSpan> merged;
-    for (const auto & s : out.pin) {
-        if (!merged.empty() && s.begin <= merged.back().end) merged.back().end = std::max(merged.back().end, s.end);
-        else merged.push_back(s);
-    }
-    out.pin.swap(merged);
-    if (out.query.empty()) { error = "query oracle: empty query"; return false; }
-    return true;
 }
 
 } // namespace luce::pflash

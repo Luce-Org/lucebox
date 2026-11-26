@@ -37,7 +37,9 @@
 #include "common/specla_mode.h"
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
+#include "pflash/pflash_drafter.h"
 #include "pflash/pflash_selection.h"
+#include "pflash/pflash_seg_reranker.h"
 #include "placement/draft_residency.h"
 #include "placement/device_select.h"
 #include "placement/kfd_topology.h"
@@ -341,11 +343,16 @@ static void print_usage(const char * prog) {
         "PFlash (speculative prefill compression):\n"
         "  --pflash on|off|auto        Compress prompts from --prefill-threshold\n"
         "                              tokens (default: auto, on when\n"
-        "                              --prefill-drafter and\n"
-        "                              PFLASH_SCORING_HEAD_GGUF are set). On needs\n"
-        "                              both.\n"
-        "  --prefill-threshold <N>     Droppable tokens a message needs to be paged\n"
-        "                              (default: 16384, the release profile)\n"
+        "                              --prefill-drafter and all four PFlash\n"
+        "                              components are available: scoring head,\n"
+        "                              segment probe, request probe, and segment\n"
+        "                              reranker). Sibling GGUFs beside\n"
+        "                              PFLASH_SCORING_HEAD_GGUF are auto-discovered.\n"
+        "                              If any component is missing, PFlash cannot\n"
+        "                              be selected.\n"
+        "  --prefill-threshold <N>     Droppable tokens a message needs to be paged,\n"
+        "                              or messages of 2048+ together (default:\n"
+        "                              8192, the release profile)\n"
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: the\n"
         "                              release curve)\n"
         "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
@@ -354,8 +361,8 @@ static void print_usage(const char * prog) {
         "                              10000:0.5 40000:0.2 100000:0.1 (quoted\n"
         "                              as one argument works the same)\n"
         "                              Neither flag: the release curve\n"
-        "                              16384:0.315 32768:0.270 65536:0.270\n"
-        "                              120000:0.225\n"
+        "                              8192:0.450 16384:0.350 32768:0.270\n"
+        "                              65536:0.260 120000:0.240\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --prefill-drafter-device <backend:gpu>\n"
@@ -474,6 +481,7 @@ struct ModelOptions {
     bool pflash_set = false;           // --pflash on|off given explicitly (unset: auto)
     bool pflash_threshold_set = false; // --prefill-threshold given explicitly
     bool pflash_ratio_set = false;     // --prefill-keep-ratio or --prefill-curve given explicitly
+    luce::server::PFlashComponents pflash_comps;  // resolved once at startup validation
     std::optional<DevicePlacement> expert_device;  // --expert-device
     // The model card's profile for this block (--profile or the card's
     // default); its environment is installed at load.
@@ -1325,26 +1333,50 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
         return 2;
     }
-    // --pflash auto (the default): PFlash is on when its files are given -- the drafter
-    // (--prefill-drafter) and the trained scoring head (PFLASH_SCORING_HEAD_GGUF).
+    // --pflash auto (the default): PFlash is on only when all required files
+    // are available -- the drafter (--prefill-drafter) and all four PFlash
+    // components (scoring head, segment probe, request probe, segment reranker)
+    // with valid GGUF contracts matching the drafter.
+    model.pflash_comps = luce::server::pflash_resolve_components();
+    const auto & pflash_comps = model.pflash_comps;
     if (!model.pflash_set && !load_balancing && !sconfig.pflash_drafter_path.empty()) {
-        const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
-        if (head && *head) {
-            sconfig.pflash = true;
-            std::fprintf(stderr, "[server] PFlash on: --prefill-drafter and PFLASH_SCORING_HEAD_GGUF are set "
-                                 "(--pflash off turns it off)\n");
+        if (!pflash_comps.complete()) {
+            std::fprintf(stderr, "[server] PFlash off: --prefill-drafter is set but PFlash requires all four "
+                                 "components (missing: %s)\n",
+                                 pflash_comps.missing_summary().c_str());
         } else {
-            std::fprintf(stderr, "[server] PFlash off: --prefill-drafter is set but PFLASH_SCORING_HEAD_GGUF "
-                                 "is not\n");
+            std::string gguf_err;
+            if (luce::common::validate_pflash_component_ggufs(
+                    sconfig.pflash_drafter_path, pflash_comps.scoring_head,
+                    pflash_comps.segment_probe, pflash_comps.request_probe,
+                    pflash_comps.seg_reranker, gguf_err)) {
+                sconfig.pflash = true;
+                std::fprintf(stderr, "[server] PFlash on: --prefill-drafter and all four PFlash components are available "
+                                     "(--pflash off turns it off)\n");
+            } else {
+                std::fprintf(stderr, "[server] PFlash off: PFlash GGUF contract check failed (%s)\n",
+                                     gguf_err.c_str());
+            }
         }
     }
     if (sconfig.pflash && !sconfig.pflash_drafter_path.empty()) {
-        const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
-        if (!head || !*head) {
-            std::fprintf(stderr, "[server] --pflash on needs the trained scoring head: set "
-                                 "PFLASH_SCORING_HEAD_GGUF (the release profile also uses PFLASH_SEGMENT_PROBE_GGUF "
-                                 "and PFLASH_REQUEST_PROBE_GGUF), or turn PFlash off\n");
+        if (!pflash_comps.complete()) {
+            std::fprintf(stderr, "[server] --pflash on requires all four PFlash components (missing: %s), "
+                                 "or turn PFlash off\n",
+                                 pflash_comps.missing_summary().c_str());
             return 2;
+        }
+        if (model.pflash_set) {
+            std::string gguf_err;
+            if (!luce::common::validate_pflash_component_ggufs(
+                    sconfig.pflash_drafter_path, pflash_comps.scoring_head,
+                    pflash_comps.segment_probe, pflash_comps.request_probe,
+                    pflash_comps.seg_reranker, gguf_err)) {
+                std::fprintf(stderr, "[server] --pflash on: PFlash GGUF contract check failed (%s), "
+                                     "or turn PFlash off\n",
+                                     gguf_err.c_str());
+                return 2;
+            }
         }
     }
     if (load_balancing && (bargs.device.is_multi_device() ||
@@ -1671,9 +1703,15 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (sconfig.pflash) {
         const bool drafter_beside_target = pflash_drafter_beside_target(
             bargs.device, model.pflash_drafter_device);
-        // A trained scoring head serves the measured release profile for
-        // every setting the operator left unset.
-        const auto release_env = luce::server::pflash_release_env();
+        if (!model.pflash_comps.complete()) {
+            std::fprintf(stderr,
+                "[server] PFlash requires all four PFlash components (missing: %s)\n",
+                model.pflash_comps.missing_summary().c_str());
+            return 1;
+        }
+        // Publish the startup-resolved component paths (no second filesystem scan)
+        // and apply the measured release profile for unset CLI flags.
+        const auto release_env = luce::server::pflash_release_env(model.pflash_comps);
         if (!release_env.empty()) {
             apply_env_defaults("PFlash release profile", release_env);
             if (!model.pflash_threshold_set) {
@@ -1681,6 +1719,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             }
             if (!model.pflash_ratio_set) {
                 sconfig.pflash_curve = luce::server::pflash_release_curve();
+                sconfig.pflash_adaptive_keep = true;
             }
         }
         std::string error;
@@ -1696,18 +1735,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         // drafter released after each prompt.
         if (bargs.max_concurrency > 1 &&
             inspect_gguf_model_info(bargs.model_path.c_str()).arch == "qwen35") {
-            const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
-            const char * legacy = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
-            luce::pflash::PFlashSelectionConfig selection;
-            std::string selection_error;
-            if (!head || !*head || (legacy && std::strcmp(legacy, "1") == 0) ||
-                !luce::pflash::resolve_pflash_selection(1 << 16, 32, selection, selection_error) ||
-                selection.mode == luce::pflash::PFlashSelectionMode::Legacy ||
-                selection.scorer != luce::pflash::PFlashScorer::Head) {
+            if (!model.pflash_comps.complete()) {
                 std::fprintf(stderr,
-                    "[server] PFlash with --max-concurrency > 1 needs the release profile's "
-                    "strict selection with the trained head's scorer (set "
-                    "PFLASH_SCORING_HEAD_GGUF; no legacy or split scorer)\n");
+                    "[server] PFlash with --max-concurrency > 1 needs all four PFlash components\n");
                 return 1;
             }
             if (sconfig.draft_residency == DraftResidencyPolicy::Persistent) {
@@ -2104,12 +2134,6 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             for (const auto & p : sconfig.pflash_curve)
                 std::fprintf(stderr, " %d:%.3f", p.first, p.second);
             std::fprintf(stderr, "\n");
-        }
-        if (const char * ident = std::getenv("PFLASH_EVAL_REF_IDENT_QUERY")) {
-            if (std::strcmp(ident, "off") != 0) {
-                std::fprintf(stderr, "[server] PFLASH_EVAL_REF_IDENT_QUERY=%s: EVALUATION REFERENCE ARM "
-                             "(identifier heuristic), not a product path\n", ident);
-            }
         }
         if (!sconfig.pflash_upstream_base.empty()) {
             std::fprintf(stderr, "[server] pflash upstream: %s  model=%s\n",
@@ -2564,7 +2588,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.pflash ? "on" : "off");
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
-        if (sconfig.pflash_curve.empty()) {
+        if (sconfig.pflash_adaptive_keep) {
+            std::fprintf(stderr, "[server] │  pflash_keep     = adaptive (curve, widen from eff %.2f, whole from %.2f;",
+                         luce::common::kPFlashAdaptiveWidenEff, luce::common::kPFlashAdaptiveBypassEff);
+            for (const auto & p : sconfig.pflash_curve) std::fprintf(stderr, " %d:%.3f", p.first, p.second);
+            std::fprintf(stderr, ")\n");
+        } else if (sconfig.pflash_curve.empty()) {
             std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
         } else {
             std::fprintf(stderr, "[server] │  pflash_keep     = curve");

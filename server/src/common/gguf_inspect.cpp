@@ -106,8 +106,6 @@ GgufModelInfo inspect_gguf_model_info(const char * path) {
 // per-file numbers `sha256sum` gets. We sidecar the result so this only
 // happens on the first server start after a model is downloaded.
 
-namespace {
-
 std::string sha256_of_file(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
@@ -129,6 +127,8 @@ std::string sha256_of_file(const std::string & path) {
     if (f.bad() || (f.fail() && !f.eof())) return {};
     return sha256_final(c);
 }
+
+namespace {
 
 // Map LLAMA_FTYPE_* int → operator-friendly tag (Q4_K_M, IQ4_XS, BF16, …).
 // Kept inline so we don't pull in llama.h here — those enum values are part
@@ -258,13 +258,13 @@ GgufMetadata read_gguf_metadata(const std::string & path,
 
     auto get_str = [&](const char * key, std::string & out) {
         int64_t id = gguf_find_key(gctx, key);
-        if (id < 0) return;
+        if (id < 0 || gguf_get_kv_type(gctx, id) != GGUF_TYPE_STRING) return;
         const char * v = gguf_get_val_str(gctx, id);
         if (v) out = v;
     };
     auto get_u32 = [&](const char * key, int32_t & out) {
         int64_t id = gguf_find_key(gctx, key);
-        if (id < 0) return;
+        if (id < 0 || gguf_get_kv_type(gctx, id) != GGUF_TYPE_UINT32) return;
         out = int32_t(gguf_get_val_u32(gctx, id));
     };
 
@@ -289,7 +289,7 @@ GgufMetadata read_gguf_metadata(const std::string & path,
     }
     if (m.vocab_size < 0) {
         int64_t toks_id = gguf_find_key(gctx, "tokenizer.ggml.tokens");
-        if (toks_id >= 0) {
+        if (toks_id >= 0 && gguf_get_kv_type(gctx, toks_id) == GGUF_TYPE_ARRAY) {
             m.vocab_size = int32_t(gguf_get_arr_n(gctx, toks_id));
         }
     }

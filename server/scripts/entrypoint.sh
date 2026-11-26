@@ -28,7 +28,7 @@
 #   LUCE_LAZY                 1 = request-scoped draft (needs LUCE_PREFILL_DRAFTER)
 #   LUCE_CACHE_TYPE_K/V       KV cache types
 #   LUCE_PFLASH               on|off|auto PFlash compression (default: auto, on
-#                             with LUCE_PREFILL_DRAFTER and PFLASH_SCORING_HEAD_GGUF)
+#                             with LUCE_PREFILL_DRAFTER and all four PFlash files)
 #   LUCE_PREFILL_KEEP, LUCE_PREFILL_THRESHOLD, LUCE_PREFILL_DRAFTER
 #   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFIX_CACHE_MAX_MIB, LUCE_PREFILL_CACHE_SLOTS
 #   LUCE_QUEUE_LIMIT          requests that may wait while every slot is busy;
@@ -372,7 +372,7 @@ if [ "${LUCE_LAZY:-0}" = 1 ]; then
     fi
 fi
 
-# auto: luce_server turns PFlash on when the drafter and PFLASH_SCORING_HEAD_GGUF are both set. The mode is always
+# auto: luce_server turns PFlash on when the drafter and all four PFlash files are given. The mode is always
 # forwarded, so an explicit off holds even when the drafter comes with the operator flags.
 if [ "$LUCE_PFLASH" = on ] && [ -z "${LUCE_PREFILL_DRAFTER:-}" ]; then
     die "LUCE_PFLASH=on requires LUCE_PREFILL_DRAFTER"

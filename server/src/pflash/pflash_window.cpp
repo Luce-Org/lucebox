@@ -30,7 +30,8 @@ bool scorable(const CompressRequest & request) {
 
 bool same_window(const CompressRequest & a, const CompressRequest & b) {
     return a.drafter_path == b.drafter_path && a.drafter_gpu == b.drafter_gpu &&
-           a.skip_park == b.skip_park && a.residency_action == b.residency_action;
+           a.skip_park == b.skip_park && a.residency_action == b.residency_action &&
+           a.use_release_profile == b.use_release_profile;
 }
 
 void release_drafter(DrafterContext & drafter, bool & loaded,
@@ -60,10 +61,26 @@ void run_window(DrafterContext & drafter, bool & loaded,
         return !parking || !window.unpark || window.unpark();
     };
 
-    if (loaded && (drafter.path != first.drafter_path || drafter.gpu != first.drafter_gpu)) {
+    const DrafterAssetMode desired_mode = first.use_release_profile
+        ? DrafterAssetMode::RequireAll
+        : DrafterAssetMode::Optional;
+    const auto env_id = [](const char * name) -> std::string {
+        const char * v = std::getenv(name);
+        return v ? pflash_file_identity(v) : std::string();
+    };
+    const std::string desired_identity =
+        "drafter=" + pflash_file_identity(first.drafter_path) +
+        "|head=" + env_id("PFLASH_SCORING_HEAD_GGUF") +
+        "|reranker=" + env_id("PFLASH_SEG_RERANKER_GGUF") +
+        "|probe=" + env_id("PFLASH_SEGMENT_PROBE_GGUF") +
+        "|request_probe=" + env_id("PFLASH_REQUEST_PROBE_GGUF");
+    if (loaded && (drafter.path != first.drafter_path || drafter.gpu != first.drafter_gpu ||
+                   drafter.loaded_asset_mode != desired_mode ||
+                   drafter.loaded_assets_identity != desired_identity)) {
         release_drafter(drafter, loaded, window);
     }
     if (!loaded) {
+        drafter.asset_mode = desired_mode;
         std::fprintf(stderr, "[%s] loading drafter from %s on GPU %d ...\n",
                      tag, first.drafter_path.c_str(), first.drafter_gpu);
         if (!load_drafter(first.drafter_path, /*gpu_layers=*/999,
@@ -102,12 +119,9 @@ void run_window(DrafterContext & drafter, bool & loaded,
         // backend's pool keeps every operator temporary of the last scoring
         // run (GiBs after a long prompt) until it is trimmed. Scoring
         // sessions are tensors of their own and are unaffected.
-        const char * keep = std::getenv("PFLASH_DRAFTER_TRIM_POOL");
-        if (!(keep && std::string(keep) == "0")) {
-            const size_t trimmed = ggml_backend_cuda_trim_pool(drafter.backend);
-            std::fprintf(stderr, "[%s] trimmed %.1f MiB from the drafter pool\n",
-                         tag, trimmed / (1024.0 * 1024.0));
-        }
+        const size_t trimmed = ggml_backend_cuda_trim_pool(drafter.backend);
+        std::fprintf(stderr, "[%s] trimmed %.1f MiB from the drafter pool\n",
+                     tag, trimmed / (1024.0 * 1024.0));
     }
 
     if (!unpark()) {
@@ -129,25 +143,25 @@ CompressResult pflash_score(DrafterContext & drafter, const CompressRequest & re
         /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
         score_query_end, request.required_instruction_spans,
         request.query_suffix_candidates, request.history_query_spans,
-        request.turn_query_span, request.extra_query_spans,
-        &request.request_messages, request.keep_query_spans));
+        request.turn_query_span,
+        request.use_release_profile ? &request.request_messages : nullptr,
+        request.keep_query_spans));
     if (!result.ok) return result;
     result.kept_spans = pflash_last_kept_spans();
     const auto & scoring = pflash_last_scoring_stats();
     result.scorer_resume = scoring.resume;
     result.scorer_new_tokens = scoring.new_tokens;
     result.scorer_forward_s = scoring.forward_s;
-    const auto & stage2 = pflash_last_stage2_outcome();
-    result.budget_widened = stage2.widened;
-    result.raw_fits = stage2.raw_fits;
-    result.stage2_budget = stage2.budget;
-    result.stage2_budget_widened = stage2.budget_widened;
-    const auto & spread = pflash_last_relevance_spread();
-    result.spread_valid = spread.valid;
-    result.spread = spread.spread;
-    result.spread_k = spread.k;
+    const auto & adaptive = pflash_last_adaptive_budget();
+    result.adaptive_valid = adaptive.valid;
+    result.adaptive_eff = adaptive.eff;
+    result.adaptive_keep_ratio = adaptive.keep_ratio;
+    result.adaptive_full_bypass = adaptive.bypass_to_full;
+    result.reranker_error = pflash_last_reranker_error();
+    result.loaded_assets_identity = pflash_last_loaded_assets_identity();
     for (const auto & candidate : pflash_last_candidate_lifts()) {
         result.candidate_lifts.push_back({candidate.span, candidate.lift});
+        result.candidate_rank_scores.push_back({candidate.span, candidate.rank_score});
     }
     result.probe_pins = pflash_last_probe_pins();
     return result;

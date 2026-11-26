@@ -301,6 +301,10 @@ struct ServerConfig {
     // Piecewise keep-ratio curve: (token_threshold, keep_ratio) sorted ascending.
     // If empty, uses pflash_keep_ratio as flat value.
     std::vector<std::pair<int, float>> pflash_curve;
+    // Adaptive keep ratio from the reranker's sink-free effective token support;
+    // on with the release profile unless the operator gives --prefill-keep-ratio
+    // or --prefill-curve.
+    bool        pflash_adaptive_keep = false;
     bool        lazy_draft      = false;   // legacy alias for request-scoped draft residency
     DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
@@ -394,17 +398,6 @@ PflashInstructionMessagePlan plan_pflash_instruction_messages(
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
     std::vector<PFlashTokenSpan> spans);
 
-// Content length (drafter tokens) up to which a user turn or assistant
-// answer of a multi-turn chat is kept whole: PFLASH_CHAT_SKELETON_TOKENS,
-// default 256; 0 keeps only role headers.
-int pflash_chat_skeleton_tokens() noexcept;
-
-// Earlier user questions of a multi-turn chat that score alongside the
-// current one, most recent first at weights 1/2, 1/4, ...:
-// PFLASH_CHAT_HISTORY_QUERIES, default 3, at most 8; 0 scores the current
-// question alone.
-int pflash_chat_history_queries() noexcept;
-
 
 // Find the last sufficiently-specific suffix of the user query inside the
 // rendered drafter-tokenized prompt. Public for model-free regression tests.
@@ -434,31 +427,6 @@ PFlashTokenSpan pflash_decoded_text_span(
     int begin,
     int end,
     const std::string & needle);
-
-// PFLASH_SELECT_QUERY_HEAD=1: query windows from the structure of the
-// latest user content ``prompt[content_begin, content_end)`` (see
-// pflash_query_blocks). ``extra`` holds the leading prose block (or its
-// first and last head_cap/2 tokens when longer) and, for a trailing block
-// longer than tail_cap, its first tail_cap/2 tokens; ``tail`` is the main
-// query window -- the trailing prose block, or its last tail_cap/2 tokens --
-// or {-1, -1} to keep today's window. A block under 16 tokens is ignored (a
-// stock line such as "Here is the material."), so a short trailing block
-// keeps today's window.
-struct PflashQueryHeadPlan {
-    std::vector<PFlashTokenSpan> extra;
-    PFlashTokenSpan tail{-1, -1};
-    std::string head_rule = "none";
-    bool structured = false;
-    int head_tokens = 0;
-    int tail_tokens = 0;
-};
-PflashQueryHeadPlan pflash_query_head_plan(
-    const Tokenizer & tokenizer,
-    const std::vector<int32_t> & prompt,
-    int content_begin,
-    int content_end,
-    int head_cap,
-    int tail_cap);
 
 // The chat turn the scorer query comes from, located by the model's own
 // chat control markers in the rendered prompt rather than message
@@ -549,9 +517,6 @@ struct PflashFallbackDecision {
     std::string refused;
 };
 bool pflash_fail_closed_from_env() noexcept;
-// Whether a strict selection scores every candidate (the block-15 head over segments), which the unified view pages
-// by; the legacy and split scorers (or PFLASH_QWEN35_LEGACY_SCORER=1) and the fold strategy do not.
-bool pflash_selection_gives_lifts(const luce::pflash::PFlashSelectionConfig & selection) noexcept;
 // Short machine-readable reason for a PFlash error string (and the backend's
 // last error, when the drafter reported one): "nonfinite_scores",
 // "compress_failed", "ceiling_exceeded", "mapping_failed", "remote_drafter",
@@ -1158,11 +1123,12 @@ private:
     // while the head mass on unheld units is at least theta of the context mass; also skips the drafter pass when
     // every unit of every region is held. < 0 = "off" (fill each region's cap).
     double pflash_recall_gate_ = -1.0;
-    // PFLASH_RECALL_TRACE_UNITS=1: the view record carries each region's units (byte cuts, kept at paging; at a
-    // question: held, head mass, cost, score) for an offline replay of recall policies. Stats only.
-    bool pflash_recall_trace_units_ = false;
     pflash_unified::ToolList pflash_region_tools_;
-    std::string pflash_unified_config_;   // config identity a stored view must match
+    std::string pflash_unified_config_;   // static config prefix (tools, recall, curve)
+    std::string pflash_head_path_;
+    std::string pflash_reranker_path_;
+    std::string pflash_probe_path_;
+    std::string pflash_request_probe_path_;
     pflash_unified::ViewStore pflash_unified_views_;
     pflash_unified::ViewDiskStore pflash_unified_disk_views_;   // with the disk session cache on
     std::atomic<uint64_t> pflash_unified_lineage_{0};

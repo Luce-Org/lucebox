@@ -343,6 +343,36 @@ TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_orders_units_across_regions_
     REQUIRE(g.regions[1].admitted == std::vector<char>({1, 1}));
 }
 
+TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_lift_floor_blocks_diffuse_noise_and_trims_tail) {
+    // Diffuse background turn (all unheld units <= 1.2x uniform) is gated out when min_unit_lift=2.0.
+    RecallRegion diffuse;
+    diffuse.unit_cost = {10, 10, 10, 10};
+    diffuse.held = {0, 0, 0, 0};
+    diffuse.score = {2.0, 1.8, 1.5, 1.2};
+    diffuse.mass = {0.20, 0.20, 0.20, 0.20};
+    diffuse.unit_lift = {1.2, 1.1, 1.0, 0.9};
+    diffuse.cap = 1000;
+    diffuse.label_cost = 5;
+    GatedRecall gd = admit_recall_gated({diffuse}, 1.0, 0.075, /*min_unit_lift=*/2.0);
+    REQUIRE(gd.gated);
+    REQUIRE(gd.regions[0].taken == 0);
+
+    // Focused turn (peak lift=6.0 >= 2.0): top 2 reranked units are admitted even if #2 had mild
+    // Stage-1 lift (reranker rescue!), then #3 (lift=3.0 >= 2.0) is admitted, while #4/#5 (lift=0.8) are skipped.
+    RecallRegion focused;
+    focused.unit_cost = {10, 10, 10, 10, 10};
+    focused.held = {0, 0, 0, 0, 0};
+    focused.score = {9.0, 8.0, 7.0, 2.0, 1.0};
+    focused.mass = {0.30, 0.08, 0.15, 0.12, 0.12};
+    focused.unit_lift = {6.0, 1.3, 3.0, 0.8, 0.8};
+    focused.cap = 1000;
+    focused.label_cost = 5;
+    GatedRecall gf = admit_recall_gated({focused}, 1.0, 0.075, /*min_unit_lift=*/2.0);
+    REQUIRE(!gf.gated);
+    REQUIRE(gf.regions[0].admitted == std::vector<char>({1, 1, 1, 0, 0}));
+    REQUIRE(gf.regions[0].taken == 3);
+}
+
 TEST_CASE(PFlashUnifiedFixture, unified_rank_units_orders_by_score_then_document) {
     REQUIRE(rank_units({0.5, 2.0, 0.5, NAN, 3.0}, {}) == std::vector<int>({4, 1, 0, 2, 3}));
     REQUIRE(rank_units({0.5, 2.0, 0.5}, {0, 1, 0}) == std::vector<int>({0, 2}));
@@ -767,6 +797,12 @@ TEST_CASE(PFlashUnifiedFixture, unified_view_store_reports_evicted_views) {
     REQUIRE(evicted.size() == 1 && evicted[0].lineage == 1);
     const auto all = store.all();
     REQUIRE(all.size() == 2 && all[0].lineage == 3 && all[1].lineage == 2);   // most recently used first
+    // Read-only lookup (touch=false) must not change LRU eviction order.
+    View peeked;
+    REQUIRE(store.find({2, 9}, {2, 9}, "c", peeked, /*touch=*/false));
+    REQUIRE(peeked.lineage == 2);
+    const auto evicted2 = store.remember(disk_test_view({4, 9}, 1, "c", 4));
+    REQUIRE(evicted2.size() == 1 && evicted2[0].lineage == 2);
 }
 
 TEST_CASE(PFlashUnifiedFixture, unified_text_helpers) {

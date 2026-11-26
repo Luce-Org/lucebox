@@ -94,10 +94,8 @@ TEST_CASE(KvflashPflashMapFixture, an_unknown_role_token_is_a_named_error_and_no
 // ---- the mode-5 startup gate ----------------------------
 namespace {
 std::map<std::string, std::string> release_env() {
-    return {{"PFLASH_SELECT_MODE", "budget_only"}, {"PFLASH_SELECT_SCORE", "density"}, {"PFLASH_SELECT_SEGMENTS", "probe"},
-            {"PFLASH_SELECT_QUERY_HEAD", "1"}, {"PFLASH_SELECT_QUERY_PARSER", "latest_user"}, {"PFLASH_SELECT_QUERY_PROBE", "1"},
-            {"PFLASH_SCORING_HEAD_GGUF", "h.gguf"}, {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"}, {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"},
-            {"PFLASH_QUERY_CANDIDATES", "1"}, {"PFLASH_QUERY_PIN", "512"}, {"PFLASH_DRAFTER_SESSIONS", "2"}};
+    return {{"PFLASH_SCORING_HEAD_GGUF", "h.gguf"}, {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"},
+            {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"}, {"PFLASH_DRAFTER_SESSIONS", "2"}};
 }
 std::string gate(const std::map<std::string, std::string> & e, int slots) {
     return kvflash_pflash2_config_error([&](const char * k) { auto i = e.find(k); return i == e.end() ? std::string() : i->second; }, slots);
@@ -107,14 +105,8 @@ TEST_CASE(KvflashPflashMapFixture, the_release_profile_passes_the_mode_5_gate) {
     CHECK(gate(release_env(), 1).empty());
     CHECK(gate(release_env(), 2).empty());
 }
-TEST_CASE(KvflashPflashMapFixture, an_unset_select_mode_is_refused_naming_it) {
-    auto e = release_env(); e.erase("PFLASH_SELECT_MODE");
-    CHECK(gate(e, 1).find("PFLASH_SELECT_MODE") != std::string::npos);
-    e = release_env(); e["PFLASH_SELECT_MODE"] = "top_p";
-    CHECK(gate(e, 1).find("PFLASH_SELECT_MODE") != std::string::npos);
-}
-TEST_CASE(KvflashPflashMapFixture, a_missing_request_probe_or_query_step_is_refused_naming_it) {
-    for (const char * k : {"PFLASH_REQUEST_PROBE_GGUF", "PFLASH_QUERY_CANDIDATES", "PFLASH_QUERY_PIN", "PFLASH_SCORING_HEAD_GGUF"}) {
+TEST_CASE(KvflashPflashMapFixture, a_missing_pflash_component_is_refused_naming_it) {
+    for (const char * k : {"PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"}) {
         auto e = release_env(); e.erase(k);
         CHECK(gate(e, 1).find(k) != std::string::npos);
     }

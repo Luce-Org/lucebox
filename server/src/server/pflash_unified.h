@@ -126,6 +126,9 @@ std::string region_preamble_text(RegionKind kind, const Layout & layout, int sho
 std::string recall_label_text(RegionKind kind, const std::string & brief);
 inline const char * recall_open() { return "[Earlier in this conversation]\n"; }
 inline const char * recall_close() { return "\n[End of earlier excerpts]\n\n"; }
+// Recall after a tool result: the same markers, set apart from the result and without the trailing blank line.
+inline std::string recall_open_after_tool() { return std::string("\n\n") + recall_open(); }
+inline const char * recall_close_after_tool() { return "\n[End of earlier excerpts]"; }
 
 // ``body`` as a line of its own at a cut in ``lines``' structure: a separator before it unless the text before
 // ``at`` ends with one, a separator after it unless the text from ``next`` starts with one; JSON-escaped in
@@ -171,6 +174,7 @@ struct RecallRegion {
     std::vector<char> held;
     std::vector<double> score;
     std::vector<double> mass;
+    std::vector<double> unit_lift;   // optional per-unit Stage-1 attention lift vs uniform (1.0 = flat)
     int cap = 0;
     int label_cost = 0;
 };
@@ -179,15 +183,17 @@ struct GatedRecall {
     std::vector<Admission> regions;      // per region, as admit_recall's
     double deficit_before = 0.0;         // D / S before any unit: the head mass on unheld units over S
     double deficit_after = 0.0;          // D / S after the admitted units
-    bool gated = false;                  // deficit_before < theta: nothing taken, the present context suffices
+    bool gated = false;                  // deficit_before < theta (or below lift floor): nothing taken
 };
 
 // ``context_mass`` = S (> 0): the head mass on every candidate that is not pinned (history, held and unheld units).
-// D = the mass of the unheld units. When D / S < ``theta`` nothing is taken. Else unheld units are taken best first
-// ACROSS regions (one order by score; region then document order on ties), each under its own region's cap with
-// admit_recall's run and label accounting (a unit that does not fit is skipped), and the taking stops as soon as the
-// mass still unheld is below theta x S. The caps bound it: the worst case is admit_recall's fill.
-GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta);
+// D = the mass of the unheld units. When D / S < ``theta`` nothing is taken. When ``min_unit_lift > 0`` and
+// ``unit_lift`` is provided, recall also gates out diffuse background turns whose peak unheld lift is below
+// ``min_unit_lift``, and after admitting the top 2 reranked units skips low-lift tail units (< ``min_unit_lift``).
+// Otherwise unheld units are taken best first ACROSS regions (one order by score; region then document order on ties),
+// each under its own region's cap with admit_recall's run and label accounting, stopping once deficit < theta x S.
+GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta,
+                               double min_unit_lift = 0.0);
 
 // Units best first: higher score first, document order on ties; ``skip`` units are left out.
 std::vector<int> rank_units(const std::vector<double> & score, const std::vector<char> & skip);
@@ -273,7 +279,7 @@ public:
     ViewStore(size_t capacity = 16, size_t byte_cap = (size_t) 256 << 20)
         : capacity_(capacity), byte_cap_(byte_cap) {}
     bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
-              const std::string & config, View & out);
+              const std::string & config, View & out, bool touch = true);
     // Returns the views it evicted (the server writes them to disk when the disk session cache is on).
     std::vector<View> remember(View view);
     // Every stored view, most recently used first (the shutdown flush).
@@ -324,7 +330,7 @@ public:
     // ViewStore::find over the views on disk whose raw prefix is longer than ``longer_than`` tokens. The file is read
     // and both prefixes compared token by token before it is returned; a file that does not load is deleted.
     bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
-              const std::string & config, size_t longer_than, View & out);
+              const std::string & config, size_t longer_than, View & out, bool read_only = false);
     void forget_lineage(uint64_t lineage);
     // ViewStore::lineages_continued_by over the views on disk, from their headers (no file is read).
     std::vector<uint64_t> lineages_continued_by(const std::vector<int32_t> & raw_tokens) const;
