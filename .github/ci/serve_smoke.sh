@@ -10,30 +10,69 @@ set -euo pipefail
 
 name=$1 at_once=$2 server=$3 model=$4
 shift 4
-port=${SERVE_SMOKE_PORT:-8098}
 log=${RUNNER_TEMP:-/tmp}/serve_smoke_$name.log
-url=http://127.0.0.1:$port
 
 [[ -r $model ]] || { echo "::error::$model is missing or not readable by $(id -un)"; exit 1; }
 
-"$server" "$model" "$@" --host 127.0.0.1 --port "$port" --model-name "$name" \
-  --kv-cache-dir off > "$log" 2>&1 &
-pid=$!
+pick_free_port() {
+  python3 -c 'import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])'
+}
+
+pid=
 # Best effort under set -e: kill fails when the server already exited (the case the
 # log explains) and wait returns the signal's status, so either would end the trap
 # before the log.
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-      echo "--- luce_server log (tail)"; tail -n 40 "$log"' EXIT
+trap '[[ -n $pid ]] && kill "$pid" 2>/dev/null || true; [[ -n $pid ]] && wait "$pid" 2>/dev/null || true
+      [[ -f $log ]] && { echo "--- luce_server log (tail)"; tail -n 40 "$log"; } || true' EXIT
 
-# A model that streams experts from the SSD (DeepSeek V4.1) loads its dense
-# weights and hot experts first: about 80 s with the file in the page cache,
-# longer cold.
-for _ in $(seq 600); do
-  curl -sf -m 5 "$url/v1/models" > /dev/null && break
-  kill -0 "$pid" 2>/dev/null || { echo "::error::luce_server exited while loading"; exit 1; }
-  sleep 1
+# When SERVE_SMOKE_PORT is unset, pick an unused loopback port and retry if
+# another process claims it between probing and luce_server's bind().
+max_attempts=1
+[[ -n ${SERVE_SMOKE_PORT:-} ]] || max_attempts=5
+
+ready=0
+for attempt in $(seq "$max_attempts"); do
+  if [[ -n ${SERVE_SMOKE_PORT:-} ]]; then
+    port=$SERVE_SMOKE_PORT
+  else
+    port=$(pick_free_port)
+  fi
+  url=http://127.0.0.1:$port
+
+  "$server" "$model" "$@" --host 127.0.0.1 --port "$port" --model-name "$name" \
+    --kv-cache-dir off > "$log" 2>&1 &
+  pid=$!
+
+  # A model that streams experts from the SSD (DeepSeek V4.1) loads its dense
+  # weights and hot experts first: about 80 s with the file in the page cache,
+  # longer cold.
+  for _ in $(seq 600); do
+    kill -0 "$pid" 2>/dev/null || break
+    if curl -sf -m 5 "$url/v1/models" > /dev/null; then
+      kill -0 "$pid" 2>/dev/null || break
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+
+  (( ready )) && break
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    pid=
+    if (( attempt < max_attempts )) && grep -q "Address already in use" "$log"; then
+      echo "port $port was claimed before bind() (attempt $attempt/$max_attempts); retrying"
+      continue
+    fi
+    echo "::error::luce_server exited while loading"
+    exit 1
+  fi
+  echo "::error::luce_server was not ready in 10 minutes"
+  exit 1
 done
-curl -sf -m 5 "$url/v1/models" > /dev/null || { echo "::error::luce_server was not ready in 10 minutes"; exit 1; }
 if [[ -n ${SERVE_SMOKE_PROFILE:-} ]] && ! grep -q "^\[server\] profile $SERVE_SMOKE_PROFILE: flags" "$log"; then
   echo "::error::luce_server did not apply the $SERVE_SMOKE_PROFILE profile"; exit 1
 fi
