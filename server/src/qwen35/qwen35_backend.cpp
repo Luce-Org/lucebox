@@ -514,7 +514,6 @@ bool Qwen35Backend::init() {
         rq.arch = kvflash_arch();
         rq.draft = cfg_.draft_path.has_value();
         rq.tree = cfg_.ddtree_mode;
-        rq.chain_spec_switch = luce::common::kvflash_chain_spec_switch();
         rq.draft_local_same_device = !use_remote_draft && !tensor_parallel && !split_gpus_ &&
             target_backend_ == draft_backend_ && cfg_.device.gpu == cfg_.draft_gpu;
         rq.draft_block = dw_.block_size;
@@ -532,18 +531,6 @@ bool Qwen35Backend::init() {
     // rollback stays on.
     cfg_.fast_rollback = luce::common::spec_fast_rollback_enabled(
         kvflash_tokens_ > 0, cfg_.fast_rollback, cfg_.fast_rollback_explicit);
-    // KVFlash is resolved from env at init; this is the authoritative
-    // paged×KVFlash compatibility check.
-    if (cfg_.paged_attention && kvflash_active() && luce::common::kvflash_concurrent_test_switch()) {
-        std::fprintf(stderr, "[kvflash] TEST SWITCH LUCE_KVFLASH_CONCURRENT_TEST=1: concurrent KVFlash slots "
-                             "opened for the C1.3 GPU gates (not a supported configuration)\n");
-    } else if (cfg_.paged_attention && kvflash_active()) {
-        std::fprintf(stderr,
-            "[paged-attention] cannot be combined with KVFlash "
-            "(resident pool %d tokens)\n", kvflash_tokens_);
-        set_last_error("paged attention cannot be combined with KVFlash");
-        return false;
-    }
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
     const int n_slots = concurrent_slots();
@@ -597,9 +584,8 @@ bool Qwen35Backend::init() {
     // pool's index space) as the write target of dead decode-batch rows.
     int64_t pool_tokens = 0;
     const bool slot_pool = seq_engine_wanted();
-    // KVFlash slots (C1.3-05): one arena of N x Q x 64 rows plus a scratch block,
-    // no PagedKvPool; --kv-pool-tokens is derived, not a size. Reachable only
-    // behind LUCE_KVFLASH_CONCURRENT_TEST until the paged x KVFlash refusal is lifted.
+    // KVFlash slots: one arena of N x Q x 64 rows plus a scratch block,
+    // no PagedKvPool; --kv-pool-tokens is derived, not a size.
     const bool kvflash_slots = slot_pool && kvflash_active();
     KvFlashArenaSizing arena;
     if (kvflash_slots) {
@@ -736,8 +722,7 @@ bool Qwen35Backend::init() {
                         n_slots, kvflash_quota_chunks(kvflash_tokens_), (long long)arena.rows,
                         kvflash_prefill_reselect_ > 0 ? "per-slot recall" : "none (LRU)");
             if (fixed_chain.enabled)
-                std::fprintf(stderr, "[parallel-chain] KVFlash fixed DFlash2 width=%d, scratch_base=%d stride=%d dead_row=%lld "
-                                     "(LUCE_KVFLASH_CHAIN_SPEC=1, test-only)\n",
+                std::fprintf(stderr, "[parallel-chain] KVFlash fixed DFlash2 width=%d, scratch_base=%d stride=%d dead_row=%lld\n",
                              fixed_chain.width, fixed_chain.scratch_base, fixed_chain.scratch_stride, (long long)arena.dead_row);
             std::fflush(stdout);
         } else if (slot_pool) {
@@ -1954,9 +1939,8 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         int64_t slab = 0, n_slab_tensors = 0;
         for (const ggml_tensor * t : cache_.ssm_state)  if (t) { slab += (int64_t)ggml_nbytes(t) / n_slots; ++n_slab_tensors; }
         for (const ggml_tensor * t : cache_.conv_state) if (t) { slab += (int64_t)ggml_nbytes(t) / n_slots; ++n_slab_tensors; }
-        const bool sticky_on = luce::common::kvflash_slot_sticky_env();
         const char * sdir = std::getenv("LUCE_KVFLASH_SESSIONS_DIR");
-        const bool staged = sticky_on && sdir && *sdir;
+        const bool staged = sdir && *sdir;
         // the park staging (kvflash_park_staging): the end slab snapshot and its packed file, the packed checkpoint and trunk
         // slabs, the records of the changed chunks (at most every chunk), the ledger and the head, held until the writer
         // thread has the park on disk (one staged park per slot: save_bundle_ waits for the slot's earlier one)
@@ -1967,9 +1951,9 @@ bool Qwen35Backend::init_kvflash_slots(int n_slots, int quota_chunks, int max_ct
         const int64_t uq_bytes = (int64_t)luce::common::kKvFlashUqSlotMaxStores * (12 + (int64_t)kvflash_uq_queries_ * qd.n_layers * qd.n_q_heads * qd.head_dim * (int64_t)sizeof(float));
         const KvFlashParkStaging staging = kvflash_park_staging(slab, n_slab_tensors, (int64_t)raw.back()->blob_header(0).size(), chunk_tokens, chunk_bytes,
                                                                 kvflash_uq_queries_ > 0 ? uq_bytes : 0);
-        kc.ladder_bytes = kvflash_ladder_bytes(slab, kvflash_slot_recall_profile(), sticky_on, staged, staging);
+        kc.ladder_bytes = kvflash_ladder_bytes(slab, kvflash_slot_recall_profile(), /*sticky=*/true, staged, staging);
         kc.stage_chunk_bytes = staged ? staging.per_chunk_bytes : 0;   // the session's own chunks, not nc_max of them
-        std::fprintf(stderr, "[kvflash] per-slot ladder: %d rungs x slab %lld B + staging %lld B = %lld B (%.1f MiB)\n", sticky_on ? kKvFlashLadderRungs : 0,
+        std::fprintf(stderr, "[kvflash] per-slot ladder: %d rungs x slab %lld B + staging %lld B = %lld B (%.1f MiB)\n", kKvFlashLadderRungs,
                      (long long)slab, (long long)(staged ? staging.fixed_bytes : 0), (long long)kc.ladder_bytes, kc.ladder_bytes / 1048576.0);
     }
     if (!kvflash_headroom_ok(quota_chunks, kHeadroom)) {

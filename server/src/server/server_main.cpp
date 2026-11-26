@@ -1667,26 +1667,17 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     const bool concurrent_kvflash = model.bargs.paged_attention &&
         (!model.kvflash_pool.empty() || luce::common::kvflash_pool_requested(env_pool));
     if (concurrent_kvflash) {
-        const luce::common::KvFlashLookup env_lookup = [](const char * k) { return std::getenv(k); };
         const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
-        const luce::common::KvFlashProfileRequest rq = luce::common::kvflash_concurrent_request(
-            arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
-        const luce::common::KvFlashProfile profile = luce::common::kvflash_resolve_concurrent_profile(rq);
-        if (!profile.ok) {
-            std::fprintf(stderr, "[kvflash] %s\n", profile.error.c_str());
-            return 2;
-        }
-        std::fprintf(stderr, "%s\n", profile.log_line.c_str());
-        if (profile.install_recall_defaults) {
+        const char * env_policy = std::getenv("LUCE_KVFLASH_POLICY");
+        const bool recall = luce::common::kvflash_concurrent_use_recall(
+            arch, model.kvflash_policy, env_policy ? env_policy : "", multi_model);
+        std::fprintf(stderr, "[kvflash] concurrent profile: %s\n",
+                     recall ? "per-slot recall" : "lru-only");
+        if (recall) {
             apply_env_defaults("KVFlash concurrent recall", luce::server::kvflash_recall_env(arch));
-            const std::string bad = luce::common::kvflash_merged_profile_error(
-                arch, model.kvflash_policy, !model.kvflash_tau.empty(), multi_model, env_lookup);
-            if (!bad.empty()) {
-                std::fprintf(stderr, "[kvflash] concurrent recall defaults conflict with a set value: %s\n", bad.c_str());
-                return 2;
-            }
+        } else {
+            set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
         }
-        if (profile.policy == "lru-only") set_environment_variable("LUCE_KVFLASH_POLICY", "lru", true);
     } else if (!model.kvflash_pool.empty()) {
         const std::string arch = inspect_gguf_model_info(model.bargs.model_path.c_str()).arch;
         std::fprintf(stderr, "[kvflash] %s\n", luce::server::kvflash_recall_banner(arch, [](const char * k) {

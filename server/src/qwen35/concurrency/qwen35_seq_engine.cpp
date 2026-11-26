@@ -129,20 +129,10 @@ void Qwen35SeqEngine::init_slots_() {
     recall_on_ = kvf_ && b_.kvflash_slot_recall_profile();
     uq_queries_ = recall_on_ && b_.kvflash_prefill_reselect_ == 4 ? b_.kvflash_uq_queries_ : 0;
     if (kvf_) {
-        sticky_on_ = kvflash_slot_sticky_env();
-        const char * rung = std::getenv("LUCE_KVFLASH_END_RUNG_MIN");
-        end_rung_min_ = rung && *rung ? std::atoi(rung) : -1;
         const char * hr = std::getenv("LUCE_KVFLASH_HEADER_RUNG");
         header_rung_ = hr && hr[0] == '1' && !hr[1];
         if (header_rung_) std::fprintf(stderr, "[kvflash] slot replay rung at the last cut before the header on recall turns (LUCE_KVFLASH_HEADER_RUNG)\n");
-        const KvFlashParkCfg pc = kvflash_park_cfg(sticky_on_, std::getenv("LUCE_KVFLASH_PARK_SHORT"), std::getenv("LUCE_KVFLASH_PARK_TAIL"), std::getenv("LUCE_KVFLASH_PARK_DECODE"));
-        park_short_on_ = pc.any() && slot_state_stash_alloc(b_.cache_, b_.target_backend_, stash_);   // the stash exists only when a mode uses it
-        park_decode_on_ = park_short_on_ && pc.decode_on;
-        park_tail_ = pc.tail;
-        std::fprintf(stderr, "[kvflash] slot sessions: %s (LUCE_KVFLASH_SLOT_STICKY)\n", sticky_on_ ? "sticky" : "cold");
-        if (sticky_on_) std::fprintf(stderr, "[kvflash] slot park short: %s, tail %d, decode stash %s (LUCE_KVFLASH_PARK_SHORT/_TAIL/_DECODE)\n", park_short_on_ ? "on" : "off", park_tail_, park_decode_on_ ? "on" : "off");
-        if (end_rung_min_ >= 0)
-            std::fprintf(stderr, "[kvflash] slot header rung on recall turns with end - R >= %d (LUCE_KVFLASH_END_RUNG_MIN)\n", end_rung_min_);
+        park_short_on_ = slot_state_stash_alloc(b_.cache_, b_.target_backend_, stash_);
         init_bundles_();
         init_heads_();
         rebind_restored_heads_();   // the start-up adopts ran before the binder and head_k_max_ existed: bind their heads now
@@ -629,7 +619,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_bounded_(
         const AdmitMeta & meta) {
     stage_parked();
     const int64_t total = (int64_t)prompt.size() + max_new_tokens;   // host backing for the whole request (R5)
-    if (sticky_on_) return admit_sticky_(request_id, prompt, sampler, total, meta);
+    if (kvf_) return admit_sticky_(request_id, prompt, sampler, total, meta);
     if (kvf_kv_) kvf_kv_->set_next_total_tokens(total);
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::busy && kvf_kv_ && uq_reclaim_idle_()) {   // the stores are a cache: one retry without them
@@ -1094,7 +1084,7 @@ size_t Qwen35SeqEngine::slab_bytes_() const {
 
 void Qwen35SeqEngine::init_bundles_() {
     const char * dir = std::getenv("LUCE_KVFLASH_SESSIONS_DIR");
-    if (!sticky_on_ || !dir || !*dir) return;
+    if (!dir || !*dir) return;
     disk_ = DiskStore::find(dir);
     if (!disk_) {
         std::fprintf(stderr, "[kvflash] sessions: no open cache directory %s: sessions stay in memory\n", dir);
@@ -1307,7 +1297,7 @@ void Qwen35SeqEngine::init_heads_() {
     const KvFlashSlotPager & p0 = kvf_kv_->pager(0);
     head_binder_ = KvFlashHeadBinder(slots_.slot_count());
     kvf_kv_->set_binder(&head_binder_);
-    head_k_max_ = sticky_on_ ? kvflash_head_k_max(p0.n_pool_blocks()) : 0;
+    head_k_max_ = kvflash_head_k_max(p0.n_pool_blocks());
     if (head_k_max_ <= 0) { std::fprintf(stderr, "[kvflash] pinned heads: off\n"); return; }
     if (disk_) {
         head_nostore_ = std::make_unique<KvFlashNoCheckpoints>();
@@ -1602,7 +1592,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         uqp = kvflash_uq_plan(q, uq_queries_, std::clamp(kv_offset, 0, (int)prompt.size()), (int)prompt.size());
     }
     rc.turn = kvflash_slot_turn_plan(prompt, kv_offset, b_.w_.im_start_id, b_.w_.user_id, ct, usable, kKvFlashCutU,
-                                     b_.kvflash_select_queries_, recall_on_, end_rung_min_, max_turn,
+                                     b_.kvflash_select_queries_, recall_on_, max_turn,
                                      uqp, capture_at);
     if (rc.turn.capture_at > 0) rc.capture_ids.assign(prompt.begin(), prompt.begin() + rc.turn.capture_at);
     if (uq_queries_ > 0) {
@@ -1674,7 +1664,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
         rc.turn.track_tail = true;   // not a recall turn (the prompt fits): its tail queries are still the next turn's prescore input
     }
     // L4: after the turn's last cut is in (the UQ cut above), with the replay's cut rule (the park tail of the step loop)
-    if (header_rung_) kvflash_slot_turn_header_rung(rc.turn, kKvFlashCutU, park_short_on_ ? park_tail_ : 0);
+    if (header_rung_) kvflash_slot_turn_header_rung(rc.turn, kKvFlashCutU, park_short_on_ ? kKvFlashParkTail : 0);
     if (rc.turn.apply_at >= 0 && m4_path[0]) {
         // Mode 4 once: the picks come from the exact scores above, applied at the resume point; no snapshot, no rewind.
         apply_once_(slot, m4_path[0] == 'r' ? "; reused" : "; prescore");
@@ -1683,7 +1673,7 @@ void Qwen35SeqEngine::plan_slot_turn_(int slot, const std::vector<int32_t> & pro
                      rc.m4_track ? "no reusable record" : "single pass off", rc.turn.end - rc.turn.r);
         if (rc.turn.r == rc.turn.kv_offset) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens, %zu cuts%s)\n",
-                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.end_rung ? ", header rung" : rc.turn.header_rung ? ", replay rung" : "");
+                     slot, rc.turn.r, rc.turn.end, rc.turn.end - rc.turn.r, rc.turn.cuts.size(), rc.turn.header_rung ? ", replay rung" : "");
         if (rc.turn.header_rung) std::fprintf(stderr, "[kvflash] slot %d header rung: the replay checkpoints at %d\n", slot, rc.turn.ckpt);
     } else if (recall_on_) {
         std::fprintf(stderr, "[kvflash] slot %d prefill reselect mode=4: skip (%d tokens fit %d blocks or no turn)\n",
@@ -1759,7 +1749,7 @@ bool Qwen35SeqEngine::rewind_slot_turn_(int slot) {
     // The R state is this turn's sticky checkpoint (the next turn resumes at R and prefills the question
     // with the recent window, as a cold turn does: a replay state there cost recall), the resume-time
     // fallback below it the trunk (Rule A); else freed (~150 MiB).
-    if (sticky_on_) place_ckpt_(slot, SlotCkpt{r, std::make_shared<const SlotStateSnapshot>(std::move(rc.snap))});
+    place_ckpt_(slot, SlotCkpt{r, std::make_shared<const SlotStateSnapshot>(std::move(rc.snap))});
     rc.snap = SlotStateSnapshot{};
     rc.snap_ok = false;
     // Pending frees would be double-freed by the truncate's relayout; the apply's page-outs must free at once
@@ -3305,11 +3295,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     // KVFlash (D1/D2): this step's rows, the decode rows and one cut per prefill
     // slot, go through the pager plan first. A slot that does not fit idles.
-    using kvf_clock = std::chrono::steady_clock;
-    const auto kvf_t0 = kvf_clock::now();
-    auto kvf_ms = [](kvf_clock::time_point a, kvf_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    kvf_clock::time_point kvf_t_run{}, kvf_t_up{};
-    int kvf_uploads = 0;
     std::vector<PrefillSlice> run_prefills;
     run_prefills.reserve(plan.prefills.size());
     std::vector<uint8_t> kvf_ran;
@@ -3324,7 +3309,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             // the slot's turn plans the cut (a first pass keeps its R and capture cuts, otherwise the next
             // multiple of U after cur_pos or the prompt end: a function of position only)
             const SlotRecall & rc = recall_[(size_t)slice.slot];
-            int c = kvflash_slot_turn_next_cut(rc.turn, seq.cur_pos, kKvFlashCutU, park_short_on_ ? park_tail_ : 0);
+            int c = kvflash_slot_turn_next_cut(rc.turn, seq.cur_pos, kKvFlashCutU, park_short_on_ ? kKvFlashParkTail : 0);
             const KvFlashTurnStep cs = kvflash_slot_turn_step(rc.turn, seq.cur_pos, c, b_.kvflash_select_queries_);
             if (cs.capture || cs.q_rows > 0 || kvflash_uq_cut_rows(rc.uq, seq.cur_pos, c) > 0) {
                 if (capture_slot >= 0) c = 0;        // one capture per step: this slot idles
@@ -3335,7 +3320,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         }
         const KvFlashStepDriver::Result ran = kvf_->run_step(work);
         if (!ran.ok) return fail_step("KVFlash step failed (page-out or allocation)");
-        kvf_t_run = kvf_clock::now();
         kvf_ran.assign((size_t)n_slots, 0);
         for (int slot : ran.ran) kvf_ran[(size_t)slot] = 1;
         if (capture_slot >= 0 && !kvf_ran[(size_t)capture_slot]) capture_slot = -1;
@@ -3494,10 +3478,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 if (!upload_kvflash_column(slot, seq_lens_[(size_t)slot])) {
                     return fail_step("KVFlash block-table column exceeds device capacity");
                 }
-                ++kvf_uploads;
             }
         }
-        kvf_t_up = kvf_clock::now();
     }
 
     bool built = false;
@@ -3696,15 +3678,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
         seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
 
-    if (park_short_on_) {   // the state before each live slot's token: what a park one token short keeps
-        for (int row = 0; park_decode_on_ && row < live_count; ++row) {
-            const int slot = live_slot_ids_[(size_t)row];
-            stash_pos_[(size_t)slot] = slot_state_stash_copy(b_.target_backend_, b_.cache_, stash_, slot, true)
-                ? live_positions_[(size_t)row] : -1;
-        }
-        for (size_t i = 0; i < prefills.size(); ++i) {   // a turn's last prompt tokens (a cut of their own, the tail): the state before them
+    if (park_short_on_) {   // a turn's last prompt tokens (a cut of their own, the tail): the state before them
+        for (size_t i = 0; i < prefills.size(); ++i) {
             const int slot = run_prefills[i].slot;
-            if (prefills[i].commit && prefills[i].chunk <= park_tail_)
+            if (prefills[i].commit && prefills[i].chunk <= kKvFlashParkTail)
                 stash_pos_[(size_t)slot] = slot_state_stash_copy(b_.target_backend_, b_.cache_, stash_, slot, true) ? prefills[i].kv_pos : -1;
         }
     }
@@ -3776,28 +3753,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                                                                  rc.m4_q_tail.empty() ? std::move(rc.q_tail) : std::move(rc.m4_q_tail));
             if (ts.snapshot) rc.snap_ok = snapshot_slot_state(b_.cache_, slot, rc.snap);
             if (ts.capture && slot == capture_slot && rc.turn.first_pass()) pending_rewind_.push_back(slot);
-            if (ts.ckpt && sticky_on_) take_ckpt_(slot, prefills[i].kv_pos + prefills[i].chunk);   // the header rung (Rule A)
+            if (ts.ckpt) take_ckpt_(slot, prefills[i].kv_pos + prefills[i].chunk);   // the header rung (Rule A)
             if (ts.preamble && !rc.capture_ids.empty()) capture_head_(slot);                       // the pinned head
         }
     }
-    const auto kvf_t_gr = kvf_clock::now();
     if (!settle_kvflash_(prefill_outputs)) return fail_step("KVFlash page-out failed");
-    if (kvf_) {   // LUCE_KVFLASH_STEP_TRACE=1: where a step's host time goes (ms), summed over 64 steps
-        static const bool trace = std::getenv("LUCE_KVFLASH_STEP_TRACE") != nullptr;
-        thread_local double sum[5] = {0, 0, 0, 0, 0}; thread_local int n = 0, ups = 0, dec = 0, pre = 0;   // per scheduler thread
-        if (trace) {
-            const auto t_end = kvf_clock::now();
-            sum[0] += kvf_ms(kvf_t0, kvf_t_run); sum[1] += kvf_ms(kvf_t_run, kvf_t_up);
-            sum[2] += kvf_ms(kvf_t_up, kvf_t_gr); sum[3] += kvf_ms(kvf_t_gr, t_end); sum[4] += kvf_ms(kvf_t0, t_end);
-            ups += kvf_uploads; dec += (int)decode_outputs.size(); pre += (int)prefills.size();
-            if (++n == 64) {
-                std::fprintf(stderr, "[kvflash-trace] 64 steps: run_step %.1f upload %.1f graph+readback %.1f settle %.1f total %.1f ms; column uploads %d decode rows %d prefill cuts %d\n",
-                             sum[0], sum[1], sum[2], sum[3], sum[4], ups, dec, pre);
-                for (double & x : sum) x = 0;
-                n = ups = dec = pre = 0;
-            }
-        }
-    }
     return result;
 }
 
@@ -3879,9 +3839,9 @@ void Qwen35SeqEngine::retire_(int slot, bool reply_first) {
         trunk_[(size_t)slot] = SlotCkpt{};
         extra_[(size_t)slot] = SlotCkpt{};
         std::vector<int32_t> history;
-        if (sticky_on_ && !tainted && slots_.park_session(slot, history)) {   // the KV and the recurrent state stay in the slot
+        if (!tainted && slots_.park_session(slot, history)) {   // the KV and the recurrent state stay in the slot
             const int fed = (int)history.size();
-            const int P = kvflash_park_point(fed, stash_pos, ckpt.pos, std::max(trunk.pos, extra.pos), park_tail_);
+            const int P = kvflash_park_point(fed, stash_pos, ckpt.pos, std::max(trunk.pos, extra.pos), kKvFlashParkTail);
             if (P < fed) {   // one token short: the rows, the state and the history all stop at P
                 if (!kvf_kv_->truncate_parked(slot, (uint32_t)P) ||
                     !slot_state_stash_copy(b_.target_backend_, b_.cache_, stash_, slot, false)) {

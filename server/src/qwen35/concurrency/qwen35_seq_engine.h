@@ -339,7 +339,7 @@ private:
     // slots, emptied when the slot's session leaves or another begins. Host memory outside the slot ledger,
     // as the serial engine's stores are.
     KvFlashUqSlots uq_store_;
-    // Sticky sessions (LUCE_KVFLASH_SLOT_STICKY, on by default with KVFlash slots). A retired slot keeps its KV and
+    // Sticky sessions (always on with KVFlash slots). A retired slot keeps its KV and
     // recurrent state parked in place; a prompt that extends its history resumes it where it parked.
     // The recurrent state cannot be sliced back, so a prompt that diverges inside the history (the client re-renders
     // the reply from text) resumes at a rung: a recurrent state saved at an earlier position (kvflash_slot_turn.h
@@ -370,7 +370,6 @@ private:
     static KvFlashLadder ladder_of_(const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex) { return {ck.pos, tr.pos, ex.pos, ex.pos > 0 && ex.pinned}; }
     // Moves the slabs of a ladder step (kvflash_ladder_resume / _ckpt) into place; a slab two rungs name is shared.
     static void apply_ladder_(const KvFlashLadderMove & m, SlotCkpt & ck, SlotCkpt & tr, SlotCkpt & ex, SlotCkpt live);
-    int end_rung_min_ = -1;                           // LUCE_KVFLASH_END_RUNG_MIN: a recall turn's header rung when end - R reaches it; -1 off
     bool header_rung_ = false;                        // LUCE_KVFLASH_HEADER_RUNG=1 (L4): a recall turn's replay checkpoints at its last cut at or before the header; 0 off
     void place_ckpt_(int slot, SlotCkpt nu);          // Rule A with a slab in hand (the R rung)
     void take_ckpt_(int slot, int pos);               // Rule A with the slot's state now (the header rung)
@@ -414,13 +413,10 @@ private:
     void log_bundle_digest_(const char * tag, int slot, const std::string & key, uint32_t gen, const std::vector<int32_t> & history, const SlotStateSnapshot & slab,
                             const SlotCkpt & ck, const SlotCkpt & tr, const SlotCkpt & ex, const std::vector<const KvFlashUqStore *> & uq, std::chrono::steady_clock::time_point t0);
     uint64_t park_tick_ = 0;
-    bool sticky_on_ = false;
-    // G-D: park one token short (kvflash_park_point). The decode step stashes each live slot's recurrent
-    // state before it feeds the slot's token; stash_pos_[slot] is the token count that state covers (-1: none).
+    // Park short (kvflash_park_point): a prefill-only turn parks kKvFlashParkTail tokens short (R's replay window is 4).
+    static constexpr int kKvFlashParkTail = 4;
     SlotStateStash stash_;
-    bool park_short_on_ = false;                      // LUCE_KVFLASH_PARK_SHORT=0 turns it off
-    bool park_decode_on_ = false;                     // LUCE_KVFLASH_PARK_DECODE=1: stash before every decode step too
-    int park_tail_ = 4;                               // LUCE_KVFLASH_PARK_TAIL: a prefill-only turn parks this many tokens short (R's replay window is 4)
+    bool park_short_on_ = false;
     std::vector<int> stash_pos_;
     AdmitResult admit_sticky_(uint64_t request_id, const std::vector<int32_t> & prompt, const SamplerCfg & sampler,
                               int64_t total, const AdmitMeta & meta);

@@ -27,7 +27,7 @@ using Skip = KvFlashRecallSkip;
 KvFlashSlotTurn first_pass_turn() {
     KvFlashSlotTurn t;
     t.phase = KvFlashTurnPhase::FirstPass; t.m4 = true;
-    t.kv_offset = 6336; t.r = 6500; t.end = 6700; t.reserve_chunks = 5; t.ckpt = 6690; t.end_rung = true; t.header_rung = true;
+    t.kv_offset = 6336; t.r = 6500; t.end = 6700; t.reserve_chunks = 5; t.ckpt = 6690; t.header_rung = true;
     t.cuts = {6500, 6600, 6700};
     return t;
 }
@@ -70,7 +70,6 @@ TEST_CASE(KvflashSlotM4Fixture, single_turn_is_one_pass_applied_at_the_resume_po
     CHECK(!t.snapshot_at_r());
     CHECK(t.apply_at == 6336);
     CHECK(t.cuts.empty());
-    CHECK(!t.end_rung);
     CHECK(!t.header_rung);
     CHECK(t.track_tail);
     CHECK(t.reserve_chunks == (6700 - 6336 + CT - 1) / CT + 1);   // room for the one pass, not the replay

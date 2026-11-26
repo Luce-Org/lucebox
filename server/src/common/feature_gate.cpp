@@ -304,14 +304,8 @@ std::string check_feature_compatibility(
                    "only for concurrent dense Qwen3.5 serving "
                    "(--max-concurrency > 1)";
         }
-        if (admission.fixed_kvflash_requested() && !luce::common::kvflash_concurrent_test_switch()) {
-            return "--paged-attention cannot be combined with KVFlash";
-        }
-        // Stage C: a draft beside the concurrent KVFlash arena is the DFlash2 chain slice, opt-in.
-        if (admission.fixed_kvflash_requested() && args.draft_path.has_value() &&
-            !luce::common::kvflash_chain_spec_switch()) {
-            return "--paged-attention with KVFlash and a draft model requires LUCE_KVFLASH_CHAIN_SPEC=1 "
-                   "(concurrent DFlash2 chain verify, test-only)";
+        if (admission.fixed_kvflash_requested() && arch != "qwen35") {
+            return "--paged-attention with KVFlash is supported only for qwen35";
         }
         if (arch_is_deepseek4_family(arch)) {
             if (target_backend != PlacementBackend::Hip) {
