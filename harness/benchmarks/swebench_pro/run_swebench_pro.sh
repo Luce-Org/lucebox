@@ -3,14 +3,13 @@ set -euo pipefail
 
 # Run SWE-bench Pro via Harbor against a running luce_server endpoint.
 #
-# Defaults target the curated 24-task long-horizon slice on Harbor's built-in
-# `scale-ai/swe-bench-pro` dataset using `terminus-2` (runs on the host, so it
-# reaches 127.0.0.1 directly with zero container networking setup).
-#
-# For in-container agents (`opencode`, `claude-code`, `codex`, `pi`, `hermes`,
-# `mini-swe-agent`), start `luce_server` with `--host 0.0.0.0`; this launcher
-# automatically adds `docker-compose.host-gateway.yaml` and routes requests
-# through `host.docker.internal` on Linux Docker hosts.
+# Defaults match Lucebox's Terminal-Bench 4.0 setup (`mini-swe-agent` 2.2.4,
+# `cost_limit: 0`, `step_limit: 0`, stock `mini.yaml`, `openai_chat_completions`)
+# on the curated 24-task long-horizon slice. Start `luce_server` with
+# `--host 0.0.0.0`; for in-container agents this launcher automatically routes
+# through `host.docker.internal` (with `docker-compose.host-gateway.yaml`) or an
+# explicit `SERVER_HOST` (e.g. Docker bridge `172.17.0.1`) and allowlists it on
+# V2's offline `no-network` tasks.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -19,7 +18,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 : "${DATASET:=scale-ai/swe-bench-pro}"
 : "${TASKS_PATH:=}"
 : "${SLICE_FILE:=$SCRIPT_DIR/long_horizon_24.txt}"
-: "${AGENT:=terminus-2}"
+: "${AGENT:=mini-swe-agent}"
+: "${AGENT_VERSION:=2.2.4}"
+: "${MINI_SWE_CONFIG:=$SCRIPT_DIR/mini-swe-agent.yaml}"
 : "${MODEL:=Qwen3.8-27B}"
 : "${SERVER_HOST:=127.0.0.1}"
 : "${SERVER_PORT:=8000}"
@@ -96,6 +97,15 @@ if [[ -n "$LIMIT" ]]; then
 fi
 
 cmd+=(-a "$AGENT" -n "$CONCURRENCY" -o "$JOBS_DIR" --job-name "$JOB_NAME")
+
+if [[ "$AGENT" == "mini-swe-agent" ]]; then
+  if [[ -n "$AGENT_VERSION" ]]; then
+    cmd+=(--ak "version=${AGENT_VERSION}")
+  fi
+  if [[ -n "$MINI_SWE_CONFIG" ]]; then
+    cmd+=(--ak "config_file=${MINI_SWE_CONFIG}")
+  fi
+fi
 
 if [[ "$AGENT" != "oracle" && "$AGENT" != "nop" ]]; then
   fmt="${API_FORMAT:-$(default_api_format "$AGENT")}"

@@ -36,14 +36,22 @@ for id in "${ids[@]}"; do
   fi
 done
 
-# 2. Default terminus-2 host-side invocation uses 127.0.0.1 and no host-gateway overlay.
+# 2. Default mini-swe-agent 2.2.4 matches TB4 config, maps 127.0.0.1 -> host.docker.internal.
 out="$(HARBOR_BIN="$FAKE_HARBOR" "$LAUNCHER")"
 grep -q -- '-d scale-ai/swe-bench-pro' <<<"$out"
-grep -q -- '-a terminus-2' <<<"$out"
+grep -q -- '-a mini-swe-agent' <<<"$out"
+grep -q -- '--ak version=2.2.4' <<<"$out"
+grep -q -- '--ak config_file=.*mini-swe-agent.yaml' <<<"$out"
 grep -q -- '-m openai/Qwen3.8-27B' <<<"$out"
-grep -q -- '--base-url http://127.0.0.1:8000/v1' <<<"$out"
+grep -q -- '--base-url http://host.docker.internal:8000/v1' <<<"$out"
 grep -q -- '--api-format openai_chat_completions' <<<"$out"
+grep -q -- '--extra-docker-compose .*docker-compose.host-gateway.yaml' <<<"$out"
 grep -q -- 'OPENAI_API_KEY=lucebox' <<<"$out"
+
+# 2b. Host-side terminus-2 uses 127.0.0.1 and no host-gateway overlay.
+out="$(HARBOR_BIN="$FAKE_HARBOR" AGENT=terminus-2 "$LAUNCHER")"
+grep -q -- '-a terminus-2' <<<"$out"
+grep -q -- '--base-url http://127.0.0.1:8000/v1' <<<"$out"
 if grep -q -- 'docker-compose.host-gateway.yaml' <<<"$out"; then
   echo "terminus-2 should not require host-gateway compose overlay" >&2
   exit 1
@@ -66,6 +74,15 @@ grep -q -- '--api-format anthropic_messages' <<<"$out"
 grep -q -- '--allow-agent-host host.docker.internal' <<<"$out"
 grep -q -- 'ANTHROPIC_API_KEY=lucebox' <<<"$out"
 grep -q -- '--dry-run' <<<"$out"
+
+# 4b. Explicit Docker bridge SERVER_HOST on V2 skips host-gateway overlay and allowlists IP.
+out="$(HARBOR_BIN="$FAKE_HARBOR" TASKS_PATH=/tmp/v2/tasks SERVER_HOST=172.17.0.1 "$LAUNCHER")"
+grep -q -- '--base-url http://172.17.0.1:8000/v1' <<<"$out"
+grep -q -- '--allow-agent-host 172.17.0.1' <<<"$out"
+if grep -q -- 'docker-compose.host-gateway.yaml' <<<"$out"; then
+  echo "explicit bridge IP should not require host-gateway compose overlay" >&2
+  exit 1
+fi
 
 # 5. Oracle skips model/auth flags.
 out="$(HARBOR_BIN="$FAKE_HARBOR" AGENT=oracle LIMIT=1 "$LAUNCHER")"

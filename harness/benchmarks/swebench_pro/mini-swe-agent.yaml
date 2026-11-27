@@ -1,0 +1,6 @@
+# Matches Lucebox's Terminal-Bench 4.0 mini-swe-agent 2.2.4 config (mix-mini.yaml):
+# mini-swe-agent drops `--cost-limit 0` (`or UNSET`) and keeps mini.yaml's $3 cap,
+# so unlimited cost/steps must be passed via config file.
+agent:
+  cost_limit: 0
+  step_limit: 0
