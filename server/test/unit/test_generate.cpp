@@ -81,7 +81,7 @@ static bool build_step_graph(
     if (!sg.ctx) return false;
 
     const int n_tokens = 1;
-    const int hidden = LUCE_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_input(sg.inp_embed);
@@ -266,7 +266,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> all_tokens = prompt;
     all_tokens.reserve(prompt.size() + n_gen);
 
-    const int hidden = LUCE_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     std::vector<float> embed_buf(hidden);
 
     GenerateStepGraph sg;
@@ -298,7 +298,7 @@ int main(int argc, char ** argv) {
         }
 
         // argmax on logits
-        const int vocab = LUCE_TARGET_VOCAB;
+        const int vocab = w.n_vocab;
         std::vector<float> logits(vocab);
         ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
         int best = 0;
