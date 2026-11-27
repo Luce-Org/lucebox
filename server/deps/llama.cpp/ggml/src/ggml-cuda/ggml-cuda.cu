@@ -6413,10 +6413,11 @@ static void ggml_cuda_q8_memo_for_producer(ggml_backend_cuda_context & ctx, cons
     // Only MMVQ reads the memo, keyed on the row length it reads, and no MUL_MAT wider than MMVQ's column limit (a
     // prompt chunk) reads it, so it gets no entry (it would cost the writes and hold its buffer until the evaluation
     // ends). The width test covers every reader of the rows, not just this one: a later matmul of another weight type
-    // may still take MMVQ at decode widths. Rows reshaped longer ([D, H, T] read as [D*H, T], the qwen4exp GDN output
-    // into ssm_out) match when D*H needs no padding: MMVQ's rows are then the producer's unpadded rows in order.
+    // may still take MMVQ at decode widths. Rows reshaped longer ([D, H, T] read as [D*H, T], the GDN gated output
+    // into ssm_out in the qwen35 and qwen4exp graphs) match when D*H needs no padding: MMVQ's rows are then the
+    // producer's unpadded rows in order.
     const int64_t K = c->src[1]->ne[0];
-    const bool flat = K != t->ne[0] && ggml_cuda_qwen4exp_graph() && c->op == GGML_OP_MUL_MAT &&
+    const bool flat = K != t->ne[0] && c->op == GGML_OP_MUL_MAT &&
                       K % t->ne[0] == 0 && K % MATRIX_ROW_PADDING == 0;
     if ((K != t->ne[0] && !flat) ||
         (c->op == GGML_OP_MUL_MAT && c->src[1]->ne[1] > ggml_cuda_mmvq_max_ncols())) return;

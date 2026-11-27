@@ -411,8 +411,8 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
     }
 
     // ── The same gated unary where MMVQ would not read its q8_1 rows: no entry, no writes ──────────────────────────
-    // [D, H, T] rows read as [D*H, T] (the GDN gated output into ssm_out) miss MMVQ's key, and at prefill widths the
-    // matmul takes another kernel that quantizes for itself.
+    // [D, H, T] rows read as [D*H, T] (the GDN gated output into ssm_out) miss MMVQ's key when D*H needs row padding,
+    // and at prefill widths the matmul takes another kernel that quantizes for itself.
     void unary_mul_unread_q8(ggml_backend_t be, int D, int H, int T) {
         const std::string name = "unary_mul_unread_q8 D=" + std::to_string(D) + " H=" + std::to_string(H) +
                                  " T=" + std::to_string(T);
@@ -610,11 +610,12 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         check(be, name, p, {}, Expect{{GGML_CUDA_QN_HC_MIX_RDNA4, fuses ? 1 : 0}}, reset);
     }
 
-    // ── The same gated unary in a qwen4exp graph: [D, H, T] rows read as [D*H, T] get their q8_1 rows when D*H needs
-    // no row padding (MMVQ's rows are then the producer's in order); otherwise, or at prefill widths, none ─────────
-    void unary_mul_long_rows_q8(ggml_backend_t be, int D, int H, int T, size_t fused) {
+    // ── The same gated unary, with or without the qwen4exp profile (qwen35 decode runs without it): [D, H, T] rows
+    // read as [D*H, T] get their q8_1 rows when D*H needs no row padding (MMVQ's rows are then the producer's in
+    // order); otherwise, or at prefill widths, none ────────────────────────────────────────────────────────────────
+    void unary_mul_long_rows_q8(ggml_backend_t be, int D, int H, int T, size_t fused, bool profile) {
         const std::string name = "unary_mul_long_rows_q8 D=" + std::to_string(D) + " H=" + std::to_string(H) +
-                                 " T=" + std::to_string(T);
+                                 " T=" + std::to_string(T) + (profile ? " qwen4exp" : " qwen35");
         const int N = 2560;
         Pattern p;
         ggml_tensor * x = p.input(GGML_TYPE_F32, D, H, T);
@@ -626,7 +627,7 @@ struct QnSplitFusionsFixture : CppUnitTestFramework::CommonFixture {
         p.output(mm);
         if (!p.alloc(be)) { fail(name + ": alloc"); return; }
         p.fill_rest();
-        const Profile prof(true);
+        const Profile prof(profile);
         const Invariant inv(true);
         check(be, name, p, {p.index_of(mm)}, GGML_CUDA_QN_UNARY_MUL_Q8, fused);
     }
@@ -1266,16 +1267,18 @@ TEST_CASE(QnSplitFusionsFixture, unary_mul_q8) {
 
 TEST_CASE(QnSplitFusionsFixture, unary_mul_unread_q8) {
     each_gpu([&](ggml_backend_t be) {
-        for (int T : {1, 4}) unary_mul_unread_q8(be, 128, 32, T);
+        for (int T : {1, 4}) unary_mul_unread_q8(be, 128, 3, T);   // 384-wide rows: MMVQ pads them
         unary_mul_unread_q8(be, 4096, 1, 64);
     });
 }
 
 TEST_CASE(QnSplitFusionsFixture, unary_mul_long_rows_q8) {
     each_gpu([&](ggml_backend_t be) {
-        for (int T : {1, 4}) unary_mul_long_rows_q8(be, 128, 32, T, 1);
-        unary_mul_long_rows_q8(be, 128, 3, 4, 0);    // 384-wide rows: MMVQ pads them
-        unary_mul_long_rows_q8(be, 128, 32, 64, 0);  // prefill width: not MMVQ
+        for (bool profile : {false, true}) {
+            for (int T : {1, 4}) unary_mul_long_rows_q8(be, 128, 32, T, 1, profile);
+            unary_mul_long_rows_q8(be, 128, 3, 4, 0, profile);    // 384-wide rows: MMVQ pads them
+            unary_mul_long_rows_q8(be, 128, 32, 64, 0, profile);  // prefill width: not MMVQ
+        }
     });
 }
 
