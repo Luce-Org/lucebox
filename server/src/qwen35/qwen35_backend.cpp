@@ -444,7 +444,7 @@ bool Qwen35Backend::init() {
         kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
         kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
     }
-    if (std::getenv("LUCE_KVFLASH") && !kvflash_qk_policy_) {
+    if (std::getenv("LUCE_KVFLASH") && (!kvflash_qk_policy_ || kvflash_prefill_reselect_ == 5)) {
         kvflash_drafter_path_ = kvflash_find_drafter(
             cfg_.target_path.c_str());
     }
@@ -2766,7 +2766,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // Full prompt ids [0, kv_offset + prompt_len) for the gated preamble pin / user-question capture
     // (empty when the restored prefix is not known, or both features are off).
     std::vector<int32_t> kvf_ids;
-    if (kvflash_active() && (kvflash_preamble_rows_ > 0 || kvflash_uq_queries_ > 0) &&
+    if (kvflash_active() && (kvflash_preamble_rows_ > 0 || kvflash_uq_queries_ > 0 || kvflash_prefill_reselect_ == 5) &&
         (kv_offset == 0 || (full_prompt && (int)full_prompt->size() >= kv_offset)))
         kvf_ids = kvflash_restore_history(tokens, kv_offset, full_prompt);
     if (kvf_paged) {
@@ -3423,7 +3423,9 @@ bool Qwen35Backend::kvflash_load_drafter() {
     if (draft_backend_) ggml_backend_synchronize(draft_backend_);
     std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
                  kvflash_drafter_path_.c_str());
-    drafter_ctx_.asset_mode = DrafterAssetMode::SkipAll;
+    drafter_ctx_.asset_mode = (kvflash_prefill_reselect_ == 5)
+        ? DrafterAssetMode::RequireAll
+        : DrafterAssetMode::SkipAll;
     if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
                       cfg_.device.gpu, drafter_ctx_)) {
         std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
@@ -3485,14 +3487,36 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
             p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
             luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
         using Skip = luce::common::KvFlashRecallSkip;
-        if (kvflash_prefill_reselect_ == 4 && p4.run) {
-            s.m4_track = kvflash_m4_single_ && (int)kvf_ids.size() == end_abs;
+        if ((kvflash_prefill_reselect_ == 4 || kvflash_prefill_reselect_ == 5) && p4.run) {
+            s.m4_track = kvflash_prefill_reselect_ == 4 && kvflash_m4_single_ && (int)kvf_ids.size() == end_abs;
             if (gate.skip == Skip::Fits) {
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=%d: skip, fits (%d chunks + %d reserve <= %d blocks)\n",
                              kvflash_prefill_reselect_, (p4.r + ctk - 1) / ctk, gate.reserve, kvflash_pager_.n_pool_blocks());
             } else if (gate.skip != Skip::None) {
-                std::fprintf(stderr, "[kvflash] prefill reselect mode=4: skip, %s (LRU)\n",
+                std::fprintf(stderr, "[kvflash] prefill reselect mode=%d: skip, %s (LRU)\n",
+                             kvflash_prefill_reselect_,
                              gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R" : "pool too small for the recall plan");
+            } else if (kvflash_prefill_reselect_ == 5) {
+                if (!kvf_ids.empty() && kvflash_load_drafter()) {
+                    const auto t_m5 = std::chrono::steady_clock::now();
+                    KvFlashPFlash2Scorer::Roles roles{
+                        w_.im_start_id, w_.user_id, w_.newline_id, w_.im_end_id,
+                        w_.tool_response_id, w_.assistant_id, w_.system_id};
+                    KvFlashPFlash2Scorer scorer(&drafter_ctx_, roles);
+                    std::vector<float> m5_scores;
+                    if (scorer.score_chunks(kvf_ids, ctk, m5_scores)) {
+                        kvflash_scores_ = std::move(m5_scores);
+                        s.m5_r = p4.r;
+                        s.m5_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_m5).count();
+                        s.apply_note = "; pflash-v3-rerank";
+                        std::fprintf(stderr, "[kvflash] prefill reselect mode=5: R5=%d (end %d, %d segs, %.1f ms%s)\n",
+                                     s.m5_r, end_abs, scorer.last_segments(), s.m5_ms, s.apply_note);
+                    } else {
+                        std::fprintf(stderr, "[kvflash] prefill reselect mode=5: pflash2 scoring failed (LRU)\n");
+                    }
+                } else {
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=5: drafter or prompt ids unavailable (LRU)\n");
+                }
             } else {
                 // A turn under the same human question runs once: from the last exact scores when they cover every
                 // recall candidate, else after a scoring with the queries the last request left (kvflash_m4_reuse.h).
@@ -3810,7 +3834,7 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     for (int b : picked) ids += (ids.empty() ? "" : ",") + std::to_string(b);
     std::fprintf(stderr, "[kvflash] prefill reselect mode=%d scorer=%s k=%d tail=%d @%d (q tok %d) "
                  "picked=[%s]: %d page events; %d in (%.1f MiB H2D) (resident %d/%d blocks) scorer %.1f ms%s\n",
-                 kvflash_prefill_reselect_, "exact",
+                 kvflash_prefill_reselect_, kvflash_prefill_reselect_ == 5 ? "pflash2" : "exact",
                  kvflash_recall_blocks_, tail, committed, q_tok, ids.c_str(), events,
                  (int)ins, (double)ins * (double)p.chunk_bytes() / 1048576.0,
                  p.resident_blocks(), p.n_pool_blocks(), score_ms, note);
@@ -3854,7 +3878,7 @@ int Qwen35Backend::kvflash_rewind_turn(const PrefixSnapshot & snap, bool zero_st
 }
 
 void Qwen35Backend::kvflash_maybe_reselect(int generated) {
-    if (kvflash_tau_ <= 0) return;
+    if (kvflash_tau_ <= 0 || kvflash_prefill_reselect_ == 4 || kvflash_prefill_reselect_ == 5) return;
     // Adaptive tau: a rescore costs ~0.11 ms per history token (full 0.6B
     // re-prefill; measured 0.9 s @8K, ~46 s bisected @256K), while decode
     // produces ~30 tok/s. Capping rescore overhead at ~15% of decode time
