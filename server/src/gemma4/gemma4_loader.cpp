@@ -530,10 +530,11 @@ void free_gemma4_weights(Gemma4Weights & w) {
 // ── Cache ──────────────────────────────────────────────────────────────
 
 bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
-                          int max_ctx, Gemma4Cache & out, int ctx_alloc) {
+                          int max_ctx, Gemma4Cache & out, int ctx_alloc,
+                          int max_forward_tokens) {
     return create_gemma4_cache_partial(
         backend, w, max_ctx, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out,
-        ctx_alloc);
+        ctx_alloc, max_forward_tokens);
 }
 
 bool create_gemma4_cache_partial(ggml_backend_t backend,
@@ -542,7 +543,11 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
                                   int layer_begin,
                                   int layer_end,
                                   Gemma4Cache & out,
-                                  int ctx_alloc) {
+                                  int ctx_alloc,
+                                  int max_forward_tokens) {
+    const int swa_size = gemma4_swa_capacity(w.sliding_window, max_ctx,
+                                            max_forward_tokens);
+    if (swa_size == 0) return false;
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0) layer_end = w.n_layer;
     if (layer_begin > layer_end || layer_end > w.n_layer) return false;
@@ -574,9 +579,9 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
     out.v.resize(w.n_layer, nullptr);
     out.kv_source.resize(w.n_layer);
 
-    // SWA layers use a ring buffer of size min(sliding_window, max_ctx).
-    const int swa_size = (w.sliding_window > 0 && w.sliding_window < max_ctx)
-                             ? w.sliding_window : max_ctx;
+    // The attention window and physical ring size are deliberately different:
+    // verification/prefill must not evict history needed by the first query,
+    // or by the next forward after rejected lookahead is discarded.
 
     // kvflash: FULL-attention layers at pool capacity; SWA ring buffers are
     // already bounded and stay at swa_size.
