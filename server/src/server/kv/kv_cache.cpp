@@ -440,9 +440,15 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         ? disk_.longest_prefix(prompt,
             mode == DiskPrefixCacheMode::Full ? nullptr : &scoped_lengths)
         : DiskPrefixCache::PrefixProbe{};
-    if (read_ && read_->owner != query.owner) drop_read();
-    if (probe.cur_pos > plan.restore.tokens && probe.cur_pos == probe.len &&
-        probe.cur_pos < (int)prompt.size()) {
+    const bool wants_disk = probe.cur_pos > plan.restore.tokens &&
+        probe.cur_pos == probe.len && probe.cur_pos < (int)prompt.size();
+    if (wants_disk) {
+        // Another request's disk read is already in flight: do not cancel it
+        // (the scheduler holds loading requests in a side list so unrelated
+        // RAM-hit / cold requests can proceed without head-of-line blocking).
+        if (read_ && read_->owner != query.owner) {
+            return PlanStatus::loading;
+        }
         if (!read_) {
             read_.emplace();
             read_->owner = query.owner;

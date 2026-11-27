@@ -239,6 +239,11 @@ struct SchedulerTestHarness {
         return server.residency_release(gpus, error);
     }
     static ServerJob * try_dequeue(HttpServer & server) { return server.try_dequeue(); }
+    static ServerJob * try_dequeue_prefix_aware(
+            HttpServer & server, const std::function<int(const ServerJob *)> & score,
+            int max_scan, uint32_t max_skips, int min_gain) {
+        return server.try_dequeue_prefix_aware(score, max_scan, max_skips, min_gain);
+    }
     static void refresh_residency(HttpServer & server) { server.refresh_residency(); }
     static json residency_info(HttpServer & server) {
         std::lock_guard<std::mutex> lk(server.residency_info_mu_);
@@ -15849,6 +15854,10 @@ public:
     StepPlanLimits step_plan_limits(int) const override {
         return {2, 64, 128, 64};
     }
+    KvPoolTokens kv_pool_tokens() const override { return {pool_tokens, pool_tokens}; }
+    std::atomic<bool> busy{false};   // admissions find no KV room
+    std::atomic<int> pool_tokens{0};
+    std::atomic<int> busy_restores{0};  // restoring admissions turned away
     AdmitResult admit(uint64_t id, const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override {
         return admit_with_prefix(id, prompt, sampler, PrefixStorePlan{});
@@ -15861,7 +15870,8 @@ public:
         for (int i = 0; i < (int)slots_.size(); ++i) {
             if (!slots_[(size_t)i].active) { chosen = i; break; }
         }
-        if (prompt.empty() || chosen < 0) {
+        if (prompt.empty() || chosen < 0 || busy) {
+            if (busy && plan.restore.valid()) ++busy_restores;
             result.status = AdmitResult::Status::busy;
             return result;
         }
@@ -16017,6 +16027,105 @@ TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_eviction_and_restore) 
     SchedulerTestHarness::flush_sessions(server);
     TEST_ASSERT(disk.stats().pending_files == 0);
     TEST_ASSERT(disk.longest_prefix({1, 300, 3, 301, 4, 9}).len == 3);
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// A request whose disk read finishes while another one waits for KV room
+// must not take the waiting one's place: both are answered once room frees.
+TEST_CASE(ServerUnitFixture, test_disk_read_ready_while_deferred_keeps_the_deferred_job) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_deferred_disk").string();
+    rm_rf(dir);
+
+    bool seeded = true, turned_away = false, served = false;
+    std::vector<std::string> wires;
+    {
+        auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+        DiskCheckpointBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(dir);
+        config.arch = "qwen35";
+        config.max_ctx = 64;
+        config.prefix_cache_cap = 2;  // a third conversation evicts the first to disk
+        config.concurrent_prefix_cache_max_bytes = 4096;
+        config.concurrent_prefix_cache = true;
+        config.admission_coalesce_ms = 0;
+        HttpServer server(engine, tokenizer, config);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        TEST_ASSERT(!disk.disabled());
+
+        std::vector<std::unique_ptr<ServerJob>> jobs;
+        std::vector<int> clients;
+        const auto make_job = [&](std::vector<int32_t> prompt, const char * id) {
+            int sockets[2] = {-1, -1};
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+            clients.push_back(sockets[1]);
+            auto job = std::make_unique<ServerJob>();
+            job->fd = sockets[0];
+            job->req.format = ApiFormat::OPENAI_CHAT;
+            job->req.prompt_tokens = std::move(prompt);
+            job->req.max_output = 1;
+            job->req.stream = false;
+            job->req.model = "scheduler-test";
+            job->req.response_id = id;
+            jobs.push_back(std::move(job));
+            return jobs.back().get();
+        };
+        const auto wait_done = [](ServerJob * job) {
+            std::unique_lock<std::mutex> lock(job->mu);
+            return job->cv.wait_for(lock, std::chrono::seconds(5), [&] { return job->done; });
+        };
+        std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+        for (const auto & [prompt, id] : std::vector<std::pair<std::vector<int32_t>, const char *>>{
+                 {{1, 100, 3, 101, 4}, "a"}, {{1, 200, 3, 201, 4}, "b"}, {{1, 300, 3, 301, 4}, "c"}}) {
+            ServerJob * job = make_job(prompt, id);
+            SchedulerTestHarness::enqueue(server, job);
+            seeded = wait_done(job) && seeded;
+        }
+        disk.drain();
+
+        backend.engine.busy = true;
+        backend.engine.pool_tokens = 64;
+        // A long prompt is deferred; a short one backfills behind it, finds its
+        // prefix on disk and waits for the read.
+        std::vector<int32_t> long_prompt = {1, 700, 3};
+        long_prompt.insert(long_prompt.end(), 30, 701);
+        long_prompt.push_back(4);
+        ServerJob * deferred = make_job(long_prompt, "deferred");
+        SchedulerTestHarness::enqueue(server, deferred);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ServerJob * from_disk = make_job({1, 100, 3, 101, 4, 9, 2, 3, 102, 4}, "from-disk");
+        SchedulerTestHarness::enqueue(server, from_disk);
+        // Its read is done and its admission came back busy, with KV still full.
+        const auto read_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (backend.engine.busy_restores == 0 && std::chrono::steady_clock::now() < read_by) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        turned_away = backend.engine.busy_restores > 0;
+        backend.engine.busy = false;
+        served = wait_done(from_disk) && wait_done(deferred);
+        SchedulerTestHarness::stop(server);
+        scheduler.join();
+        for (size_t i = 3; i < clients.size(); ++i) {
+            std::string wire;
+            char buf[4096];
+            for (ssize_t n; (n = ::recv(clients[i], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
+                wire.append(buf, (size_t) n);
+            }
+            wires.push_back(std::move(wire));
+        }
+        for (const auto & job : jobs) close(job->fd);
+        for (const int fd : clients) close(fd);
+    }
+
+    TEST_ASSERT(seeded && turned_away && served);
+    for (const std::string & wire : wires) {
+        TEST_ASSERT_MSG(wire.rfind("HTTP/1.1 200 ", 0) == 0 &&
+                            wire.find("HTTP/1.1 ", 1) == std::string::npos, wire);
+    }
     rm_rf(dir);
     unlink(path.c_str());
 }
@@ -21935,4 +22044,225 @@ TEST_CASE(ServerUnitFixture, test_inkling2_chat_boundaries_and_pflash_unified_se
     TEST_ASSERT(tool_run.served_text[0].find("<|message_tool|>read_file<|content_text|>") != std::string::npos);
     TEST_ASSERT(ends_with(tool_run.served_text[0], "<|end_message|>"));
     TEST_ASSERT(tp.tokens.size() < tool_run.ids[0].size());
+}
+
+// Prefix-leader disconnect handoff: when a prefilling slot disconnects while
+// another request is waiting on its in-flight shared-prefix capture, the
+// scheduler finishes the capture as an orphaned leader so the waiter restores
+// the newly committed checkpoint instead of restarting prefill from scratch.
+TEST_CASE(ServerUnitFixture, test_prefix_leader_disconnect_handoff_serves_waiter) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    struct MultiStepPrefixEngine final : SeqEngine {
+        DiskPayloadBackend & backend;
+        std::mutex mu;
+        std::condition_variable cv;
+        bool hold_first_chunk = true;
+        int prefill_steps = 0;
+        std::vector<PrefixStoreRef> restores;
+        struct Slot {
+            bool active = false;
+            int chunks_done = 0;
+            PrefixCaptureTicket capture;
+        };
+        std::vector<Slot> slots{2};
+
+        explicit MultiStepPrefixEngine(DiskPayloadBackend & b) : backend(b) {}
+        int slot_count() const override { return 2; }
+        int max_context() const override { return 64; }
+        bool supports_prefix_store() const override { return true; }
+        bool prefix_store_in_backend_snapshots() const override { return true; }
+        size_t estimate_prefix_store_bytes(int) const override { return 256; }
+        bool token_is_eos(int32_t token) const override { return token == 2; }
+        StepPlanLimits step_plan_limits(int) const override { return {2, 2, 4, 2}; }
+        AdmitResult admit(uint64_t id, const std::vector<int32_t> & p, const SamplerCfg & s) override {
+            return admit_with_prefix(id, p, s, {});
+        }
+        AdmitResult admit_with_prefix(uint64_t, const std::vector<int32_t> & prompt,
+                                      const SamplerCfg &, const PrefixStorePlan & plan) override {
+            std::lock_guard<std::mutex> lk(mu);
+            AdmitResult r;
+            int chosen = -1;
+            for (int i = 0; i < 2; ++i) if (!slots[(size_t)i].active) { chosen = i; break; }
+            if (prompt.empty() || chosen < 0) { r.status = AdmitResult::Status::busy; return r; }
+            slots[(size_t)chosen] = Slot{true, 0, {}};
+            r.status = AdmitResult::Status::admitted;
+            r.slot = chosen;
+            if (plan.restore.valid()) {
+                r.prefix_store.restore_attempted = true;
+                const int idx = (int)plan.restore.id - 1;
+                if (backend.snapshot_cur_pos(idx) == plan.restore.tokens) {
+                    r.prefix_store.restored = plan.restore;
+                    restores.push_back(plan.restore);
+                } else {
+                    r.prefix_store.invalidated = plan.restore;
+                }
+            }
+            if (!r.prefix_store.invalidated.valid() && plan.capture.valid()) {
+                slots[(size_t)chosen].capture = plan.capture;
+                r.prefix_store.capture = plan.capture;
+            }
+            cv.notify_all();
+            return r;
+        }
+        StepResult step(const StepPlan & plan) override {
+            std::unique_lock<std::mutex> lk(mu);
+            StepResult res;
+            for (const StepInput & in : plan.decode) res.decode.push_back({in.slot, 2, false, {}});
+            for (const PrefillSlice & sl : plan.prefills) {
+                Slot & s = slots[(size_t)sl.slot];
+                ++s.chunks_done;
+                ++prefill_steps;
+                PrefillOutput out;
+                out.slot = sl.slot;
+                if (hold_first_chunk && s.chunks_done == 1 && s.capture.valid()) {
+                    out.status = PrefillOutput::Status::advanced;
+                    cv.notify_all();
+                    cv.wait_for(lk, std::chrono::seconds(5), [&] { return !hold_first_chunk; });
+                } else {
+                    out.status = PrefillOutput::Status::completed;
+                    out.token = 2;
+                    if (s.capture.valid()) {
+                        const int idx = (int)s.capture.checkpoint.id - 1;
+                        backend.slots[idx] = DiskPayloadBackend::make(s.capture.checkpoint.tokens);
+                        out.prefix_store.status = PrefixStoreEvent::Status::saved;
+                        out.prefix_store.ticket = s.capture;
+                        out.prefix_store.bytes = 256;
+                        s.capture = {};
+                    }
+                }
+                res.prefills.push_back(std::move(out));
+            }
+            cv.notify_all();
+            return res;
+        }
+        void retire(int slot) override {
+            std::lock_guard<std::mutex> lk(mu);
+            slots[(size_t)slot] = Slot{};
+            cv.notify_all();
+        }
+        void discard_prefix_store(PrefixStoreRef cp) override { backend.drop((int)cp.id - 1); }
+    };
+    struct HandoffBackend : DiskPayloadBackend {
+        MultiStepPrefixEngine engine{*this};
+        SeqEngine * seq_engine() override { return &engine; }
+    };
+
+    auto backend_owner = std::make_unique<HandoffBackend>();
+    HandoffBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 4;
+    config.concurrent_prefix_cache = true;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.admission_coalesce_ms = 0;
+    config.shared_prefix_wait_min_tokens = 2;
+    HttpServer server(engine, tokenizer, config);
+
+    auto make_job = [&](std::vector<int32_t> prompt, const char * id, int (&fds)[2]) {
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = fds[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+        return job;
+    };
+    int lf[2]{-1, -1}, wf[2]{-1, -1};
+    auto leader = make_job({1, 100, 3, 201, 4}, "leader", lf);
+    auto waiter = make_job({1, 100, 3, 301, 4}, "waiter", wf);
+
+    std::thread sched([&] { SchedulerTestHarness::run(server, backend.engine); });
+    SchedulerTestHarness::enqueue(server, leader.get());
+    {
+        std::unique_lock<std::mutex> lk(backend.engine.mu);
+        TEST_ASSERT(backend.engine.cv.wait_for(lk, std::chrono::seconds(5),
+            [&] { return backend.engine.prefill_steps >= 1; }));
+    }
+    SchedulerTestHarness::enqueue(server, waiter.get());
+    {
+        std::lock_guard<std::mutex> lk(backend.engine.mu);
+        backend.engine.hold_first_chunk = false;
+    }
+    leader->client_disconnected.store(true, std::memory_order_release);
+    backend.engine.cv.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lk(leader->mu);
+        TEST_ASSERT(leader->cv.wait_for(lk, std::chrono::seconds(5), [&] { return leader->done; }));
+    }
+    {
+        std::unique_lock<std::mutex> lk(waiter->mu);
+        TEST_ASSERT(waiter->cv.wait_for(lk, std::chrono::seconds(5), [&] { return waiter->done; }));
+    }
+    SchedulerTestHarness::stop(server);
+    sched.join();
+    for (int fd : {lf[0], lf[1], wf[0], wf[1]}) close(fd);
+    unlink(path.c_str());
+
+    TEST_ASSERT(backend.engine.restores.size() == 1);
+    TEST_ASSERT(backend.engine.restores[0].tokens == 3);
+}
+
+// The prefix-aware queue's score: the longest resident entry that is a strict
+// prefix of the prompt; a state-only entry without its KV does not count.
+TEST_CASE(ServerUnitFixture, test_fast_cached_prefix_len_scores_restorable_strict_prefix) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    PrefixCache cache(4, tokenizer);
+    std::vector<int32_t> warm_prefix(600, 10);
+    warm_prefix.front() = 1;
+    warm_prefix.back() = 3;
+    cache.confirm_inline_snap(0, 600, warm_prefix, /*protect=*/false, 4096);
+
+    std::vector<int32_t> warm_prompt = warm_prefix;
+    warm_prompt.push_back(42);
+    std::vector<int32_t> cold_prompt(605, 99);
+
+    TEST_ASSERT(cache.fast_cached_prefix_len(warm_prompt) == 600);
+    TEST_ASSERT(cache.fast_cached_prefix_len(warm_prefix) == 0);
+    TEST_ASSERT(cache.fast_cached_prefix_len(cold_prompt) == 0);
+
+    cache.mark_state_only(0, 128);
+    TEST_ASSERT(cache.fast_cached_prefix_len(warm_prompt) == 0);
+
+    unlink(path.c_str());
+}
+
+// A queued job whose cached prefix beats the head's by min_gain tokens goes
+// first, the head is passed over at most max_skips times, and taking the tail
+// keeps the queue linked.
+TEST_CASE(ServerUnitFixture, test_prefix_aware_dequeue_promotes_warm_job_with_bounded_skips) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    LuceEngine engine(std::make_unique<DiskCheckpointBackend>());
+    HttpServer server(engine, tokenizer, ServerConfig{});
+
+    ServerJob head, warm, cold, warmer, late;
+    const std::map<const ServerJob *, int> cached = {
+        {&head, 0}, {&warm, 600}, {&cold, 100}, {&warmer, 1000}, {&late, 700}};
+    const auto score = [&](const ServerJob * job) { return cached.at(job); };
+    const auto next = [&] {
+        return SchedulerTestHarness::try_dequeue_prefix_aware(server, score, 16, 2, 512);
+    };
+    for (ServerJob * job : {&head, &warm, &cold}) SchedulerTestHarness::enqueue(server, job);
+    TEST_ASSERT(next() == &warm);    // 600 >= 0 + 512
+    SchedulerTestHarness::enqueue(server, &warmer);
+    TEST_ASSERT(next() == &warmer);  // the tail
+    SchedulerTestHarness::enqueue(server, &late);
+    TEST_ASSERT(next() == &head);    // skipped twice already
+    TEST_ASSERT(next() == &late);    // 700 >= 100 + 512
+    TEST_ASSERT(next() == &cold);
+    TEST_ASSERT(SchedulerTestHarness::try_dequeue(server) == nullptr);
+    unlink(path.c_str());
 }

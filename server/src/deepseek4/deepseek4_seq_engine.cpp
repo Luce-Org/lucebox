@@ -638,6 +638,8 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     result.decode.reserve(inputs.size());
     result.prefills.reserve(plan.prefills.size());
 
+    SeqSlotManager::StagedAppends staged_rollback(slots_, inputs.size(), plan.prefills.size());
+
     for (const StepInput & input : inputs) {
         DecodeOutput out;
         out.slot = input.slot;
@@ -656,12 +658,14 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         if (append.new_block >= 0 &&
             !set_block(input.slot, append.new_block_index,
                        append.new_block)) {
+            slots_.rollback_step(input.slot);
             out.failed = true;
             out.error = "DeepSeek4 decode block-table update failed";
             decode_lanes.push_back(-1);
             result.decode.push_back(std::move(out));
             continue;
         }
+        staged_rollback.decode(input.slot);
         decode_lanes.push_back((int)lane_tokens.size());
         lane_tokens.push_back(input.token);
         lane_positions.push_back(append.position);
@@ -717,10 +721,12 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
                                   chunk.new_blocks[i]) && blocks_ok;
         }
         if (!blocks_ok) {
+            slots_.rollback_prefill(slice.slot, n_rows);
             fail_prefill(slice.slot, result.prefills,
                          "DeepSeek4 prefill block-table update failed");
             continue;
         }
+        staged_rollback.prefill(slice.slot, n_rows);
         const SeqSlot & slot = slots_.slot(slice.slot);
         const bool commit = slot.cur_pos == slot.prompt_len;
         // One gathered lane per prompt row, in chronological order. Only the
@@ -736,10 +742,17 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     }
 
     if (lane_tokens.empty()) {
+        staged_rollback.commit();
         report_captures(result.prefills);
         return result;
     }
+    // fail_step drops the prefill failures staging recorded (a staged image
+    // already erased, a K/V append): the step is clean only without them.
+    const bool staging_clean = std::none_of(
+        result.prefills.begin(), result.prefills.end(),
+        [](const PrefillOutput & out) { return out.status == PrefillOutput::Status::failed; });
     if (lane_tokens.size() > (size_t) DEEPSEEK4_MAX_GATHERED_ROWS) {
+        result.state_clean = staging_clean;
         return fail_step("DeepSeek4 gathered step exceeds sixteen rows");
     }
 
@@ -748,6 +761,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         (size_t)b_.w_.n_embd * lane_tokens.size());
     if (!b_.w_.embedder.embed(lane_tokens.data(), (int)lane_tokens.size(),
                               embeddings.data())) {
+        result.state_clean = staging_clean;
         return fail_step("DeepSeek4 token embedding failed");
     }
 
@@ -784,6 +798,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     // prefilling in the same step.
     const bool bucket_history = b_.moe_hybrid_ &&
         (plan.prefills.empty() || b_.w_.hc_staggered_pre);
+    staged_rollback.commit();
     if (!deepseek4_paged_gathered_step(
             b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
             embeddings.data(), lane_tokens.data(), lane_positions.data(),

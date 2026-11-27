@@ -1000,6 +1000,21 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    // Bounded prefix-aware dequeue: scans up to `max_scan` queued jobs when at
+    // least two jobs wait and the head has been skipped fewer than `max_skips`
+    // times, promoting a later job whose warm-prefix score beats the head by at
+    // least `min_gain` tokens. Falls back to strict FIFO otherwise.
+    ServerJob * try_dequeue_prefix_aware(
+        const std::function<int(const ServerJob *)> & score_fn,
+        int max_scan, uint32_t max_skips, int min_gain);
+    // Bounded backfill dequeue: returns the first queued non-image job within
+    // `max_scan` whose prompt is at most `max_prompt_tokens` long and that did
+    // not come back busy in deferred wait `wait`, or null.
+    ServerJob * try_dequeue_shorter_than(size_t max_prompt_tokens, int max_scan,
+                                         uint64_t wait);
+    // Return a job to the front of the queue (used when a backfilled job
+    // turns out busy).
+    void requeue_front(ServerJob * job);
     // The head of the queue whatever residency says. Only for the shutdown
     // drain, which answers the job without running it.
     ServerJob * take_queued_job();
@@ -1089,6 +1104,7 @@ private:
     bool send_error(SocketHandle fd, int status, const std::string & message);
     // --queue-limit reached: 503 with Retry-After, in the request's API shape.
     void send_queue_full(SocketHandle fd, const ParsedRequest & req);
+    std::string format_sse_headers() const;
     bool send_sse_headers(ServerJob * job);
 
     // Send raw bytes with stall detection.
@@ -1318,6 +1334,8 @@ struct ServerJob {
     // compression thread. When it was compressed, req.prompt_tokens holds the
     // served prompt and req.client_prompt_tokens the client prompt's size.
     bool          pflash_prepared = false;
+    uint32_t      queue_skips = 0;  // prefix-aware reorder skips (anti-starvation)
+    uint64_t      backfill_busy_wait = 0;  // deferred wait it backfilled busy in
     nlohmann::json pflash_stats;          // usage.timings.pflash
     int           pflash_error_status = 0; // prompt preparation failed
     std::string   pflash_error;

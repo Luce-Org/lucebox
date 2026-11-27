@@ -229,6 +229,13 @@ public:
     void drop_read(const void * owner = nullptr);
     void reap_reads();
     void join_reads();
+    // True when `owner`'s in-flight disk read has finished and is ready to
+    // adopt into staging on the next plan() call.
+    bool read_done(const void * owner) const {
+        return read_ && read_->owner == owner &&
+               read_->result->done.load(std::memory_order_acquire);
+    }
+    bool has_active_read() const { return read_.has_value(); }
     // Dropped reads still running: an idle scheduler polls to reap them.
     bool reads_to_reap() const { return !finished_reads_.empty(); }
     ~KvCache() { join_reads(); }

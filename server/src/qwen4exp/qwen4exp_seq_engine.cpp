@@ -838,6 +838,9 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         int slot;
         bool complete;
         size_t segment;
+        int count;
+        bool failed = false;
+        std::string error;
     };
     std::vector<PendingPrefill> pending_prefills;
     std::vector<std::vector<int32_t>> segment_tokens;
@@ -849,9 +852,16 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     decode_rows.reserve(plan.decode.size());
     decode_positions.reserve(plan.decode.size());
 
+    // Keeps slots_ as it was if staging or the batched forward fails before commit.
+    SeqSlotManager::StagedAppends staged_rollback(slots_, plan.decode.size(), plan.prefills.size());
+
     for (const StepInput & input : plan.decode) {
         const auto appended = slots_.append_token(input.slot, input.token);
-        if (!appended.ok) return fail("qwen4exp decode reservation failed");
+        if (!appended.ok) {
+            result.state_clean = true;
+            return fail("qwen4exp decode reservation failed");
+        }
+        staged_rollback.decode(input.slot);
         segment_tokens.emplace_back(1, input.token);
         decode_positions.push_back(appended.position);
         decode_rows.push_back(forward_segments.size());
@@ -862,22 +872,28 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (const PrefillSlice & slice : plan.prefills) {
         const SeqSlot & before = slots_.slot(slice.slot);
         const int count = prefill_segment(slice.slot, slice.max_tokens);
-        if (count <= 0) return fail("qwen4exp prefill made no progress");
+        if (count <= 0) {
+            result.state_clean = true;
+            return fail("qwen4exp prefill made no progress");
+        }
         const int pos = before.cur_pos;
         segment_tokens.emplace_back(
             before.sample_history.begin() + pos,
             before.sample_history.begin() + pos + count);
         const SeqSlotManager::PrefillChunk appended =
             slots_.append_prefill(slice.slot, count);
-        if (!appended.ok || appended.rows.size() != (size_t) count)
+        if (!appended.ok || appended.rows.size() != (size_t) count) {
+            result.state_clean = true;
             return fail("qwen4exp prefill reservation failed");
+        }
+        staged_rollback.prefill(slice.slot, count);
         const size_t segment_index = forward_segments.size();
         forward_segments.push_back({
             caches_[(size_t) slice.slot], segment_tokens.back().data(),
             count, pos});
         const bool complete = slots_.slot(slice.slot).cur_pos ==
                               slots_.slot(slice.slot).prompt_len;
-        pending_prefills.push_back({slice.slot, complete, segment_index});
+        pending_prefills.push_back({slice.slot, complete, segment_index, count, false, {}});
     }
 
     std::vector<std::vector<float>> logits;
@@ -907,6 +923,12 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
             drafting ? &hidden : nullptr, &greedy, sampled.data());
         if (!forward.ok || logits.size() != tokens.size() || (!greedy.empty() && greedy.size() != tokens.size()))
             return fail("qwen4exp batched decode forward failed");
+        for (size_t i = 0; i < plan.decode.size(); ++i) {
+            const bool picked = !greedy.empty() &&
+                                !slots_.slot(plan.decode[i].slot).sampler.needs_logit_processing();
+            if (!picked && logits[i].size() != (size_t) weights_.n_vocab)
+                return fail("qwen4exp forward returned malformed logits");
+        }
         const size_t hd = (size_t)weights_.n_embd * weights_.n_hc;
         for (size_t i = 0; drafting && i < plan.decode.size(); ++i) {
             const int id = plan.decode[i].slot;
@@ -926,26 +948,38 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
         }
     }
     logits.resize(forward_segments.size());
-    for (size_t i = plan.decode.size(); i < forward_segments.size(); ++i) {
-        const auto & segment = forward_segments[i];
-        const int id = plan.prefills[i - plan.decode.size()].slot;
+    for (size_t p = 0; p < pending_prefills.size(); ++p) {
+        PendingPrefill & pending = pending_prefills[p];
+        const size_t seg_idx = pending.segment;
+        const auto & segment = forward_segments[seg_idx];
+        const int id = pending.slot;
         const Qwen4ExpInputs inputs = prompt_inputs(id, segment);
-        if (mtp_[(size_t)id].live
-                ? !mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[i], &inputs)
-                : !qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
-                                    segment.n_tokens, segment.pos0, logits[i], nullptr, false, false, &inputs).ok)
-            return fail("qwen4exp solo prefill forward failed");
+        const bool ok = mtp_[(size_t)id].live
+            ? mtp_prefill(id, segment.tokens, segment.n_tokens, segment.pos0, logits[seg_idx], &inputs)
+            : qwen4exp_forward(backend_, weights_, *segment.cache, segment.tokens,
+                               segment.n_tokens, segment.pos0, logits[seg_idx], nullptr, false, false, &inputs).ok;
+        if (!ok || logits[seg_idx].size() != (size_t)weights_.n_vocab) {
+            // Isolate solo prefill failures to this slot instead of failing
+            // already-computed decode slots or peer prefills.
+            slots_.rollback_prefill(id, pending.count);
+            pending.failed = true;
+            pending.error = !ok
+                ? "qwen4exp solo prefill forward failed"
+                : "qwen4exp forward returned malformed logits";
+        }
     }
-    for (size_t i = 0; i < logits.size(); ++i) {
-        const bool picked = i < plan.decode.size() && !greedy.empty() &&
-                            !slots_.slot(plan.decode[i].slot).sampler.needs_logit_processing();
-        if (!picked && logits[i].size() != (size_t) weights_.n_vocab)
-            return fail("qwen4exp forward returned malformed logits");
-    }
+    staged_rollback.commit();
     if (!forward_segments.empty()) {
         ggml_backend_synchronize(backend_);
-        for (const Qwen4ExpForwardSegment & segment : forward_segments)
+        for (size_t i = 0; i < plan.decode.size(); ++i) {
+            const Qwen4ExpForwardSegment & segment = forward_segments[i];
             segment.cache->cur_pos = segment.pos0 + segment.n_tokens;
+        }
+        for (const PendingPrefill & pending : pending_prefills) {
+            if (pending.failed) continue;
+            const Qwen4ExpForwardSegment & segment = forward_segments[pending.segment];
+            segment.cache->cur_pos = segment.pos0 + segment.n_tokens;
+        }
     }
 
     result.decode.reserve(plan.decode.size());
@@ -966,6 +1000,12 @@ SeqEngine::StepResult Qwen4ExpSeqEngine::step(const StepPlan & plan) {
     for (const PendingPrefill & pending : pending_prefills) {
         PrefillOutput output;
         output.slot = pending.slot;
+        if (pending.failed) {
+            output.status = PrefillOutput::Status::failed;
+            output.error = pending.error;
+            result.prefills.push_back(std::move(output));
+            continue;
+        }
         const PrefixCaptureTicket capture = slots_.slot(pending.slot).pending_capture;
         if (capture.valid() &&
             slots_.slot(pending.slot).cur_pos == capture.checkpoint.tokens) {

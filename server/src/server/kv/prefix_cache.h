@@ -97,6 +97,11 @@ public:
         int max_prefix_tokens,
         const std::vector<int> * precomputed_boundaries = nullptr);
 
+    // Longest restorable entry that is a strict prefix of the prompt, without
+    // a boundary scan, hashing or allocation. Used by prefix-aware queue
+    // selection to batch warm-prefix requests without head-of-line delay.
+    int fast_cached_prefix_len(const std::vector<int32_t> & prompt_ids) const;
+
     // Promote and count only after an engine restored this checkpoint.
     void record_inline_hit(
         int slot, int prefix_len, size_t prompt_len);

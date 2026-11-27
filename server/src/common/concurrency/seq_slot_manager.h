@@ -153,6 +153,10 @@ public:
     // admitted prompt is guaranteed not to wait on another sequence.
     PrefillChunk append_prefill(int slot, int n_tokens);
 
+    // Rewind the most recent `n_tokens` prefill rows on a prefilling slot
+    // after a failed forward, keeping the rewound pages reserved on the slot.
+    bool rollback_prefill(int slot, int n_tokens);
+
     // Record a finished prefill and expose the slot to decode.
     // Materialize a copied checkpoint into this request's freshly-reserved
     // physical pages. Valid only before ordinary prefill has advanced. The
@@ -195,6 +199,34 @@ public:
 
     bool rollback_step(int slot);
 
+    // A step's appends, undone unless committed: a step that fails before its
+    // compute leaves every slot as it was (StepResult::state_clean).
+    class StagedAppends {
+    public:
+        StagedAppends(SeqSlotManager & slots, size_t decode, size_t prefills) : slots_(slots) {
+            decode_.reserve(decode);
+            prefill_.reserve(prefills);
+        }
+        StagedAppends(const StagedAppends &) = delete;
+        StagedAppends & operator=(const StagedAppends &) = delete;
+        ~StagedAppends() {
+            if (committed_) return;
+            for (auto it = prefill_.rbegin(); it != prefill_.rend(); ++it) {
+                slots_.rollback_prefill(it->first, it->second);
+            }
+            for (auto it = decode_.rbegin(); it != decode_.rend(); ++it) slots_.rollback_step(*it);
+        }
+        void decode(int slot) { decode_.push_back(slot); }
+        void prefill(int slot, int n_tokens) { prefill_.emplace_back(slot, n_tokens); }
+        void commit() { committed_ = true; }
+
+    private:
+        SeqSlotManager & slots_;
+        std::vector<int> decode_;
+        std::vector<std::pair<int, int>> prefill_;
+        bool committed_ = false;
+    };
+
     // Tokens per slot for one decode step (zero for non-decoders). Preflight
     // the entire cohort before reserving anything; excludes parked slots.
     bool reserve_decode(const std::vector<int> & growth);
@@ -215,9 +247,12 @@ public:
     // False means insufficient pool capacity; the slot stays parked.
     bool resume_recompute(int slot);
     // True when the parked slot's resume reservation fits free pool blocks
-    // with one growth block of headroom per resident sequence — the
-    // scheduler's early-resume probe ahead of a full drain.
+    // with hysteresis headroom for active residents — the scheduler's
+    // early-resume probe ahead of a full drain.
     bool kv_restore_feasible(int slot) const;
+    // Physical KV footprint (total vs. exclusive reclaimable tokens) for
+    // shared-block-aware offload victim selection.
+    SeqEngine::KvOffloadFootprint kv_offload_footprint(int slot) const;
 
     // Release the slot's blocks and clear its state. Safe on inactive slots
     // and after a failed admission/prefill.

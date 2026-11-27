@@ -187,6 +187,13 @@ public:
     PagedKvStatus owned_block_count(PagedKvSequenceHandle handle,
                                     uint32_t & out_count) const;
 
+    // Return how many of this sequence's appended + reserved blocks are held
+    // exclusively by this sequence (seq_refcount == 1 && pin_refcount == 0),
+    // i.e. the exact number of physical blocks that clear()/release() will
+    // immediately return to the global free list.
+    PagedKvStatus exclusive_block_count(PagedKvSequenceHandle handle,
+                                        uint32_t & out_count) const;
+
     // Pin the leading `full_block_count` complete blocks of an active sequence
     // (must satisfy full_block_count <= kv_seq_len / block_size) so their
     // physical KV pages stay immutable and resident for zero-copy sharing.

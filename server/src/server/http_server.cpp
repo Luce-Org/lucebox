@@ -7829,6 +7829,83 @@ ServerJob * HttpServer::try_dequeue() {
     return pop_job_locked();
 }
 
+ServerJob * HttpServer::try_dequeue_prefix_aware(
+        const std::function<int(const ServerJob *)> & score_fn,
+        int max_scan, uint32_t max_skips, int min_gain) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (residency_blocks_admission_locked()) return nullptr;
+    if (!queue_head_ || !queue_head_->next || !score_fn || max_scan <= 1 ||
+        queue_head_->queue_skips >= max_skips || queue_head_->pflash_prepared) {
+        return pop_job_locked();
+    }
+    const int head_score = queue_head_->req.images ? 0 : score_fn(queue_head_);
+    ServerJob * best_prev = nullptr;
+    ServerJob * best = queue_head_;
+    int best_score = head_score;
+    ServerJob * prev = queue_head_;
+    ServerJob * cur = queue_head_->next;
+    int scanned = 1;
+    while (cur && scanned < max_scan) {
+        if (!cur->req.images && !cur->client_disconnected.load(std::memory_order_acquire)) {
+            const int score = score_fn(cur);
+            if (score >= head_score + min_gain && score > best_score) {
+                best_score = score;
+                best_prev = prev;
+                best = cur;
+            }
+        }
+        prev = cur;
+        cur = cur->next;
+        ++scanned;
+    }
+    if (best == queue_head_) return pop_job_locked();
+    for (ServerJob * p = queue_head_; p && p != best; p = p->next) {
+        ++p->queue_skips;
+    }
+    best_prev->next = best->next;
+    if (queue_tail_ == best) queue_tail_ = best_prev;
+    best->next = nullptr;
+    return best;
+}
+
+ServerJob * HttpServer::try_dequeue_shorter_than(
+        size_t max_prompt_tokens, int max_scan, uint64_t wait) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (residency_blocks_admission_locked() || !queue_head_ || max_scan < 1) {
+        return nullptr;
+    }
+    ServerJob * prev = nullptr;
+    ServerJob * cur = queue_head_;
+    int scanned = 0;
+    while (cur && scanned < max_scan) {
+        if (!cur->req.images && cur->backfill_busy_wait != wait &&
+            cur->req.prompt_tokens.size() <= max_prompt_tokens) {
+            if (prev) {
+                prev->next = cur->next;
+                if (queue_tail_ == cur) queue_tail_ = prev;
+            } else {
+                queue_head_ = cur->next;
+                if (!queue_head_) queue_tail_ = nullptr;
+            }
+            cur->next = nullptr;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->next;
+        ++scanned;
+    }
+    return nullptr;
+}
+
+void HttpServer::requeue_front(ServerJob * job) {
+    if (!job) return;
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    job->next = queue_head_;
+    queue_head_ = job;
+    if (!queue_tail_) queue_tail_ = job;
+    queue_cv_.notify_one();
+}
+
 ServerJob * HttpServer::take_queued_job() {
     std::lock_guard<std::mutex> lk(queue_mu_);
     return pop_job_locked();
@@ -8154,7 +8231,7 @@ void HttpServer::send_queue_full(SocketHandle fd, const ParsedRequest & req) {
                   "Retry-After: " + std::to_string(kQueueFullRetryAfterSeconds) + "\r\n");
 }
 
-bool HttpServer::send_sse_headers(ServerJob * job) {
+std::string HttpServer::format_sse_headers() const {
     std::string header = "HTTP/1.1 200 OK\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n";
@@ -8162,6 +8239,11 @@ bool HttpServer::send_sse_headers(ServerJob * job) {
     header += "Content-Type: text/event-stream\r\n"
               "Cache-Control: no-cache\r\n"
               "Connection: keep-alive\r\n\r\n";
+    return header;
+}
+
+bool HttpServer::send_sse_headers(ServerJob * job) {
+    const std::string header = format_sse_headers();
     return send_job_bytes(job, header.data(), header.size());
 }
 
