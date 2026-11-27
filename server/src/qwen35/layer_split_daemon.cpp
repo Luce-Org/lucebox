@@ -6,7 +6,7 @@
 #include "io_utils.h"
 #include "qwen35_layer_split_dflash_target.h"
 #include "prefill_helpers.h"
-#include "common/dflash_spec_decode.h"
+#include "common/dflash/dflash_spec_decode.h"
 
 #include <algorithm>
 #include <cstdio>

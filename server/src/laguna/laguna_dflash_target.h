@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "common/dflash_target.h"
+#include "common/dflash/dflash_target.h"
 #include "laguna_internal.h"
 
 #include "ggml.h"

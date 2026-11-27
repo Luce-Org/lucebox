@@ -4,7 +4,7 @@
 #include "qwen35moe_pipelined_decode.h"
 
 #include "../common/moe_hybrid_types_impl.h"
-#include "../common/dflash_capture.h"
+#include "../common/dflash/dflash_capture.h"
 #include "../common/moe_hybrid_routing_stats.h"
 
 #include "ggml-alloc.h"

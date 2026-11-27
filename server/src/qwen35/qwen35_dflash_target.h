@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "common/dflash_target.h"
+#include "common/dflash/dflash_target.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights
 #include "step_graph.h"
 #include "graph_builders.h"

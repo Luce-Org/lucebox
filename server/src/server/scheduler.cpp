@@ -570,6 +570,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             // request planned again after a disk read keeps it).
             const auto boundaries = find_all_boundaries(
                 req.prompt_tokens, prefix_cache_.chat_markers());
+            query.precomputed_boundaries = &boundaries;
             query.prefer_head = shared_prefixes_.prefers_head(boundaries, !req.tools.empty());
             query.forced_cut = req.pin_end_token;
             if (query.prefer_head && query.forced_cut <= 0) {
@@ -1223,6 +1224,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
             }
+            if (prefill_candidates.empty()) {
+                step_plan.prefills.clear();
+                long_prompt_waiting = false;
+                held_long_prompts = false;
+                long_prompt_in_step = false;
+                return;
+            }
             const bool decoders_turn = !step_plan.decode.empty() &&
                 std::chrono::steady_clock::now() < decode_only_until;
             const auto limits = engine.step_plan_limits((int)step_plan.decode.size());
@@ -1242,9 +1250,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     [&](const PrefillCandidate & c) { return !fits_one_step(c); }),
                     prefill_candidates.end());
             }
-            step_plan.prefills = decoders_turn
-                ? std::vector<PrefillSlice>{}
-                : plan_prefill_slices(prefill_candidates, limits, prefill_round_robin_start);
+            if (decoders_turn) {
+                step_plan.prefills.clear();
+            } else {
+                plan_prefill_slices_into(
+                    prefill_candidates, limits, step_plan.prefills,
+                    prefill_round_robin_start);
+            }
             long_prompt_in_step = std::any_of(step_plan.prefills.begin(), step_plan.prefills.end(),
                 [&](const PrefillSlice & slice) {
                     return slots[(size_t)slice.slot].prompt_left > limits.max_prefill_tokens_per_sequence;
@@ -1316,7 +1328,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (held_long_prompts) ++short_first_steps;
         else if (long_prompt_in_step || !long_prompt_waiting) short_first_steps = 0;
 
-        const auto step_started = std::chrono::steady_clock::now();
+        const auto step_started = !step_plan.prefills.empty() && !step_plan.decode.empty()
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         SeqEngine::StepResult step_result = engine.step(step_plan);
         // Long prompt work shares the time with the decoding requests, from
         // its first chunk to its last; a short prompt (an agent's next turn,
@@ -1324,29 +1338,30 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // them up. The work is every prompt still prefilling, not one: an
         // agent's subagents arrive together, each prompt short, and the
         // decoding requests beside them would otherwise wait for all of them.
-        const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
-        const int long_prompt_tokens = step_limits.time_share_prompt_tokens > 0
-            ? step_limits.time_share_prompt_tokens
-            : step_limits.max_prefill_tokens_per_sequence;
-        long long prompt_work = 0;
-        for (int i = 0; i < n_slots; ++i) {
-            const SchedSlot & s = slots[(size_t)i];
-            if (s.job && s.prefilling) prompt_work += s.prompt_new;
-        }
-        const bool long_prompt = !step_plan.prefills.empty() &&
-            prompt_work > long_prompt_tokens;
-        for (const PrefillSlice & slice : step_plan.prefills) {
-            SchedSlot & s = slots[(size_t)slice.slot];
-            if (s.prompt_left != std::numeric_limits<int>::max())
-                s.prompt_left = std::max(0, s.prompt_left - slice.max_tokens);
-        }
-        if (long_prompt && !step_plan.decode.empty()) {
-            const double share = step_limits.prefill_time_share;
-            if (share > 0.0 && share < 1.0) {
-                const auto now = std::chrono::steady_clock::now();
-                decode_only_until = now + std::chrono::duration_cast<
-                    std::chrono::steady_clock::duration>(
-                        (now - step_started) * ((1.0 - share) / share));
+        if (!step_plan.prefills.empty()) {
+            const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
+            const int long_prompt_tokens = step_limits.time_share_prompt_tokens > 0
+                ? step_limits.time_share_prompt_tokens
+                : step_limits.max_prefill_tokens_per_sequence;
+            long long prompt_work = 0;
+            for (int i = 0; i < n_slots; ++i) {
+                const SchedSlot & s = slots[(size_t)i];
+                if (s.job && s.prefilling) prompt_work += s.prompt_new;
+            }
+            const bool long_prompt = prompt_work > long_prompt_tokens;
+            for (const PrefillSlice & slice : step_plan.prefills) {
+                SchedSlot & s = slots[(size_t)slice.slot];
+                if (s.prompt_left != std::numeric_limits<int>::max())
+                    s.prompt_left = std::max(0, s.prompt_left - slice.max_tokens);
+            }
+            if (long_prompt && !step_plan.decode.empty()) {
+                const double share = step_limits.prefill_time_share;
+                if (share > 0.0 && share < 1.0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    decode_only_until = now + std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                            (now - step_started) * ((1.0 - share) / share));
+                }
             }
         }
         const std::string protocol_error =
@@ -1436,10 +1451,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // resets the stall clock; a reader that makes no progress for 30 s
         // or lets the buffer hit the cap is dropped (its slot retires).
         {
-            const auto now = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point now{};
+            bool have_now = false;
             for (int i = 0; i < n_slots; i++) {
                 SchedSlot & s = slots[(size_t)i];
-                if (!s.job || s.client_disconnected) continue;
+                if (!s.job || s.client_disconnected || s.send_buffer.empty()) continue;
                 bool flush_ok = false;
                 {
                     std::lock_guard<std::mutex> lock(s.job->write_mu);
@@ -1449,6 +1465,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     s.client_disconnected = true;
                     s.finished = true;
                     continue;
+                }
+                if (s.send_buffer.empty()) continue;
+                if (!have_now) {
+                    now = std::chrono::steady_clock::now();
+                    have_now = true;
                 }
                 if (s.send_buffer.should_drop(now, kClientStallTimeout,
                                               kMaxSlotSendBuffer)) {

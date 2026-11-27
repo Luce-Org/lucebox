@@ -1,10 +1,12 @@
 #pragma once
 
 #include "seq_slot_manager.h"
+#include "common/pinned_transfer.h"
 #include "ggml-backend.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <optional>
 #include <limits>
@@ -49,12 +51,17 @@ public:
     void discard(int slot);
 
 private:
+    struct SavedSlot {
+        std::unique_ptr<uint8_t[]> data;
+        size_t size = 0;
+    };
     bool payload_size(size_t blocks, size_t & bytes, std::string & error) const;
     SeqSlotManager & slots_;
     PagedKvPool & pool_;
     ggml_backend_t backend_;
     std::vector<PagedKvTensor> tensors_;
-    std::vector<std::vector<uint8_t>> saved_;
+    std::vector<SavedSlot> saved_;
+    PinnedTransfer transfer_;
 };
 
 } // namespace luce::common

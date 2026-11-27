@@ -411,7 +411,8 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
     const std::vector<int32_t> & prompt = *query.prompt;
     EngineCheckpoints & engine = *engine_;
     PrefixStorePlan & plan = out.plan;
-    const auto hit = index_.lookup_candidate(prompt, (int)prompt.size() - 1);
+    const auto hit = index_.lookup_candidate(
+        prompt, (int)prompt.size() - 1, query.precomputed_boundaries);
     int restore_kv_slot = -1;
     if (hit.first >= 0 && hit.second > 0 && hit.second < (int)prompt.size()) {
         out.restore_slot = hit.first;
@@ -506,7 +507,7 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
             prompt, restored_len, query.prefer_head, forced_cut, out.restore_slot,
             [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
             /*reachable_from=*/0, checkpoints_.restore_point_spacing(), learned,
-            restore_kv_slot);
+            restore_kv_slot, query.precomputed_boundaries);
     };
     PrefixCache::InlineReservation capture =
         reserve_capture(query.forced_cut, query.learned_cut);
