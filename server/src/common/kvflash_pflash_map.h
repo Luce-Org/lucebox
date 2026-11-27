@@ -5,14 +5,22 @@
 #include "pflash_types.h"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace luce::common {
+
+// Prefer the bidirectional seg-reranker `.rank_score` when populated (> 0);
+// fall back to calibrated Stage-1 `.lift` when the reranker did not run.
+inline double kvflash_pflash_rank_score(double lift, double rank_score) {
+    return rank_score > 0.0 ? rank_score : lift;
+}
 
 // The chunk score of each chunk_tokens-sized chunk of an n_tokens prompt: the largest density of the
 // segments overlapping it, 0 where none does. kvflash_recall_pick then sums
@@ -101,14 +109,47 @@ inline int kvflash_message_query_end(const PFlashRequestMessages & m) {
     return m.all_spans.empty() ? 0 : m.all_spans.back().end;
 }
 
-// Mode 5 needs the PFlash model files loaded and enough drafter sessions (default 2) to cover the slots.
-inline std::string kvflash_pflash2_config_error(const std::function<std::string(const char *)> & get, int slots) {
-    static const char * const kRequired[] = {
-        "PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"};
-    for (const char * name : kRequired) {
-        const std::string v = get(name);
-        if (v.empty())
-            return std::string("mode 5 needs ") + name + " set (got unset)";
+// Mode 5 needs all four PFlash v3 model files (either explicit env vars or sibling
+// auto-discovery beside PFLASH_SCORING_HEAD_GGUF, matching launch_profiles.h) and
+// enough drafter sessions (default 2) to cover the slots.
+inline std::string kvflash_pflash2_config_error(
+    const std::function<std::string(const char *)> & get,
+    int slots,
+    const std::function<bool(const std::string &)> & exists = {}) {
+    const auto is_disabled = [](const std::string & val) -> bool {
+        std::string low;
+        low.reserve(val.size());
+        for (unsigned char c : val) low.push_back((char) std::tolower(c));
+        return low == "0" || low == "off" || low == "none" || low == "false" || low == "no";
+    };
+    const std::string head = get("PFLASH_SCORING_HEAD_GGUF");
+    if (head.empty() || is_disabled(head))
+        return "mode 5 needs PFLASH_SCORING_HEAD_GGUF set (got " + (head.empty() ? std::string("unset") : head) + ")";
+
+    const size_t slash = head.find_last_of("/\\");
+    const std::string head_dir = slash == std::string::npos ? std::string() : head.substr(0, slash + 1);
+    const auto file_exists = [&](const std::string & path) -> bool {
+        if (exists) return exists(path);
+        std::error_code ec;
+        return std::filesystem::is_regular_file(path, ec) && !ec;
+    };
+
+    struct SiblingSpec { const char * env; const char * file; };
+    static constexpr SiblingSpec kSiblings[] = {
+        {"PFLASH_SEGMENT_PROBE_GGUF", "segment-probe.gguf"},
+        {"PFLASH_REQUEST_PROBE_GGUF", "request-probe.gguf"},
+        {"PFLASH_SEG_RERANKER_GGUF",  "seg-reranker.gguf"},
+    };
+    for (const auto & spec : kSiblings) {
+        const std::string v = get(spec.env);
+        if (!v.empty()) {
+            if (is_disabled(v))
+                return std::string("mode 5 needs ") + spec.env + " enabled (got " + v + ")";
+            continue;
+        }
+        if (!file_exists(head_dir + spec.file))
+            return std::string("mode 5 needs ") + spec.env + " set or " + spec.file +
+                   " beside PFLASH_SCORING_HEAD_GGUF (got unset)";
     }
     const std::string s = get("PFLASH_DRAFTER_SESSIONS");
     int sessions = 2;

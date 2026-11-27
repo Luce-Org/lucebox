@@ -5,6 +5,7 @@
 #include "kvflash_pflash_map.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 using namespace luce::common;
@@ -91,22 +92,60 @@ TEST_CASE(KvflashPflashMapFixture, an_unknown_role_token_is_a_named_error_and_no
     CHECK(!kvflash_message_map({}, kChat).all_error.empty());   // nothing to map
 }
 
+// ---- reranker score preference over Stage-1 lift --------
+TEST_CASE(KvflashPflashMapFixture, rank_score_overrides_stage1_lift_when_positive) {
+    CHECK(kvflash_pflash_rank_score(1.5, 4.25) == 4.25);
+    CHECK(kvflash_pflash_rank_score(1.5, 0.0) == 1.5);
+    CHECK(kvflash_pflash_rank_score(1.5, -1.0) == 1.5);
+}
+
 // ---- the mode-5 startup gate ----------------------------
 namespace {
 std::map<std::string, std::string> release_env() {
-    return {{"PFLASH_SCORING_HEAD_GGUF", "h.gguf"}, {"PFLASH_SEGMENT_PROBE_GGUF", "s.gguf"},
-            {"PFLASH_REQUEST_PROBE_GGUF", "r.gguf"}, {"PFLASH_DRAFTER_SESSIONS", "2"}};
+    return {{"PFLASH_SCORING_HEAD_GGUF", "/models/pflash/seg-scoring-head.gguf"},
+            {"PFLASH_SEGMENT_PROBE_GGUF", "/models/pflash/segment-probe.gguf"},
+            {"PFLASH_REQUEST_PROBE_GGUF", "/models/pflash/request-probe.gguf"},
+            {"PFLASH_SEG_RERANKER_GGUF", "/models/pflash/seg-reranker.gguf"},
+            {"PFLASH_DRAFTER_SESSIONS", "2"}};
 }
-std::string gate(const std::map<std::string, std::string> & e, int slots) {
-    return kvflash_pflash2_config_error([&](const char * k) { auto i = e.find(k); return i == e.end() ? std::string() : i->second; }, slots);
+std::string gate(const std::map<std::string, std::string> & e, int slots,
+                 const std::set<std::string> & files = {}) {
+    return kvflash_pflash2_config_error(
+        [&](const char * k) { auto i = e.find(k); return i == e.end() ? std::string() : i->second; },
+        slots,
+        [&](const std::string & path) { return files.count(path) > 0; });
 }
 }
 TEST_CASE(KvflashPflashMapFixture, the_release_profile_passes_the_mode_5_gate) {
     CHECK(gate(release_env(), 1).empty());
     CHECK(gate(release_env(), 2).empty());
 }
+TEST_CASE(KvflashPflashMapFixture, sibling_auto_discovery_beside_scoring_head_passes_the_mode_5_gate) {
+    const std::map<std::string, std::string> head_only = {
+        {"PFLASH_SCORING_HEAD_GGUF", "/models/pflash/seg-scoring-head.gguf"},
+        {"PFLASH_DRAFTER_SESSIONS", "2"},
+    };
+    const std::set<std::string> all_siblings = {
+        "/models/pflash/segment-probe.gguf",
+        "/models/pflash/request-probe.gguf",
+        "/models/pflash/seg-reranker.gguf",
+    };
+    CHECK(gate(head_only, 2, all_siblings).empty());
+
+    // Dropping seg-reranker.gguf from disk refuses naming PFLASH_SEG_RERANKER_GGUF.
+    auto no_reranker = all_siblings;
+    no_reranker.erase("/models/pflash/seg-reranker.gguf");
+    const std::string err = gate(head_only, 1, no_reranker);
+    CHECK(err.find("PFLASH_SEG_RERANKER_GGUF") != std::string::npos);
+
+    // Explicitly disabling a sibling refuses even when the file exists beside the head.
+    auto disabled = head_only;
+    disabled["PFLASH_SEG_RERANKER_GGUF"] = "off";
+    CHECK(gate(disabled, 1, all_siblings).find("PFLASH_SEG_RERANKER_GGUF") != std::string::npos);
+}
 TEST_CASE(KvflashPflashMapFixture, a_missing_pflash_component_is_refused_naming_it) {
-    for (const char * k : {"PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_REQUEST_PROBE_GGUF"}) {
+    for (const char * k : {"PFLASH_SCORING_HEAD_GGUF", "PFLASH_SEGMENT_PROBE_GGUF",
+                           "PFLASH_REQUEST_PROBE_GGUF", "PFLASH_SEG_RERANKER_GGUF"}) {
         auto e = release_env(); e.erase(k);
         CHECK(gate(e, 1).find(k) != std::string::npos);
     }
