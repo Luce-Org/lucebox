@@ -36,17 +36,22 @@ for id in "${ids[@]}"; do
   fi
 done
 
-# 2. Default mini-swe-agent 2.2.4 matches TB4 config, maps 127.0.0.1 -> host.docker.internal.
+# 2. Default pi 1.5.2 matches TB4 mix-pi.yaml, maps 127.0.0.1 -> host.docker.internal.
 out="$(HARBOR_BIN="$FAKE_HARBOR" "$LAUNCHER")"
 grep -q -- '-d scale-ai/swe-bench-pro' <<<"$out"
-grep -q -- '-a mini-swe-agent' <<<"$out"
-grep -q -- '--ak version=2.2.4' <<<"$out"
-grep -q -- '--ak config_file=.*mini-swe-agent.yaml' <<<"$out"
+grep -q -- '-a pi' <<<"$out"
+grep -q -- '--ak version=1.5.2' <<<"$out"
 grep -q -- '-m openai/Qwen3.8-27B' <<<"$out"
 grep -q -- '--base-url http://host.docker.internal:8000/v1' <<<"$out"
 grep -q -- '--api-format openai_chat_completions' <<<"$out"
 grep -q -- '--extra-docker-compose .*docker-compose.host-gateway.yaml' <<<"$out"
 grep -q -- 'OPENAI_API_KEY=lucebox' <<<"$out"
+
+# 2a. mini-swe-agent 2.2.4 matches TB4 mix-mini.yaml.
+out="$(HARBOR_BIN="$FAKE_HARBOR" AGENT=mini-swe-agent "$LAUNCHER")"
+grep -q -- '-a mini-swe-agent' <<<"$out"
+grep -q -- '--ak version=2.2.4' <<<"$out"
+grep -q -- '--ak config_file=.*mini-swe-agent.yaml' <<<"$out"
 
 # 2b. Host-side terminus-2 uses 127.0.0.1 and no host-gateway overlay.
 out="$(HARBOR_BIN="$FAKE_HARBOR" AGENT=terminus-2 "$LAUNCHER")"

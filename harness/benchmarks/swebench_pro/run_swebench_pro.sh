@@ -18,8 +18,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 : "${DATASET:=scale-ai/swe-bench-pro}"
 : "${TASKS_PATH:=}"
 : "${SLICE_FILE:=$SCRIPT_DIR/long_horizon_24.txt}"
-: "${AGENT:=mini-swe-agent}"
-: "${AGENT_VERSION:=2.2.4}"
+: "${AGENT:=pi}"
+: "${AGENT_VERSION:=}"
 : "${MINI_SWE_CONFIG:=$SCRIPT_DIR/mini-swe-agent.yaml}"
 : "${MODEL:=Qwen3.8-27B}"
 : "${SERVER_HOST:=127.0.0.1}"
@@ -98,10 +98,12 @@ fi
 
 cmd+=(-a "$AGENT" -n "$CONCURRENCY" -o "$JOBS_DIR" --job-name "$JOB_NAME")
 
-if [[ "$AGENT" == "mini-swe-agent" ]]; then
-  if [[ -n "$AGENT_VERSION" ]]; then
-    cmd+=(--ak "version=${AGENT_VERSION}")
-  fi
+if [[ "$AGENT" == "pi" ]]; then
+  pi_ver="${AGENT_VERSION:-1.5.2}"
+  cmd+=(--ak "version=${pi_ver}")
+elif [[ "$AGENT" == "mini-swe-agent" ]]; then
+  mswea_ver="${AGENT_VERSION:-2.2.4}"
+  cmd+=(--ak "version=${mswea_ver}")
   if [[ -n "$MINI_SWE_CONFIG" ]]; then
     cmd+=(--ak "config_file=${MINI_SWE_CONFIG}")
   fi

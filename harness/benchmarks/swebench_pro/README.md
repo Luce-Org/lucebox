@@ -16,9 +16,9 @@ Designed for benchmarking long-context multi-turn coding workloads (e.g., KVFlas
 
 ## Quick start
 
-### 1. Default agent (`mini-swe-agent` 2.2.4, matching Terminal-Bench 4.0)
+### 1. Default agent (`pi` 1.5.2, matching Terminal-Bench 4.0 `mix-pi.yaml`)
 
-Defaults match Lucebox's Terminal-Bench 4.0 setup (`mini-swe-agent` `2.2.4`, stock `mini.yaml`, `agent.cost_limit: 0`, `agent.step_limit: 0`, `openai_chat_completions`, native `bash` tool calls). Start `luce_server` with `--host 0.0.0.0`:
+Defaults match Lucebox's Terminal-Bench 4.0 `pi` setup (`pi` `1.5.2`, `openai_chat_completions`, SSE `stream=true` + native `read`/`bash`/`edit`/`write` tool calls). Streaming avoids Harbor's `gost` egress-control sidecar 15s idle read timeout on SWE-bench Pro V2's `no-network` tasks (which breaks non-streaming `mini-swe-agent` turns longer than 15s). Start `luce_server` with `--host 0.0.0.0`:
 
 ```bash
 # Terminal 1: start luce_server listening on the Docker bridge
@@ -30,14 +30,15 @@ DRY_RUN=1 harness/benchmarks/swebench_pro/run_swebench_pro.sh
 SERVER_HOST=172.17.0.1 CONCURRENCY=1 harness/benchmarks/swebench_pro/run_swebench_pro.sh
 ```
 
-### 2. Other agents (`opencode`, `claude-code`, `codex`, `terminus-2`)
+### 2. Other agents (`mini-swe-agent` 2.2.4, `opencode`, `claude-code`, `codex`, `terminus-2`)
 
-In-container agents (`opencode`, `claude-code`, `codex`) route through `host.docker.internal` (with `docker-compose.host-gateway.yaml`) or an explicit `SERVER_HOST`. Host-side `terminus-2` reaches `127.0.0.1` directly without container networking:
+`AGENT=mini-swe-agent` pins `2.2.4` with `mini-swe-agent.yaml` (`cost_limit: 0`, `step_limit: 0`, matching TB4's `mix-mini.yaml`; recommended only on V1 `public`-network tasks since it sends `stream=false`). Host-side `terminus-2` reaches `127.0.0.1` directly without container networking:
 
 ```bash
-AGENT=opencode    CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
-AGENT=claude-code CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
-AGENT=terminus-2  CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
+AGENT=mini-swe-agent CONCURRENCY=1 harness/benchmarks/swebench_pro/run_swebench_pro.sh
+AGENT=opencode       CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
+AGENT=claude-code    CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
+AGENT=terminus-2     CONCURRENCY=4 harness/benchmarks/swebench_pro/run_swebench_pro.sh
 ```
 
 ### 3. Using SWE-bench Pro V2 (prebuilt images, no Docker build step)
@@ -64,8 +65,8 @@ AGENT=oracle LIMIT=1 harness/benchmarks/swebench_pro/run_swebench_pro.sh
 | `DATASET` | `scale-ai/swe-bench-pro` | Harbor registry dataset (ignored when `TASKS_PATH` is set) |
 | `TASKS_PATH` | *(unset)* | Local Harbor task directory (e.g. `SWE-bench_Pro-os/v2/tasks`) |
 | `SLICE_FILE` | `long_horizon_24.txt` | Task ID list, or `all` for the full dataset |
-| `AGENT` | `mini-swe-agent` | `mini-swe-agent`, `terminus-2`, `opencode`, `claude-code`, `codex`, `pi`, `hermes`, `oracle`, `nop` |
-| `AGENT_VERSION` | `2.2.4` | Pinned `mini-swe-agent` version (matches TB4) |
+| `AGENT` | `pi` | `pi`, `mini-swe-agent`, `terminus-2`, `opencode`, `claude-code`, `codex`, `hermes`, `oracle`, `nop` |
+| `AGENT_VERSION` | `1.5.2` (`pi`) / `2.2.4` (`mini-swe-agent`) | Pinned TB4 agent version |
 | `MINI_SWE_CONFIG` | `mini-swe-agent.yaml` | `cost_limit: 0`, `step_limit: 0` config passed to `mini-swe-agent` |
 | `MODEL` | `Qwen3.8-27B` | Exposed model name on `luce_server` (`--model-name`) |
 | `SERVER_HOST` | `127.0.0.1` | Auto-mapped to `host.docker.internal` for in-container agents |
