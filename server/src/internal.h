@@ -696,7 +696,7 @@ struct PrefixSnapshot {
     // OwnedSnapshot holds tensors only, so a pooled snapshot (KV in the pager
     // blob) would be written with no KV and restore garbage: never persist it.
     bool disk_persistable() const {
-        return !is_pooled && !state_only &&
+        return !is_pooled && !state_only && kv_start == 0 &&
                (layout == Layout::dense || layout == Layout::paged);
     }
 };
@@ -783,7 +783,8 @@ bool snapshot_paged_target_cache(
     int block_size,
     int token_count,
     PrefixSnapshot & snap,
-    const PrefixSnapshot * base_kv = nullptr);
+    const PrefixSnapshot * base_kv = nullptr,
+    size_t pinned_full_blocks = 0);
 
 // Atomically replace a paged snapshot. The incumbent remains valid when
 // allocation, layout validation, or any staged copy fails.
@@ -795,7 +796,8 @@ bool replace_paged_target_cache(
     int token_count,
     PrefixSnapshot & destination,
     PrefixSnapshot * displaced = nullptr,
-    const PrefixSnapshot * base_kv = nullptr);
+    const PrefixSnapshot * base_kv = nullptr,
+    size_t pinned_full_blocks = 0);
 
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and

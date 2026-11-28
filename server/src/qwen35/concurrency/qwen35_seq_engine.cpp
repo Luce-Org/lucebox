@@ -61,13 +61,14 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         int max_prefills,
         int mixed_prefill_tokens, int long_mixed_prefill_tokens,
         int long_prefill_threshold, int idle_prefill_tokens,
-        int prefill_quantum)
+        int prefill_quantum, bool target_is_uma)
     : max_prefills_(std::max(1, max_prefills)),
       mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
       long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
       long_prefill_threshold_(std::max(1, long_prefill_threshold)),
       idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
-      prefill_quantum_(std::max(1, prefill_quantum)), pool_(pool),
+      prefill_quantum_(std::max(1, prefill_quantum)),
+      target_is_uma_(target_is_uma), pool_(pool),
       b_(backend), slots_(pool, max_ctx),
       offload_(slots_, pool, backend.target_backend_,
                qwen_paged_kv_planes(backend.cache_, pool.block_size())),
@@ -117,7 +118,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         const char * env = std::getenv("LUCE_ADAPTIVE_SPEC_WIDTH");
         adaptive_chain_width_ = !(env && env[0] == '0' && env[1] == '\0');
     }
-    for (int width : {4, 6, 8, fixed_chain_.width}) {
+    for (int width : {2, 3, 4, 6, 8, fixed_chain_.width}) {
         if (width >= 2 && width <= fixed_chain_.width &&
             std::find(chain_width_choices_.begin(), chain_width_choices_.end(),
                       width) == chain_width_choices_.end()) {
@@ -694,6 +695,10 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_images(
 }
 
 size_t Qwen35SeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    if (target_is_uma_) {
+        const int tail = std::max(1, std::min(tokens, (int)pool_.block_size()));
+        return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tail);
+    }
     return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tokens);
 }
 
@@ -835,12 +840,13 @@ bool Qwen35SeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
         drop_prefix_snapshot_kv(b_.prefix_snapshots_[index]);
 }
 
-bool Qwen35SeqEngine::arm_capture(
+bool Qwen35SeqEngine::arm_followup_capture(
         int slot, PrefixCaptureTicket ticket, int restored_tokens) {
-    if (slot < 0 || slot >= slots_.slot_count()) return false;
+    if (slot < 0 || slot >= slots_.slot_count() || !slots_.is_prefilling(slot)) return false;
     const Qwen35Slot & sequence = slots_.slot(slot);
     if (!ticket.valid() || checkpoint_index(ticket.checkpoint) < 0 ||
         ticket.checkpoint.tokens <= restored_tokens ||
+        ticket.checkpoint.tokens <= sequence.cur_pos ||
         ticket.checkpoint.tokens > sequence.prompt_len) return false;
     slots_.slot(slot).pending_capture = ticket;
     return true;
@@ -1000,7 +1006,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
 
     const int admitted_slot = result.slot;
     if (!result.prefix_store.invalidated.valid() &&
-        arm_capture(
+        arm_followup_capture(
             admitted_slot, plan.capture,
             result.prefix_store.restored.tokens)) {
         result.prefix_store.capture = plan.capture;
@@ -1041,10 +1047,12 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
             }
         }
     }
+    const size_t uma_pin_blocks = target_is_uma_
+        ? (size_t)(ticket.checkpoint.tokens / (int)pool_.block_size()) : 0;
     if (!replace_paged_target_cache(
             b_.cache_, slot, sequence.block_table,
             (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot,
-            &b_.displaced_snapshots_[checkpoint], base_kv)) {
+            &b_.displaced_snapshots_[checkpoint], base_kv, uma_pin_blocks)) {
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - capture_started).count();
@@ -1055,7 +1063,12 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
         return event;
     }
     // Pin full physical blocks of this checkpoint on GPU for zero-copy sharing.
-    pin_gpu_prefix(checkpoint, slot, ticket.checkpoint.tokens);
+    const bool pinned = pin_gpu_prefix(checkpoint, slot, ticket.checkpoint.tokens);
+    if (uma_pin_blocks > 0 && !pinned) {
+        free_prefix_snapshot(snapshot);
+        event.error = "UMA zero-copy prefix pin failed";
+        return event;
+    }
     if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
         restored_kv_checkpoint_[(size_t)slot] = checkpoint;
         restored_kv_tokens_[(size_t)slot] = ticket.checkpoint.tokens;

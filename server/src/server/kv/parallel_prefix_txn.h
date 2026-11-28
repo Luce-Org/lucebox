@@ -54,6 +54,7 @@ public:
     int target_tokens() const {
         return active() ? ticket_.checkpoint.tokens : 0;
     }
+    PrefixCaptureTicket ticket() const { return ticket_; }
 
     Resolution resolve(
             const PrefixStoreEvent & event,

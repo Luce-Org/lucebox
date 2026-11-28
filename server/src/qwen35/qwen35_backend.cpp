@@ -524,10 +524,22 @@ bool Qwen35Backend::init() {
               env_int_or_default("LUCE_MAX_CONCURRENT_PREFILLS", 8),
               1, std::min(n_slots, 8))
         : 1;
+    bool target_is_uma = false;
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    {
+        cudaDeviceProp prop{};
+        if (cfg_.device.gpu >= 0 &&
+            cudaGetDeviceProperties(&prop, cfg_.device.gpu) == cudaSuccess) {
+            target_is_uma = (prop.integrated != 0);
+        }
+    }
+#endif
+    const int default_mixed = target_is_uma ? 512 : 1024;
+    const int default_long_mixed = target_is_uma ? 1024 : 1536;
     const int mixed_prefill_tokens = std::max(
-        1, env_int_or_default("LUCE_MIXED_PREFILL_TOKENS", 2048));
+        1, env_int_or_default("LUCE_MIXED_PREFILL_TOKENS", default_mixed));
     const int long_mixed_prefill_tokens = std::max(
-        1, env_int_or_default("LUCE_LONG_MIXED_PREFILL_TOKENS", 4096));
+        1, env_int_or_default("LUCE_LONG_MIXED_PREFILL_TOKENS", default_long_mixed));
     const int long_prefill_threshold = std::max(
         1, env_int_or_default("LUCE_LONG_PREFILL_THRESHOLD", 768));
     const int idle_prefill_tokens = std::max(
@@ -691,7 +703,7 @@ bool Qwen35Backend::init() {
                 dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
-                idle_prefill_tokens, prefill_quantum);
+                idle_prefill_tokens, prefill_quantum, target_is_uma);
             if (fixed_chain.enabled) {
                 std::fprintf(stderr,
                     "[parallel-chain] fixed DFlash2 width=%d, "

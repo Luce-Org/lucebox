@@ -260,6 +260,7 @@ public:
 
     // Release engine-owned payload without touching server policy metadata.
     virtual void discard_prefix_store(PrefixStoreRef) {}
+    virtual bool arm_followup_capture(int /*slot*/, PrefixCaptureTicket /*ticket*/, int /*restored_tokens*/) { return false; }
     // State-only checkpoints. A checkpoint that a deeper one extends repeats
     // its attention rows: drop_prefix_kv() frees them and keeps what the
     // position alone determines, and a restore of it names the deeper

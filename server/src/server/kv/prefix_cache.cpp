@@ -628,10 +628,26 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         return {};
     }
 
-    const auto key = hash_prefix(prompt_ids.data(), target_cut);
-    if (find_entry(key) >= 0) return {};
-    for (const auto & active : active_reservations_) {
-        if (active.key == key) return {};
+    auto already_present = [&](const PrefixHash & h) {
+        if (find_entry(h) >= 0) return true;
+        for (const auto & active : active_reservations_) {
+            if (active.key == h) return true;
+        }
+        return false;
+    };
+    auto key = hash_prefix(prompt_ids.data(), target_cut);
+    if (already_present(key)) {
+        if (!prefer_tools_boundary) return {};
+        // Another request already cached or is capturing the shared system+tools head:
+        // fall back to this conversation's deeper boundary so its next turn hits.
+        const int deep_cut = select_inline_snapshot_boundary(
+            candidates, std::max(restored_prefix_len, target_cut),
+            /*prefer_head=*/false, reachable_from);
+        if (deep_cut <= target_cut) return {};
+        target_cut = deep_cut;
+        forced = false;
+        key = hash_prefix(prompt_ids.data(), target_cut);
+        if (already_present(key)) return {};
     }
 
     const bool protect = prefer_tools_boundary &&

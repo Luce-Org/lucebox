@@ -67,7 +67,8 @@ public:
                     int long_mixed_prefill_tokens = 4096,
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
-                    int prefill_quantum = 512);
+                    int prefill_quantum = 512,
+                    bool target_is_uma = false);
     ~Qwen35SeqEngine() override;
 
     // Destroy every graph that captures draft-weight tensors. Qwen35Backend
@@ -86,6 +87,7 @@ public:
     size_t estimate_prefix_store_bytes(int tokens) const override;
 
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
+    bool arm_followup_capture(int slot, PrefixCaptureTicket ticket, int restored_tokens) override;
     size_t estimate_prefix_state_bytes(int tokens) const override;
     bool drop_prefix_kv(PrefixStoreRef checkpoint) override;
 
@@ -121,7 +123,7 @@ public:
             std::min(max_prefills_ * per_sequence, total_cap),
             prefill_quantum_,
             /*prefill_time_share=*/mixed ? 0.5 : 1.0,
-            /*time_share_prompt_tokens=*/8192,
+            /*time_share_prompt_tokens=*/2048,
         };
     }
 
@@ -200,6 +202,7 @@ private:
     int long_prefill_threshold_;
     int idle_prefill_tokens_;
     int prefill_quantum_;
+    bool target_is_uma_ = false;
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
@@ -250,8 +253,6 @@ private:
                              double walk_ms);
     PrefixStoreEvent capture_prefix(
         int slot, PrefixCaptureTicket ticket);
-    bool arm_capture(
-        int slot, PrefixCaptureTicket ticket, int restored_tokens);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
     void unpin_gpu_prefix(int index);
     void unpin_all_gpu_prefixes();

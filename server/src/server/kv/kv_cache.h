@@ -224,6 +224,8 @@ public:
     void captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & event,
                   const std::vector<int32_t> & prompt, DiskPrefixCacheMode mode,
                   const std::function<std::string()> & aux);
+    PrefixCaptureTxn plan_followup_capture(const std::vector<int32_t> & prompt,
+                                           int committed_tokens, int committed_slot);
     // The disk read in flight: dropped (its owner left, or another request
     // got the head of the line), reaped once done, joined at shutdown.
     void drop_read(const void * owner = nullptr);

@@ -471,6 +471,7 @@ struct ModelOptions {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
+    bool prefix_cache_slots_set = false;
     // --agent-turn-cache (true) or --no-agent-turn-cache (false); unset turns
     // it on wherever it can run (resolve_agent_turn_cache).
     std::optional<bool> agent_turn_cache;
@@ -925,6 +926,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+            model.prefix_cache_slots_set = true;
         } else if (std::strcmp(
                        argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
             if (i + 1 >= argc ||
@@ -1999,6 +2001,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // This rewrites ServerConfig rather than rejecting the launch, which is
     // why it lives here and not in the gate.
     if (backend_cache.paged_attention) {
+        if (backend_execution.max_concurrency > 1 && !model.prefix_cache_slots_set && sconfig.prefix_cache_cap > 0) {
+            sconfig.prefix_cache_cap = std::clamp(backend_execution.max_concurrency * 3, sconfig.prefix_cache_cap, 64);
+        }
         if (backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0) {
             std::fprintf(stderr,
                 "[server] concurrent paged serving enables copied in-memory "

@@ -640,6 +640,32 @@ void KvCache::restored(const KvPlan & plan, const PrefixStoreAdmission & prefix,
     }
 }
 
+PrefixCaptureTxn KvCache::plan_followup_capture(
+        const std::vector<int32_t> & prompt, int committed_tokens, int committed_slot) {
+    if (!engine_ || !engine_->supported() || committed_tokens <= 0 ||
+        committed_tokens >= (int)prompt.size() - 1) {
+        return {};
+    }
+    EngineCheckpoints & engine = *engine_;
+    PrefixCache::InlineReservation capture = index_.reserve_inline_snap(
+        prompt, committed_tokens, /*prefer_head=*/false, /*forced_cut=*/0,
+        committed_slot,
+        [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
+        /*reachable_from=*/0, checkpoints_.restore_point_spacing(),
+        /*learned_cut=*/false, committed_slot, nullptr);
+    if (!capture.active() || capture.slot() == committed_slot ||
+        capture.target_cut() <= committed_tokens) {
+        capture.cancel();
+        return {};
+    }
+    PrefixCaptureTicket ticket;
+    ticket.id = next_capture_id_++;
+    if (next_capture_id_ == 0) next_capture_id_ = 1;
+    ticket.checkpoint = EngineCheckpoints::ref(
+        Checkpoint::of_cache_slot(capture.slot()), capture.target_cut());
+    return PrefixCaptureTxn(std::move(capture), engine.engine(), ticket);
+}
+
 void KvCache::captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & event,
                        const std::vector<int32_t> & prompt, DiskPrefixCacheMode mode,
                        const std::function<std::string()> & aux) {

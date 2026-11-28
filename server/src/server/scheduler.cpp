@@ -1459,9 +1459,40 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (decoders_turn) {
                 step_plan.prefills.clear();
             } else {
+                // Leader-first + SRPT priority: unblock prefix_waiters in 1x prefill time,
+                // and drive closest-to-done prefills to completion instead of stalling all
+                // slots in lockstep. Idle long-prefill waves concentrate across only enough
+                // slots to saturate max_prefill_tokens_total (same GPU tok/s, ~2x lower mean TTFT).
+                auto effective_limits = limits;
+                size_t rr_start = prefill_round_robin_start;
+                const bool anti_starve_long = !held_long_prompts && long_prompt_waiting && short_first_steps >= kShortFirstSteps;
+                if (prefill_candidates.size() > 1 && !anti_starve_long) {
+                    auto is_prefix_leader = [&](int slot_idx) {
+                        for (const auto & w : prefix_waiters) {
+                            if (w.leader == slot_idx) return true;
+                        }
+                        return false;
+                    };
+                    for (auto & c : prefill_candidates) {
+                        const uint64_t tier = is_prefix_leader(c.slot) ? 0ULL : 1ULL;
+                        const uint64_t rem = (uint64_t)std::max(0, slots[(size_t)c.slot].prompt_left);
+                        c.order = (tier << 56) | ((rem & 0xFFFFFFULL) << 32) |
+                                  (c.order & 0xFFFFFFFFULL);
+                    }
+                    if (step_plan.decode.empty() && long_prompt_waiting) {
+                        const int needed = std::max(
+                            1,
+                            (effective_limits.max_prefill_tokens_total +
+                             effective_limits.max_prefill_tokens_per_sequence - 1) /
+                                effective_limits.max_prefill_tokens_per_sequence);
+                        effective_limits.max_prefill_sequences = std::min(
+                            effective_limits.max_prefill_sequences, needed);
+                        rr_start = 0;
+                    }
+                }
                 plan_prefill_slices_into(
-                    prefill_candidates, limits, step_plan.prefills,
-                    prefill_round_robin_start);
+                    prefill_candidates, effective_limits, step_plan.prefills,
+                    rr_start);
             }
             long_prompt_in_step = std::any_of(step_plan.prefills.begin(), step_plan.prefills.end(),
                 [&](const PrefillSlice & slice) {
@@ -1703,6 +1734,22 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     s.cache_capture, out.prefix_store, captured_req.prompt_tokens,
                     captured_req.disk_cache_policy.mode,
                     [&]() { return session_replay_blob(captured_req, nullptr); });
+                if (out.prefix_store.status == PrefixStoreEvent::Status::saved &&
+                    out.status != PrefillStatus::completed && out.status != PrefillStatus::failed &&
+                    !s.capture_orphan && !s.cache_capture.active() &&
+                    !captured_req.images) {
+                    const int committed_tok = out.prefix_store.ticket.checkpoint.tokens;
+                    const int committed_slot =
+                        EngineCheckpoints::of(out.prefix_store.ticket.checkpoint).cache_slot();
+                    auto followup = kv_cache_.plan_followup_capture(
+                        captured_req.prompt_tokens, committed_tok, committed_slot);
+                    if (followup.active() &&
+                        engine.arm_followup_capture(out.slot, followup.ticket(), committed_tok)) {
+                        s.cache_capture = std::move(followup);
+                    } else {
+                        followup.cancel();
+                    }
+                }
             }
             if (out.status == PrefillStatus::failed) {
                 s.error = to_response_error(
