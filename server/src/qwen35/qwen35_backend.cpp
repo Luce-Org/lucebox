@@ -3465,6 +3465,7 @@ bool Qwen35Backend::kvflash_load_drafter() {
     if (draft_backend_) ggml_backend_synchronize(draft_backend_);
     std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
                  kvflash_drafter_path_.c_str());
+    drafter_ctx_.asset_mode = DrafterAssetMode::SkipAll;
     if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
                       cfg_.device.gpu, drafter_ctx_)) {
         std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "

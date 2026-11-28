@@ -4,6 +4,7 @@
 // cards (LUCE_MODEL_CARDS_SOURCE_DIR).
 
 #include "CppUnitTestFramework.hpp"
+#include "../scoped_env.h"
 #include "placement/device_select.h"
 #include "common/chain_rollback_policy.h"
 #include "common/feature_gate.h"
@@ -239,9 +240,9 @@ struct LaunchPolicyFixture : CommonFixture {
         return dims;
     }
 
-    // Auto placement charges what attach_rollback_storage() attaches: with a
-    // KVFlash pool and no explicit --fast-rollback that is exact restore, the
-    // two snapshots only, and those are also there with --no-fast-rollback.
+    // Auto placement charges what attach_rollback_storage() attaches: Auto
+    // resolves to fast rollback (even under KVFlash), while Exact
+    // (--no-fast-rollback) uses the two snapshots only.
     void test_rollback_charge_follows_the_resolved_rollback_mode() {
         using luce::common::RollbackMode;
         using luce::common::spec_rollback_checkpoints;
@@ -850,12 +851,12 @@ struct LaunchPolicyFixture : CommonFixture {
         // One quoted argument and separate arguments give the same curve.
         std::vector<std::pair<int, float>> quoted;
         std::string error;
-        CHECK(parse_pflash_curve_arg("16384:0.315 32768:0.270 65536:0.270 120000:0.225", quoted, error));
+        CHECK(parse_pflash_curve_arg("8192:0.450 16384:0.350 32768:0.270 65536:0.260 120000:0.240", quoted, error));
         CHECK(quoted == pflash_release_curve());
-        CHECK(kPFlashReleaseThreshold == 16384);  // the release default server/README.md documents
+        CHECK(kPFlashReleaseThreshold == 8192);  // the release default server/README.md documents
 
         std::vector<std::pair<int, float>> split;
-        for (const char * arg : {"16384:0.315", "32768:0.270", "65536:0.270", "120000:0.225"}) {
+        for (const char * arg : {"8192:0.450", "16384:0.350", "32768:0.270", "65536:0.260", "120000:0.240"}) {
             CHECK(parse_pflash_curve_arg(arg, split, error));
         }
         CHECK(split == quoted);
@@ -873,6 +874,135 @@ struct LaunchPolicyFixture : CommonFixture {
             CHECK(!parse_pflash_curve_arg(bad, curve, error));
             CHECK(!error.empty());
         }
+    }
+
+    void test_pflash_requires_all_four_components() {
+        using EnvGuard = luce_test::ScopedEnvVar;
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / "luce_pflash_all4_test";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        CHECK(fs::create_directories(dir, ec));
+        const fs::path head = dir / "seg-scoring-head.gguf";
+        const fs::path seg  = dir / "segment-probe.gguf";
+        const fs::path req  = dir / "request-probe.gguf";
+        const fs::path rr   = dir / "seg-reranker.gguf";
+        for (const auto & p : {head, seg, req, rr}) {
+            std::ofstream f(p);
+            f << "stub";
+        }
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", nullptr);
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", nullptr);
+            CHECK(!pflash_resolve_components().complete());
+            CHECK(pflash_resolve_components().missing().size() == 4);
+            CHECK(pflash_release_env().empty());
+        }
+        // All four sibling files present beside PFLASH_SCORING_HEAD_GGUF -> complete & auto-discovered.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", nullptr);
+            const auto comps = pflash_resolve_components();
+            CHECK(comps.complete());
+            CHECK(comps.segment_probe == seg.string());
+            CHECK(comps.request_probe == req.string());
+            CHECK(comps.seg_reranker == rr.string());
+            CHECK(!pflash_release_env().empty());
+        }
+        // Removing any single sibling component prevents PFlash selection.
+        for (const auto & drop : {seg, req, rr}) {
+            fs::remove(drop, ec);
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", nullptr);
+            const auto comps = pflash_resolve_components();
+            CHECK(!comps.complete());
+            CHECK(comps.missing().size() == 1);
+            CHECK(pflash_release_env().empty());
+            std::ofstream f(drop);
+            f << "stub";
+        }
+        // Explicitly disabling reranker also refuses selection.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", seg.string().c_str());
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", req.string().c_str());
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", "off");
+            CHECK(!pflash_resolve_components().complete());
+            CHECK(pflash_release_env().empty());
+        }
+        // A named file that does not open is missing, and the summary names it.
+        {
+            const std::string typo = (dir / "typo-reranker.gguf").string();
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", typo.c_str());
+            const auto comps = pflash_resolve_components();
+            CHECK(!comps.complete());
+            CHECK(comps.missing_summary().find("does not open: " + typo) != std::string::npos);
+            CHECK(pflash_release_env().empty());
+        }
+        // So is a head that does not open, though its siblings exist.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", (dir / "seg-scoring-head-v2.gguf").string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", seg.string().c_str());
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", req.string().c_str());
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", rr.string().c_str());
+            CHECK(!pflash_resolve_components().complete());
+        }
+        // An empty probe variable turns the probe off; the sibling beside the head does not stand in.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", "");
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", nullptr);
+            const auto comps = pflash_resolve_components();
+            CHECK(!comps.complete());
+            CHECK(comps.missing().size() == 1);
+        }
+        // A directory path is not a regular file and must not pass the startup gate.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", dir.string().c_str());
+            const auto comps = pflash_resolve_components();
+            CHECK(!comps.complete());
+            CHECK(comps.missing_summary().find("does not open: " + dir.string()) != std::string::npos);
+            CHECK(pflash_release_env().empty());
+        }
+        // When all four assets are present, pflash_release_env() publishes only the three sibling asset paths.
+        {
+            EnvGuard g1("PFLASH_SCORING_HEAD_GGUF", head.string().c_str());
+            EnvGuard g2("PFLASH_SEGMENT_PROBE_GGUF", nullptr);
+            EnvGuard g3("PFLASH_REQUEST_PROBE_GGUF", nullptr);
+            EnvGuard g4("PFLASH_SEG_RERANKER_GGUF", nullptr);
+            const auto env = pflash_release_env();
+            CHECK(env.size() == 3);
+            const auto has_name = [&](const char * name) {
+                return std::any_of(env.begin(), env.end(),
+                                   [&](const LaunchProfileEnv & e) { return e.name == name; });
+            };
+            CHECK(has_name("PFLASH_SEGMENT_PROBE_GGUF"));
+            CHECK(has_name("PFLASH_REQUEST_PROBE_GGUF"));
+            CHECK(has_name("PFLASH_SEG_RERANKER_GGUF"));
+            // Carrying the pre-resolved PFlashComponents into pflash_release_env(comps) avoids a
+            // second filesystem scan (TOCTOU) even if a sibling disappears afterward.
+            const auto snapshot = pflash_resolve_components();
+            CHECK(snapshot.complete());
+            fs::remove(rr, ec);
+            const auto from_snapshot = pflash_release_env(snapshot);
+            CHECK(from_snapshot.size() == 3);
+            CHECK(from_snapshot[2].name == "PFLASH_SEG_RERANKER_GGUF");
+            CHECK(from_snapshot[2].value == rr.string());
+        }
+        fs::remove_all(dir, ec);
     }
 
     void test_kvflash_recall_defaults_need_a_qwen35_target() {
@@ -990,10 +1120,11 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
     test_kvflash_recall_defaults_need_a_qwen35_target();
-    test_kvflash_recall_preamble_reserve_is_18_chunks();
+    test_kvflash_recall_preamble_reserve_is_64_chunks();
     test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
     test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
     test_kvflash_recall_defaults_are_the_shipped_profile();
     test_pflash_curve_arg_accepts_quoted_and_split_points();
     test_pflash_curve_arg_rejects_bad_points();
+    test_pflash_requires_all_four_components();
 }

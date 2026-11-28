@@ -76,8 +76,10 @@ RULES = [
     ("share/model_cards/", CARD_OTHER, "cards of models the serve jobs don't run"),
     ("server/test/python/", PY, "Python server tests"),
     ("server/test/", CPP_GPU, "C++ tests (luce_server links none of them)"),
-    # Documentation and static media affect no build or test target.
-    ("*.md", NONE, "documentation"),
+    # Markdown runs the Python lane so test_docs_paths.py can check that the
+    # quick-start commands still resolve against this tree. Other static media
+    # affects no build or test target.
+    ("*.md", PY, "documentation, whose quick-start paths the Python lane checks"),
     ("docs/", NONE, "documentation"),
     ("server/docs/", NONE, "documentation"),
     ("assets/", NONE, "images"),
@@ -135,6 +137,10 @@ def plan(paths: list[str] | None) -> tuple[frozenset[str], dict[str, list[str]]]
         rule = next((rule for rule in RULES if matches(path, rule[0])), None)
         needs, why = (rule[1], rule[2]) if rule else (ALL, UNKNOWN)
         jobs |= needs
+        # Specific directory rules shadow "*.md", but every markdown change
+        # must reach the quick-start path check in the Python lane.
+        if path.endswith(".md"):
+            jobs |= PY
         reasons.setdefault(why, []).append(path)
     return frozenset(jobs), reasons
 

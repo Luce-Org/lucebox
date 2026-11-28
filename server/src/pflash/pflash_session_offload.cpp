@@ -8,14 +8,7 @@
 #include <cstring>
 #include <sstream>
 
-#include <cstdlib>
-
 namespace luce::pflash {
-
-bool pflash_session_offload_pinned_enabled() noexcept {
-    const char * raw = std::getenv("PFLASH_SESSION_OFFLOAD_PINNED");
-    return raw && std::string(raw) == "1";
-}
 
 PFlashHostBlob & PFlashHostBlob::operator=(PFlashHostBlob && o) noexcept {
     if (this != &o) {

@@ -54,6 +54,22 @@ bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
         return true;
     }
 
+    // Try Inkling 2 family: explicit role and end-of-message control tokens.
+    // Checked before Laguna (whose XML markers match any BPE tokenizer) and
+    // matched via exact vocabulary tokens so unrelated tokenizers cannot hit.
+    const int32_t ink_sys  = exact_control_token("<|message_system|>");
+    const int32_t ink_usr  = exact_control_token("<|message_user|>");
+    const int32_t ink_mdl  = exact_control_token("<|message_model|>");
+    const int32_t ink_tool = exact_control_token("<|message_tool|>");
+    const int32_t ink_end  = exact_control_token("<|end_message|>");
+    if (ink_sys >= 0 && ink_usr >= 0 && ink_mdl >= 0 && ink_tool >= 0 && ink_end >= 0) {
+        out.family = "inkling2";
+        out.sys_role_prefix = {ink_sys};
+        out.end_msg_seqs = {{ink_end}};
+        out.next_role_starts = {{ink_usr}, {ink_mdl}, {ink_sys}, {ink_tool}};
+        return true;
+    }
+
     // Try Laguna family: XML-style markers.
     auto start_sys = tok.encode("<system>");
     auto end_sys   = tok.encode("</system>");

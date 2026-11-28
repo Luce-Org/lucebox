@@ -32,7 +32,7 @@ Fused single-kernel decode for Qwen3.5-0.8B, adapted for NVIDIA Pascal GPUs.
 ## Build
 
 ```bash
-cd megakernel
+cd optimizations/megakernel
 python -m venv .venv && source .venv/bin/activate
 pip install torch
 pip install -e . --no-build-isolation
@@ -57,7 +57,7 @@ python final_bench.py --backend bf16
 The dflash build also supports Pascal. Add `-DCMAKE_CUDA_ARCHITECTURES=61` to your cmake command:
 
 ```bash
-cd dflash
+cd server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=61
 cmake --build build --target test_dflash -j
 ```

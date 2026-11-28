@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -34,14 +35,15 @@ REPO = Path(__file__).resolve().parents[2]
     [
         (["server/src/qwen35/qwen35_backend.cpp", "server/test/unit/test_qwen35_x.cpp"], CPP_QWEN38),
         (["server/src/deepseek4/deepseek4_dspark.cpp"], CPP_DS41),
-        (["server/share/deepseek41/placement_lucebox.json", "server/docs/DS41.md"], DS41_PROFILE),
+        # The doc also runs the Python lane, which holds the quick-start path check.
+        (["server/share/deepseek41/placement_lucebox.json", "server/docs/DS41.md"], DS41_PROFILE | PY),
         (["server/test/unit/test_server_unit.cpp"], CPP_GPU),
         (["server/test/python/test_bench_ds4_decode.py"], PY),
-        (["share/model_cards/README.md"], NONE),
         (["share/model_cards/qwen3.8-27b.json"], CARD_QWEN38),
-        (["share/model_cards/deepseek-v4.1-flash.json", "share/model_cards/README.md"], CARD_DS41),
+        (["share/model_cards/deepseek-v4.1-flash.json", "share/model_cards/README.md"], CARD_DS41 | PY),
         (["share/model_cards/gemma-4-31b-it.json", "share/model_cards/_schema.json"], CARD_OTHER),
-        (["README.md", "server/docs/DS41.md", "docs/guide.md"], NONE),
+        # Markdown runs the Python lane, which holds the quick-start path check.
+        (["README.md", "server/docs/DS41.md", "docs/guide.md"], PY),
         ([".github/workflows/docker.yml", "Dockerfile"], NONE),
         (["harness/clients/run_pi.sh"], PY_CPP),
         (["harness/clients/common.sh"], PY_CPP),
@@ -90,6 +92,17 @@ def test_hidden_shared_change_alongside_docs_still_runs_full_suite() -> None:
 def test_every_rule_names_a_path_in_the_tree(pattern: str) -> None:
     # A renamed directory would otherwise leave a rule that never matches.
     assert (REPO / pattern).exists(), f"{pattern} is gone: update ci_plan.RULES"
+
+
+def test_every_markdown_change_runs_the_docs_check() -> None:
+    # A directory rule (server/test/, share/model_cards/) shadows "*.md"; the
+    # quick-start check would otherwise be skipped on those files.
+    files = subprocess.run(
+        ["git", "ls-files", "*.md"], cwd=REPO, capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert files
+    missing = [name for name in files if not PY <= plan([name])[0]]
+    assert not missing, f"markdown does not select the Python lane: {missing}"
 
 
 def test_full_runs_everything(

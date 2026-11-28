@@ -14,6 +14,7 @@
 
 #include "pflash_drafter.h"
 #include "pflash_compress.h"
+#include "pflash_seg_kcos.h"
 #include "pflash_selection.h"
 #include "pflash_query_candidates.h"
 #include "common/gguf_inspect.h"
@@ -32,12 +33,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <map>
-#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -53,16 +52,17 @@ static size_t causal_mask_bytes(int kv_start, int n_tokens) {
     return (size_t)align_up_i(kv_start + n_tokens, 256) * align_up_i(n_tokens, 32) * sizeof(uint16_t);
 }
 
-// The drafter cache's KV types: the target's resolution without the
-// LUCE_KV_TQ3 shorthand, since the drafter never wants the TurboQuant
-// rotation. Resolved without touching the environment, which other threads
-// read while a concurrent server scores a prompt.
+// The drafter cache's KV types: the target's resolution starting from F16
+// (the precision the scoring head was trained at, with no K/Q rotation) and
+// without the LUCE_KV_TQ3 shorthand, since the drafter never wants the
+// TurboQuant rotation. Resolved without touching the environment, which
+// other threads read while a concurrent server scores a prompt.
 struct DrafterKvTypes {
     ggml_type k = GGML_TYPE_COUNT;
     ggml_type v = GGML_TYPE_COUNT;
-    DrafterKvTypes() {
+    explicit DrafterKvTypes(ggml_type default_type = GGML_TYPE_F16) {
         luce::resolve_kv_types(k, v, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
-                               /*tq3_shorthand=*/false);
+                               /*tq3_shorthand=*/false, /*default_type=*/default_type);
     }
 };
 
@@ -126,7 +126,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
 
     TargetCache cache;
-    const DrafterKvTypes kv;
+    const DrafterKvTypes kv(GGML_TYPE_Q4_0);
     if (!create_target_cache(w, S, 0, w.backend, cache, true, 0,
                              /*paged_attention=*/false, 1,
                              /*concurrent_tree=*/false, kv.k, kv.v)) {
@@ -450,8 +450,7 @@ std::vector<int32_t> qwen35_score_and_compress(
 
     const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
-        env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
+        -1, -1,
         env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
@@ -573,9 +572,9 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.checkpoint = 0;
     session.probe_raw.clear();
     session.subunit_raw.clear();
+    session.container_raw.clear();
     session.request_raw.clear();
     session.request_rows.clear();
-    session.stage2_cand.clear();
     session.query_windows.clear();
     session.query_sets.clear();
     session.host_id = 0;
@@ -583,14 +582,6 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
 }
 
 namespace {
-
-// Stage-2 fallbacks since the process started, by reason (the text before ": ").
-long stage2_count_fallback(const std::string & reason) {
-    static std::mutex mutex;
-    static std::map<std::string, long> counts;
-    const std::lock_guard<std::mutex> lock(mutex);
-    return ++counts[reason.substr(0, reason.find(": "))];
-}
 
 int scoring_session_limit() {
     const char * raw = std::getenv("PFLASH_DRAFTER_SESSIONS");
@@ -661,9 +652,9 @@ Qwen35ScoringSession * acquire_scoring_session(
         int query_end,
         bool need_probe,
         bool need_subunit,
+        bool need_container,
         bool need_request,
         const std::vector<PFlashTokenSpan> & other_windows,
-        bool force_fresh,
         int resume_cap,
         int & resume,
         int & shared_prefix,
@@ -674,9 +665,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     // padded K view and moves the tail ubatches off the MMA kernel, which
     // changes the scores (resident drafter vs a freshly loaded one).
     const int S_padded = align_up_i(S, 256);
-    // Stage 2 (force_fresh): no session resume, every call scores the whole prompt from fresh rows, as
-    // PFLASH_DRAFTER_SESSIONS=0 does (the contract's stage-2 inputs are F32 rows only).
-    const int limit = force_fresh ? 0 : scoring_session_limit();
+    const int limit = scoring_session_limit();
     const size_t row_floats = (size_t) w.n_embd * (size_t) (query_end - query_start);
     resume = 0;
     shared_prefix = 0;
@@ -716,6 +705,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         }
         if ((need_probe && (int) session->probe_raw.size() < r) ||
             (need_subunit && (int) session->subunit_raw.size() < r) ||
+            (need_container && (int) session->container_raw.size() < r) ||
             (need_request && (int) session->request_raw.size() < r)) {
             r = 0;
         }
@@ -774,9 +764,9 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->checkpoint = 0;
     target->probe_raw.clear();
     target->subunit_raw.clear();
+    target->container_raw.clear();
     target->request_raw.clear();
     target->request_rows.clear();
-    target->stage2_cand.clear();
     target->query_windows.clear();
     target->query_sets.clear();
     target->host_valid = false;
@@ -818,9 +808,9 @@ void copy_session_bookkeeping(const Qwen35ScoringSession & from, Qwen35ScoringSe
     to.keys_trained = from.keys_trained;
     to.probe_raw = from.probe_raw;
     to.subunit_raw = from.subunit_raw;
+    to.container_raw = from.container_raw;
     to.request_raw = from.request_raw;
     to.request_rows = from.request_rows;
-    to.stage2_cand = from.stage2_cand;
     to.query_windows = from.query_windows;
     to.query_sets = from.query_sets;
     to.last_used = from.last_used;
@@ -841,36 +831,27 @@ void drop_host_store(DrafterContext & ctx, const std::string & reason) {
     ctx.host_sessions.reset();
 }
 
-ggml_backend_buffer_type_t pinned_host_type(ggml_backend_t backend) {
-    // Plain host memory unless PFLASH_SESSION_OFFLOAD_PINNED=1.
-    if (!luce::pflash::pflash_session_offload_pinned_enabled()) return nullptr;
-    ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
-    return dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-}
-
 } // namespace
 
 std::string qwen35_session_identity(const DrafterContext & ctx, const Qwen35DrafterState & st) {
-    const auto env_file = [](const char * name) {
-        const char * value = std::getenv(name);
-        return luce::pflash::pflash_file_identity(value ? value : "");
-    };
+    const std::string drafter_id = !st.drafter_file_id.empty()
+        ? st.drafter_file_id
+        : luce::pflash::pflash_file_identity(st.gguf_path);
     const TargetWeights & w = st.weights;
     std::ostringstream id;
     // The store lives in this process's memory, so the build cannot change under it; the stamp names it anyway.
     id << "format=2\n"
        << "build=" << __DATE__ << ' ' << __TIME__ << '\n'
-       << "drafter=" << luce::pflash::pflash_file_identity(st.gguf_path) << '\n'
+       << "drafter=" << drafter_id << '\n'
        << "drafter_sha256=" << st.gguf_sha256 << '\n'
        << "gpu=" << ctx.gpu << '\n'
        << "dims=" << w.n_layer << ',' << w.n_embd << ',' << w.n_head << ',' << w.n_head_kv << ','
        << w.n_embd_head_k << '\n'
-       << "head=" << env_file("PFLASH_SCORING_HEAD_GGUF") << '|' << st.head_loaded << '\n'
-       << "segment_probe=" << env_file("PFLASH_SEGMENT_PROBE_GGUF") << '|' << st.probe_loaded << '|'
-       << (st.probe_sub_fc2_w != nullptr) << '\n'
-       << "request_probe=" << env_file("PFLASH_REQUEST_PROBE_GGUF") << '|' << st.request_loaded << '|'
-       << st.request_stub << '|' << st.request_checkpoint_sha256 << '\n'
-       << "stage2=" << env_file(luce::pflash::kStage2GgufEnv) << '|' << st.stage2_loaded << '\n'
+       << "head=" << st.head_file_id << '|' << st.head_loaded << '\n'
+       << "segment_probe=" << st.probe_file_id << '|' << st.probe_loaded << '|'
+       << (st.probe_sub_fc2_w != nullptr) << '|' << (st.probe_cont_fc2_w != nullptr) << '\n'
+       << "request_probe=" << st.request_probe_file_id << '|' << st.request_loaded << '|'
+       << st.request_checkpoint_sha256 << '\n'
        << "sessions=" << scoring_session_limit() << '\n'
        << "grid=" << luce::pflash::kScoringResumeGrid << ',' << luce::pflash::kScoringUbatch << ','
        << luce::pflash::kScoringCutBack << '\n';
@@ -880,7 +861,7 @@ std::string qwen35_session_identity(const DrafterContext & ctx, const Qwen35Draf
 void qwen35_offload_sessions(DrafterContext & ctx) {
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
     if (!st) return;
-    const int limit = st->stage2_loaded ? 0 : scoring_session_limit();
+    const int limit = scoring_session_limit();
     if (limit == 0) {
         drop_host_store(ctx, "sessions are off for this drafter");
         return;
@@ -911,7 +892,6 @@ void qwen35_offload_sessions(DrafterContext & ctx) {
     }
     const auto plan = luce::pflash::pflash_plan_offload(entries, devices, limit);
 
-    // Released entries give their (pinned) storage to the copies below.
     std::vector<luce::pflash::PFlashHostBlob> pool;
     std::vector<Qwen35HostSession> kept;
     for (auto & h : s.sessions) {
@@ -925,7 +905,6 @@ void qwen35_offload_sessions(DrafterContext & ctx) {
     const size_t n_dropped = s.sessions.size() - kept.size();
     s.sessions = std::move(kept);
     const size_t n_kept = s.sessions.size();
-    ggml_backend_buffer_type_t pinned = pinned_host_type(st->weights.backend);
     size_t copied = 0, copied_bytes = 0;
     for (size_t index : plan.copy_devices) {
         Qwen35ScoringSession & session = *st->sessions[index];
@@ -951,7 +930,7 @@ void qwen35_offload_sessions(DrafterContext & ctx) {
         }
         std::string error;
         if (!luce::pflash::pflash_copy_to_host(tensors, qwen35_session_token_dims(session, tensors),
-                                               session.checkpoint, pinned, host.copy, error)) {
+                                               session.checkpoint, /*pinned=*/nullptr, host.copy, error)) {
             std::fprintf(stderr, "[qwen35-sessions] session not offloaded (%zu tokens): %s\n",
                          session.ids.size(), error.c_str());
             continue;
@@ -968,9 +947,9 @@ void qwen35_offload_sessions(DrafterContext & ctx) {
     }
     pool.clear();
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "[qwen35-sessions] offload: copied %zu session(s) (%.1f MiB%s), kept %zu unchanged host "
+    std::fprintf(stderr, "[qwen35-sessions] offload: copied %zu session(s) (%.1f MiB), kept %zu unchanged host "
                  "cop%s, released %zu; host RAM held %.1f MiB in %zu session(s) (%.0f ms)\n",
-                 copied, copied_bytes / (1024.0 * 1024.0), pinned ? ", pinned" : "", n_kept,
+                 copied, copied_bytes / (1024.0 * 1024.0), n_kept,
                  n_kept == 1 ? "y" : "ies", n_dropped, host_store_bytes(s) / (1024.0 * 1024.0), s.sessions.size(), ms);
     std::fflush(stderr);
     if (s.sessions.empty()) ctx.host_sessions.reset();
@@ -978,7 +957,7 @@ void qwen35_offload_sessions(DrafterContext & ctx) {
 
 void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st, const std::vector<int32_t> & ids) {
     if (!ctx.host_sessions || ctx.host_sessions->sessions.empty()) return;
-    const int limit = st.stage2_loaded ? 0 : scoring_session_limit();
+    const int limit = scoring_session_limit();
     if (limit == 0) {
         drop_host_store(ctx, "sessions are off for this drafter");
         return;
@@ -1075,9 +1054,6 @@ static std::vector<int32_t> strict_score_impl(
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    std::vector<float> * token_mass_out,
-    std::vector<PFlashTokenSpan> * segments_out,
-    bool * density_out,
     int resume_cap,
     const std::string & redone,
     std::string & redo) {
@@ -1107,60 +1083,19 @@ static std::vector<int32_t> strict_score_impl(
     const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
     const bool use_probe = st.probe_loaded &&
         experiment.segmentation != luce::pflash::PFlashSegmentation::Fixed;
-    // PFLASH_SELECT_QUERY_PROBE=1: the request probe's own trunk runs on
-    // the same tap whatever the segmentation mode.
-    const bool request_probe = experiment.query_probe;
-    if (request_probe && !st.request_loaded) {
-        set_last_error("PFLASH_SELECT_QUERY_PROBE=1: the drafter has no request probe");
-        return {};
-    }
-    // cand_v5 and stage 2 (STAGE2-CONTRACT.md): stage 2 runs only with a cand_v5 probe and its own GGUF. The
-    // latest user message's span is known before the forward: its x̂ sums ride in the key graph while it is fresh.
+    const bool request_probe = experiment.query_probe && st.request_loaded;
     const bool request_v5 = request_probe && st.request_v5;
-    const bool stage2_on = request_v5 && st.stage2_loaded;
-    PFlashTokenSpan stage2_latest_span{-1, -1};
-    if (stage2_on && experiment.request_messages_all_error.empty()) {
-        const int latest = luce::pflash::pflash_request_latest_user(experiment.request_messages_all);
-        if (latest >= 0) stage2_latest_span = experiment.request_messages_all[(size_t) latest].span;
-    }
-    // Query step 1 (pflash_query_candidates.h): relative candidates (qcand), the verbatim pin (qpin) and the
-    // dev-only replay grid (qgrid). Fail closed on any missing input; never today's windows while qcand is on.
+    // Relative query candidates + verbatim pin (pflash_query_candidates.h): active
+    // whenever both the request probe and segment probe are loaded.
     const luce::pflash::PFlashQueryConfig & qcfg = experiment.query;
-    const bool qcand = request_probe && qcfg.candidates > 0;
-    const bool qpin = request_probe && qcfg.pin_tokens > 0;
-    const char * qgrid_path = request_probe ? std::getenv("PFLASH_QUERY_GRID") : nullptr;
-    const bool qgrid = qgrid_path && *qgrid_path;
-    const bool qstep = qcand || qpin || qgrid;
-    if (qstep && st.stage2_loaded) {
-        set_last_error("PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN / PFLASH_QUERY_GRID do not combine with request "
-                       "stage 2 (PFLASH_REQUEST_STAGE2_GGUF)");
-        return {};
-    }
-    if (qstep && !use_probe) {
-        set_last_error("PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN / PFLASH_QUERY_GRID need the segment probe");
-        return {};
-    }
+    const bool qcand = request_probe && use_probe && qcfg.candidates > 0;
+    const bool qpin = request_probe && use_probe && qcfg.pin_tokens > 0;
+    const bool qstep = qcand || qpin;
     if (qstep && (!experiment.request_messages_all_error.empty() || experiment.request_messages_all.empty())) {
         set_last_error("query step: no message mapping from the caller" +
                        (experiment.request_messages_all_error.empty()
                             ? std::string() : ": " + experiment.request_messages_all_error));
         return {};
-    }
-    std::vector<luce::pflash::PFlashGridConfig> qgrid_configs;
-    if (qgrid) {
-        std::ifstream in(qgrid_path);
-        std::stringstream text;
-        text << in.rdbuf();
-        std::string grid_error;
-        if (!in || !luce::pflash::pflash_query_grid_parse(text.str(), qgrid_configs, grid_error)) {
-            set_last_error("PFLASH_QUERY_GRID: " + (grid_error.empty() ? std::string("unreadable file") : grid_error));
-            return {};
-        }
-        const char * out_path = std::getenv("PFLASH_QUERY_GRID_OUT");
-        if (!out_path || !*out_path) {
-            set_last_error("PFLASH_QUERY_GRID needs PFLASH_QUERY_GRID_OUT");
-            return {};
-        }
     }
 
     auto t0 = std::chrono::steady_clock::now();
@@ -1172,23 +1107,17 @@ static std::vector<int32_t> strict_score_impl(
         experiment.turn_query.end > experiment.turn_query.begin) {
         other_windows.push_back(experiment.turn_query);
     }
-    for (const auto & span : experiment.extra_queries) {
-        if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
-    }
-    // Stage 2 alone decides look-back: the fixed earlier-question windows (PFLASH_CHAT_HISTORY_QUERIES) are
-    // dropped while it is loaded, also from today's windows on a fallback.
-    const bool drop_history = st.stage2_loaded;
     for (const auto & span : experiment.history_queries) {
-        if (drop_history) break;
         if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
     }
     // The query step resumes like every other request (pflash_scoring_resume.h: exact by construction); its query
     // rows come from this call's activations or the session's exact F32 sets, else the request is redone from 0.
-    const bool sessions_on = !st.stage2_loaded && scoring_session_limit() > 0;
+    const bool sessions_on = scoring_session_limit() > 0;
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
-        use_probe && st.probe_sub_fc2_w != nullptr, request_probe, other_windows,
-        /*force_fresh=*/st.stage2_loaded, resume_cap, resume, shared_prefix, scratch);
+        use_probe && st.probe_sub_fc2_w != nullptr,
+        use_probe && st.probe_cont_fc2_w != nullptr, request_probe, other_windows,
+        resume_cap, resume, shared_prefix, scratch);
     if (!session) return {};
     if (resume > 0 && (resume % luce::pflash::kScoringResumeGrid != 0 ||
                        resume > S - luce::pflash::kScoringCutBack)) {
@@ -1231,7 +1160,6 @@ static std::vector<int32_t> strict_score_impl(
         return {};
     }
     ggml_tensor * act_in = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, std::max(1, n_new));
-    ggml_tensor * act_out = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, std::max(1, n_new));
     ggml_backend_buffer_t act_buf = ggml_backend_alloc_ctx_tensors(act_ctx, w.backend);
     if (!act_buf) {
         ggml_free(act_ctx);
@@ -1252,33 +1180,24 @@ static std::vector<int32_t> strict_score_impl(
         return {};
     };
 
-    {
-        const int batch = 2048;
-        std::vector<float> emb((size_t)hidden * batch);
-        for (int i = 0; i < n_new; i += batch) {
-            const int n = std::min(batch, n_new - i);
-            if (!w.embedder.embed(ids.data() + resume + i, n, emb.data())) {
-                return fail("qwen35 drafter embedding failed");
-            }
-            ggml_backend_tensor_set(act_in, emb.data(), (size_t)i * act_in->nb[1],
-                                    (size_t)hidden * n * sizeof(float));
-        }
-    }
-
-    // Blocks 0..14 over the new tokens only, layer by layer. Each
-    // DeltaNet layer's recurrent state is copied once it reaches the
-    // checkpoint.
-    const auto snapshot_layer = [&](int il) {
+    // Blocks 0..14 over the new tokens only, fused per ubatch: one graph runs
+    // all 15 blocks for [start, start + n), sharing one causal mask and M-RoPE
+    // position tensor across the full-attention blocks, keeping intermediate
+    // [hidden, n] activations in transient scratch, and writing only the final
+    // block-14 output into act_in. Each DeltaNet layer's recurrent state is
+    // copied once the ubatch loop reaches the checkpoint.
+    const auto snapshot_all_delta = [&]() {
         int dn = 0;
-        for (int l = 0; l < il; ++l) {
-            if (((l + 1) % w.full_attention_interval) != 0) ++dn;
-        }
-        if (dn < (int) cache.ssm_state.size() && cache.ssm_state[(size_t) dn] &&
-            cache.ssm_state_snap[(size_t) dn]) {
-            ggml_backend_tensor_copy(cache.ssm_state[(size_t) dn],
-                                     cache.ssm_state_snap[(size_t) dn]);
-            ggml_backend_tensor_copy(cache.conv_state[(size_t) dn],
-                                     cache.conv_state_snap[(size_t) dn]);
+        for (int il = 0; il < kQwen35HeadBlock; ++il) {
+            if (((il + 1) % w.full_attention_interval) == 0) continue;
+            if (dn < (int) cache.ssm_state.size() && cache.ssm_state[(size_t) dn] &&
+                cache.ssm_state_snap[(size_t) dn]) {
+                ggml_backend_tensor_copy(cache.ssm_state[(size_t) dn],
+                                         cache.ssm_state_snap[(size_t) dn]);
+                ggml_backend_tensor_copy(cache.conv_state[(size_t) dn],
+                                         cache.conv_state_snap[(size_t) dn]);
+            }
+            ++dn;
         }
     };
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
@@ -1288,38 +1207,50 @@ static std::vector<int32_t> strict_score_impl(
     const auto ubatch_at = [&](int start) {
         return std::min(ubatch, (start < cut ? cut : S) - start);
     };
-    // Graph of layer il over tokens [start, start + n), writing act_out.
+    const bool has_attn = w.full_attention_interval <= kQwen35HeadBlock;
+    // One host buffer for every ubatch's graph metadata, instead of a fresh
+    // allocation per ubatch.
+    std::vector<uint8_t> graph_mem(16 * 1024 * 1024);
+    // Graph of blocks 0..14 over tokens [start, start + n), reading embedded
+    // inputs from `inp` and writing block-14 outputs into act_in.
     // nullptr (error set) on failure.
-    const auto layer_graph = [&](int il, int start, int n, ggml_cgraph *& gf,
-                                 ggml_tensor *& pos) -> ggml_context * {
+    const auto ubatch_graph = [&](int start, int n, ggml_cgraph *& gf,
+                                  ggml_tensor *& inp, ggml_tensor *& pos) -> ggml_context * {
         ggml_init_params ip{};
-        ip.mem_size = 512 * 1024 * 1024;
+        ip.mem_size = graph_mem.size();
+        ip.mem_buffer = graph_mem.data();
         ip.no_alloc = true;
         ggml_context * ctx = ggml_init(ip);
         if (!ctx) {
-            set_last_error("qwen35 drafter layer graph ctx init failed");
+            set_last_error("qwen35 drafter ubatch graph ctx init failed");
             return nullptr;
         }
         gf = ggml_new_graph_custom(ctx, 16384, false);
-        ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1],
-                                         (size_t)(start - resume) * act_in->nb[1]);
+        inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n);
+        ggml_set_input(inp);
         pos = nullptr;
         ggml_tensor * mask = nullptr;
-        if (((il + 1) % w.full_attention_interval) == 0) {
+        if (has_attn) {
             pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
             ggml_set_input(pos);
             mask = build_qwen35_causal_mask(ctx, gf, start, n);
         }
-        ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask,
-                                               start, n, false, 0);
-        ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1],
-                                         (size_t)(start - resume) * act_out->nb[1]);
-        if (ggml_nelements(out) != ggml_nelements(dst)) {
+        ggml_tensor * cur = inp;
+        for (int il = 0; il < kQwen35HeadBlock; ++il) {
+            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            cur = build_qwen35_layer(ctx, gf, w, cache, il, cur,
+                                     is_attn ? pos : nullptr,
+                                     is_attn ? mask : nullptr,
+                                     start, n, false, 0);
+        }
+        ggml_tensor * dst = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1],
+                                         (size_t)(start - resume) * act_in->nb[1]);
+        if (ggml_nelements(cur) != ggml_nelements(dst)) {
             ggml_free(ctx);
             set_last_error("qwen35 layer output shape mismatch");
             return nullptr;
         }
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, cur, dst));
         return ctx;
     };
     const auto fail_graph = [&]() -> std::vector<int32_t> {
@@ -1328,19 +1259,18 @@ static std::vector<int32_t> strict_score_impl(
         session->ids.clear();
         return {};
     };
-    // Size the compute buffer once, for a full-attention layer over the
-    // ubatch with the largest mask: allocating per ubatch would regrow it
-    // with every ubatch of the first attention layer.
-    if (n_new > 0 && w.full_attention_interval <= kQwen35HeadBlock) {
+    // Size the compute buffer once, for the ubatch with the largest causal
+    // mask: allocating per ubatch would otherwise regrow it as kv_len grows.
+    if (n_new > 0) {
         int worst = resume;
         for (int start = resume; start < S; start += ubatch_at(start)) {
             if (causal_mask_bytes(start, ubatch_at(start)) >=
                 causal_mask_bytes(worst, ubatch_at(worst))) worst = start;
         }
         ggml_cgraph * gf = nullptr;
+        ggml_tensor * inp = nullptr;
         ggml_tensor * pos = nullptr;
-        ggml_context * ctx = layer_graph(w.full_attention_interval - 1, worst,
-                                         ubatch_at(worst), gf, pos);
+        ggml_context * ctx = ubatch_graph(worst, ubatch_at(worst), gf, inp, pos);
         if (!ctx) return fail_graph();
         const bool reserved = ggml_gallocr_reserve(alloc, gf);
         ggml_free(ctx);
@@ -1349,41 +1279,45 @@ static std::vector<int32_t> strict_score_impl(
             return fail("qwen35 drafter graph allocation failed");
         }
     }
-    for (int il = 0; il < kQwen35HeadBlock; ++il) {
-        const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
-        if (!is_attn && checkpoint == resume) snapshot_layer(il);
-        for (int start = resume; start < S;) {
-            const int n = ubatch_at(start);
-            ggml_cgraph * gf = nullptr;
-            ggml_tensor * pos = nullptr;
-            ggml_context * ctx = layer_graph(il, start, n, gf, pos);
-            if (!ctx) return fail_graph();
-            if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-                ggml_free(ctx); ggml_gallocr_free(alloc);
-                return fail("qwen35 drafter graph allocation failed");
-            }
-            if (is_attn) {
-                std::vector<int32_t> p4((size_t)4 * n, 0);
-                for (int i = 0; i < n; ++i) {
-                    const int p = start + i;
-                    p4[(size_t)0 * n + i] = p;
-                    p4[(size_t)1 * n + i] = p;
-                    p4[(size_t)2 * n + i] = p;
-                }
-                ggml_backend_tensor_set(pos, p4.data(), 0, p4.size() * sizeof(int32_t));
-            }
-            const auto status = ggml_backend_graph_compute(w.backend, gf);
-            ggml_free(ctx);
-            if (status != GGML_STATUS_SUCCESS) {
-                ggml_gallocr_free(alloc);
-                return fail("qwen35 drafter graph compute failed");
-            }
-            start += n;
-            if (!is_attn && start == checkpoint && checkpoint > resume) {
-                snapshot_layer(il);
-            }
+    if (checkpoint == resume) snapshot_all_delta();
+    std::vector<float> emb((size_t)hidden * (size_t)ubatch);
+    std::vector<int32_t> p4((size_t)4 * (size_t)ubatch, 0);
+    for (int start = resume; start < S;) {
+        const int n = ubatch_at(start);
+        if (!w.embedder.embed(ids.data() + start, n, emb.data())) {
+            ggml_gallocr_free(alloc);
+            return fail("qwen35 drafter embedding failed");
         }
-        std::swap(act_in, act_out);
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * inp = nullptr;
+        ggml_tensor * pos = nullptr;
+        ggml_context * ctx = ubatch_graph(start, n, gf, inp, pos);
+        if (!ctx) return fail_graph();
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+            ggml_free(ctx); ggml_gallocr_free(alloc);
+            return fail("qwen35 drafter graph allocation failed");
+        }
+        ggml_backend_tensor_set(inp, emb.data(), 0, (size_t)hidden * (size_t)n * sizeof(float));
+        if (pos) {
+            std::fill_n(p4.begin(), (size_t)4 * (size_t)n, 0);
+            for (int i = 0; i < n; ++i) {
+                const int p = start + i;
+                p4[(size_t)0 * n + i] = p;
+                p4[(size_t)1 * n + i] = p;
+                p4[(size_t)2 * n + i] = p;
+            }
+            ggml_backend_tensor_set(pos, p4.data(), 0, (size_t)4 * (size_t)n * sizeof(int32_t));
+        }
+        const auto status = ggml_backend_graph_compute(w.backend, gf);
+        ggml_free(ctx);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(alloc);
+            return fail("qwen35 drafter graph compute failed");
+        }
+        start += n;
+        if (start == checkpoint && checkpoint > resume) {
+            snapshot_all_delta();
+        }
     }
     ggml_gallocr_free(alloc);
     auto t1 = std::chrono::steady_clock::now();
@@ -1428,20 +1362,8 @@ static std::vector<int32_t> strict_score_impl(
                 windows.push_back(std::move(tail));
             }
         }
-        // The user's prose around pasted material (query head), at the
-        // query's own weight.
-        for (const auto & span : experiment.extra_queries) {
-            if (span.end > query_start || span.end - span.begin < 1) continue;
-            ScoredWindow extra;
-            extra.begin = span.begin;
-            extra.end = span.end;
-            if (rows_for(span.begin, span.end, extra.rows)) {
-                windows.push_back(std::move(extra));
-            }
-        }
         double weight = 1.0;
         for (const auto & span : experiment.history_queries) {
-            if (drop_history) break;
             weight *= 0.5;
             if (span.end > query_start || span.end - span.begin < 1) continue;
             ScoredWindow history;
@@ -1457,7 +1379,7 @@ static std::vector<int32_t> strict_score_impl(
     // never scored here.
     std::vector<ScoredWindow> keep_rows;
     for (const auto & span : experiment.keep_queries) {
-        if (drop_history || span.end > query_start || span.end - span.begin < 1) continue;
+        if (span.end > query_start || span.end - span.begin < 1) continue;
         ScoredWindow keep;
         keep.begin = span.begin;
         keep.end = span.end;
@@ -1469,12 +1391,9 @@ static std::vector<int32_t> strict_score_impl(
     session->probe_raw.resize(use_probe ? (size_t) resume : 0);
     session->subunit_raw.resize(
         use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
+    session->container_raw.resize(
+        use_probe && st.probe_cont_fc2_w ? (size_t) resume : 0);
     session->request_raw.resize(request_probe ? (size_t) resume : 0);
-    session->stage2_cand.resize(stage2_on ? (size_t) resume * luce::pflash::kStage2Embed : 0);
-    // Stage 2: the fresh latest user message's x̂ column sums, one per key chunk it overlaps ([parts][hidden]).
-    const bool stage2_latest_fresh = stage2_on && stage2_latest_span.end > stage2_latest_span.begin &&
-        stage2_latest_span.begin >= resume;
-    std::vector<float> stage2_msum;
 
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
@@ -1483,11 +1402,13 @@ static std::vector<int32_t> strict_score_impl(
     const int key_chunk = luce::pflash::kScoringResumeGrid;
     if (n_new > 0) {
         ggml_init_params nip{};
-        nip.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
+        nip.mem_size = (size_t)6 * ggml_tensor_overhead() + 4096;
         nip.no_alloc = true;
         ggml_context * nctx = ggml_init(nip);
         ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
         ggml_tensor * subunit_new = use_probe && st.probe_sub_fc2_w
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+        ggml_tensor * container_new = use_probe && st.probe_cont_fc2_w
             ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
         ggml_tensor * request_new = request_probe
             ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
@@ -1498,39 +1419,9 @@ static std::vector<int32_t> strict_score_impl(
             return fail("qwen35 probe buffer allocation failed");
         }
         const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
-        // Stage 2: c(t) of the new tokens, and the fresh latest message's x̂ column sums.
-        ggml_context * s2ctx = nullptr;
-        ggml_backend_buffer_t s2buf = nullptr;
-        ggml_tensor * cand_new = nullptr;
-        ggml_tensor * msum_new = nullptr;
-        int msum_parts = 0;
-        if (stage2_on) {
-            for (int b = 0; b < n_new && stage2_latest_fresh; b += key_chunk) {
-                const int n = std::min(key_chunk, n_new - b);
-                if (std::max(stage2_latest_span.begin, resume + b) <
-                    std::min(stage2_latest_span.end, resume + b + n)) ++msum_parts;
-            }
-            ggml_init_params sip2{};
-            sip2.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
-            sip2.no_alloc = true;
-            s2ctx = ggml_init(sip2);
-            if (s2ctx) {
-                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_new);
-                msum_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, hidden, std::max(1, msum_parts));
-                s2buf = ggml_backend_alloc_ctx_tensors(s2ctx, w.backend);
-            }
-            if (!s2buf) {
-                if (s2ctx) ggml_free(s2ctx);
-                if (nbuf) ggml_backend_buffer_free(nbuf);
-                ggml_free(nctx);
-                return fail("qwen35 stage-2 buffer allocation failed");
-            }
-            if (msum_parts == 0) msum_new = nullptr;
-        }
         ggml_init_params kip{};
         kip.mem_size = ggml_tensor_overhead() *
-                           (size_t)(64 + (request_probe ? 40 : 24) * n_key_chunks +
-                                    (stage2_on ? 24 * n_key_chunks : 0)) +
+                           (size_t)(64 + (request_probe ? 48 : 32) * n_key_chunks) +
                        ggml_graph_overhead_custom(4096, false) + 64 * 1024;
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
@@ -1566,6 +1457,14 @@ static std::vector<int32_t> strict_score_impl(
                     ggml_build_forward_expand(kgf,
                         ggml_cpy(kctx, ggml_reshape_1d(kctx, sub, n), s_dst));
                 }
+                if (container_new) {
+                    ggml_tensor * cont = ggml_add(kctx,
+                        ggml_mul_mat(kctx, st.probe_cont_fc2_w, p), st.probe_cont_fc2_b);
+                    ggml_tensor * c_dst = ggml_view_1d(kctx, container_new, n,
+                        (size_t)b * ggml_element_size(container_new));
+                    ggml_build_forward_expand(kgf,
+                        ggml_cpy(kctx, ggml_reshape_1d(kctx, cont, n), c_dst));
+                }
             }
             if (request_new) {
                 // Request probe: its own LayerNorm -> fc1 -> GELU(erf) -> fc2
@@ -1580,25 +1479,6 @@ static std::vector<int32_t> strict_score_impl(
                     (size_t)b * ggml_element_size(request_new));
                 ggml_build_forward_expand(kgf,
                     ggml_cpy(kctx, ggml_reshape_1d(kctx, req, n), r_dst));
-            }
-            if (cand_new) {
-                // Stage 2: c(t) = cand(x̂_t), kept per token while the session covers it.
-                ggml_tensor * c = luce::pflash::pflash_stage2_build_cand(kctx, st.stage2_dev, x_norm);
-                ggml_tensor * c_dst = ggml_view_2d(kctx, cand_new, luce::pflash::kStage2Embed, n,
-                                                   cand_new->nb[1], (size_t) b * cand_new->nb[1]);
-                ggml_build_forward_expand(kgf, ggml_cpy(kctx, c, c_dst));
-            }
-            if (msum_new) {
-                const int lo = std::max(stage2_latest_span.begin, resume + b);
-                const int hi = std::min(stage2_latest_span.end, resume + b + n);
-                if (lo < hi) {
-                    ggml_tensor * col = luce::pflash::pflash_stage2_build_column_sum(
-                        kctx, x_norm, lo - (resume + b), hi - (resume + b));
-                    const int part = (int) (stage2_msum.size() / (size_t) hidden);
-                    stage2_msum.resize(stage2_msum.size() + (size_t) hidden);
-                    ggml_tensor * m_dst = ggml_view_1d(kctx, msum_new, hidden, (size_t) part * msum_new->nb[1]);
-                    ggml_build_forward_expand(kgf, ggml_cpy(kctx, col, m_dst));
-                }
             }
         }
         ggml_gallocr_t kalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
@@ -1615,23 +1495,17 @@ static std::vector<int32_t> strict_score_impl(
                 ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + resume, 0,
                                         (size_t) n_new * sizeof(float));
             }
+            if (container_new) {
+                session->container_raw.resize((size_t) S);
+                ggml_backend_tensor_get(container_new, session->container_raw.data() + resume, 0,
+                                        (size_t) n_new * sizeof(float));
+            }
         }
         if (key_ok && request_new) {
             session->request_raw.resize((size_t) S);
             ggml_backend_tensor_get(request_new, session->request_raw.data() + resume, 0,
                                     (size_t) n_new * sizeof(float));
         }
-        if (key_ok && cand_new) {
-            session->stage2_cand.resize((size_t) S * luce::pflash::kStage2Embed);
-            ggml_backend_tensor_get(cand_new,
-                session->stage2_cand.data() + (size_t) resume * luce::pflash::kStage2Embed, 0,
-                (size_t) n_new * luce::pflash::kStage2Embed * sizeof(float));
-        }
-        if (key_ok && msum_new && !stage2_msum.empty()) {
-            ggml_backend_tensor_get(msum_new, stage2_msum.data(), 0, stage2_msum.size() * sizeof(float));
-        }
-        if (s2buf) ggml_backend_buffer_free(s2buf);
-        if (s2ctx) ggml_free(s2ctx);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         ggml_free(nctx);
         if (!key_ok) return fail("qwen35 key graph compute failed");
@@ -1639,6 +1513,61 @@ static std::vector<int32_t> strict_score_impl(
 
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
+    const std::vector<float> & container_raw = session->container_raw;
+    // Tap-count smoothing over raw segment-probe logits (torch Conv1d,
+    // symmetric padding) plus residual logit, then sigmoid.
+    const auto smooth_probe = [&](const std::vector<float> & raw,
+                                  const std::vector<float> & conv_w, float conv_b,
+                                  std::vector<float> & out) {
+        const int taps = (int) conv_w.size();
+        const int radius = taps / 2;
+        out.assign((size_t) S, 0.0f);
+        for (int t = 0; t < S; ++t) {
+            float acc = raw[(size_t) t] + conv_b;
+            for (int k = 0; k < taps; ++k) {
+                const int u = t + k - radius;
+                if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
+            }
+            out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
+        }
+    };
+    std::vector<float> container_probs;
+    if (use_probe && !container_raw.empty() && !st.probe_cont_conv_w.empty()) {
+        smooth_probe(container_raw, st.probe_cont_conv_w, st.probe_cont_conv_b, container_probs);
+    }
+
+    // Precompute smoothed segment-probe probabilities and line-alignment flags
+    // once per forward: segment() is called up to 3x per request (unit_segments,
+    // fit_pin, and final selection) with different forced pin spans.
+    std::vector<float> probe_boundary;
+    std::vector<float> probe_split_scores;
+    luce::pflash::PFlashLineFlags probe_lines;
+    bool have_probe_lines = false;
+    int probe_boundaries_in_context = 0;
+    const int seg_query_end = score_query_end < 0 ? S : score_query_end;
+    const int seg_query_begin = seg_query_end - std::min(n_lookahead, seg_query_end);
+    if (use_probe) {
+        smooth_probe(probe_raw, st.probe_conv_w, st.probe_conv_b, probe_boundary);
+        if (!subunit_raw.empty()) {
+            smooth_probe(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, probe_split_scores);
+        }
+        for (int t = 1; t < S; ++t) {
+            if (t >= seg_query_begin &&
+                (t < seg_query_end || !experiment.query_suffix_candidates)) {
+                continue;
+            }
+            if (probe_boundary[(size_t) t] > st.probe_threshold) ++probe_boundaries_in_context;
+        }
+        const bool forced_probe =
+            experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
+        if ((probe_boundaries_in_context >= 4 || forced_probe) &&
+            st.probe_line_aligned && st.probe_vocab) {
+            std::vector<std::string> texts((size_t) S);
+            for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
+            probe_lines = luce::pflash::pflash_line_flags(texts);
+            have_probe_lines = true;
+        }
+    }
 
     // Candidates: probe segments cut at the pinned spans' edges, or fixed
     // chunks when the probe is off or finds too few boundaries.
@@ -1647,67 +1576,24 @@ static std::vector<int32_t> strict_score_impl(
         segments.clear();
         density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
         if (!use_probe) return;
-        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
-        // padding) plus the residual logit, then sigmoid: the boundary score
-        // per token.
-        const auto smooth = [&](const std::vector<float> & raw,
-                                const std::vector<float> & conv_w, float conv_b,
-                                std::vector<float> & out) {
-            const int taps = (int) conv_w.size();
-            const int radius = taps / 2;
-            out.assign((size_t) S, 0.0f);
-            for (int t = 0; t < S; ++t) {
-                float acc = raw[(size_t) t] + conv_b;
-                for (int k = 0; k < taps; ++k) {
-                    const int u = t + k - radius;
-                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
-                }
-                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
-            }
-        };
-        std::vector<float> boundary;
-        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
-        // Sub-unit scores feed only the oversize interior argmax below.
-        std::vector<float> split_scores;
-        if (!subunit_raw.empty()) {
-            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
-        }
-        const int query_end = score_query_end < 0 ? S : score_query_end;
-        const int query_begin = query_end - std::min(n_lookahead, query_end);
-        std::vector<int> forced{query_begin, query_end};
+        std::vector<int> forced{seg_query_begin, seg_query_end};
         for (const auto & span : pins) {
             forced.push_back(span.begin);
             forced.push_back(span.end);
         }
-        int boundaries_in_context = 0;
-        for (int t = 1; t < S; ++t) {
-            if (t >= query_begin &&
-                (t < query_end || !experiment.query_suffix_candidates)) {
-                continue;
-            }
-            if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
-        }
         const bool forced_probe =
             experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
-        if (boundaries_in_context >= 4 || forced_probe) {
-            if (st.probe_line_aligned && st.probe_vocab) {
-                std::vector<std::string> texts((size_t) S);
-                for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
-                const auto lines = luce::pflash::pflash_line_flags(texts);
-                segments = luce::pflash::pflash_probe_segments(
-                    boundary, S, st.probe_threshold, st.probe_min_segment,
-                    st.probe_max_segment, forced, split_scores, &lines);
-            } else {
-                segments = luce::pflash::pflash_probe_segments(
-                    boundary, S, st.probe_threshold, st.probe_min_segment,
-                    st.probe_max_segment, forced, split_scores);
-            }
+        if (probe_boundaries_in_context >= 4 || forced_probe) {
+            segments = luce::pflash::pflash_probe_segments(
+                probe_boundary, S, st.probe_threshold, st.probe_min_segment,
+                st.probe_max_segment, forced, probe_split_scores,
+                have_probe_lines ? &probe_lines : nullptr);
         }
         if (segments.empty()) {
             std::fprintf(stderr,
                 "[qwen35-segment-probe] %d boundaries in the context, "
                 "falling back to fixed %d-token chunks\n",
-                boundaries_in_context, experiment.chunk_size);
+                probe_boundaries_in_context, experiment.chunk_size);
         } else {
             if (experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
                 density = true;
@@ -1715,7 +1601,7 @@ static std::vector<int32_t> strict_score_impl(
             std::fprintf(stderr,
                 "[qwen35-segment-probe] %d boundaries in the context -> %zu segments "
                 "(threshold %.2f, %d-%d tokens), score=%s\n",
-                boundaries_in_context, segments.size(), st.probe_threshold,
+                probe_boundaries_in_context, segments.size(), st.probe_threshold,
                 st.probe_min_segment, st.probe_max_segment,
                 density ? "density" : "sum");
         }
@@ -1747,30 +1633,16 @@ static std::vector<int32_t> strict_score_impl(
         return total;
     };
 
-    // Request probe (PFLASH_SELECT_QUERY_PROBE=1): the query set from the
-    // request logits of the human messages, its block-14 rows, and the rows
-    // later turns will need -- all read here, while this call's activations
-    // (act_in) still exist. Rows before ``resume`` come from the session's
-    // store; a query row found nowhere falls the whole request back to
-    // today's windows.
+    // Request probe: the query set from the request logits of the human
+    // messages, its block-14 rows, and the rows later turns will need -- all
+    // read here, while this call's activations (act_in) still exist.
     luce::pflash::PFlashRequestProbeTrace request_trace;
     std::vector<float> request_query_rows;      // [hidden, query tokens]
-    // Query step 1 state: units, the served candidate set and pin, the grid's candidate sets and oracle, and the
-    // block-14 rows of every query token set any of them scores (keyed by the ascending token list).
     luce::pflash::PFlashQueryTrace query_trace;
     luce::pflash::PFlashQueryUnits qunits;
-    std::vector<luce::pflash::PFlashQueryCandidateSet> qgrid_sets;   // per grid config (empty unless cand)
-    luce::pflash::PFlashQueryOracle qoracle;
-    std::string qoracle_error = "no_oracle_dir";
-    std::string qfingerprint;
     std::map<std::vector<int>, std::vector<float>> qrows;
-    int qrows_new = 0;
-    // Stage 2's pass-1 assembly (STAGE2-CONTRACT.md section 5), when it ran.
-    luce::pflash::PFlashStage2Assembly stage2_asm;
-    bool stage2_assembled = false;
     if (request_probe) {
         request_trace.tau = st.request_tau;
-        request_trace.stub = st.request_stub;
         request_trace.store_invalidated_turns = request_rows_invalidated;
         const auto gather = [&](const std::vector<int> & positions,
                                 std::vector<float> & rows, int & fresh,
@@ -1807,185 +1679,18 @@ static std::vector<int32_t> strict_score_impl(
             }
             return true;
         };
-        // Stage 2 pass 1 on the cand_v5 set (contract section 4): seed, m_all / m_s1, message head, look-back
-        // attention over E, the token model, then the assembly (seed > promoted > post-latest, widening).
-        const auto stage2_pass1 = [&]() -> bool {
-            auto & s2t = request_trace.stage2;
-            const auto & msgs = experiment.request_messages_all;
-            const auto started = std::chrono::steady_clock::now();
-            const auto finish = [&]() {
-                s2t.pass1_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started).count();
-            };
-            luce::pflash::PFlashStage2Layout layout;
-            std::string layout_error;
-            if (!luce::pflash::pflash_stage2_layout(msgs, S, layout, layout_error)) {
-                s2t.reason = "message_mapping";
-                request_trace.fallback = "message_mapping: " + layout_error;
-                finish();
-                return true;
-            }
-            const std::vector<float> & s1 = session->request_raw;
-            if (layout.latest < 0) {
-                s2t.reason = "no_user_message";     // the cand_v5 set alone
-                finish();
-                return true;
-            }
-            const PFlashTokenSpan latest = layout.latest_span;
-            bool seed_capped = false;
-            int reserve = 0;
-            std::vector<int> post_latest;
-            // Contract v3: R slots reserved for the post-latest cues; the seed (m_s1, the look-back queries) is
-            // capped at 1024 - R.
-            const std::vector<int> seed = luce::pflash::pflash_request_capped_seed(
-                s1, st.request_tau, msgs, luce::pflash::kRequestQueryCap, luce::pflash::kRequestPostReserve, reserve,
-                post_latest, &seed_capped);
-            s2t.post_reserve = reserve;
-            luce::pflash::PFlashStage2Latest lat;
-            lat.m_all.assign((size_t) hidden, 0.0);
-            std::vector<float> seed_rows((size_t) hidden * seed.size());
-            if (latest.end <= latest.begin || latest.begin >= resume) {
-                // Fresh: m_all from the key graph's column sums, the seed rows from this call's activations.
-                const size_t parts = stage2_msum.size() / (size_t) hidden;
-                if (latest.end > latest.begin && parts == 0) {
-                    s2t.reason = "rows_missing";
-                    request_trace.fallback = "rows_missing";
-                    finish();
-                    return true;
-                }
-                for (size_t p = 0; p < parts; ++p) {
-                    for (int k = 0; k < hidden; ++k) lat.m_all[(size_t) k] += (double) stage2_msum[p * hidden + (size_t) k];
-                }
-                if (latest.end > latest.begin) {
-                    for (auto & v : lat.m_all) v /= (double) (latest.end - latest.begin);
-                }
-                for (size_t q = 0; q < seed.size(); ++q) {
-                    ggml_backend_tensor_get(act_in, seed_rows.data() + q * (size_t) hidden,
-                                            (size_t) (seed[q] - resume) * act_in->nb[1],
-                                            (size_t) hidden * sizeof(float));
-                }
-            } else {
-                // Unreachable while stage 2 forces fresh scoring (resume 0); fail closed, traced and counted.
-                s2t.reason = "rows_missing";
-                request_trace.fallback = "rows_missing";
-                finish();
-                return true;
-            }
-            if (seed.empty()) {
-                lat.m_s1 = lat.m_all;
-            } else {
-                lat.m_s1.assign((size_t) hidden, 0.0);
-                std::vector<double> xh((size_t) hidden);
-                for (size_t q = 0; q < seed.size(); ++q) {
-                    luce::pflash::pflash_stage2_xhat(seed_rows.data() + q * (size_t) hidden, st.stage2_w_in.data(),
-                                                     hidden, w.rms_eps, xh.data());
-                    for (int k = 0; k < hidden; ++k) lat.m_s1[(size_t) k] += xh[(size_t) k];
-                }
-                for (auto & v : lat.m_s1) v /= (double) seed.size();
-            }
-            luce::pflash::pflash_stage2_message_head(st.stage2, lat);
-            const char * dump = std::getenv(luce::pflash::kStage2FeaturesEnv);
-            const bool dumping = dump && *dump;
-            const size_t N = layout.earlier.size();
-            const bool look = lat.lookback_logit >= st.stage2.tau_lb && N > 0;   // NaN -> false
-            std::vector<float> a, x, s2;
-            if (N > 0 && (look || dumping)) {
-                luce::pflash::PFlashStage2AttentionInputs in;
-                in.backend = w.backend;
-                in.keys = session->keys;
-                in.wq = st.head_wq;
-                in.w_in = L.attn_norm;
-                in.w_qn = L.q_norm;
-                in.rms_eps = w.rms_eps;
-                std::string error;
-                if (!luce::pflash::pflash_stage2_attention_gpu(in, layout.earlier, seed_rows.data(),
-                                                                (int) seed.size(), a, s2t.attention_tiles, error)) {
-                    set_last_error(error);
-                    return false;
-                }
-                std::vector<float> cand(N * (size_t) luce::pflash::kStage2Embed);
-                for (size_t i = 0; i < N; ++i) {
-                    std::copy_n(session->stage2_cand.data() +
-                                    (size_t) layout.earlier[i] * luce::pflash::kStage2Embed,
-                                (size_t) luce::pflash::kStage2Embed, cand.data() + i * luce::pflash::kStage2Embed);
-                }
-                luce::pflash::pflash_stage2_features(layout, a, s1, cand, lat, x);
-                if (!luce::pflash::pflash_stage2_mlp_gpu(w.backend, st.stage2_dev, st.stage2.norm_eps, x, (int) N,
-                                                         s2, error)) {
-                    set_last_error(error);
-                    return false;
-                }
-                s2t.s2_computed = true;
-            }
-            const int budget = (int) std::floor((double) S * (double) keep_ratio);
-            stage2_asm = luce::pflash::pflash_stage2_assemble(
-                msgs, s1, luce::pflash::pflash_stage2_full_s2(layout, s2, S), lat.lookback_logit,
-                lat.vague_logit, st.request_tau, st.stage2.tau2, st.stage2.tau_lb, st.stage2.tau_fb, budget, S);
-            stage2_assembled = true;
-            if (stage2_asm.seed != seed || stage2_asm.reserve != reserve) {
-                set_last_error("stage 2: the assembly's seed or reserve differs from pass 1's");
-                return false;
-            }
-            if (dumping && !luce::pflash::pflash_stage2_dump_features(dump, S, msgs, layout, seed, lat, a, x, s2)) {
-                set_last_error(std::string(luce::pflash::kStage2FeaturesEnv) + ": feature dump write failed");
-                return false;
-            }
-            // The assembled query replaces the cand_v5 set's tokens; the set keeps its runs for the row store.
-            request_trace.set.tokens = stage2_asm.query;
-            request_trace.set.latest_tokens = (int) stage2_asm.seed.size();
-            request_trace.set.turn_tokens = (int) (stage2_asm.promoted.size() + stage2_asm.post.size());
-            request_trace.set.capped = stage2_asm.seed_capped || stage2_asm.promoted_capped;
-            request_trace.set.fallback = stage2_asm.reason;
-            request_trace.fallback = stage2_asm.reason;
-            s2t.active = true;
-            s2t.latest_message = layout.latest;
-            s2t.latest_span = latest;
-            s2t.seed_tokens = (int) stage2_asm.seed.size();
-            s2t.seed_capped = stage2_asm.seed_capped;
-            s2t.latest_tokens = std::max(0, latest.end - latest.begin);
-            s2t.lookback_logit = lat.lookback_logit;
-            s2t.vague_logit = lat.vague_logit;
-            s2t.lookback = stage2_asm.lookback;
-            s2t.earlier_tokens = (int) N;
-            s2t.promoted_tokens = (int) stage2_asm.promoted.size();
-            s2t.promoted_capped = stage2_asm.promoted_capped;
-            s2t.promoted_runs = stage2_asm.promoted_runs;
-            s2t.post_tokens = (int) stage2_asm.post.size();
-            s2t.widened = stage2_asm.widened;
-            s2t.budget = budget;
-            s2t.budget_widened = stage2_asm.budget;
-            s2t.raw_fits = stage2_asm.raw_fits;
-            finish();
-            return true;
-        };
         if (request_v5) {
-            request_trace.stage2.evaluated = true;
-            request_trace.stage2.resume = resume;
-            request_trace.stage2.history_dropped = drop_history ? (int) experiment.history_queries.size() : 0;
             if (!experiment.request_messages_all_error.empty()) {
                 request_trace.fallback = "message_mapping: " + experiment.request_messages_all_error;
-                request_trace.stage2.reason = "message_mapping";
             } else {
                 request_trace.set = luce::pflash::pflash_request_query_set_v5(
                     session->request_raw, experiment.request_messages_all, st.request_tau);
                 request_trace.fallback = request_trace.set.fallback;
-                request_trace.stage2.seed_tokens = (int) request_trace.set.seed.size();
-                request_trace.stage2.seed_capped = request_trace.set.seed_capped;
-                request_trace.stage2.post_reserve = request_trace.set.reserve;
-                if (!stage2_on) {
-                    request_trace.stage2.reason = "stage2_not_loaded";
-                } else if (request_trace.fallback != "logits_missing" && !stage2_pass1()) {
-                    session->ids.clear();
-                    cleanup();
-                    return {};
-                }
             }
         } else if (!experiment.request_messages_error.empty()) {
             request_trace.fallback = "message_mapping: " + experiment.request_messages_error;
         } else {
             if (st.request_turns) {
-                // Candidate rule: the human messages and every
-                // non-system messages, with their message indices.
                 std::vector<luce::pflash::PFlashRequestCandidate> candidates;
                 const auto & hidx = experiment.request_human_index;
                 const auto & ridx = experiment.request_recent_index;
@@ -2014,7 +1719,6 @@ static std::vector<int32_t> strict_score_impl(
             }
         }
         if (request_trace.fallback.empty()) {
-            // v2 calibrated abstention: an unreliable extraction restores today's complete behaviour.
             request_trace.policy_evaluated = true;
             request_trace.abstain = luce::pflash::pflash_request_abstain(
                 request_trace.set, session->request_raw, st.request_tau, S, st.request_policy);
@@ -2029,16 +1733,11 @@ static std::vector<int32_t> strict_score_impl(
             request_query_rows.clear();
             request_trace.rows_new = request_trace.rows_stored = 0;
         }
-        // The query pin alone (no candidates) serves this request set: its rows must be exact, never BF16 stored
-        // rows nor a resume-dependent "rows_missing" fallback.
         if (qpin && !qcand && resume > 0 &&
             (request_trace.rows_stored > 0 || request_trace.fallback == "rows_missing")) {
             redo = "request_set_rows_before_resume";
             return fail("query step: request-set rows not exactly available; redo from token 0");
         }
-        // Retain each message's turn (previous first, so the latest is the
-        // most recently used), whatever this call decided; with the v3 rule
-        // the recent turns' runs too (oldest first).
         std::vector<luce::pflash::PFlashRequestMessageRuns> retained;
         for (size_t k = request_trace.set.turns.size(); k-- > 0;) {
             retained.push_back(request_trace.set.turns[k]);
@@ -2048,15 +1747,6 @@ static std::vector<int32_t> strict_score_impl(
         }
         for (const auto & message : retained) {
             std::vector<int> turn = luce::pflash::pflash_request_turn_tokens(message);
-            if (stage2_assembled && !stage2_asm.promoted.empty()) {
-                // Promoted earlier tokens are query rows too: keep them with their message's turn.
-                for (const int t : stage2_asm.promoted) {
-                    if (t >= message.message.begin && t < message.message.end) turn.push_back(t);
-                }
-                std::sort(turn.begin(), turn.end());
-                turn.erase(std::unique(turn.begin(), turn.end()), turn.end());
-                turn = luce::pflash::pflash_request_cap_tail(turn, luce::pflash::kRequestQueryCap);
-            }
             if (turn.empty()) continue;
             std::vector<float> rows;
             int fresh = 0;
@@ -2068,37 +1758,6 @@ static std::vector<int32_t> strict_score_impl(
         }
         request_trace.store_turns = (int) session->request_rows.turns().size();
         request_trace.store_tokens = session->request_rows.tokens();
-        // Feature capture and parity checks (request probe on only): append
-        // this call's block-14 rows and request logits to
-        // PFLASH_TRACE_REQUEST_FEATURES as one record: char[4] "RPF2",
-        // i32 resume, i32 n_new, i32 hidden, f32 rows[n_new][hidden],
-        // f32 request_logits[n_new] (tokens resume .. resume + n_new).
-        if (const char * features = std::getenv("PFLASH_TRACE_REQUEST_FEATURES")) {
-            if (*features && n_new > 0) {
-                std::vector<float> rows((size_t) hidden * (size_t) n_new);
-                ggml_backend_tensor_get(act_in, rows.data(), 0, rows.size() * sizeof(float));
-                FILE * file = std::fopen(features, "ab");
-                const int32_t header[3] = {resume, n_new, hidden};
-                const bool written = file &&
-                    std::fwrite("RPF2", 1, 4, file) == 4 &&
-                    std::fwrite(header, sizeof(header), 1, file) == 1 &&
-                    std::fwrite(rows.data(), sizeof(float), rows.size(), file) == rows.size() &&
-                    std::fwrite(session->request_raw.data() + resume, sizeof(float),
-                                (size_t) n_new, file) == (size_t) n_new;
-                if (file) std::fclose(file);
-                if (!written) {
-                    return fail("PFLASH_TRACE_REQUEST_FEATURES: feature dump write failed");
-                }
-            }
-        }
-        const char * dump = std::getenv("PFLASH_TRACE_REQUEST_LOGITS");
-        if (dump && std::strcmp(dump, "1") == 0) {
-            for (const auto & message : request_trace.set.messages) {
-                request_trace.message_logits.emplace_back(
-                    session->request_raw.begin() + message.message.begin,
-                    session->request_raw.begin() + message.message.end);
-            }
-        }
         if (qstep) {
             // Units from the selector's own segmentation of this request (cut at the caller's pins), ranked by the
             // stage-1 logits; every query token set's rows are read now, exactly (see the gather below).
@@ -2127,31 +1786,6 @@ static std::vector<int32_t> strict_score_impl(
                 }
                 if (qcfg.end_share > 0.0f) wanted.push_back({query_end - 1});
             }
-            if (qgrid) {
-                qfingerprint = luce::pflash::pflash_ids_fingerprint(ids);
-                for (const auto & g : qgrid_configs) {
-                    luce::pflash::PFlashQueryCandidateSet set;
-                    if (g.mode == luce::pflash::PFlashGridMode::Candidates) {
-                        set = luce::pflash::pflash_query_candidate_set(qunits, session->request_raw, g.query);
-                        for (const auto & c : set.candidates) wanted.push_back(c.tokens);
-                        if (g.query.end_share > 0.0f) wanted.push_back({query_end - 1});
-                    }
-                    qgrid_sets.push_back(std::move(set));
-                }
-                if (const char * dir = std::getenv("PFLASH_QUERY_ORACLE_DIR")) {
-                    std::ifstream in(std::string(dir) + "/" + qfingerprint + ".json");
-                    if (!in) {
-                        qoracle_error = "no_oracle_file";
-                    } else {
-                        std::stringstream text;
-                        text << in.rdbuf();
-                        if (luce::pflash::pflash_query_oracle_parse(text.str(), S, qoracle, qoracle_error)) {
-                            qoracle_error.clear();
-                            wanted.push_back(qoracle.query);
-                        }
-                    }
-                }
-            }
             // Exact rows only: a set after the resume point from this call's activations, a set before it from
             // the session's F32 sets; anything else (a set that spans the resume point, or one never stored) redoes
             // the request from token 0. Never the BF16 request-row store.
@@ -2168,49 +1802,10 @@ static std::vector<int32_t> strict_score_impl(
                     redo = tokens.back() >= resume ? "query_set_spans_resume" : "query_set_not_stored";
                     return fail("query step: query rows not exactly available; redo from token 0");
                 }
-                qrows_new += fresh;
                 qrows.emplace(tokens, std::move(rows));
             }
             query_trace.rank_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - r0).count();
-        }
-    }
-    // PFLASH_EVAL_REF_IDENT_QUERY: the identifier query's block-14 rows, read
-    // while this call's activations exist. Positions before ``resume`` have
-    // no rows (only the request probe keeps a row store): the request then
-    // falls back to today's windows.
-    const luce::pflash::PFlashIdentQuery ident_mode = experiment.query_ident;
-    luce::pflash::PFlashIdentQueryTrace ident_trace;
-    std::vector<float> ident_query_rows;   // [hidden, query tokens]
-    if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
-        ident_trace.mode = ident_mode;
-        ident_trace.turns = experiment.ident_turns;
-        ident_trace.ident_tokens = (int) experiment.ident_tokens.size();
-        std::vector<int> query = experiment.ident_tokens;
-        if (!experiment.ident_error.empty()) {
-            ident_trace.fallback = "mapping: " + experiment.ident_error;
-        } else if (query.empty()) {
-            ident_trace.fallback = "no_identifiers";
-        } else {
-            if (qstep && resume > 0 && query.front() < resume) {
-                // Served by the query pin path: never a resume-dependent fallback.
-                redo = "ident_rows_before_resume";
-                return fail("query step: identifier rows not exactly available; redo from token 0");
-            }
-            if (query.front() < resume || query.back() >= S) {
-                ident_trace.fallback = "rows_missing";
-            } else {
-                ident_query_rows.assign((size_t) hidden * query.size(), 0.0f);
-                size_t index = 0;
-                for (const auto & span : luce::pflash::pflash_request_token_spans(query)) {
-                    const int n = span.end - span.begin;
-                    ggml_backend_tensor_get(act_in, ident_query_rows.data() + index * (size_t) hidden,
-                                            (size_t) (span.begin - resume) * act_in->nb[1],
-                                            (size_t) hidden * (size_t) n * sizeof(float));
-                    index += (size_t) n;
-                }
-                ident_trace.tokens = std::move(query);
-            }
         }
     }
     cleanup();
@@ -2239,154 +1834,291 @@ static std::vector<int32_t> strict_score_impl(
     // window scores itself. The logits land in one [S, rows, H] buffer for
     // a single softmax. History windows share the query's key set and mix
     // into its mass at their weights.
-    const int n_key_chunks = (S + key_chunk - 1) / key_chunk;
-    const auto score_window = [&](const ScoredWindow & window,
-                                  std::vector<float> & mass) -> bool {
-        const int nq = window.end - window.begin;
-        ggml_init_params lip{};
-        lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
-        lip.no_alloc = true;
-        ggml_context * lctx = ggml_init(lip);
-        if (!lctx) {
-            set_last_error("qwen35 score buffer ctx allocation failed");
-            return false;
-        }
-        ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, nq, H);
-        ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, nq);
-        ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, nq);
-        ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
-        if (!lbuf) {
-            ggml_free(lctx);
-            set_last_error("qwen35 score buffer allocation failed");
-            return false;
-        }
-        ggml_backend_tensor_set(x_q, window.rows.data(), 0,
-                                window.rows.size() * sizeof(float));
-        {
-            // Keys are the context before the query window and, when the
-            // tokens after it are candidates too, the context after it. NoPE
-            // scoring has no position term, so a later key scores like an
-            // earlier one.
-            std::vector<float> m((size_t)nq * S, -INFINITY);
-            for (int t = 0; t < nq; ++t) {
-                float * row = m.data() + (size_t)t * S;
-                std::fill_n(row, (size_t)query_start, 0.0f);
-                if (experiment.query_suffix_candidates) {
-                    std::fill_n(row + query_end, (size_t)(S - query_end), 0.0f);
-                }
-                if (window.end <= query_start) {
-                    std::fill_n(row + window.begin, (size_t)nq, -INFINITY);
+    // The segment reranker's query: weighted mean of Q grouped across GQA heads
+    // into [D * Hk], the reranker's key feature layout.
+    std::vector<double> rerank_q_accum((size_t) D * (size_t) Hk, 0.0);
+    double rerank_q_weight_sum = 0.0;
+    const auto add_q_grouped = [&](const float * q_host, int n_q_toks, double weight,
+                                   std::vector<double> & dst_vec) {
+        if (!st.seg_reranker.loaded || !q_host || n_q_toks <= 0 || !(weight > 0.0)) return;
+        if (dst_vec.size() != (size_t) D * (size_t) Hk) dst_vec.assign((size_t) D * (size_t) Hk, 0.0);
+        const int gqa = std::max(1, H / Hk);
+        const double scale = weight / ((double) n_q_toks * (double) gqa);
+        for (int t = 0; t < n_q_toks; ++t) {
+            for (int h = 0; h < H; ++h) {
+                const int kv_h = h / gqa;
+                const float * src = q_host + ((size_t) t * (size_t) H + (size_t) h) * (size_t) D;
+                double * dst = dst_vec.data() + (size_t) kv_h * (size_t) D;
+                for (int d = 0; d < D; ++d) {
+                    dst[d] += (double) src[d] * scale;
                 }
             }
-            ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
         }
-        ggml_init_params sip{};
-        sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
-                       ggml_graph_overhead_custom(4096, false) + 64 * 1024;
-        sip.no_alloc = true;
-        ggml_context * sctx = ggml_init(sip);
-        if (!sctx) {
-            ggml_backend_buffer_free(lbuf); ggml_free(lctx);
-            set_last_error("qwen35 score graph ctx allocation failed");
+    };
+    const auto accum_q_vec = [&](const std::vector<double> & vec, double weight) {
+        if (!st.seg_reranker.loaded || vec.size() != rerank_q_accum.size() || !(weight > 0.0)) return;
+        for (size_t i = 0; i < vec.size(); ++i) rerank_q_accum[i] += vec[i] * weight;
+        rerank_q_weight_sum += weight;
+    };
+
+    // Pre-permute session->keys [D, Hk, S] -> [D, S, Hk] ONCE on the GPU for all
+    // Block-15 NoPE scoring calls (windows + request candidate sets), eliminating
+    // repeated chunked permute+copy loops across every tile.
+    struct PermutedKeys {
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor *         tensor = nullptr;  // [D, S, Hk] F32 contiguous
+        void release() {
+            if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+            if (ctx) { ggml_free(ctx); ctx = nullptr; }
+            tensor = nullptr;
+        }
+        ~PermutedKeys() { release(); }
+    } k_perm_cache;
+    const auto ensure_k_perm = [&]() -> bool {
+        if (k_perm_cache.tensor) return true;
+        ggml_init_params kip{};
+        kip.mem_size = 4 * ggml_tensor_overhead() + 4096;
+        kip.no_alloc = true;
+        k_perm_cache.ctx = ggml_init(kip);
+        if (!k_perm_cache.ctx) {
+            set_last_error("qwen35 K_perm ctx allocation failed");
             return false;
         }
-        ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
-        ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
-        ggml_tensor * Q = nullptr;
-        if (st.head_loaded) {
-            Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, nq);
-        } else {
-            // Native block 15 packs query and gate rows per head; keep the query half.
-            ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
-                                               D * 2, H, nq);
-            Q = ggml_view_3d(sctx, QG, D, H, nq,
-                             ggml_element_size(QG) * D * 2,
-                             ggml_element_size(QG) * D * 2 * H, 0);
+        k_perm_cache.tensor = ggml_new_tensor_3d(k_perm_cache.ctx, GGML_TYPE_F32, D, S, Hk);
+        k_perm_cache.buf = ggml_backend_alloc_ctx_tensors(k_perm_cache.ctx, w.backend);
+        if (!k_perm_cache.buf) {
+            k_perm_cache.release();
+            set_last_error("qwen35 K_perm buffer allocation failed");
+            return false;
         }
-        Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
-        ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, nq, H]
-        for (int b = 0; b < S; b += key_chunk) {
-            const int n = std::min(key_chunk, S - b);
-            ggml_tensor * K = ggml_view_3d(sctx, session->keys, D, Hk, n,
-                                           session->keys->nb[1], session->keys->nb[2],
-                                           (size_t)b * session->keys->nb[2]);
-            K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, n, Hk]
-            ggml_tensor * K_score = K;
-            if (H != Hk) {
-                const int gqa = H / Hk;
-                ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, n, 1, Hk);
-                ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, n, gqa, Hk);
-                K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, n, H);
-            }
-            ggml_tensor * part = ggml_mul_mat(sctx, K_score, Q_perm);  // [n, nq, H]
-            ggml_tensor * dst = ggml_view_3d(sctx, logits, n, nq, H,
-                                             logits->nb[1], logits->nb[2],
-                                             (size_t)b * logits->nb[0]);
-            ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
+        ggml_init_params gip{};
+        gip.mem_size = 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false) + 4096;
+        gip.no_alloc = true;
+        ggml_context * gctx = ggml_init(gip);
+        if (!gctx) {
+            k_perm_cache.release();
+            set_last_error("qwen35 K_perm graph ctx allocation failed");
+            return false;
         }
-        ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
-                                                1.0f / std::sqrt((float)D), 0.0f);
-        ggml_set_output(probs);
-        ggml_build_forward_expand(sgf, probs);
-        ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-        const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
-            ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
-        std::vector<float> probs_h;
-        if (ok) {
-            probs_h.resize((size_t)S * nq * H);
-            ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
-        }
-        ggml_gallocr_free(salloc);
-        ggml_free(sctx);
-        ggml_backend_buffer_free(lbuf);
-        ggml_free(lctx);
+        ggml_cgraph * gf = ggml_new_graph_custom(gctx, 64, false);
+        ggml_tensor * kv = ggml_view_3d(gctx, session->keys, D, Hk, S,
+                                        session->keys->nb[1], session->keys->nb[2], 0);
+        ggml_tensor * kp = ggml_permute(gctx, kv, 0, 2, 1, 3);  // [D, S, Hk]
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, kp, k_perm_cache.tensor));
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+        const bool ok = ggml_gallocr_alloc_graph(alloc, gf) &&
+            ggml_backend_graph_compute(w.backend, gf) == GGML_STATUS_SUCCESS;
+        ggml_gallocr_free(alloc);
+        ggml_free(gctx);
         if (!ok) {
-            set_last_error("qwen35 score graph compute failed");
+            k_perm_cache.release();
+            set_last_error("qwen35 K_perm compute failed");
             return false;
         }
-        const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
-        if (nonfinite != 0) {
-            const std::string message =
-                "non-finite Qwen3.5 scoring-head scores: " + std::to_string(nonfinite) +
-                "/" + std::to_string(probs_h.size());
-            std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
-            std::fflush(stderr);
-            set_last_error(message);
-            return false;
-        }
-        scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
         return true;
+    };
+
+    // Block-15 NoPE scorer for contiguous query windows and gathered
+    // request-probe sets: one [S, 1] broadcast mask uploaded per call, one batched
+    // GEMM against the pre-permuted K_perm [D, S, Hk] per query tile, then softmax
+    // and sum_rows on the device so only [1, S] comes back to the host.
+    const auto score_rows_tiled = [&](const float * rows_data,
+                                      int nq,
+                                      const std::vector<float> & mask_row,
+                                      std::vector<float> & out_mass,
+                                      int * tiles_counter,
+                                      std::vector<double> * q_vec_out,
+                                      const char * err_tag) -> bool {
+        if (q_vec_out) q_vec_out->assign((size_t) D * (size_t) Hk, 0.0);
+        if (nq <= 0) {
+            out_mass.assign((size_t) S, 0.0f);
+            return true;
+        }
+        if (!ensure_k_perm()) return false;
+
+        const int kTile = (S <= 131072) ? 64 : 32;
+        const bool gqa_fold = (H != Hk) && ((H % Hk) == 0);
+        const float sm_scale = 1.0f / std::sqrt((float) D);
+
+        ggml_init_params mip{};
+        mip.mem_size = 4 * ggml_tensor_overhead() + 4096;
+        mip.no_alloc = true;
+        ggml_context * mctx = ggml_init(mip);
+        if (!mctx) {
+            set_last_error(std::string("qwen35 ") + err_tag + " mask ctx allocation failed");
+            return false;
+        }
+        ggml_tensor * mask_1d = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, S, 1);
+        ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors(mctx, w.backend);
+        if (!mbuf) {
+            ggml_free(mctx);
+            set_last_error(std::string("qwen35 ") + err_tag + " mask buffer allocation failed");
+            return false;
+        }
+        ggml_backend_tensor_set(mask_1d, mask_row.data(), 0, (size_t) S * sizeof(float));
+
+        std::vector<double> sum((size_t) S, 0.0);
+        std::vector<float> part((size_t) S);
+        bool failed = false;
+        for (int q0 = 0; q0 < nq; q0 += kTile) {
+            const int n = std::min(kTile, nq - q0);
+            ggml_init_params lip{};
+            lip.mem_size = 4 * ggml_tensor_overhead() + 4096;
+            lip.no_alloc = true;
+            ggml_context * lctx = ggml_init(lip);
+            if (!lctx) {
+                set_last_error(std::string("qwen35 ") + err_tag + " input ctx allocation failed");
+                failed = true;
+                break;
+            }
+            ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, n);
+            ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
+            if (!lbuf) {
+                ggml_free(lctx);
+                set_last_error(std::string("qwen35 ") + err_tag + " input buffer allocation failed");
+                failed = true;
+                break;
+            }
+            ggml_backend_tensor_set(x_q, rows_data + (size_t) q0 * hidden, 0,
+                                    (size_t) hidden * n * sizeof(float));
+
+            ggml_init_params sip{};
+            sip.mem_size = 64 * ggml_tensor_overhead() +
+                           ggml_graph_overhead_custom(256, false) + 16 * 1024;
+            sip.no_alloc = true;
+            ggml_context * sctx = ggml_init(sip);
+            if (!sctx) {
+                ggml_backend_buffer_free(lbuf);
+                ggml_free(lctx);
+                set_last_error(std::string("qwen35 ") + err_tag + " graph ctx allocation failed");
+                failed = true;
+                break;
+            }
+            ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 256, false);
+            ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
+            ggml_tensor * Q = nullptr;
+            if (st.head_loaded) {
+                Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, n);
+            } else {
+                // Native block 15 packs query and gate rows per head; keep the query half.
+                ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
+                                                   D * 2, H, n);
+                Q = ggml_view_3d(sctx, QG, D, H, n,
+                                 ggml_element_size(QG) * D * 2,
+                                 ggml_element_size(QG) * D * 2 * H, 0);
+            }
+            Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
+            if (st.seg_reranker.loaded && q_vec_out) {
+                ggml_set_output(Q);
+                ggml_build_forward_expand(sgf, Q);
+            }
+            ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, n, H]
+            ggml_tensor * Q_score = gqa_fold
+                ? ggml_reshape_3d(sctx, Q_perm, D, (int64_t) n * (H / Hk), Hk)
+                : Q_perm;
+            // Single batched GEMM: K_perm [D, S, Hk] x Q_score [D, n*(H/Hk), Hk] -> [S, n*(H/Hk), Hk].
+            ggml_tensor * logits = ggml_mul_mat(sctx, k_perm_cache.tensor, Q_score);
+            // Reshape [S, n*(H/Hk), Hk] -> [S, 1, n*H] so mask_1d [S, 1] broadcasts cleanly across dim 2.
+            ggml_tensor * logits_3d = ggml_reshape_3d(sctx, logits, S, 1, (int64_t) n * H);
+            ggml_tensor * probs = ggml_soft_max_ext_inplace(sctx, logits_3d, mask_1d, sm_scale, 0.0f);
+            // Sum over (query, head) per key on device: [S, n*H] -> [n*H, S] -> [1, S].
+            ggml_tensor * per_key = ggml_sum_rows(sctx, ggml_cont(sctx,
+                ggml_transpose(sctx, ggml_reshape_2d(sctx, probs, S, (int64_t) n * H))));
+            ggml_set_output(per_key);
+            ggml_build_forward_expand(sgf, per_key);
+
+            ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+            const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
+                ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                ggml_backend_tensor_get(per_key, part.data(), 0, (size_t) S * sizeof(float));
+                if (st.seg_reranker.loaded && q_vec_out) {
+                    std::vector<float> q_h((size_t) D * (size_t) H * (size_t) n);
+                    ggml_backend_tensor_get(Q, q_h.data(), 0, q_h.size() * sizeof(float));
+                    add_q_grouped(q_h.data(), n, (double) n / (double) std::max(1, nq), *q_vec_out);
+                }
+            }
+            ggml_gallocr_free(salloc);
+            ggml_free(sctx);
+            ggml_backend_buffer_free(lbuf);
+            ggml_free(lctx);
+            if (!ok) {
+                set_last_error(std::string("qwen35 ") + err_tag + " graph compute failed");
+                failed = true;
+                break;
+            }
+            const size_t nonfinite = count_nonfinite_scores(part.data(), part.size());
+            if (nonfinite != 0) {
+                const std::string message =
+                    std::string("non-finite Qwen3.5 scoring-head scores (") + err_tag + "): " +
+                    std::to_string(nonfinite) + "/" + std::to_string(part.size());
+                std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+                std::fflush(stderr);
+                set_last_error(message);
+                failed = true;
+                break;
+            }
+            for (int j = 0; j < S; ++j) sum[(size_t) j] += (double) part[(size_t) j];
+            if (tiles_counter) ++(*tiles_counter);
+        }
+        ggml_backend_buffer_free(mbuf);
+        ggml_free(mctx);
+        if (failed) return false;
+
+        const double denominator = (double) H * (double) nq;
+        out_mass.assign((size_t) S, 0.0f);
+        for (int j = 0; j < S; ++j) out_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
+        return true;
+    };
+
+    const auto score_window = [&](const ScoredWindow & window,
+                                  std::vector<float> & mass,
+                                  std::vector<double> * q_vec_out = nullptr) -> bool {
+        const int nq = window.end - window.begin;
+        std::vector<float> mask_row((size_t) S, -INFINITY);
+        std::fill_n(mask_row.begin(), (size_t) query_start, 0.0f);
+        if (experiment.query_suffix_candidates) {
+            std::fill_n(mask_row.begin() + query_end, (size_t) (S - query_end), 0.0f);
+        }
+        if (window.end <= query_start) {
+            std::fill_n(mask_row.begin() + window.begin, (size_t) nq, -INFINITY);
+        }
+        return score_rows_tiled(window.rows.data(), nq, mask_row, mass, nullptr, q_vec_out, "score");
     };
     std::vector<float> token_mass;
     // Today's windows: each scored on its own, mixed at their weights.
-    const auto score_windows = [&]() -> bool {
+    const auto score_windows = [&](std::vector<double> * q_vec_out = nullptr) -> bool {
         token_mass.clear();
         double total_weight = 0.0;
+        if (q_vec_out) q_vec_out->assign((size_t) D * (size_t) Hk, 0.0);
         for (const auto & window : windows) {
             std::vector<float> mass;
-            if (!score_window(window, mass)) return false;
+            std::vector<double> wq;
+            if (!score_window(window, mass, q_vec_out ? &wq : nullptr)) return false;
             if (token_mass.empty()) token_mass.assign(mass.size(), 0.0f);
             for (size_t i = 0; i < mass.size(); ++i) {
                 token_mass[i] += (float) window.weight * mass[i];
             }
+            if (q_vec_out && wq.size() == q_vec_out->size()) {
+                for (size_t i = 0; i < wq.size(); ++i) (*q_vec_out)[i] += window.weight * wq[i];
+            }
             total_weight += window.weight;
         }
         for (auto & value : token_mass) value = (float) (value / total_weight);
+        if (q_vec_out && total_weight > 0.0) {
+            for (auto & v : *q_vec_out) v /= total_weight;
+        }
         return true;
     };
     // Request probe: ONE gathered query set with one common key mask --
     // today's key range (the context before the query window, and after it
     // when those tokens are candidates) minus every query token -- mean over
-    // heads and query tokens, as for a window. Queries run in bounded tiles;
-    // each tile's probabilities are reduced to one row per key on the
-    // device, so only [S] floats per tile come back.
-    // The identifier query uses the same scoring with its tokens left among
-    // the keys (scored, not pinned: arm viii's key mask).
+    // heads and query tokens, as for a window.
     const auto score_request_set = [&](const std::vector<int> & tokens,
                                        const std::vector<float> & rows,
-                                       bool mask_query_tokens, int & tiles) -> bool {
-        constexpr int kTile = 32;
-        const int nq = (int) tokens.size();
+                                       bool mask_query_tokens, int & tiles,
+                                       std::vector<double> * q_vec_out = nullptr) -> bool {
         std::vector<float> mask_row((size_t) S, -INFINITY);
         std::fill_n(mask_row.begin(), (size_t) query_start, 0.0f);
         if (experiment.query_suffix_candidates) {
@@ -2395,118 +2127,13 @@ static std::vector<int32_t> strict_score_impl(
         if (mask_query_tokens) {
             for (const int t : tokens) mask_row[(size_t) t] = -INFINITY;
         }
-        std::vector<double> sum((size_t) S, 0.0);
-        std::vector<float> part((size_t) S);
-        for (int q0 = 0; q0 < nq; q0 += kTile) {
-            const int n = std::min(kTile, nq - q0);
-            ggml_init_params lip{};
-            lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
-            lip.no_alloc = true;
-            ggml_context * lctx = ggml_init(lip);
-            if (!lctx) {
-                set_last_error("qwen35 request score buffer ctx allocation failed");
-                return false;
-            }
-            ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n, H);
-            ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n);
-            ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, n);
-            ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
-            if (!lbuf) {
-                ggml_free(lctx);
-                set_last_error("qwen35 request score buffer allocation failed");
-                return false;
-            }
-            ggml_backend_tensor_set(x_q, rows.data() + (size_t) q0 * hidden, 0,
-                                    (size_t) hidden * n * sizeof(float));
-            for (int t = 0; t < n; ++t) {
-                ggml_backend_tensor_set(mask, mask_row.data(), (size_t) t * mask->nb[1],
-                                        (size_t) S * sizeof(float));
-            }
-            ggml_init_params sip{};
-            sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
-                           ggml_graph_overhead_custom(4096, false) + 64 * 1024;
-            sip.no_alloc = true;
-            ggml_context * sctx = ggml_init(sip);
-            if (!sctx) {
-                ggml_backend_buffer_free(lbuf); ggml_free(lctx);
-                set_last_error("qwen35 request score graph ctx allocation failed");
-                return false;
-            }
-            ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
-            ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
-            ggml_tensor * Q = nullptr;
-            if (st.head_loaded) {
-                Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, n);
-            } else {
-                ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
-                                                   D * 2, H, n);
-                Q = ggml_view_3d(sctx, QG, D, H, n,
-                                 ggml_element_size(QG) * D * 2,
-                                 ggml_element_size(QG) * D * 2 * H, 0);
-            }
-            Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
-            ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, n, H]
-            for (int b = 0; b < S; b += key_chunk) {
-                const int nk = std::min(key_chunk, S - b);
-                ggml_tensor * K = ggml_view_3d(sctx, session->keys, D, Hk, nk,
-                                               session->keys->nb[1], session->keys->nb[2],
-                                               (size_t)b * session->keys->nb[2]);
-                K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, nk, Hk]
-                ggml_tensor * K_score = K;
-                if (H != Hk) {
-                    const int gqa = H / Hk;
-                    ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, nk, 1, Hk);
-                    ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, nk, gqa, Hk);
-                    K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, nk, H);
-                }
-                ggml_tensor * scores = ggml_mul_mat(sctx, K_score, Q_perm);  // [nk, n, H]
-                ggml_tensor * dst = ggml_view_3d(sctx, logits, nk, n, H,
-                                                 logits->nb[1], logits->nb[2],
-                                                 (size_t)b * logits->nb[0]);
-                ggml_build_forward_expand(sgf, ggml_cpy(sctx, scores, dst));
-            }
-            ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
-                                                    1.0f / std::sqrt((float)D), 0.0f);
-            // Sum over (query, head) per key: [S, n*H] -> [n*H, S] -> [1, S].
-            ggml_tensor * per_key = ggml_sum_rows(sctx, ggml_cont(sctx,
-                ggml_transpose(sctx, ggml_reshape_2d(sctx, probs, S, (int64_t) n * H))));
-            ggml_set_output(per_key);
-            ggml_build_forward_expand(sgf, per_key);
-            ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-            const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
-                ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
-            if (ok) {
-                ggml_backend_tensor_get(per_key, part.data(), 0, (size_t) S * sizeof(float));
-            }
-            ggml_gallocr_free(salloc);
-            ggml_free(sctx);
-            ggml_backend_buffer_free(lbuf);
-            ggml_free(lctx);
-            if (!ok) {
-                set_last_error("qwen35 request score graph compute failed");
-                return false;
-            }
-            const size_t nonfinite = count_nonfinite_scores(part.data(), part.size());
-            if (nonfinite != 0) {
-                const std::string message =
-                    "non-finite Qwen3.5 scoring-head scores (request probe): " +
-                    std::to_string(nonfinite) + "/" + std::to_string(part.size());
-                std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
-                std::fflush(stderr);
-                set_last_error(message);
-                return false;
-            }
-            for (int j = 0; j < S; ++j) sum[(size_t) j] += part[(size_t) j];
-            ++tiles;
-        }
-        const double denominator = (double) H * (double) nq;
-        token_mass.assign((size_t) S, 0.0f);
-        for (int j = 0; j < S; ++j) token_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
-        return true;
+        return score_rows_tiled(rows.data(), (int) tokens.size(), mask_row, token_mass,
+                                &tiles, q_vec_out, "request probe");
     };
     // ---------------------------------------------------------------- query step 1
     // Masses of query token sets, cached per set (one tile stream per set; tiles never mix sets).
     std::map<std::vector<int>, std::vector<float>> qmass;
+    std::map<std::vector<int>, std::vector<double>> qmass_qvec;
     int qtiles = 0;
     const auto query_mass = [&](const std::vector<int> & tokens) -> const std::vector<float> * {
         auto hit = qmass.find(tokens);
@@ -2516,16 +2143,20 @@ static std::vector<int32_t> strict_score_impl(
             set_last_error("query step: the rows of a query set are missing");
             return nullptr;
         }
-        if (!score_request_set(tokens, rows->second, /*mask_query_tokens=*/true, qtiles)) return nullptr;
+        std::vector<double> qv;
+        if (!score_request_set(tokens, rows->second, /*mask_query_tokens=*/true, qtiles,
+                               st.seg_reranker.loaded ? &qv : nullptr)) return nullptr;
+        if (st.seg_reranker.loaded) qmass_qvec.emplace(tokens, std::move(qv));
         return &qmass.emplace(tokens, token_mass).first->second;
     };
-    // Today's windows as a blend candidate (PFLASH_QUERY_TW): its mass, scored and mixed exactly as today (cached),
+    // Today's windows as a blend candidate: its mass, scored and mixed as usual (cached),
     // and its score = the unit score of s1 over the window tokens inside non-system message content.
     std::vector<float> qwindows_mass;
+    std::vector<double> qwindows_qvec;
     bool qwindows_ready = false;
     const auto windows_mass_cached = [&]() -> const std::vector<float> * {
         if (!qwindows_ready) {
-            if (!score_windows()) return nullptr;
+            if (!score_windows(st.seg_reranker.loaded ? &qwindows_qvec : nullptr)) return nullptr;
             qwindows_mass = token_mass;
             qwindows_ready = true;
         }
@@ -2558,7 +2189,8 @@ static std::vector<int32_t> strict_score_impl(
     // The blend (pflash_query_candidates.h): probe candidates, TW, END, with their weights.
     const auto query_blend_mass = [&](const luce::pflash::PFlashQueryCandidateSet & set,
                                       const luce::pflash::PFlashQueryConfig & q, std::vector<float> & out,
-                                      luce::pflash::PFlashQueryBlend & blend, float & tw_score_out) -> bool {
+                                      luce::pflash::PFlashQueryBlend & blend, float & tw_score_out,
+                                      bool accumulate_rerank_q = false) -> bool {
         tw_score_out = q.tw_score ? tw_unit_score(q.unit_score) : std::numeric_limits<float>::quiet_NaN();
         blend = luce::pflash::pflash_query_blend(set, q, tw_score_out);
         std::vector<std::vector<float>> masses;
@@ -2568,18 +2200,28 @@ static std::vector<int32_t> strict_score_impl(
             if (!m) return false;
             masses.push_back(*m);
             weights.push_back(blend.probe[i]);
+            if (accumulate_rerank_q) {
+                auto qit = qmass_qvec.find(set.candidates[i].tokens);
+                if (qit != qmass_qvec.end()) accum_q_vec(qit->second, blend.probe[i]);
+            }
         }
         if (blend.tw > 0.0) {
             const auto * m = windows_mass_cached();
             if (!m) return false;
             masses.push_back(*m);
             weights.push_back(blend.tw);
+            if (accumulate_rerank_q) accum_q_vec(qwindows_qvec, blend.tw);
         }
         if (blend.end > 0.0) {
-            const auto * m = query_mass({query_end - 1});
+            const std::vector<int> end_tok{query_end - 1};
+            const auto * m = query_mass(end_tok);
             if (!m) return false;
             masses.push_back(*m);
             weights.push_back(blend.end);
+            if (accumulate_rerank_q) {
+                auto qit = qmass_qvec.find(end_tok);
+                if (qit != qmass_qvec.end()) accum_q_vec(qit->second, blend.end);
+            }
         }
         std::string error;
         if (!luce::pflash::pflash_query_aggregate(masses, weights, q.aggregate, out, error)) {
@@ -2628,201 +2270,6 @@ static std::vector<int32_t> strict_score_impl(
             cap /= 2;
         }
     };
-    const auto spans_json = [](const std::vector<PFlashTokenSpan> & spans) {
-        std::string out = "[";
-        for (size_t i = 0; i < spans.size(); ++i) {
-            out += (i ? ",[" : "[") + std::to_string(spans[i].begin) + "," + std::to_string(spans[i].end) + "]";
-        }
-        return out + "]";
-    };
-    const auto json_str = [](const std::string & text) {
-        std::string out = "\"";
-        for (const char c : text) {
-            if (c == '"' || c == '\\') out += '\\';
-            if ((unsigned char) c >= 0x20) out += c;
-        }
-        return out + "\"";
-    };
-    const auto num = [](double v) {
-        if (!std::isfinite(v)) return std::string("null");
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%.9g", v);
-        return std::string(buf);
-    };
-    const auto candidates_json = [&](const luce::pflash::PFlashQueryCandidateSet & set) {
-        std::string out = "[";
-        for (size_t i = 0; i < set.candidates.size(); ++i) {
-            const auto & c = set.candidates[i];
-            std::vector<PFlashTokenSpan> unit_spans;
-            for (const int u : c.units) unit_spans.push_back(qunits.units[(size_t) u].span);
-            out += std::string(i ? "," : "") + "{\"message\":" + std::to_string(c.message) + ",\"units\":" +
-                spans_json(merge_spans(unit_spans)) + ",\"tokens\":" + std::to_string(c.tokens.size()) +
-                ",\"score\":" + num(c.score) + ",\"weight\":" + num(c.weight) + "}";
-        }
-        return out + "]";
-    };
-    // Dev-only replay grid: every config's selection on this forward, then the served selection below.
-    if (qgrid) {
-        const auto grid_started = std::chrono::steady_clock::now();
-        std::vector<float> windows_mass;
-        bool have_windows = false;
-        std::vector<float> p1_mass;
-        bool have_p1 = false;
-        int p1_tiles = 0;
-        std::string record = "{\"fp\":\"" + qfingerprint + "\",\"n_tokens\":" + std::to_string(S) +
-            ",\"budget\":" + std::to_string(qbudget) + ",\"keep_ratio\":" + num(keep_ratio) +
-            ",\"query_window\":[" + std::to_string(query_start) + "," + std::to_string(query_end) + "]" +
-            ",\"units\":" + std::to_string(qunits.units.size()) + ",\"latest\":" + std::to_string(qunits.latest) +
-            ",\"system_used\":" + (qunits.system_used ? "true" : "false") +
-            ",\"p1_fallback\":" + json_str(request_trace.fallback) +
-            ",\"oracle\":" + json_str(qoracle_error) + ",\"configs\":{";
-        for (size_t gi = 0; gi < qgrid_configs.size(); ++gi) {
-            const auto & g = qgrid_configs[gi];
-            const auto c0 = std::chrono::steady_clock::now();
-            std::vector<float> mass;
-            std::vector<PFlashTokenSpan> cpins = required_instruction_spans;
-            std::string fallback, error, cand = "[]", blend_json;
-            int query_tokens = 0;
-            bool ok = true;
-            if (g.mode == luce::pflash::PFlashGridMode::S1 ||
-                (g.mode == luce::pflash::PFlashGridMode::P1 && !request_trace.fallback.empty())) {
-                if (g.mode == luce::pflash::PFlashGridMode::P1) fallback = request_trace.fallback;
-                if (!have_windows) {
-                    if (!score_windows()) { session->ids.clear(); return {}; }
-                    windows_mass = token_mass;
-                    have_windows = true;
-                }
-                mass = windows_mass;
-            } else if (g.mode == luce::pflash::PFlashGridMode::P1) {
-                // The served P1 path: the set's tokens pinned (+ the policy recency pin), or today's windows and
-                // pins when they do not fit while the caller's pins do (pins_exceed_budget).
-                auto p1pins = cpins;
-                for (const auto & span : luce::pflash::pflash_request_token_spans(request_trace.set.tokens)) {
-                    p1pins.push_back(span);
-                }
-                if (!request_trace.set.messages.empty()) {
-                    const auto recency = luce::pflash::pflash_request_recency_pin(
-                        request_trace.set.messages[0].message, st.request_policy.recency_pin_tokens);
-                    if (recency.begin >= 0) p1pins.push_back(recency);
-                }
-                p1pins = merge_spans(std::move(p1pins));
-                std::vector<PFlashTokenSpan> segs, base;
-                bool dens = false;
-                segment(p1pins, segs, dens);
-                segment(required_instruction_spans, base, dens);
-                if (charged(p1pins, segs) > qbudget && charged(required_instruction_spans, base) <= qbudget) {
-                    fallback = "pins_exceed_budget";
-                    if (!have_windows) {
-                        if (!score_windows()) { session->ids.clear(); return {}; }
-                        windows_mass = token_mass;
-                        have_windows = true;
-                    }
-                    mass = windows_mass;
-                } else {
-                    if (!have_p1) {
-                        if (!score_request_set(request_trace.set.tokens, request_query_rows,
-                                               /*mask_query_tokens=*/true, p1_tiles)) {
-                            session->ids.clear();
-                            return {};
-                        }
-                        p1_mass = token_mass;
-                        have_p1 = true;
-                    }
-                    mass = p1_mass;
-                    cpins = p1pins;
-                    query_tokens = (int) request_trace.set.tokens.size();
-                }
-            } else if (g.mode == luce::pflash::PFlashGridMode::Candidates) {
-                const auto & set = qgrid_sets[gi];
-                if (set.candidates.empty()) {
-                    error = "no_candidates";
-                    ok = false;
-                } else {
-                    luce::pflash::PFlashQueryBlend blend;
-                    float tws = 0.0f;
-                    if (!query_blend_mass(set, g.query, mass, blend, tws)) { session->ids.clear(); return {}; }
-                    for (const auto & c : set.candidates) query_tokens += (int) c.tokens.size();
-                    cand = candidates_json(set);
-                    std::string probe_w = "[";
-                    for (size_t i = 0; i < blend.probe.size(); ++i) probe_w += (i ? "," : "") + num(blend.probe[i]);
-                    blend_json = ",\"blend\":{\"probe\":" + probe_w + "],\"tw\":" + num(blend.tw) + ",\"end\":" +
-                        num(blend.end) + ",\"tw_score\":" + num(tws) + "}";
-                }
-            } else {
-                if (!qoracle_error.empty()) {
-                    error = qoracle_error;
-                    ok = false;
-                } else {
-                    const auto * m = query_mass(qoracle.query);
-                    if (!m) { session->ids.clear(); return {}; }
-                    mass = *m;
-                    query_tokens = (int) qoracle.query.size();
-                    if (g.oracle_pin) {
-                        auto p = cpins;
-                        p.insert(p.end(), qoracle.pin.begin(), qoracle.pin.end());
-                        p = merge_spans(std::move(p));
-                        std::vector<PFlashTokenSpan> segs;
-                        bool dens = false;
-                        segment(p, segs, dens);
-                        if (charged(p, segs) <= qbudget) cpins = p;
-                        else fallback = "oracle_pin_exceeds_budget";
-                    }
-                }
-            }
-            luce::pflash::PFlashQueryPin pin;
-            int cap_used = 0;
-            std::vector<PFlashTokenSpan> kept;
-            int kept_tokens = 0;
-            if (ok && g.query.pin_tokens > 0) cpins = fit_pin(cpins, g.query, pin, cap_used);
-            if (ok) {
-                std::vector<PFlashTokenSpan> segs;
-                bool dens = false;
-                segment(cpins, segs, dens);
-                const auto out = select_pflash_chunks(
-                    ids, mass, keep_ratio, n_lookahead, score_query_end, /*pool_kernel=*/1, experiment, cpins,
-                    /*direct_mass=*/true, /*write_trace=*/false, segs.empty() ? nullptr : &segs, dens,
-                    /*other_token_scores=*/nullptr, /*split_fraction=*/0.0, st.fold_vocab.get());
-                if (out.empty()) {
-                    error = std::string("select: ") + luce_last_error();
-                    ok = false;
-                } else {
-                    kept = pflash_last_kept_spans();
-                    kept_tokens = (int) out.size();
-                }
-            }
-            int pin_tokens = 0;
-            for (const auto & span : cpins) pin_tokens += span.end - span.begin;
-            const double ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - c0).count();
-            record += std::string(gi ? "," : "") + json_str(g.name) + ":{\"mode\":\"" +
-                luce::pflash::pflash_grid_mode_name(g.mode) + "\",\"kept\":" + spans_json(kept) +
-                ",\"kept_tokens\":" + std::to_string(kept_tokens) + ",\"pins\":" + spans_json(cpins) +
-                ",\"pin_tokens\":" + std::to_string(pin_tokens) + ",\"verbatim_pin\":" + spans_json(pin.spans) +
-                ",\"verbatim_pin_tokens\":" + std::to_string(pin.tokens) + ",\"pin_cap_used\":" +
-                std::to_string(cap_used) + ",\"query_tokens\":" + std::to_string(query_tokens) +
-                ",\"fallback\":" + json_str(fallback) + ",\"candidates\":" + cand +
-                (g.mode == luce::pflash::PFlashGridMode::Candidates
-                     ? ",\"latest_z\":" + num(qgrid_sets[gi].latest_z) + ",\"latest_null\":" +
-                           (qgrid_sets[gi].latest_null ? "true" : "false")
-                     : std::string()) +
-                blend_json + ",\"ms\":" + num(ms) +
-                (error.empty() ? std::string() : ",\"error\":" + json_str(error)) + "}";
-        }
-        const double grid_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - grid_started).count();
-        record += "},\"timing_ms\":{\"grid\":" + num(grid_ms) + ",\"rank\":" + num(query_trace.rank_us / 1000.0) +
-            ",\"forward\":" + num(std::chrono::duration<double, std::milli>(t1 - t0).count()) +
-            "},\"query_tiles\":" + std::to_string(qtiles) + ",\"p1_tiles\":" + std::to_string(p1_tiles) +
-            ",\"rows_new\":" + std::to_string(qrows_new) + "}\n";
-        FILE * file = std::fopen(std::getenv("PFLASH_QUERY_GRID_OUT"), "ab");
-        const bool written = file && std::fwrite(record.data(), 1, record.size(), file) == record.size();
-        if (file) std::fclose(file);
-        if (!written) {
-            session->ids.clear();
-            set_last_error("PFLASH_QUERY_GRID_OUT: write failed");
-            return {};
-        }
-    }
     // The served candidates replace the request set (named, not a fallback to windows).
     if (qcand) request_trace.fallback = "replaced_by_query_candidates";
     if (qcand || qpin) request_trace.query = &query_trace;
@@ -2831,16 +2278,17 @@ static std::vector<int32_t> strict_score_impl(
     query_trace.redo = !redone.empty();
     query_trace.redo_reason = redone;
     bool request_set = request_probe && request_trace.fallback.empty();
-    const bool ident_set = ident_mode != luce::pflash::PFlashIdentQuery::Off &&
-        ident_trace.fallback.empty();
     const auto pass2_started = std::chrono::steady_clock::now();
+    rerank_q_accum.assign((size_t) D * (size_t) Hk, 0.0);
+    rerank_q_weight_sum = 0.0;
     if (qcand) {
-        // The served candidates: one mass per candidate (cached from the grid when it ran), aggregated.
         const int tiles_before = qtiles;
-        qmass.clear();   // timing and tiles of the served path alone
+        qmass.clear();
+        qmass_qvec.clear();
         qwindows_ready = false;
         std::vector<float> aggregated;
-        if (!query_blend_mass(query_trace.set, qcfg, aggregated, query_trace.blend, query_trace.tw_score)) {
+        if (!query_blend_mass(query_trace.set, qcfg, aggregated, query_trace.blend, query_trace.tw_score,
+                              /*accumulate_rerank_q=*/true)) {
             session->ids.clear();
             return {};
         }
@@ -2848,62 +2296,21 @@ static std::vector<int32_t> strict_score_impl(
         query_trace.tiles = qtiles - tiles_before;
         query_trace.score_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - pass2_started).count();
-    } else if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows,
-                                         /*mask_query_tokens=*/true, request_trace.query_tiles)
-        : ident_set ? !score_request_set(ident_trace.tokens, ident_query_rows,
-                                         /*mask_query_tokens=*/false, ident_trace.query_tiles)
-                    : !score_windows()) {
-        session->ids.clear();
-        return {};
-    }
-    if (request_trace.stage2.evaluated) {
-        request_trace.stage2.pass2_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - pass2_started).count();
-    }
-    // Stage 2's budget (contract section 5 step 5): B' = min(n, B + B/2) when l_vague >= tau_fb, whatever query
-    // the request ends up scoring; raw_fits keeps every token (the caller serves the raw prompt). The selector
-    // budget is floor(S * ratio), so the ratio is the float whose budget is exactly B'.
-    float select_keep_ratio = keep_ratio;
-    int select_budget = (int) std::floor((double) S * (double) keep_ratio);
-    if (stage2_assembled && stage2_asm.widened) {
-        select_budget = stage2_asm.budget;
-        if (stage2_asm.raw_fits) {
-            select_keep_ratio = 1.0f;
-        } else {
-            float r = (float) (((double) select_budget + 0.5) / (double) S);
-            for (int k = 0; k < 8 && (int) std::floor((double) S * (double) r) > select_budget; ++k) {
-                r = std::nextafter(r, 0.0f);
-            }
-            for (int k = 0; k < 8 && (int) std::floor((double) S * (double) r) < select_budget; ++k) {
-                r = std::nextafter(r, 2.0f);
-            }
-            if ((int) std::floor((double) S * (double) r) != select_budget) {
-                set_last_error("stage 2: no keep ratio gives the widened budget");
-                session->ids.clear();
-                return {};
-            }
-            select_keep_ratio = r;
+    } else {
+        std::vector<double> single_qv;
+        std::vector<double> * qv_ptr = st.seg_reranker.loaded ? &single_qv : nullptr;
+        const bool ok_score = request_set
+            ? score_request_set(request_trace.set.tokens, request_query_rows,
+                                /*mask_query_tokens=*/true, request_trace.query_tiles, qv_ptr)
+            : score_windows(qv_ptr);
+        if (!ok_score) {
+            session->ids.clear();
+            return {};
         }
+        if (st.seg_reranker.loaded) accum_q_vec(single_qv, 1.0);
     }
-    if (stage2_assembled) {
-        luce::common::PFlashStage2Outcome outcome;
-        outcome.widened = stage2_asm.widened;
-        outcome.raw_fits = stage2_asm.raw_fits;
-        outcome.budget = (int) std::floor((double) S * (double) keep_ratio);
-        outcome.budget_widened = stage2_asm.budget;
-        pflash_set_stage2_outcome(outcome);
-    }
-    if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
-        ident_trace.query_tokens = ident_set ? (int) ident_trace.tokens.size() : 0;
-        if (!ident_set) ident_trace.tokens.clear();
-        std::fprintf(stderr,
-            "[pflash-ident-query] mode=%s %s turns=%d ident_tokens=%d query_tokens=%d tiles=%d\n",
-            luce::pflash::pflash_ident_query_name(ident_mode),
-            ident_set ? "scored" : ("fallback=" + ident_trace.fallback).c_str(),
-            ident_trace.turns, ident_trace.ident_tokens, ident_trace.query_tokens,
-            ident_trace.query_tiles);
-        std::fflush(stderr);
-    }
+    const float select_keep_ratio = keep_ratio;
+    const int select_budget = (int) std::floor((double) S * (double) keep_ratio);
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d, resumed at %d, "
@@ -2911,13 +2318,13 @@ static std::vector<int32_t> strict_score_impl(
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
         std::chrono::duration<double>(t2 - t1).count(),
-        qcand ? query_trace.set.candidates.size() : request_set || ident_set ? (size_t) 1 : windows.size(),
+        qcand ? query_trace.set.candidates.size() : request_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
     pflash_set_scoring_stats({resume, n_new,
                               qcand ? (int) query_trace.set.candidates.size()
-                                    : request_set || ident_set ? 1 : (int) windows.size(),
+                                    : request_set ? 1 : (int) windows.size(),
                               std::chrono::duration<double>(t1 - t0).count()});
 
     std::vector<PFlashTokenSpan> segments;
@@ -2948,7 +2355,7 @@ static std::vector<int32_t> strict_score_impl(
         }
         pins.swap(merged);
     }
-    // PFLASH_QUERY_PIN: the latest user message's top whole units, charged, shrunk to fit the budget.
+    // Query pin: the latest user message's top whole units, charged, shrunk to fit the budget.
     if (qpin) pins = fit_pin(pins, qcfg, query_trace.pin, query_trace.pin_cap_used);
     segment(pins, segments, density);
 
@@ -2995,10 +2402,15 @@ static std::vector<int32_t> strict_score_impl(
                 pins = required_instruction_spans;
                 segments.swap(base_segments);
                 density = base_density;
-                if (!score_windows()) {
+                // The windows' query replaces the request set's, for the reranker too.
+                std::vector<double> window_qv;
+                if (!score_windows(st.seg_reranker.loaded ? &window_qv : nullptr)) {
                     session->ids.clear();
                     return {};
                 }
+                rerank_q_accum.assign(rerank_q_accum.size(), 0.0);
+                rerank_q_weight_sum = 0.0;
+                accum_q_vec(window_qv, 1.0);
             }
         } else {
             request_trace.mandatory_tokens = charged(pins, segments);
@@ -3030,7 +2442,7 @@ static std::vector<int32_t> strict_score_impl(
         std::fprintf(stderr,
             "[pflash-request-probe] %s query_tokens=%d (latest %d, previous %d%s) rows new=%d "
             "stored=%d pins_new=%d mandatory=%d (base %d) budget=%d store=%d turns/%d tokens "
-            "(evicted %d, invalidated %d) messages:%s%s%s\n",
+            "(evicted %d, invalidated %d) messages:%s%s\n",
             request_set ? "scored" : ("fallback=" + request_trace.fallback).c_str(),
             request_trace.query_tokens, request_trace.set.latest_tokens,
             request_trace.set.previous_tokens, request_trace.set.capped ? ", capped" : "",
@@ -3038,7 +2450,7 @@ static std::vector<int32_t> strict_score_impl(
             request_trace.mandatory_tokens, request_trace.mandatory_tokens_base,
             request_trace.token_budget, request_trace.store_turns, request_trace.store_tokens,
             request_trace.store_evicted_turns, request_trace.store_invalidated_turns,
-            runs.empty() ? " none" : runs.c_str(), request_trace.stub ? " (stub row)" : "",
+            runs.empty() ? " none" : runs.c_str(),
             policy_note.c_str());
         if (query_trace.evaluated) {
             const auto & qs = query_trace.set;
@@ -3062,55 +2474,164 @@ static std::vector<int32_t> strict_score_impl(
                 query_trace.rank_us / 1000.0, query_trace.score_us / 1000.0, query_trace.blend.tw,
                 (double) query_trace.tw_score, query_trace.blend.end, cands.c_str());
         }
-        auto & s2t = request_trace.stage2;
-        if (s2t.evaluated) {
-            // Every request that does not score the stage-2 query is a named, counted reason.
-            s2t.fallback = request_set || qcand ? std::string() : request_trace.fallback;
-            if (!s2t.fallback.empty()) {
-                s2t.fallback_count = stage2_count_fallback(s2t.fallback);
-                std::fprintf(stderr, "[pflash-request-stage2] FALLBACK reason=\"%s\" count=%ld\n",
-                             s2t.fallback.c_str(), s2t.fallback_count);
-            }
-            std::fprintf(stderr,
-                "[pflash-request-stage2] %s%s L=%d [%d,%d) seed=%d%s latest=%d l_lb=%.4f l_vague=%.4f lookback=%d "
-                "earlier=%d promoted=%d%s (runs %d) post=%d widened=%d budget=%d->%d raw_fits=%d s2=%d resume=%d "
-                "history_dropped=%d tiles=%d pass1=%.1fms pass2=%.1fms\n",
-                s2t.active ? "active" : "inactive", s2t.reason.empty() ? "" : (" reason=" + s2t.reason).c_str(),
-                s2t.latest_message, s2t.latest_span.begin, s2t.latest_span.end,
-                s2t.seed_tokens, s2t.seed_capped ? " (capped)" : "", s2t.latest_tokens,
-                (double) s2t.lookback_logit, (double) s2t.vague_logit, (int) s2t.lookback, s2t.earlier_tokens,
-                s2t.promoted_tokens, s2t.promoted_capped ? " (capped)" : "", s2t.promoted_runs, s2t.post_tokens,
-                (int) s2t.widened, s2t.budget, s2t.budget_widened, (int) s2t.raw_fits, (int) s2t.s2_computed,
-                s2t.resume, s2t.history_dropped, s2t.attention_tiles, s2t.pass1_us / 1000.0, s2t.pass2_us / 1000.0);
-        }
         std::fflush(stderr);
     }
 
-    if (token_mass_out) {
-        // Scoring only (two-scorer selection): return the per-token mass,
-        // the probe segments and the ranking rule; the caller selects.
-        *token_mass_out = token_mass;
-        if (segments_out) *segments_out = segments;
-        if (density_out) *density_out = density;
-        return ids;
-    }
-
     luce::pflash::PFlashSelectionConfig request_config;
-    const bool traced_query = request_probe || ident_mode != luce::pflash::PFlashIdentQuery::Off;
-    if (traced_query) {
+    if (request_probe) {
         request_config = experiment;
-        if (request_probe) request_config.request_probe_trace = &request_trace;
-        if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
-            request_config.ident_query_trace = &ident_trace;
+        request_config.request_probe_trace = &request_trace;
+    }
+    // Release pre-permuted K buffer before reranker/selection VRAM allocations.
+    k_perm_cache.release();
+    std::vector<float> adj_kcos;
+    std::vector<float> seg_keys;
+    std::vector<float> rerank_scores;
+    pflash_set_reranker_error({});
+    pflash_set_loaded_assets_identity(st.loaded_assets_identity);
+    if (st.seg_reranker.loaded) {
+        std::vector<PFlashTokenSpan> fixed_spans;
+        const std::vector<PFlashTokenSpan> * spans_for_kcos = &segments;
+        if (segments.empty() && experiment.chunk_size > 0) {
+            const int n_chunks = (S + experiment.chunk_size - 1) / experiment.chunk_size;
+            fixed_spans.reserve((size_t) n_chunks);
+            for (int c = 0; c < n_chunks; ++c) {
+                const int b = c * experiment.chunk_size;
+                fixed_spans.push_back({b, std::min(S, b + experiment.chunk_size)});
+            }
+            spans_for_kcos = &fixed_spans;
+        }
+        // Match training: feed ONLY non-mandatory, positive-mass body segments
+        // into kcos, scalar z-scoring, and the bidirectional reranker so BOS/
+        // instruction sinks and zero-mass masked query tails cannot distort
+        // per-document z-scores or max_log_dens.
+        const int rr_q_end = score_query_end < 0 ? S : score_query_end;
+        const int rr_q_begin = rr_q_end - std::min(n_lookahead, rr_q_end);
+        const size_t n_all = spans_for_kcos->size();
+        std::vector<size_t> opt_indices;
+        std::vector<PFlashTokenSpan> opt_spans;
+        std::vector<float> base_log_dens(n_all, (float) std::log(1e-12));
+        opt_indices.reserve(n_all);
+        opt_spans.reserve(n_all);
+        const int tok_sz = (int) token_mass.size();
+        for (size_t i = 0; i < n_all; ++i) {
+            const int b = (*spans_for_kcos)[i].begin;
+            const int e = (*spans_for_kcos)[i].end;
+            const int s0 = std::max(0, b);
+            const int e0 = std::min(tok_sz, e);
+            const int len = std::max(1, e0 - s0);
+            double sum_m = 0.0;
+            for (int t = s0; t < e0; ++t) sum_m += (double) token_mass[(size_t) t];
+            base_log_dens[i] = (float) std::log(std::max(1e-12, sum_m / (double) len));
+            const bool mandatory =
+                luce::pflash::pflash_chunk_is_structurally_required(
+                    b, e, rr_q_begin, rr_q_end, S, pins,
+                    /*query_suffix_structural=*/ !experiment.query_suffix_candidates);
+            if (!mandatory && b > 0 && sum_m > 0.0) {
+                opt_indices.push_back(i);
+                opt_spans.push_back({b, e});
+            }
+        }
+        // The loader admits only kbar ([k_bar]) and kbar_katt ([k_bar, k_att]) at the drafter's key width.
+        const bool rr_is_katt = (st.seg_reranker.feature_mode == "kbar_katt");
+        std::vector<float> seg_katt;
+        std::string rr_failure;
+        if (opt_spans.size() >= 2) {
+            if (!pflash_adjacent_segment_key_cosine(
+                    w.backend, session->keys, opt_spans, adj_kcos, &seg_keys,
+                    rr_is_katt ? token_mass.data() : nullptr,
+                    rr_is_katt ? &seg_katt : nullptr)) {
+                adj_kcos.clear();
+                seg_keys.clear();
+                seg_katt.clear();
+                rr_failure = "segment key cosine computation failed";
+            }
+            const int k_dim = D * Hk;
+            const int expected_in_dim = rr_is_katt ? (2 * k_dim) : k_dim;
+            if (rr_failure.empty() &&
+                (seg_keys.empty() ||
+                 (rr_is_katt && seg_katt.size() != seg_keys.size()))) {
+                rr_failure = "segment reranker key features missing";
+            }
+            if (rr_failure.empty() && !(rerank_q_weight_sum > 0.0)) {
+                rr_failure = "segment reranker query vector missing";
+            }
+            if (rr_failure.empty()) {
+                auto t_rr0 = std::chrono::steady_clock::now();
+                std::vector<float> q_vec((size_t) k_dim, 0.0f);
+                double norm_sq = 0.0;
+                for (size_t d = 0; d < q_vec.size(); ++d) {
+                    const double v = rerank_q_accum[d] / rerank_q_weight_sum;
+                    q_vec[d] = (float) v;
+                    norm_sq += v * v;
+                }
+                if (norm_sq > 1e-16 && std::isfinite(norm_sq)) {
+                    const float inv_n = (float) (1.0 / std::sqrt(norm_sq));
+                    for (float & v : q_vec) v *= inv_n;
+                }
+                std::vector<float> seg_dual;
+                std::vector<float> q_dual;
+                const float * rr_seg_ptr = seg_keys.data();
+                const float * rr_q_ptr   = q_vec.data();
+                if (rr_is_katt) {
+                    const size_t n_opt = opt_spans.size();
+                    seg_dual.resize(n_opt * (size_t) expected_in_dim);
+                    for (size_t i = 0; i < n_opt; ++i) {
+                        float * dst = seg_dual.data() + i * (size_t) expected_in_dim;
+                        std::memcpy(dst, seg_keys.data() + i * (size_t) k_dim,
+                                    (size_t) k_dim * sizeof(float));
+                        std::memcpy(dst + k_dim, seg_katt.data() + i * (size_t) k_dim,
+                                    (size_t) k_dim * sizeof(float));
+                    }
+                    q_dual.resize((size_t) expected_in_dim);
+                    std::memcpy(q_dual.data(), q_vec.data(), (size_t) k_dim * sizeof(float));
+                    std::memcpy(q_dual.data() + k_dim, q_vec.data(), (size_t) k_dim * sizeof(float));
+                    rr_seg_ptr = seg_dual.data();
+                    rr_q_ptr   = q_dual.data();
+                }
+                std::vector<float> rr_scalars, rr_log_dens, opt_scores;
+                pflash_reranker_build_scalars(
+                    S, token_mass, opt_spans,
+                    container_probs.empty() ? nullptr : &container_probs,
+                    adj_kcos.empty() ? nullptr : &adj_kcos,
+                    rr_scalars, rr_log_dens);
+                float pred_m = 0.0f;
+                std::string rr_err;
+                if (pflash_seg_reranker_run(
+                        st.seg_reranker, w.backend, (int) opt_spans.size(),
+                        rr_seg_ptr, rr_q_ptr, rr_scalars.data(), rr_log_dens.data(),
+                        opt_scores, nullptr, &pred_m, &rr_err)) {
+                    rerank_scores = std::move(base_log_dens);
+                    for (size_t k = 0; k < opt_indices.size(); ++k) {
+                        rerank_scores[opt_indices[k]] = opt_scores[k];
+                    }
+                    auto t_rr1 = std::chrono::steady_clock::now();
+                    std::fprintf(stderr,
+                        "[pflash-reranker] scored N=%zu/%zu time=%.2fms pred_m=%.3f\n",
+                        opt_spans.size(), n_all,
+                        std::chrono::duration<double, std::milli>(t_rr1 - t_rr0).count(),
+                        pred_m);
+                    std::fflush(stderr);
+                } else {
+                    rr_failure = rr_err.empty() ? "seg reranker graph compute failed" : rr_err;
+                }
+            }
+            if (!rr_failure.empty()) {
+                pflash_set_reranker_error(rr_failure);
+                std::fprintf(stderr,
+                    "[pflash-reranker] WARNING failed (%s), falling back to Stage-1 scores\n",
+                    rr_failure.c_str());
+                std::fflush(stderr);
+                rerank_scores.clear();
+            }
         }
     }
     return select_pflash_chunks(
         ids, token_mass, select_keep_ratio, n_lookahead, score_query_end,
-        /*pool_kernel=*/1, traced_query ? request_config : experiment, pins,
+        /*pool_kernel=*/1, request_probe ? request_config : experiment, pins,
         /*direct_mass=*/true, /*write_trace=*/true,
         segments.empty() ? nullptr : &segments, density,
-        /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
-        st.fold_vocab.get());
+        rerank_scores.empty() ? nullptr : &rerank_scores);
 }
 
 std::vector<int32_t> qwen35_strict_score_and_compress(
@@ -3120,13 +2641,10 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     int n_lookahead,
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    std::vector<float> * token_mass_out,
-    std::vector<PFlashTokenSpan> * segments_out,
-    bool * density_out) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
     std::string redo;
     auto kept = strict_score_impl(st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
-                                  required_instruction_spans, token_mass_out, segments_out, density_out,
+                                  required_instruction_spans,
                                   std::numeric_limits<int>::max(), std::string(), redo);
     if (redo.empty()) return kept;
     // A query row the resumed session could not give exactly: the whole request again from token 0 (its session
@@ -3135,7 +2653,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::fflush(stderr);
     const std::string reason = redo;
     kept = strict_score_impl(st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
-                             required_instruction_spans, token_mass_out, segments_out, density_out,
+                             required_instruction_spans,
                              /*resume_cap=*/0, reason, redo);
     if (!redo.empty()) {
         set_last_error("query step: redo from token 0 asked for another redo");
@@ -3159,83 +2677,41 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         return {};
     }
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
+    // Standalone scoring without PFlash assets preserves the legacy all-layer
+    // contract (honoring caller chunk_size and pool_kernel).
+    if (!st->head_loaded && !st->probe_loaded && !st->request_loaded &&
+        !st->seg_reranker.loaded && !experiment.query_probe &&
+        required_instruction_spans.empty() && !experiment.query_suffix_candidates &&
+        experiment.history_queries.empty() && experiment.turn_query.begin < 0) {
+        luce::pflash::PFlashSelectionConfig legacy = experiment;
+        legacy.configured = false;
+        legacy.selection_active = false;
+        legacy.mode = luce::pflash::PFlashSelectionMode::Legacy;
+        return qwen35_score_and_compress(
+            st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel,
+            score_query_end, legacy, required_instruction_spans);
+    }
     // Sessions offloaded when the drafter was last released come back before
-    // any scoring (the strict scorer is the only one that reads them).
+    // any scoring.
     st->session_ctx_limit = luce::pflash::pflash_session_ctx_limit(st->ctx_train, ctx.engine_max_ctx);
     qwen35_restore_sessions(ctx, *st, ids);
-    // Strict budget selection scores with the block-15 head; the
-    // legacy all-layer running-max scorer stays available for legacy
-    // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
-    const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
-    const bool force_legacy = (legacy_scorer && std::string(legacy_scorer) == "1") ||
-        experiment.scorer == luce::pflash::PFlashScorer::Legacy;
-    // Only the block-15 head scores keys after the query window; the
-    // running-max scorer, alone or in the split, keeps the suffix.
-    luce::pflash::PFlashSelectionConfig suffix_kept = experiment;
-    suffix_kept.query_suffix_candidates = false;
-    if (experiment.selection_active &&
-        experiment.scorer == luce::pflash::PFlashScorer::Split) {
-        // Two scorers, one budget: the block-15 head ranks (and segments)
-        // first, the all-layer running-max scorer fills the remainder.
-        std::vector<float> head_mass;
-        std::vector<PFlashTokenSpan> head_segments;
-        bool head_density = false;
-        if (qwen35_strict_score_and_compress(
-                *st, ids, keep_ratio, n_lookahead, score_query_end, suffix_kept,
-                required_instruction_spans, &head_mass, &head_segments,
-                &head_density).empty()) {
-            return {};
-        }
-        std::vector<float> other_scores;
-        if (qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
-                                      n_lookahead, pool_kernel, score_query_end,
-                                      suffix_kept, required_instruction_spans,
-                                      &other_scores).empty()) {
-            return {};
-        }
-        if (other_scores.size() != head_mass.size()) {
-            set_last_error("two-scorer selection: score lengths differ");
-            return {};
-        }
+    auto kept = qwen35_strict_score_and_compress(
+        *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+        required_instruction_spans);
+    // Non-finite head scores (once in ~500 development requests, not
+    // reproduced) leave the scoring session forgotten: score the prompt
+    // again from scratch, one drafter forward, instead of failing the
+    // request.
+    if (kept.empty() &&
+        std::strncmp(luce_last_error(), "non-finite", 10) == 0) {
         std::fprintf(stderr,
-            "[pflash-select] two-scorer selection: head fraction %.2f, "
-            "segments=%s\n", experiment.split_fraction,
-            head_segments.empty() ? "fixed" : "probe");
+            "[qwen35-scorer] non-finite scores; rescoring from scratch\n");
         std::fflush(stderr);
-        return select_pflash_chunks(
-            ids, head_mass, keep_ratio, n_lookahead, score_query_end,
-            /*pool_kernel=*/1, suffix_kept, required_instruction_spans,
-            /*direct_mass=*/true, /*write_trace=*/true,
-            head_segments.empty() ? nullptr : &head_segments, head_density,
-            &other_scores, experiment.split_fraction);
-    }
-    if (experiment.selection_active && !force_legacy) {
-        auto kept = qwen35_strict_score_and_compress(
+        kept = qwen35_strict_score_and_compress(
             *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
             required_instruction_spans);
-        // Non-finite head scores (once in ~500 development requests, not
-        // reproduced) leave the scoring session forgotten: score the prompt
-        // again from scratch, one drafter forward, instead of failing the
-        // request.
-        if (kept.empty() &&
-            std::strncmp(luce_last_error(), "non-finite", 10) == 0) {
-            std::fprintf(stderr,
-                "[qwen35-scorer] non-finite scores; rescoring from scratch\n");
-            std::fflush(stderr);
-            kept = qwen35_strict_score_and_compress(
-                *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
-                required_instruction_spans);
-        }
-        return kept;
     }
-    if (st->head_loaded && !experiment.selection_active) {
-        set_last_error("Qwen3.5 scoring head requires strict selection");
-        return {};
-    }
-    return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
-                                     n_lookahead, pool_kernel, score_query_end,
-                                     suffix_kept,
-                                     required_instruction_spans);
+    return kept;
 }
 
 } // namespace luce::common

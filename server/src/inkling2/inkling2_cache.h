@@ -144,7 +144,8 @@ bool create_inkling2_cache(ggml_backend_t target_backend,
                            ggml_type kv_type,
                            Inkling2Cache & out,
                            std::string & error,
-                           int fixed_remote_split_pos = -1);
+                           int fixed_remote_split_pos = -1,
+                           size_t extra_target_reserve = 0);
 
 void reset_inkling2_cache(Inkling2Cache & cache);
 void free_inkling2_cache(Inkling2Cache & cache);

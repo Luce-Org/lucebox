@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -121,9 +122,12 @@ def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str
         if pred is None:
             return False, f"no numeric answer found, gold={gold}"
         try:
-            correct = abs(float(pred) - float(gold)) < 1e-6
-        except (ValueError, TypeError):
-            correct = pred.strip() == gold.strip()
+            gold_str = str(gold)
+            if "/" in gold_str:
+                raise ValueError(f"invalid gold: {gold_str!r}")
+            correct = abs(Fraction(pred) - Fraction(gold_str)) < 1e-6
+        except (ValueError, TypeError, ZeroDivisionError):
+            correct = pred.strip() == str(gold).strip()
         return correct, f"pred={pred} gold={gold}"
     else:
         # Math-style: extract \boxed{} and compare

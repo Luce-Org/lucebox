@@ -144,7 +144,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_FP_USE_BSA` | Gemma 4 sliding-window prefill: dispatch the FlashPrefill sparse forward through the BSA launcher (CUTLASS on CUDA, rocWMMA on HIP). Enabled by presence; on by default with PFlash. The PFlash scorer does not read it. |
 | `LUCE_FP_HIP_ROW` | HIP row-kernel path for flash prefill. |
 | `LUCE_FP_PROFILE` / `LUCE_FP_DUMP_COUNTS` | 🐛 **debug** FlashPrefill profiling/debug. |
-| `LUCE_PFLASH` | Docker entrypoint: `auto` (default), `on` or `off`, passed as `--pflash`. With `auto`, PFlash is on for supported targets when `LUCE_PREFILL_DRAFTER` (an existing file) and `PFLASH_SCORING_HEAD_GGUF` are set. |
+| `LUCE_PFLASH` | Docker entrypoint: `auto` (default), `on` or `off`, passed as `--pflash`. With `auto`, PFlash is on for supported targets when `LUCE_PREFILL_DRAFTER` (an existing file) and all four PFlash files (scoring head, segment probe, request probe, segment reranker) are given. |
 | `LUCE_PREFILL_THRESHOLD` | Prefill length threshold. |
 | `LUCE_PREFILL_DRAFTER` | Docker entrypoint: the PFlash drafter GGUF (Qwen3.5-0.8B), passed as `--prefill-drafter` when `LUCE_PFLASH` is not `off`. |
 | `LUCE_PREFILL_KEEP` | Docker entrypoint: fraction of source tokens PFlash keeps, passed as `--prefill-keep-ratio`. |

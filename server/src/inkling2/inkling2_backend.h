@@ -13,6 +13,7 @@
 
 #include "common/adaptive_spec_width.h"
 #include "common/model_backend.h"
+#include "pflash/pflash_drafter.h"
 #include "placement/placement_config.h"
 
 #include "inkling2_internal.h"
@@ -36,6 +37,11 @@ struct Inkling2BackendConfig {
     int                         chunk = 512;
     ggml_type                   cache_type_k = GGML_TYPE_COUNT; // COUNT -> Q8_0 default (or F16 via --cache-type-k f16)
     ggml_type                   cache_type_v = GGML_TYPE_COUNT;
+    // PFlash: when the drafter scores beside the resident model on GPU pflash_gpu (-1: none),
+    // auto-sizing and Split-KV keep pflash_bytes + pflash_bytes_per_token * max_ctx free there.
+    int                         pflash_gpu = -1;
+    size_t                      pflash_bytes = 0;
+    size_t                      pflash_bytes_per_token = 0;
 };
 
 struct Inkling2Snapshot {
@@ -89,13 +95,20 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
 
-    bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
-    void free_drafter() override {}
+    // PFlash: the drafter scores the prompt beside the resident model, or in the
+    // memory a park frees (pflash_window.h).
+    CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests);
+    bool handle_compress(const std::string & line, const DaemonIO & io) override;
+    void free_drafter() override;
+    bool pflash_gives_candidate_scores() const override { return true; }
 
     void shutdown() override;
 
 private:
     GenerateResult run(const GenerateRequest & req, const DaemonIO & io, int restored);
+    size_t pflash_reserve(ggml_backend_t device, int ctx) const;
     bool load_all();
     void release_device_state();
     void release_all();
@@ -112,6 +125,8 @@ private:
     int                   fitted_remote_split_pos_ = -1;
     bool                  parked_         = false;
     bool                  released_       = false;
+    DrafterContext        drafter_ctx_;          // PFlash drafter, loaded at the first compress
+    bool                  drafter_loaded_ = false;
     std::vector<float>    last_logits_;
     std::array<Inkling2Snapshot, kMaxSlots> snapshots_;
     AdaptiveSpecWidth     spec_width_{kInkling2MaxVerify};

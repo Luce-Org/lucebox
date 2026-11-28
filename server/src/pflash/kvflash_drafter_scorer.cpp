@@ -145,7 +145,7 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
     if (query_end <= 0) { std::fprintf(stderr, "[kvflash] pflash2: the last message is empty, no query\n"); return false; }
     const std::vector<int32_t> kept = drafter_score_and_compress(
         *ctx_, ids, /*keep_ratio=*/1.0f, /*chunk_size=*/256, /*n_lookahead=*/kPflash2Lookahead, /*pool_kernel=*/1,
-        query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, {}, &msgs);
+        query_end, {}, /*query_suffix_candidates=*/true, {}, {-1, -1}, &msgs);
     const auto & lifts = pflash_last_candidate_lifts();
     if (kept.empty() || lifts.empty()) return false;
 

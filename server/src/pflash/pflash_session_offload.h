@@ -22,11 +22,6 @@
 
 namespace luce::pflash {
 
-// Whether stored sessions go to pinned host memory: only with PFLASH_SESSION_OFFLOAD_PINNED=1 (exactly "1").
-// The default is plain (pageable) memory: pinned buffers (hipHostMalloc) raised peak VRAM by up to 1.0 GiB at a
-// ~223K-token prompt, left about 0.5 GiB of VRAM in use between requests and slowed target prefill on an R9700.
-bool pflash_session_offload_pinned_enabled() noexcept;
-
 // Host bytes: pinned (a buffer of the device's host buffer type) when one is given and can be allocated, else plain
 // memory.
 class PFlashHostBlob {

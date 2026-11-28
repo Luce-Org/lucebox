@@ -3,11 +3,9 @@
 // "PFlash" is the whole compression concept (score -> select -> emit); the
 // pflash drafter is the scorer model behind it — Qwen3.5-0.8B for now
 // (qwen35_drafter.cpp + qwen35_loader.cpp): it runs the model's first
-// fifteen blocks and scores the context with block 15's NoPE Q/K
-// attention-mass head, with the all-layer running-max scorer kept as an
-// opt-in alternative (PFLASH_QWEN35_LEGACY_SCORER=1 or the PFLASH scorer
-// config). This header is the model-agnostic API surface; a future drafter
-// slots in behind load_drafter / drafter_score_and_compress.
+// sixteen blocks (0..15) and scores the context with block 15's NoPE Q/K
+// attention-mass head. This header is the model-agnostic API surface; a
+// future drafter slots in behind load_drafter / drafter_score_and_compress.
 //
 // Hosted in the SAME process / SAME ggml allocator as the dflash target, so
 // we never pay the cross-process VRAM contention that broke the Python
@@ -35,6 +33,16 @@ namespace luce::common {
 struct Qwen35DrafterState;
 struct DrafterHostSessions;
 
+// Controls how load_drafter() handles the four PFlash component GGUFs:
+//   Optional   : standalone tools/tests (load whichever PFLASH_*_GGUF are set)
+//   RequireAll : server PFlash serving path (all four PFlash assets must load)
+//   SkipAll    : KVFlash-only residency scorer (ignore PFLASH_*_GGUF, load all blocks)
+enum class DrafterAssetMode {
+    Optional,
+    RequireAll,
+    SkipAll,
+};
+
 struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
     // Scorer state for the current drafter (Qwen3.5-0.8B). The public API
@@ -43,8 +51,12 @@ struct DrafterContext {
     Qwen35DrafterState *  state   = nullptr;   // owned scorer weights + heads
     int                   gpu     = -1;
     bool                  loaded  = false;
-    // The GGUF the loaded weights came from (empty when none are loaded).
+    DrafterAssetMode      asset_mode = DrafterAssetMode::Optional;
+    DrafterAssetMode      loaded_asset_mode = DrafterAssetMode::Optional;
+    // The GGUF the loaded weights came from (empty when none are loaded), and
+    // the file-identity tuple of the drafter + loaded PFlash assets.
     std::string           path;
+    std::string           loaded_assets_identity;
     // The serving engine's max context (its --max-ctx), set by the owner after load_drafter(); scoring sessions are
     // never sized past it (nor past the drafter's trained context). 0 = unknown: the drafter's context alone.
     int                   engine_max_ctx = 0;
@@ -53,6 +65,23 @@ struct DrafterContext {
     // call restores them (qwen35_drafter.h).
     std::shared_ptr<DrafterHostSessions> host_sessions;
 };
+
+// File identity string (`path@size:mtime:ctime:ino` on POSIX) used to detect
+// in-place replacements of PFlash asset files in view keys and drafter loads.
+std::string pflash_file_identity(const std::string & path);
+std::string pflash_file_identity_from_fd(const std::string & path, int fd);
+
+// Header + payload-extent GGUF contract validation for the drafter + all four
+// PFlash component files (scoring head, segment probe, request probe, segment
+// reranker). Reads GGUF metadata and tensor descriptors without allocating
+// weights or touching any GPU.
+bool validate_pflash_component_ggufs(
+    const std::string & drafter_path,
+    const std::string & head_path,
+    const std::string & segment_probe_path,
+    const std::string & request_probe_path,
+    const std::string & seg_reranker_path,
+    std::string & error);
 
 // Load the drafter GGUF (a Qwen3.5-0.8B GGUF today).
 // Creates a fresh GPU backend if `backend` is null. Otherwise uses the
@@ -95,13 +124,8 @@ void free_drafter_weights(DrafterContext & ctx);
 //                    recent first, mixed into the scores at halving weights
 //   turn_query   strict selection only: the latest user turn's tail, mixed
 //                    in at the query's own weight
-//   extra_queries  strict selection only (PFLASH_SELECT_QUERY_HEAD=1): the
-//                    user's prose blocks around pasted material, each mixed
-//                    in at the query's own weight
-//   request_messages  PFLASH_SELECT_QUERY_PROBE=1 only: the human user
-//                    messages' content spans the request probe reads
-//                    (nullptr: none, the request falls back to today's
-//                    windows)
+//   request_messages  request probe only: the human user messages' content
+//                    spans and full message map (nullptr when unavailable)
 //   keep_queries strict selection only: windows a later request scores as
 //                    history queries; never scored here, their rows are
 //                    kept so that request can resume the scoring session
@@ -120,7 +144,6 @@ std::vector<int32_t> drafter_score_and_compress(
     bool   query_suffix_candidates = false,
     const std::vector<PFlashTokenSpan> & history_queries = {},
     PFlashTokenSpan turn_query = {-1, -1},
-    const std::vector<PFlashTokenSpan> & extra_queries = {},
     const PFlashRequestMessages * request_messages = nullptr,
     const std::vector<PFlashTokenSpan> & keep_queries = {});
 

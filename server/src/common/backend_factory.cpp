@@ -311,6 +311,9 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.chunk         = execution.chunk;
         cfg.cache_type_k  = cache.cache_type_k;
         cfg.cache_type_v  = cache.cache_type_v;
+        cfg.pflash_gpu    = cache.pflash_reserve_gpu;
+        cfg.pflash_bytes  = (size_t) std::max(0LL, cache.pflash_reserve_bytes);
+        cfg.pflash_bytes_per_token = (size_t) std::max(0LL, cache.pflash_reserve_bytes_per_token);
 
         auto backend = std::make_unique<Inkling2Backend>(std::move(cfg));
         if (!backend->init()) {

@@ -105,8 +105,8 @@ int main(int argc, char ** argv) {
         iss >> cmd;
         if (cmd == "request" || cmd == "request2") {
             // request <lookahead> <score_query_end> <suffix 0|1> <n_spans> [<b> <e>]... <n_human> [<b> <e>]... <path>
-            // As segment, plus the human user messages' content spans (latest first) the request probe reads
-            // (PFLASH_SELECT_QUERY_PROBE=1); compressed ids go to --stream-fd like compress.
+            // As segment, plus the human user messages' content spans (latest first) the request probe reads;
+            // compressed ids go to --stream-fd like compress.
             // request2 <lookahead> <score_query_end> <suffix 0|1> <n_spans> [<b> <e>]... <n_messages>
             //          [<role> <b> <e>]... <path>
             // As request, with EVERY normalised message in order (role system|user|assistant|tool, content span):
@@ -126,6 +126,7 @@ int main(int argc, char ** argv) {
             if (ok) iss >> n_human;
             ok = ok && (bool) iss && n_human >= 0 && (all_messages || n_human <= 2);
             luce::common::PFlashRequestMessages human;
+            human.human_only = !all_messages;
             for (int i = 0; ok && i < n_human; ++i) {
                 std::string role;
                 if (all_messages) iss >> role;
@@ -165,7 +166,7 @@ int main(int argc, char ** argv) {
             const float keep = (keep_raw && std::atoi(keep_raw) > 0 ? std::atoi(keep_raw) : 187.5f) / 1000.0f;
             std::vector<int32_t> out = drafter_score_and_compress(
                 ctx, ids, keep, 256, lookahead, 1, query_end, spans, suffix != 0,
-                {}, {-1, -1}, {}, &human);
+                {}, {-1, -1}, &human);
             const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (out.empty()) {
                 std::fprintf(stderr, "[pflash-daemon] request failed: %s\n", luce_last_error());
