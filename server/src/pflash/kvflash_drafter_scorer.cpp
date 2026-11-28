@@ -151,7 +151,10 @@ bool KvFlashPFlash2Scorer::score_chunks(const std::vector<int32_t> & ids, int ch
 
     std::vector<PFlashTokenSpan> spans;
     std::vector<double> density;
-    for (const auto & l : lifts) { spans.push_back(l.span); density.push_back(l.lift); }
+    for (const auto & l : lifts) {
+        spans.push_back(l.span);
+        density.push_back(kvflash_pflash_rank_score(l.lift, l.rank_score));
+    }
     out = kvflash_pflash_chunk_scores(spans, density, S, chunk_tokens);
     stats_ = pflash_last_scoring_stats();
     segments_ = (int)spans.size();

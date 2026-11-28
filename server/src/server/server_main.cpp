@@ -1695,12 +1695,39 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
+    if (model.pflash_drafter_device && model.pflash_drafter_device->gpu >= 0) {
+        const std::string gpu_s = std::to_string(model.pflash_drafter_device->gpu);
+        set_environment_variable("LUCE_KVFLASH_DRAFTER_GPU", gpu_s.c_str(), true);
+    }
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
     if (const char * refusal = pflash_drafter_device_refusal(
             bargs.device, model.target_device_auto, model.pflash_drafter_device)) {
         std::fprintf(stderr, "[server] --prefill-drafter-device %s\n", refusal);
         return 2;
+    }
+    if (!sconfig.pflash && sconfig.kvflash_enabled && !sconfig.pflash_drafter_path.empty() &&
+        model.pflash_comps.complete()) {
+        // KVFlash Mode 5 can use the four PFlash v3 assets even when prefill compression is off.
+        std::string gguf_err;
+        if (luce::common::validate_pflash_component_ggufs(
+                sconfig.pflash_drafter_path, model.pflash_comps.scoring_head,
+                model.pflash_comps.segment_probe, model.pflash_comps.request_probe,
+                model.pflash_comps.seg_reranker, gguf_err)) {
+            const auto release_env = luce::server::pflash_release_env(model.pflash_comps);
+            if (!release_env.empty()) {
+                apply_env_defaults("KVFlash PFlash assets", release_env);
+            }
+        } else if (sconfig.kvflash_recall_mode == "prefill-reselect=5") {
+            std::fprintf(stderr,
+                "[server] KVFlash mode 5: PFlash GGUF contract check failed (%s)\n",
+                gguf_err.c_str());
+            return 2;
+        } else {
+            std::fprintf(stderr,
+                "[server] KVFlash PFlash assets skipped: GGUF contract check failed (%s)\n",
+                gguf_err.c_str());
+        }
     }
     if (sconfig.pflash) {
         const bool drafter_beside_target = pflash_drafter_beside_target(

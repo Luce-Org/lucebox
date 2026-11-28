@@ -23,6 +23,7 @@
 
 #include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/kv_slot_residency.h"
 #include "common/concurrency/paged_kv_offload.h"
 #include "common/dflash/dflash2_head.h"
 #include "common/dflash/dflash_draft_kv.h"
@@ -34,10 +35,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace luce::common {
@@ -68,7 +73,8 @@ public:
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
                     int prefill_quantum = 512,
-                    bool target_is_uma = false);
+                    bool target_is_uma = false,
+                    int kvflash_tokens = 0);
     ~Qwen35SeqEngine() override;
 
     // Destroy every graph that captures draft-weight tensors. Qwen35Backend
@@ -160,6 +166,8 @@ private:
         int kv_pos = 0;
         int chunk = 0;
         bool commit = false;
+        int res_tokens = 0;
+        int prefix_res_tokens = 0;
         std::vector<int64_t> rows;
         // Axis-major [4 x chunk] rotary positions when the slot holds images;
         // empty means the plain kv_pos + i positions.
@@ -206,6 +214,16 @@ private:
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
+    void kvflash_init_slot(int slot, const std::vector<int32_t> & prompt,
+                           const uint32_t * shared_blocks,
+                           uint32_t shared_block_count, int shared_tokens);
+    bool kvflash_sync_slot_table(int slot, int cur_pos, int chunk_start_pos,
+                                 int & out_res_tokens, int & out_prefix_res_tokens);
+    void kvflash_clear_slot(int slot);
+    void kvflash_enqueue_score(int slot, const std::vector<int32_t> & prompt);
+    bool kvflash_take_score(int slot, std::vector<float> & out_scores,
+                            double & out_ms, int & out_segs);
+    void kvflash_stop_scorer_thread();
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
@@ -285,6 +303,35 @@ private:
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     PagedKvOffload offload_;
+    std::unique_ptr<KvSlotResidency> kvflash_;
+    std::vector<uint64_t> kvflash_uploaded_epoch_;
+    std::vector<int>      kvflash_res_tokens_;
+    std::vector<int>      kvflash_slot_r_;
+    std::vector<uint8_t>  kvflash_recalled_;
+    std::vector<int32_t>  kvflash_active_blocks_;
+    std::vector<KvSlotResidency::Snapshot> kvflash_prefix_snapshots_;
+    struct KvFlashScoreJob {
+        int slot = -1;
+        uint64_t gen = 0;
+        int chunk_tokens = 64;
+        std::vector<int32_t> prompt;
+    };
+    struct KvFlashScoreSlot {
+        uint64_t gen = 0;
+        bool pending = false;
+        bool ready = false;
+        bool ok = false;
+        double ms = 0.0;
+        int segs = 0;
+        std::vector<float> scores;
+    };
+    std::mutex kvflash_score_mu_;
+    std::condition_variable kvflash_score_cv_;
+    std::deque<KvFlashScoreJob> kvflash_score_q_;
+    std::vector<KvFlashScoreSlot> kvflash_score_slots_;
+    std::thread kvflash_score_thread_;
+    bool kvflash_score_stop_ = false;
+    bool kvflash_async_enabled_ = false;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;
     bool            fixed_chain_ready_ = false;

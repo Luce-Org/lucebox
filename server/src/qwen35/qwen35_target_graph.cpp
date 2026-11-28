@@ -3567,13 +3567,13 @@ bool paged_snapshot_matches(
          kv.attn_v_snap.size() != cache.attn_v.size())) return false;
 
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!check_kv_tensors) continue;
         const bool present = cache.attn_k[i] != nullptr;
         if (present &&
             (!paged_rows_fit(cache.attn_k[i], blocks, block_size, tokens) ||
              !paged_rows_fit(cache.attn_v[i], blocks, block_size, tokens))) {
             return false;
         }
-        if (!check_kv_tensors) continue;
         if ((kv.attn_k_snap[i] != nullptr) != present ||
             (kv.attn_v_snap[i] != nullptr) != present) return false;
         const int expected_rows = kv.kv_start > 0 ? (tokens - kv.kv_start) : tokens;
@@ -3647,11 +3647,12 @@ bool snapshot_paged_target_cache(
         set_last_error("snapshot_paged_target_cache: invalid arguments");
         return false;
     }
+    const bool force_state_only = (pinned_full_blocks == std::numeric_limits<size_t>::max());
     const size_t full_blocks = (size_t)(token_count / block_size);
-    const size_t skip_full = std::min(pinned_full_blocks, full_blocks);
+    const size_t skip_full = force_state_only ? 0 : std::min(pinned_full_blocks, full_blocks);
     const int kv_start_row = (int)(skip_full * (size_t)block_size);
-    const int kv_rows = token_count - kv_start_row;
-    const bool skip_kv = (kv_rows <= 0);
+    const int kv_rows = force_state_only ? 0 : (token_count - kv_start_row);
+    const bool skip_kv = force_state_only || (kv_rows <= 0);
     const bool needs_alloc = !snap.ctx ||
         snap.layout != PrefixSnapshot::Layout::paged ||
         snap.cur_pos != token_count ||

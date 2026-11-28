@@ -15,15 +15,18 @@ struct KvflashPrefillReselectFixture {};
 std::vector<float> ramp(int n) { std::vector<float> s((size_t)n); for (int i = 0; i < n; i++) s[(size_t)i] = (float)((i * 37) % 101); return s; }
 }
 
-// ---- the mode gate: only 0 and 4 exist -----------------------------------------------------------------
+// ---- the mode gate: 0, 4 and 5 exist -----------------------------------------------------------------
 
 TEST_CASE(KvflashPrefillReselectFixture, modes_one_to_three_are_off) {
     std::string why;
-    for (int m : {1, 2, 3, 5, 6, -1, 100}) {
+    for (int m : {1, 2, 3, 6, -1, 100}) {
         CHECK(kvflash_reselect_mode(m, true, "exact", &why) == 0);
         CHECK(kvflash_reselect_mode(m, true, "pflash2", &why) == 0);
     }
     CHECK(kvflash_reselect_mode(0, true, "exact", &why) == 0);
+    CHECK(kvflash_reselect_mode(5, true, nullptr, &why) == 5);
+    CHECK(why.empty());
+    CHECK(kvflash_reselect_mode(5, false, nullptr, &why) == 0);
 }
 TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy_and_the_exact_scorer) {
     std::string why;

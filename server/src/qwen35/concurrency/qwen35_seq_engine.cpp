@@ -61,7 +61,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         int max_prefills,
         int mixed_prefill_tokens, int long_mixed_prefill_tokens,
         int long_prefill_threshold, int idle_prefill_tokens,
-        int prefill_quantum, bool target_is_uma)
+        int prefill_quantum, bool target_is_uma,
+        int kvflash_tokens)
     : max_prefills_(std::max(1, max_prefills)),
       mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
       long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
@@ -82,6 +83,94 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
     step_seen_.assign(static_cast<size_t>(n_slots), 0);
     gpu_prefix_pins_.resize(static_cast<size_t>(Qwen35Backend::PREFIX_SLOTS));
+    if (kvflash_tokens > 0) {
+        slots_.set_max_resident_tokens(kvflash_tokens);
+        KvSlotResidency::Config kcfg;
+        kcfg.per_slot_tokens = kvflash_tokens;
+        kcfg.chunk_tokens = KvFlashConfig{}.chunk_tokens;
+        const char * pre_env = std::getenv("LUCE_KVFLASH_PREAMBLE_ROWS");
+        int pre_reserve = b_.kvflash_preamble_reserve_;
+        if ((!pre_env || !*pre_env) &&
+            kvflash_preamble_gate(b_.w_.im_start_id, b_.w_.system_id).empty()) {
+            const int def_res = kvflash_preamble_reserve_in_pool(
+                kvflash_tokens, 4096, kcfg.chunk_tokens);
+            if (def_res > pre_reserve) pre_reserve = def_res;
+        }
+        kcfg.preamble_reserve_tokens = pre_reserve;
+        const char * rb_env = std::getenv("LUCE_KVFLASH_RECALL_BLOCKS");
+        const bool rb_explicit_auto = (rb_env && std::string(rb_env) == "auto");
+        const bool rb_unset = (!rb_env || !*rb_env);
+        int recall_blocks = b_.kvflash_recall_blocks_;
+        if ((rb_explicit_auto || (rb_unset && recall_blocks > 0)) &&
+            (rb_explicit_auto || kvflash_tokens > 16384)) {
+            const int avail_chunks = std::max(
+                0, kvflash_tokens / kcfg.chunk_tokens - pre_reserve / kcfg.chunk_tokens - 1);
+            recall_blocks = std::max(recall_blocks, std::max(6, avail_chunks / 30));
+        }
+        kcfg.recall_chunks = kKvFlashRecallUnit * recall_blocks;
+        kcfg.tail_window_chunks = 4;
+        kvflash_ = std::make_unique<KvSlotResidency>(
+            pool, backend.target_backend_,
+            qwen_paged_kv_planes(backend.cache_, pool.block_size()), kcfg);
+        kvflash_uploaded_epoch_.assign(static_cast<size_t>(n_slots), 0);
+        kvflash_res_tokens_.assign(static_cast<size_t>(n_slots), 0);
+        kvflash_slot_r_.assign(static_cast<size_t>(n_slots), -1);
+        kvflash_recalled_.assign(static_cast<size_t>(n_slots), 0);
+        kvflash_score_slots_.resize(static_cast<size_t>(n_slots));
+        kvflash_prefix_snapshots_.resize(static_cast<size_t>(Qwen35Backend::PREFIX_SLOTS));
+        const char * dg_env = std::getenv("LUCE_KVFLASH_DRAFTER_GPU");
+        const int drafter_gpu = (dg_env && *dg_env) ? std::atoi(dg_env) : b_.cfg_.device.gpu;
+        if (b_.kvflash_prefill_reselect_ == 5 &&
+            drafter_gpu != b_.cfg_.device.gpu &&
+            b_.kvflash_load_drafter()) {
+            kvflash_async_enabled_ = true;
+            kvflash_score_thread_ = std::thread([this]() {
+                while (true) {
+                    KvFlashScoreJob job;
+                    {
+                        std::unique_lock<std::mutex> lk(kvflash_score_mu_);
+                        kvflash_score_cv_.wait(lk, [&]() {
+                            return kvflash_score_stop_ || !kvflash_score_q_.empty();
+                        });
+                        if (kvflash_score_stop_) return;
+                        job = std::move(kvflash_score_q_.front());
+                        kvflash_score_q_.pop_front();
+                        if (job.slot < 0 || job.slot >= (int)kvflash_score_slots_.size() ||
+                            kvflash_score_slots_[(size_t)job.slot].gen != job.gen) {
+                            continue;
+                        }
+                    }
+                    std::vector<float> scores;
+                    double ms = 0.0;
+                    int segs = 0;
+                    const bool ok = b_.kvflash_score_pflash2(
+                        job.prompt, job.chunk_tokens, scores, ms, segs);
+                    {
+                        std::lock_guard<std::mutex> lk(kvflash_score_mu_);
+                        if (job.slot >= 0 && job.slot < (int)kvflash_score_slots_.size()) {
+                            auto & sl = kvflash_score_slots_[(size_t)job.slot];
+                            if (sl.gen == job.gen) {
+                                sl.pending = false;
+                                sl.ready = true;
+                                sl.ok = ok;
+                                sl.ms = ms;
+                                sl.segs = segs;
+                                sl.scores = std::move(scores);
+                            }
+                        }
+                    }
+                    kvflash_score_cv_.notify_all();
+                }
+            });
+        }
+        std::fprintf(stderr,
+            "[parallel-kvflash] enabled: per_slot=%d tok (%d chunks), "
+            "preamble_reserve=%d tok, recall=%d chunks (mode=%d, unit=%d, async_hip=%s)\n",
+            kvflash_tokens, kvflash_->budget_chunks(),
+            kcfg.preamble_reserve_tokens, kcfg.recall_chunks,
+            b_.kvflash_prefill_reselect_, b_.kvflash_select_unit_,
+            kvflash_async_enabled_ ? "on" : "off");
+    }
 
     embed_rows_cap_ = static_cast<size_t>(
         std::min(max_prefills_ * kIdlePrefillChunk,
@@ -230,6 +319,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
 }
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
+    kvflash_stop_scorer_thread();
     if (b_.target_backend_) {
         ggml_backend_synchronize(b_.target_backend_);
     }
@@ -650,6 +740,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         clear_slot_images(result.slot);
         reset_recurrent_slot(b_.cache_, result.slot);
         reset_slot_draft_kv(result.slot);
+        kvflash_init_slot(result.slot, prompt, nullptr, 0, 0);
     }
     return result;
 }
@@ -800,6 +891,9 @@ void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
     {
         const int drop_idx = checkpoint_index(checkpoint);
         if (drop_idx >= 0) {
+            if (drop_idx < (int)kvflash_prefix_snapshots_.size()) {
+                kvflash_prefix_snapshots_[(size_t)drop_idx] = KvSlotResidency::Snapshot{};
+            }
             unpin_gpu_prefix(drop_idx);
             for (size_t s = 0; s < restored_kv_checkpoint_.size(); ++s) {
                 if (restored_kv_checkpoint_[s] == drop_idx) {
@@ -821,9 +915,15 @@ size_t Qwen35SeqEngine::estimate_prefix_state_bytes(int tokens) const {
 }
 
 bool Qwen35SeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
+    bool dropped_kvf = false;
     {
         const int drop_idx = checkpoint_index(checkpoint);
         if (drop_idx >= 0) {
+            if (drop_idx < (int)kvflash_prefix_snapshots_.size() &&
+                kvflash_prefix_snapshots_[(size_t)drop_idx].valid()) {
+                kvflash_prefix_snapshots_[(size_t)drop_idx] = KvSlotResidency::Snapshot{};
+                dropped_kvf = true;
+            }
             unpin_gpu_prefix(drop_idx);
             for (size_t s = 0; s < restored_kv_checkpoint_.size(); ++s) {
                 if (restored_kv_checkpoint_[s] == drop_idx) {
@@ -837,7 +937,7 @@ bool Qwen35SeqEngine::drop_prefix_kv(PrefixStoreRef checkpoint) {
     return index >= 0 &&
         b_.prefix_snapshots_[index].layout == PrefixSnapshot::Layout::paged &&
         b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens &&
-        drop_prefix_snapshot_kv(b_.prefix_snapshots_[index]);
+        (dropped_kvf || drop_prefix_snapshot_kv(b_.prefix_snapshots_[index]));
 }
 
 bool Qwen35SeqEngine::arm_followup_capture(
@@ -865,7 +965,24 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
     PrefixSnapshot * snap = nullptr;
     const PrefixSnapshot * kv_from = nullptr;
 
-    if (plan.restore.valid()) {
+    bool kvf_snap_restore = false;
+    bool kvf_skip_restore = false;
+    if (kvflash_ && plan.restore.valid()) {
+        const int ridx = checkpoint_index(plan.restore);
+        if (ridx >= 0 && ridx < (int)kvflash_prefix_snapshots_.size()) {
+            const auto & ksnap = kvflash_prefix_snapshots_[(size_t)ridx];
+            const auto & psnap = b_.prefix_snapshots_[ridx];
+            if (ksnap.valid() && ksnap.tokens == plan.restore.tokens &&
+                psnap.ctx && psnap.cur_pos == plan.restore.tokens &&
+                ksnap.generation == psnap.generation) {
+                kvf_snap_restore = true;
+            }
+        }
+        if (!kvf_snap_restore && plan.restore.tokens > kvflash_->config().per_slot_tokens) {
+            kvf_skip_restore = true;
+        }
+    }
+    if (plan.restore.valid() && !kvf_skip_restore) {
         restore_index = checkpoint_index(plan.restore);
         const bool metadata_valid =
             restore_index >= 0 &&
@@ -879,7 +996,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             b_.prefix_snapshots_[kv_index].cur_pos == plan.restore_kv.tokens
                 ? &b_.prefix_snapshots_[kv_index] : nullptr;
 
-        if (snap && snap->ctx &&
+        if (!kvf_snap_restore && snap && snap->ctx &&
             snap->layout == PrefixSnapshot::Layout::paged &&
             snap->cur_pos == plan.restore.tokens) {
             const uint32_t full_blocks =
@@ -928,9 +1045,62 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
     slots_.slot(slot).pending_capture = {};
     bool restored = false;
     size_t shared_blocks_used = 0;
-    if (plan.restore.valid()) {
+    if (plan.restore.valid() && !kvf_skip_restore) {
         const auto restore_started = std::chrono::steady_clock::now();
-        if (snap && snap->ctx &&
+        if (kvf_snap_restore && snap && snap->ctx &&
+            snap->layout == PrefixSnapshot::Layout::paged &&
+            snap->cur_pos == plan.restore.tokens) {
+            const auto & ksnap = kvflash_prefix_snapshots_[(size_t)restore_index];
+            const int preamble_end = kvflash_->config().preamble_reserve_tokens > 0
+                ? kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id) : 0;
+            std::vector<uint8_t> blk_mask, chk_mask;
+            kvflash_->build_restore_resident_mask(ksnap, preamble_end, blk_mask, chk_mask);
+            std::vector<uint32_t> block_table;
+            bool seeded_ok = slots_.seed_evicted_prefix(slot, plan.restore.tokens, blk_mask, block_table);
+            while (!seeded_ok && evict_one_gpu_prefix()) {
+                seeded_ok = slots_.seed_evicted_prefix(slot, plan.restore.tokens, blk_mask, block_table);
+            }
+            const size_t total_blocks = (static_cast<size_t>(plan.restore.tokens) + block_sz - 1) / block_sz;
+            std::string kerr;
+            restored = seeded_ok &&
+                restore_paged_target_cache(
+                    *snap, b_.cache_, slot, block_table,
+                    (int)block_sz, nullptr, /*shared_prefix_blocks=*/total_blocks) &&
+                kvflash_->restore_snapshot(
+                    slot, slots_.slot(slot).handle, ksnap, preamble_end,
+                    chk_mask, block_table, kerr);
+            if (restored) {
+                kvflash_uploaded_epoch_[(size_t)slot] = 0;
+                kvflash_res_tokens_[(size_t)slot] = 0;
+                kvflash_recalled_[(size_t)slot] = 0;
+                kvflash_slot_r_[(size_t)slot] = -1;
+                if (b_.kvflash_prefill_reselect_ == 5 && kvflash_->config().recall_chunks > 0 &&
+                    (int)prompt.size() - plan.restore.tokens >= 64) {
+                    const int ct = kvflash_->chunk_tokens();
+                    const int pin_res = kvflash_->effective_pin_reserve_chunks(slot);
+                    const int max_turn = kvflash_max_turn_tokens(
+                        ct, kvflash_->budget_chunks(),
+                        pin_res,
+                        kvflash_->config().recall_chunks);
+                    const auto p4 = kvflash_mode4_plan(
+                        prompt, 0, b_.w_.im_start_id, b_.w_.user_id, max_turn);
+                    if (p4.run && p4.r > 0 && p4.r < (int)prompt.size()) {
+                        const int r_pos = std::max(p4.r, plan.restore.tokens);
+                        kvflash_slot_r_[(size_t)slot] = r_pos;
+                        const KvFlashRecallGate gate = kvflash_recall_gate(
+                            true, r_pos, (int)prompt.size(), ct,
+                            kvflash_->budget_chunks(),
+                            pin_res,
+                            kvflash_->config().recall_chunks);
+                        if (gate.skip == KvFlashRecallSkip::None && kvflash_async_enabled_) {
+                            kvflash_enqueue_score(slot, prompt);
+                        }
+                    }
+                }
+                int res_tok = 0, pre_tok = 0;
+                restored = kvflash_sync_slot_table(slot, plan.restore.tokens, -1, res_tok, pre_tok);
+            }
+        } else if (snap && snap->ctx &&
             snap->layout == PrefixSnapshot::Layout::paged &&
             snap->cur_pos == plan.restore.tokens) {
             Qwen35SlotManager::PrefillChunk seeded;
@@ -986,9 +1156,17 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             result.prefix_store.restored = plan.restore;
             const size_t total_blocks =
                 (static_cast<size_t>(plan.restore.tokens) + block_sz - 1) / block_sz;
+            if (!kvf_snap_restore) {
+                const uint32_t * sh_ptr = (pin_src_idx >= 0 && shared_blocks_used > 0)
+                    ? gpu_prefix_pins_[static_cast<size_t>(pin_src_idx)].blocks.data()
+                    : nullptr;
+                kvflash_init_slot(slot, prompt, sh_ptr, (uint32_t)shared_blocks_used,
+                                  plan.restore.tokens);
+            }
             std::fprintf(stderr,
-                "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
+                "[parallel-pc%s] restored checkpoint=%llu seq_slot=%d "
                 "tokens=%d shared_blocks=%zu/%zu time_ms=%.1f\n",
+                kvf_snap_restore ? "-kvf" : "",
                 (unsigned long long)plan.restore.id, slot,
                 plan.restore.tokens, shared_blocks_used, total_blocks,
                 (double)restore_elapsed_us / 1000.0);
@@ -1002,6 +1180,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             restored_kv_tokens_[(size_t)slot] = 0;
         }
         reset_recurrent_slot(b_.cache_, slot);
+        kvflash_init_slot(slot, prompt, nullptr, 0, 0);
     }
 
     const int admitted_slot = result.slot;
@@ -1033,6 +1212,56 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
         event.error = "prefix capture page table is incomplete";
         return event;
     }
+    if (kvflash_) {
+        bool has_evicted = ticket.checkpoint.tokens > kvflash_->config().per_slot_tokens;
+        for (uint32_t b : sequence.block_table) {
+            if (b == PagedKvPool::kEvictedBlock) { has_evicted = true; break; }
+        }
+        if (has_evicted) {
+            const auto capture_started = std::chrono::steady_clock::now();
+            PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
+            if (!replace_paged_target_cache(
+                    b_.cache_, slot, sequence.block_table,
+                    (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot,
+                    &b_.displaced_snapshots_[checkpoint], nullptr,
+                    std::numeric_limits<size_t>::max())) {
+                event.error = luce_last_error();
+                if (event.error.empty()) event.error = "kvflash state-only prefix capture failed";
+                return event;
+            }
+            KvSlotResidency::Snapshot ksnap;
+            std::string kerr;
+            if (!kvflash_->capture_snapshot(slot, ticket.checkpoint.tokens, ksnap, kerr)) {
+                free_prefix_snapshot(snapshot);
+                event.error = kerr;
+                return event;
+            }
+            ksnap.generation = snapshot.generation;
+            unpin_gpu_prefix(checkpoint);
+            kvflash_prefix_snapshots_[(size_t)checkpoint] = std::move(ksnap);
+            if (slot >= 0 && (size_t)slot < restored_kv_checkpoint_.size()) {
+                restored_kv_checkpoint_[(size_t)slot] = -1;
+                restored_kv_tokens_[(size_t)slot] = 0;
+            }
+            event.status = PrefixStoreEvent::Status::saved;
+            event.elapsed_us =
+                (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - capture_started).count();
+            // CoW shared_ptr chunks share RAM across multi-turn snapshots; report delta bytes
+            // (+ state slab) so PrefixCache doesn't prematurely evict active 60K-100K sessions.
+            const auto & saved_ksnap = kvflash_prefix_snapshots_[(size_t)checkpoint];
+            event.bytes = (snapshot.buf ? ggml_backend_buffer_get_size(snapshot.buf) : 0) +
+                std::max(saved_ksnap.delta_bytes, saved_ksnap.total_bytes() / 3);
+            std::fprintf(stderr,
+                "[parallel-pc-kvf] saved checkpoint=%llu seq_slot=%d tokens=%d "
+                "chunks=%zu bytes=%zu time_ms=%.1f\n",
+                (unsigned long long)ticket.checkpoint.id, slot,
+                ticket.checkpoint.tokens,
+                kvflash_prefix_snapshots_[(size_t)checkpoint].chunks.size(),
+                event.bytes, (double)event.elapsed_us / 1000.0);
+            return event;
+        }
+    }
     const auto capture_started = std::chrono::steady_clock::now();
     PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
     const PrefixSnapshot * base_kv = nullptr;
@@ -1061,6 +1290,9 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
             event.error = "paged prefix capture failed";
         }
         return event;
+    }
+    if (checkpoint < (int)kvflash_prefix_snapshots_.size()) {
+        kvflash_prefix_snapshots_[(size_t)checkpoint] = KvSlotResidency::Snapshot{};
     }
     // Pin full physical blocks of this checkpoint on GPU for zero-copy sharing.
     const bool pinned = pin_gpu_prefix(checkpoint, slot, ticket.checkpoint.tokens);
@@ -1144,6 +1376,139 @@ bool Qwen35SeqEngine::upload_block_table_delta(
     return true;
 }
 
+void Qwen35SeqEngine::kvflash_stop_scorer_thread() {
+    if (!kvflash_score_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(kvflash_score_mu_);
+        kvflash_score_stop_ = true;
+    }
+    kvflash_score_cv_.notify_all();
+    kvflash_score_thread_.join();
+}
+
+void Qwen35SeqEngine::kvflash_enqueue_score(
+        int slot, const std::vector<int32_t> & prompt) {
+    if (!kvflash_async_enabled_ || !kvflash_ ||
+        slot < 0 || slot >= (int)kvflash_score_slots_.size()) return;
+    KvFlashScoreJob job;
+    job.slot = slot;
+    job.chunk_tokens = kvflash_->chunk_tokens();
+    job.prompt = prompt;
+    {
+        std::lock_guard<std::mutex> lk(kvflash_score_mu_);
+        auto & sl = kvflash_score_slots_[(size_t)slot];
+        ++sl.gen;
+        sl.pending = true;
+        sl.ready = false;
+        sl.ok = false;
+        sl.scores.clear();
+        job.gen = sl.gen;
+        kvflash_score_q_.push_back(std::move(job));
+    }
+    kvflash_score_cv_.notify_one();
+}
+
+bool Qwen35SeqEngine::kvflash_take_score(
+        int slot, std::vector<float> & out_scores,
+        double & out_ms, int & out_segs) {
+    if (!kvflash_async_enabled_ ||
+        slot < 0 || slot >= (int)kvflash_score_slots_.size()) return false;
+    std::unique_lock<std::mutex> lk(kvflash_score_mu_);
+    auto & sl = kvflash_score_slots_[(size_t)slot];
+    if (!sl.pending && !sl.ready) return false;
+    kvflash_score_cv_.wait(lk, [&]() {
+        return kvflash_score_stop_ || !sl.pending;
+    });
+    if (!sl.ready) return false;
+    const bool ok = sl.ok;
+    out_ms = sl.ms;
+    out_segs = sl.segs;
+    out_scores = std::move(sl.scores);
+    sl.ready = false;
+    return ok;
+}
+
+void Qwen35SeqEngine::kvflash_clear_slot(int slot) {
+    if (!kvflash_ || slot < 0 || slot >= (int)kvflash_uploaded_epoch_.size()) return;
+    if (kvflash_async_enabled_ && slot < (int)kvflash_score_slots_.size()) {
+        std::lock_guard<std::mutex> lk(kvflash_score_mu_);
+        auto & sl = kvflash_score_slots_[(size_t)slot];
+        ++sl.gen;
+        sl.pending = false;
+        sl.ready = false;
+        sl.scores.clear();
+    }
+    kvflash_->clear(slot);
+    kvflash_uploaded_epoch_[(size_t)slot] = 0;
+    kvflash_res_tokens_[(size_t)slot] = 0;
+    kvflash_slot_r_[(size_t)slot] = -1;
+    kvflash_recalled_[(size_t)slot] = 0;
+}
+
+void Qwen35SeqEngine::kvflash_init_slot(
+        int slot, const std::vector<int32_t> & prompt,
+        const uint32_t * shared_blocks, uint32_t shared_block_count,
+        int shared_tokens) {
+    if (!kvflash_ || slot < 0 || slot >= (int)kvflash_uploaded_epoch_.size()) return;
+    const int preamble_end = kvflash_->config().preamble_reserve_tokens > 0
+        ? kvflash_preamble_end(prompt, b_.w_.im_start_id, b_.w_.system_id) : 0;
+    kvflash_->init_slot(
+        slot, slots_.slot(slot).handle, preamble_end,
+        shared_blocks, shared_block_count, shared_tokens);
+    kvflash_uploaded_epoch_[(size_t)slot] = 0;
+    kvflash_res_tokens_[(size_t)slot] = shared_tokens;
+    kvflash_recalled_[(size_t)slot] = 0;
+    kvflash_slot_r_[(size_t)slot] = -1;
+    if (b_.kvflash_prefill_reselect_ == 5 && kvflash_->config().recall_chunks > 0) {
+        const int ct = kvflash_->chunk_tokens();
+        const int pin_res = kvflash_->effective_pin_reserve_chunks(slot);
+        const int max_turn = kvflash_max_turn_tokens(
+            ct, kvflash_->budget_chunks(),
+            pin_res,
+            kvflash_->config().recall_chunks);
+        const auto p4 = kvflash_mode4_plan(
+            prompt, 0, b_.w_.im_start_id, b_.w_.user_id, max_turn);
+        if (p4.run && p4.r > 0 && p4.r < (int)prompt.size()) {
+            const int r_pos = std::max(p4.r, shared_tokens);
+            kvflash_slot_r_[(size_t)slot] = r_pos;
+            const KvFlashRecallGate gate = kvflash_recall_gate(
+                /*turn_found=*/true, r_pos, (int)prompt.size(), ct,
+                kvflash_->budget_chunks(),
+                pin_res,
+                kvflash_->config().recall_chunks);
+            if (gate.skip == KvFlashRecallSkip::None && kvflash_async_enabled_) {
+                kvflash_enqueue_score(slot, prompt);
+            }
+        }
+    }
+    if (shared_tokens > 0) {
+        int res = 0, pre = 0;
+        kvflash_sync_slot_table(slot, shared_tokens, -1, res, pre);
+    }
+}
+
+bool Qwen35SeqEngine::kvflash_sync_slot_table(
+        int slot, int cur_pos, int chunk_start_pos,
+        int & out_res_tokens, int & out_prefix_res_tokens) {
+    if (!kvflash_) return true;
+    if (!kvflash_->build_active_block_table(
+            slot, cur_pos, kvflash_active_blocks_,
+            out_res_tokens, out_prefix_res_tokens, chunk_start_pos)) {
+        return false;
+    }
+    const uint64_t ep = kvflash_->epoch(slot);
+    if (ep != kvflash_uploaded_epoch_[(size_t)slot]) {
+        if (!upload_block_table_delta(
+                slot, 0, kvflash_active_blocks_.data(),
+                kvflash_active_blocks_.size())) {
+            return false;
+        }
+        kvflash_uploaded_epoch_[(size_t)slot] = ep;
+    }
+    kvflash_res_tokens_[(size_t)slot] = out_res_tokens;
+    return true;
+}
+
 void Qwen35SeqEngine::fail_prefill(
         int slot, std::vector<PrefillOutput> & prefill_outputs,
         const char * log_message, const char * client_message) {
@@ -1175,17 +1540,74 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
         stage.chunk = std::min(
             stage.chunk, capture.checkpoint.tokens - stage.kv_pos);
     }
+    if (kvflash_) {
+        const int r_pos = kvflash_slot_r_[(size_t)slot];
+        if (!kvflash_recalled_[(size_t)slot] && r_pos > 0 && stage.kv_pos < r_pos) {
+            stage.chunk = std::min(stage.chunk, r_pos - stage.kv_pos);
+        }
+        if (!kvflash_recalled_[(size_t)slot] && r_pos > 0 && stage.kv_pos == r_pos) {
+            kvflash_recalled_[(size_t)slot] = 1;
+            const int ct = kvflash_->chunk_tokens();
+            const KvFlashRecallGate gate = kvflash_recall_gate(
+                /*turn_found=*/true, r_pos, seq.prompt_len, ct,
+                kvflash_->budget_chunks(),
+                kvflash_->effective_pin_reserve_chunks(slot),
+                kvflash_->config().recall_chunks);
+            if (gate.skip == KvFlashRecallSkip::None && b_.kvflash_prefill_reselect_ == 5) {
+                const auto t_wait = std::chrono::steady_clock::now();
+                std::vector<float> scores;
+                double ms = 0.0;
+                int segs = 0;
+                const bool have_scores = kvflash_async_enabled_
+                    ? kvflash_take_score(slot, scores, ms, segs)
+                    : b_.kvflash_score_pflash2(seq.sample_history, ct, scores, ms, segs);
+                const double wait_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_wait).count();
+                if (have_scores) {
+                    std::vector<int> picked;
+                    std::string rerr;
+                    if (kvflash_->apply_recall(slot, r_pos, seq.prompt_len, scores,
+                                               b_.kvflash_select_unit_, &picked, rerr)) {
+                        std::fprintf(stderr,
+                            "[parallel-kvflash] slot=%d mode=5 R=%d end=%d segs=%d "
+                            "picked=%zu units (score=%.1fms wait=%.1fms, res=%d/%d chunks)\n",
+                            slot, r_pos, seq.prompt_len, segs, picked.size(), ms, wait_ms,
+                            kvflash_->resident_chunks(slot), kvflash_->budget_chunks());
+                    } else {
+                        std::fprintf(stderr,
+                            "[parallel-kvflash] slot=%d recall warning: %s\n",
+                            slot, rerr.c_str());
+                    }
+                }
+            }
+        }
+        const int max_evict_tok = std::max(
+            1, (kvflash_->budget_chunks() - kvflash_->pinned_chunks(slot) -
+                kvflash_->config().tail_window_chunks - 1) * kvflash_->chunk_tokens());
+        stage.chunk = std::min(stage.chunk, max_evict_tok);
+    }
     if (stage.chunk <= 0) return PrefillStage{};
     stage.commit = stage.kv_pos + stage.chunk >= seq.prompt_len;
 
+    if (kvflash_) {
+        std::string kerr;
+        if (!kvflash_->ensure_capacity(slot, stage.kv_pos, stage.chunk, kerr)) {
+            fail_prefill(slot, prefill_outputs, kerr.c_str(),
+                         "kvflash prefill residency eviction failed");
+            return PrefillStage{};
+        }
+    }
     Qwen35SlotManager::PrefillChunk chunk =
         slots_.append_prefill(slot, stage.chunk);
+    while (!chunk.ok && evict_one_gpu_prefix()) {
+        chunk = slots_.append_prefill(slot, stage.chunk);
+    }
     if (!chunk.ok || chunk.rows.size() != (size_t)stage.chunk) {
         fail_prefill(slot, prefill_outputs, "prefill K/V allocation failed",
                      "prefill K/V allocation failed");
         return PrefillStage{};
     }
-    if (!upload_block_table_delta(
+    if (!kvflash_ && !upload_block_table_delta(
             slot, chunk.first_new_block, chunk.new_blocks.data(),
             chunk.new_blocks.size())) {
         // step() reports a clean failure: no rows of this chunk may stay.
@@ -1204,6 +1626,21 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
         fail_prefill(slot, prefill_outputs, "prefill embed failed",
                      "prefill embedding failed");
         return PrefillStage{};
+    }
+    if (kvflash_) {
+        kvflash_->on_tokens_written(slot, stage.kv_pos, stage.kv_pos + stage.chunk);
+        if (!kvflash_sync_slot_table(
+                slot, stage.kv_pos + stage.chunk, stage.kv_pos,
+                stage.res_tokens, stage.prefix_res_tokens)) {
+            slots_.rollback_prefill(slot, stage.chunk);
+            kvflash_->truncate(slot, stage.kv_pos);
+            fail_prefill(slot, prefill_outputs, "kvflash prefill dense block-table upload failed",
+                         "kvflash prefill block-table update failed");
+            return PrefillStage{};
+        }
+    } else {
+        stage.res_tokens = stage.kv_pos + stage.chunk;
+        stage.prefix_res_tokens = stage.kv_pos;
     }
     if (slot < static_cast<int>(slot_images_.size()) &&
         slot_images_[static_cast<size_t>(slot)].payload) {
@@ -1538,6 +1975,13 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     // AR peers write their ordinary rows in the same target forward. Host
     // history and positions remain staged until every promotion succeeds.
     for (ArLane & lane : ar_lanes) {
+        if (kvflash_) {
+            std::string kerr;
+            if (!kvflash_->ensure_capacity(lane.slot, slots_.slot(lane.slot).cur_pos, 1, kerr)) {
+                result.error = kerr;
+                return result;
+            }
+        }
         Qwen35SlotManager::StepAppend append =
             slots_.append_token(lane.slot, lane.token);
         while (!append.ok && append.busy &&
@@ -1551,7 +1995,14 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
         staged_round.track(lane.slot);
-        if (append.new_block >= 0 &&
+        if (kvflash_) {
+            kvflash_->on_tokens_written(lane.slot, append.position, append.position + 1);
+            int res_tok = 0, pre_tok = 0;
+            if (!kvflash_sync_slot_table(lane.slot, append.position + 1, -1, res_tok, pre_tok)) {
+                result.error = "compact AR kvflash dense block-table update failed";
+                return result;
+            }
+        } else if (append.new_block >= 0 &&
             !upload_block_table_delta(
                 lane.slot, append.new_block_index,
                 &append.new_block, 1)) {
@@ -1585,11 +2036,22 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     int max_prefix = 1;
     for (const Proposal & proposal : proposals) {
-        max_prefix = std::max(
-            max_prefix, slots_.slot(proposal.slot).cur_pos);
+        if (kvflash_) {
+            int res_tok = 0, pre_tok = 0;
+            if (!kvflash_sync_slot_table(
+                    proposal.slot, slots_.slot(proposal.slot).cur_pos, -1, res_tok, pre_tok)) {
+                result.error = "chain verify kvflash dense block-table upload failed";
+                return result;
+            }
+            max_prefix = std::max(max_prefix, res_tok);
+        } else {
+            max_prefix = std::max(
+                max_prefix, slots_.slot(proposal.slot).cur_pos);
+        }
     }
     for (const ArLane & lane : ar_lanes) {
-        max_prefix = std::max(max_prefix, lane.position + 1);
+        const int eff = kvflash_ ? kvflash_res_tokens_[(size_t)lane.slot] : (lane.position + 1);
+        max_prefix = std::max(max_prefix, eff);
     }
 
     int max_top_n = 0;
@@ -1638,8 +2100,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         chain_state_slots_[static_cast<size_t>(lane_index)] = lane.slot;
         chain_tokens_[static_cast<size_t>(lane_index)] = lane.token;
         chain_query_slots_[static_cast<size_t>(lane_index)] = lane.slot;
-        chain_query_positions_[static_cast<size_t>(lane_index)] = lane.position;
-        seq_lens_[static_cast<size_t>(lane.slot)] = lane.position + 1;
+        const int ar_eff = kvflash_ ? kvflash_res_tokens_[(size_t)lane.slot] : (lane.position + 1);
+        chain_query_positions_[static_cast<size_t>(lane_index)] = ar_eff - 1;
+        seq_lens_[static_cast<size_t>(lane.slot)] = ar_eff;
         for (int axis = 0; axis < 3; ++axis) {
             chain_positions_[static_cast<size_t>(axis) * total_rows + lane_index] =
                 lane.position + rope_delta(lane.slot);
@@ -1656,8 +2119,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         chain_tree_sizes_[static_cast<size_t>(lane_index)] = tree_width;
         chain_mapped_slots_[static_cast<size_t>(mapped_lane)] = proposal.slot;
         chain_state_slots_[static_cast<size_t>(mapped_lane)] = proposal.slot;
-        seq_lens_[static_cast<size_t>(proposal.slot)] =
-            slots_.slot(proposal.slot).cur_pos;
+        seq_lens_[static_cast<size_t>(proposal.slot)] = kvflash_
+            ? kvflash_res_tokens_[static_cast<size_t>(proposal.slot)]
+            : slots_.slot(proposal.slot).cur_pos;
         const int64_t slot_scratch_base =
             static_cast<int64_t>(fixed_chain_.scratch_base) +
             static_cast<int64_t>(proposal.slot) * fixed_chain_.scratch_stride;
@@ -2001,6 +2465,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
+        if (kvflash_) {
+            std::string kerr;
+            if (!kvflash_->ensure_capacity(
+                    proposal.slot, slots_.slot(proposal.slot).cur_pos,
+                    static_cast<int>(proposal.accepted), kerr)) {
+                result.error = kerr;
+                return result;
+            }
+        }
         proposal.append = slots_.append_tokens(
             proposal.slot, proposal.tokens.data(),
             static_cast<int>(proposal.accepted));
@@ -2019,7 +2492,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             return result;
         }
         staged_round.track(proposal.slot);
-        if (!block_table_delta_fits(
+        if (!kvflash_ && !block_table_delta_fits(
                 proposal.slot, append.first_new_block,
                 append.new_blocks.size())) {
             result.error = "accepted chain block-table update failed";
@@ -2161,15 +2634,28 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     }
 
     for (const Proposal & proposal : proposals) {
-        if (!upload_block_table_delta(
-                proposal.slot, proposal.append.first_new_block,
-                proposal.append.new_blocks.data(),
-                proposal.append.new_blocks.size())) {
-            std::fprintf(stderr,
-                "[parallel] validated chain block-table upload failed\n");
-            std::abort();
+        if (kvflash_) {
+            kvflash_->on_tokens_written(
+                proposal.slot, proposal.append.position, proposal.seq_len);
+            int res_tok = 0, pre_tok = 0;
+            if (!kvflash_sync_slot_table(
+                    proposal.slot, proposal.seq_len, -1, res_tok, pre_tok)) {
+                std::fprintf(stderr,
+                    "[parallel] validated chain kvflash dense block-table upload failed\n");
+                std::abort();
+            }
+            seq_lens_[static_cast<size_t>(proposal.slot)] = res_tok;
+        } else {
+            if (!upload_block_table_delta(
+                    proposal.slot, proposal.append.first_new_block,
+                    proposal.append.new_blocks.data(),
+                    proposal.append.new_blocks.size())) {
+                std::fprintf(stderr,
+                    "[parallel] validated chain block-table upload failed\n");
+                std::abort();
+            }
+            seq_lens_[static_cast<size_t>(proposal.slot)] = proposal.seq_len;
         }
-        seq_lens_[static_cast<size_t>(proposal.slot)] = proposal.seq_len;
     }
     commit_io_stage_.set(
         b_.target_backend_, b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
@@ -2402,6 +2888,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         out.slot = in.slot;
         out.failed = true;
         int compact_row = -1;
+        if (kvflash_) {
+            std::string kerr;
+            if (!kvflash_->ensure_capacity(in.slot, slots_.slot(in.slot).cur_pos, 1, kerr)) {
+                out.error = kerr;
+                decode_outputs.push_back(std::move(out));
+                output_rows_.push_back(compact_row);
+                continue;
+            }
+        }
         Qwen35SlotManager::StepAppend app =
             slots_.append_token(in.slot, in.token);
         while (!app.ok && app.busy &&
@@ -2417,7 +2912,18 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             output_rows_.push_back(compact_row);
             continue;
         }
-        if (app.new_block >= 0 &&
+        if (kvflash_) {
+            kvflash_->on_tokens_written(in.slot, app.position, app.position + 1);
+            int res_tok = 0, pre_tok = 0;
+            if (!kvflash_sync_slot_table(in.slot, app.position + 1, -1, res_tok, pre_tok)) {
+                slots_.rollback_step(in.slot);
+                kvflash_->truncate(in.slot, app.position);
+                out.error = "kvflash decode dense block-table upload failed";
+                decode_outputs.push_back(std::move(out));
+                output_rows_.push_back(compact_row);
+                continue;
+            }
+        } else if (app.new_block >= 0 &&
             !upload_block_table_delta(
                 in.slot, app.new_block_index, &app.new_block, 1)) {
             slots_.rollback_step(in.slot);
@@ -2432,7 +2938,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         live_positions_.push_back(app.position);
         live_physical_rows_.push_back(app.physical_row);
         live_slot_ids_.push_back(in.slot);
-        max_kv_len = std::max(max_kv_len, app.position + 1);
+        const int eff_kv_len = kvflash_ ? kvflash_res_tokens_[(size_t)in.slot] : (app.position + 1);
+        max_kv_len = std::max(max_kv_len, eff_kv_len);
         out.failed = false;
         decode_outputs.push_back(std::move(out));
         output_rows_.push_back(compact_row);
@@ -2477,7 +2984,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int pos = live_positions_[(size_t)row];
         active_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
         state_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
-        seq_lens_[(size_t)live_slot_ids_[(size_t)row]] = pos + 1;
+        const int lslot = live_slot_ids_[(size_t)row];
+        seq_lens_[(size_t)lslot] = kvflash_ ? kvflash_res_tokens_[(size_t)lslot] : (pos + 1);
         for (int h = 0; h < n_head_kv; ++h) {
             dec_rows_[(size_t)h * decode_bucket + row] =
                 live_physical_rows_[(size_t)row];
@@ -2494,8 +3002,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         segments.push_back({n_prefill, prefill.chunk, slot});
         n_prefill += prefill.chunk;
         n_commits += prefill.commit ? 1 : 0;
-        max_kv_len = std::max(max_kv_len, prefill.kv_pos + prefill.chunk);
-        seq_lens_[(size_t)slot] = prefill.kv_pos + prefill.chunk;
+        max_kv_len = std::max(max_kv_len, prefill.res_tokens);
+        seq_lens_[(size_t)slot] = prefill.res_tokens;
     }
     const bool with_prefill = n_prefill > 0;
     const int n_total = n_prefill + decode_bucket;
@@ -2702,7 +3210,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             for (int row = 0; row < prefill.chunk; ++row) {
                 query_slot_ids_[(size_t)(token_offset + row)] = slot;
                 query_positions_[(size_t)(token_offset + row)] =
-                    prefill.kv_pos + row;
+                    prefill.prefix_res_tokens + row;
             }
             if (prefill.commit) {
                 logits_rows_.push_back(token_offset + prefill.chunk - 1);
@@ -2710,10 +3218,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             token_offset += prefill.chunk;
         }
         for (int row = 0; row < live_count; ++row) {
-            query_slot_ids_[(size_t)(n_prefill + row)] =
-                live_slot_ids_[(size_t)row];
+            const int lslot = live_slot_ids_[(size_t)row];
+            query_slot_ids_[(size_t)(n_prefill + row)] = lslot;
             query_positions_[(size_t)(n_prefill + row)] =
-                live_positions_[(size_t)row];
+                kvflash_ ? (kvflash_res_tokens_[(size_t)lslot] - 1)
+                         : live_positions_[(size_t)row];
         }
         for (int row = 0; row < decode_bucket; ++row) {
             logits_rows_.push_back(n_prefill + row);
@@ -2961,6 +3470,7 @@ bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
         if (!ok) return false;
         reset_recurrent_slot(b_.cache_, slot);
         reset_slot_draft_kv(slot);
+        kvflash_init_slot(slot, slots_.slot(slot).sample_history, nullptr, 0, 0);
         return true;
     }
     std::vector<int32_t> blocks;
@@ -2986,6 +3496,7 @@ bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
         error = "slot history cannot be re-prefilled within the paged KV pool";
         return false;
     }
+    kvflash_clear_slot(slot);
     offload_.discard(slot);
     return true;
 }
@@ -2995,6 +3506,7 @@ void Qwen35SeqEngine::retire(int slot) {
         restored_kv_checkpoint_[(size_t)slot] = -1;
         restored_kv_tokens_[(size_t)slot] = 0;
     }
+    kvflash_clear_slot(slot);
     offload_.discard(slot);
     clear_slot_images(slot);
     if (!slots_.is_active(slot)) return;

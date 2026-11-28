@@ -416,6 +416,8 @@ protected:
     // after a residency release frees it). No-op without a path.
     void kvflash_ensure_scorer();
     bool kvflash_load_drafter();
+    bool kvflash_score_pflash2(const std::vector<int32_t> & ids, int chunk_tokens,
+                               std::vector<float> & out, double & ms_out, int & segs_out);
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────

@@ -17464,7 +17464,9 @@ TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_backends_reselect_m
     TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "exact") == "prefill-reselect=4");  // the default profile
     TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", "exact").empty());   // --kvflash-policy lru turns recall off
     TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "pflash2").empty());  // mode 4 needs the exact scorer
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", "exact").empty());    // retired mode
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", "exact") == "prefill-reselect=5");  // mode 5 (PFlash v3)
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "lru", "exact").empty());   // --kvflash-policy lru turns recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "3", "qk", "exact").empty());    // retired mode
     TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", "exact").empty());    // the user turned recall off
     TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", "exact").empty());
     TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", "exact").empty());    // no recall on other architectures
