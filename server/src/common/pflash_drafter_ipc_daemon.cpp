@@ -3,7 +3,7 @@
 #include "pflash_drafter_ipc.h"
 
 #include "luce.h"
-#include "dflash_draft_ipc.h"
+#include "common/dflash/dflash_draft_ipc.h"
 #include "pflash/pflash_drafter.h"
 
 #include <algorithm>

@@ -40,18 +40,22 @@ server/src/
 ├── common/                 # Shared infrastructure (all backends)
 │   ├── model_backend.h     # ModelBackend abstract interface
 │   ├── snapshot_backend.h  # Platform-aware snapshot backend selection
-│   ├── dflash_target.h     # DFlashTarget interface (spec decode)
 │   ├── daemon_loop.{h,cpp} # Generic stdin/stdout daemon loop
 │   ├── backend_ipc.{h,cpp} # Generic backend IPC process lifecycle
 │   ├── gguf_inspect.{h,cpp}# Read arch + layer count from GGUF
 │   ├── layer_split_utils.{h,cpp}  # compute_layer_ranges()
-│   ├── dflash_layer_split_runtime.h  # LayerSplitRuntimeConfig + ActivationPair
-│   ├── dflash_feature_ring.{h,cpp}   # DraftFeatureMirror + ring copy helpers
-│   ├── dflash_capture.{h,cpp}        # target_capture_index() helper
-│   ├── dflash_draft_ipc.{h,cpp}      # DFlash draft IPC client + remote copy
-│   ├── dflash_draft_ipc_daemon.cpp   # DFlash draft mode for backend_ipc_daemon
-│   ├── dflash_draft_graph.{h,cpp}    # Universal build_draft_step (DFlash draft graph)
-│   ├── dflash_spec_decode.{h,cpp}    # Generic spec-decode loop over DFlashTarget
+│   ├── dflash/             # Shared DFlash speculative decoding modules
+│   │   ├── dflash_target.h             # DFlashTarget interface (spec decode)
+│   │   ├── dflash_layer_split_runtime.h# LayerSplitRuntimeConfig + ActivationPair
+│   │   ├── dflash_feature_ring.{h,cpp} # DraftFeatureMirror + ring copy helpers
+│   │   ├── dflash_capture.{h,cpp}      # target_capture_index() helper
+│   │   ├── dflash_draft_ipc.{h,cpp}    # DFlash draft IPC client + remote copy
+│   │   ├── dflash_draft_ipc_daemon.cpp # DFlash draft mode for backend_ipc_daemon
+│   │   ├── dflash_draft_graph.{h,cpp}  # Universal build_draft_step (DFlash draft graph)
+│   │   ├── dflash_draft_kv.{h,cpp}     # Drafter KV ring + packed batch graph
+│   │   ├── dflash2_batch.cpp           # Batched GPU DFlash2 projection & selection
+│   │   ├── dflash2_head.{h,cpp}        # DFlash2 selector head
+│   │   └── dflash_spec_decode.{h,cpp}  # Generic spec-decode loop over DFlashTarget
 │   ├── ddtree.{h,cpp}     # Dynamic Draft Tree algorithm
 │   ├── attn_masks.h        # Causal + tree attention mask builders
 │   ├── peer_access.{h,cpp} # CUDA peer-access utilities
@@ -139,7 +143,7 @@ struct ModelBackend {
   protocol exposes them for all architectures.
 - `try_handle_command()` is the escape hatch for arch-specific extensions.
 
-### 2. DFlashTarget (`common/dflash_target.h`)
+### 2. DFlashTarget (`common/dflash/dflash_target.h`)
 
 Optional interface for backends that want speculative decoding with the
 universal DFlash draft model:
@@ -231,8 +235,8 @@ Key components:
 - **Graph builders**: Per-target `graph_builders.{h,cpp}` build the
   ggml compute graphs for target forward and lm_head projection. The
   universal DFlash draft graph (`build_draft_step`) lives in
-  `common/dflash_draft_graph.{h,cpp}` and is shared across all targets.
-- **Spec decode** (`common/dflash_spec_decode.{h,cpp}`): The generic
+  `common/dflash/dflash_draft_graph.{h,cpp}` and is shared across all targets.
+- **Spec decode** (`common/dflash/dflash_spec_decode.{h,cpp}`): The generic
   draft→verify→accept loop, typed against `DFlashTarget`. Reusable by every
   backend.
 - **DFlashTarget adapters** (`qwen35_dflash_target.{h,cpp}` for single-GPU,
@@ -241,8 +245,8 @@ Key components:
   `TargetLayerSplitShard`) to the generic `DFlashTarget` interface so the
   shared spec-decode loop can drive verification.
 - **Feature transfer + backend IPC daemon** (`common/backend_ipc.{h,cpp}`,
-  `common/dflash_feature_ring.{h,cpp}`, `common/dflash_capture.{h,cpp}`,
-  `common/dflash_draft_ipc.{h,cpp}`, `common/dflash_draft_ipc_daemon.cpp`):
+  `common/dflash/dflash_feature_ring.{h,cpp}`, `common/dflash/dflash_capture.{h,cpp}`,
+  `common/dflash/dflash_draft_ipc.{h,cpp}`, `common/dflash/dflash_draft_ipc_daemon.cpp`):
   Move captured target activations into the draft-side ring buffer
   (`DraftFeatureMirror`) and ship them across processes/GPUs. The IPC
   process lifecycle is shared through `backend_ipc`; the DFlash draft client,

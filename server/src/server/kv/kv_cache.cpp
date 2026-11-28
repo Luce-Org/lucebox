@@ -411,7 +411,8 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
     const std::vector<int32_t> & prompt = *query.prompt;
     EngineCheckpoints & engine = *engine_;
     PrefixStorePlan & plan = out.plan;
-    const auto hit = index_.lookup_candidate(prompt, (int)prompt.size() - 1);
+    const auto hit = index_.lookup_candidate(
+        prompt, (int)prompt.size() - 1, query.precomputed_boundaries);
     int restore_kv_slot = -1;
     if (hit.first >= 0 && hit.second > 0 && hit.second < (int)prompt.size()) {
         out.restore_slot = hit.first;
@@ -439,9 +440,15 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
         ? disk_.longest_prefix(prompt,
             mode == DiskPrefixCacheMode::Full ? nullptr : &scoped_lengths)
         : DiskPrefixCache::PrefixProbe{};
-    if (read_ && read_->owner != query.owner) drop_read();
-    if (probe.cur_pos > plan.restore.tokens && probe.cur_pos == probe.len &&
-        probe.cur_pos < (int)prompt.size()) {
+    const bool wants_disk = probe.cur_pos > plan.restore.tokens &&
+        probe.cur_pos == probe.len && probe.cur_pos < (int)prompt.size();
+    if (wants_disk) {
+        // Another request's disk read is already in flight: do not cancel it
+        // (the scheduler holds loading requests in a side list so unrelated
+        // RAM-hit / cold requests can proceed without head-of-line blocking).
+        if (read_ && read_->owner != query.owner) {
+            return PlanStatus::loading;
+        }
         if (!read_) {
             read_.emplace();
             read_->owner = query.owner;
@@ -506,7 +513,7 @@ KvCache::PlanStatus KvCache::plan(const KvPlanQuery & query, KvPlan & out) {
             prompt, restored_len, query.prefer_head, forced_cut, out.restore_slot,
             [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
             /*reachable_from=*/0, checkpoints_.restore_point_spacing(), learned,
-            restore_kv_slot);
+            restore_kv_slot, query.precomputed_boundaries);
     };
     PrefixCache::InlineReservation capture =
         reserve_capture(query.forced_cut, query.learned_cut);
@@ -631,6 +638,32 @@ void KvCache::restored(const KvPlan & plan, const PrefixStoreAdmission & prefix,
         index_.record_inline_hit(plan.restore_slot, prefix.restored.tokens, prompt.size());
         consider_pin(plan.restore_slot, prompt, client);
     }
+}
+
+PrefixCaptureTxn KvCache::plan_followup_capture(
+        const std::vector<int32_t> & prompt, int committed_tokens, int committed_slot) {
+    if (!engine_ || !engine_->supported() || committed_tokens <= 0 ||
+        committed_tokens >= (int)prompt.size() - 1) {
+        return {};
+    }
+    EngineCheckpoints & engine = *engine_;
+    PrefixCache::InlineReservation capture = index_.reserve_inline_snap(
+        prompt, committed_tokens, /*prefer_head=*/false, /*forced_cut=*/0,
+        committed_slot,
+        [&engine](int target_cut) { return engine.estimate_bytes(target_cut); },
+        /*reachable_from=*/0, checkpoints_.restore_point_spacing(),
+        /*learned_cut=*/false, committed_slot, nullptr);
+    if (!capture.active() || capture.slot() == committed_slot ||
+        capture.target_cut() <= committed_tokens) {
+        capture.cancel();
+        return {};
+    }
+    PrefixCaptureTicket ticket;
+    ticket.id = next_capture_id_++;
+    if (next_capture_id_ == 0) next_capture_id_ = 1;
+    ticket.checkpoint = EngineCheckpoints::ref(
+        Checkpoint::of_cache_slot(capture.slot()), capture.target_cut());
+    return PrefixCaptureTxn(std::move(capture), engine.engine(), ticket);
 }
 
 void KvCache::captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & event,

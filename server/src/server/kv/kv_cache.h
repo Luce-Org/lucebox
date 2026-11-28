@@ -147,6 +147,9 @@ struct KvPlanQuery {
     // the least it must add to be captured instead of the request's own cut.
     std::function<int()> queued_shared_prefix;
     int shared_prefix_min_tokens = 0;
+    // Optional precomputed chat boundaries for `*prompt` (avoids rescanning
+    // the prompt in lookup_candidate and reserve_inline_snap).
+    const std::vector<int> * precomputed_boundaries = nullptr;
 };
 
 class KvCache {
@@ -221,11 +224,20 @@ public:
     void captured(PrefixCaptureTxn & capture, const PrefixStoreEvent & event,
                   const std::vector<int32_t> & prompt, DiskPrefixCacheMode mode,
                   const std::function<std::string()> & aux);
+    PrefixCaptureTxn plan_followup_capture(const std::vector<int32_t> & prompt,
+                                           int committed_tokens, int committed_slot);
     // The disk read in flight: dropped (its owner left, or another request
     // got the head of the line), reaped once done, joined at shutdown.
     void drop_read(const void * owner = nullptr);
     void reap_reads();
     void join_reads();
+    // True when `owner`'s in-flight disk read has finished and is ready to
+    // adopt into staging on the next plan() call.
+    bool read_done(const void * owner) const {
+        return read_ && read_->owner == owner &&
+               read_->result->done.load(std::memory_order_acquire);
+    }
+    bool has_active_read() const { return read_.has_value(); }
     // Dropped reads still running: an idle scheduler polls to reap them.
     bool reads_to_reap() const { return !finished_reads_.empty(); }
     ~KvCache() { join_reads(); }

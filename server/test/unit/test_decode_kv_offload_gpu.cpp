@@ -195,16 +195,14 @@ Transcript continue_request(SeqEngine & engine, const std::vector<int32_t> & pro
     return transcript;
 }
 
-void check_model(std::string_view model_env, bool speculative, bool recompute = false) {
-    const std::string model = luce_test::require_model(model_env).string();
-    const std::string draft = speculative
-        ? luce_test::require_model(luce_test::kDraftModelEnv).string() : std::string();
+// Two concurrent sequences over a 768-token paged pool.
+std::unique_ptr<ModelBackend> paged_backend(const std::string & model, const std::string & draft) {
     if (ggml_backend_cuda_get_device_count() == 0) {
         throw CppUnitTestFramework::TestSkippedException("GPU is unavailable");
     }
     BackendArgs args;
     args.model_path = model;
-    if (speculative) args.draft_path = draft;
+    if (!draft.empty()) args.draft_path = draft;
     args.device.backend = compiled_placement_backend();
     args.device.max_ctx = 1024;
     args.draft_device = args.device;
@@ -218,13 +216,27 @@ void check_model(std::string_view model_env, bool speculative, bool recompute = 
     }
     auto backend = create_backend(std::get<BackendPlan>(prepared));
     GPU_OFFLOAD_CHECK(backend && backend->seq_engine());
-    Tokenizer tokenizer;
-    GPU_OFFLOAD_CHECK(tokenizer.load_from_gguf(model.c_str()));
-    const auto words = tokenizer.encode("The quick brown fox jumps over the lazy dog. ");
+    return backend;
+}
+
+// `text` repeated to 130 tokens: crosses DS4's first compressed-page boundary.
+std::vector<int32_t> repeated_prompt(const Tokenizer & tokenizer, const char * text) {
+    const auto words = tokenizer.encode(text);
     GPU_OFFLOAD_CHECK(!words.empty());
     std::vector<int32_t> prompt;
     while (prompt.size() < 130) prompt.insert(prompt.end(), words.begin(), words.end());
-    prompt.resize(130); // crosses DS4's first compressed-page boundary
+    prompt.resize(130);
+    return prompt;
+}
+
+void check_model(std::string_view model_env, bool speculative, bool recompute = false) {
+    const std::string model = luce_test::require_model(model_env).string();
+    const std::string draft = speculative
+        ? luce_test::require_model(luce_test::kDraftModelEnv).string() : std::string();
+    auto backend = paged_backend(model, draft);
+    Tokenizer tokenizer;
+    GPU_OFFLOAD_CHECK(tokenizer.load_from_gguf(model.c_str()));
+    const auto prompt = repeated_prompt(tokenizer, "The quick brown fox jumps over the lazy dog. ");
     auto & engine = *backend->seq_engine();
     if (recompute) {
         for (Recovery recovery : {Recovery::recompute, Recovery::checkpoint_recompute}) {
@@ -251,6 +263,53 @@ void check_model(std::string_view model_env, bool speculative, bool recompute = 
     std::printf("matched %zu continuation tokens (%d speculative children)\n",
                 resumed.tokens.size(), resumed.speculative_children);
 }
+}
+
+// A disk hit reaches the engine as a host checkpoint the KV cache adopted
+// into a snapshot slot behind its back (snapshot_free, then snapshot_adopt).
+// Restoring it must read its own rows, not the GPU pages still pinned for the
+// slot's previous checkpoint of the same length.
+TEST_CASE(DecodeKvOffloadGpuFixture, QwenAdoptedCheckpointIgnoresStalePrefixPin) {
+    const std::string model = luce_test::require_model(luce_test::kQwen35ModelEnv).string();
+    auto backend = paged_backend(model, std::string());
+    Tokenizer tokenizer;
+    GPU_OFFLOAD_CHECK(tokenizer.load_from_gguf(model.c_str()));
+    const auto a = repeated_prompt(tokenizer, "The quick brown fox jumps over the lazy dog. ");
+    const auto b = repeated_prompt(tokenizer, "Seven green parrots sang loudly above the harbor at dawn. ");
+    auto & engine = *backend->seq_engine();
+    constexpr int kTokens = 96;                            // six whole 16-token pages
+    constexpr int kStaging = ModelBackend::kMaxSlots - 1;  // where disk hits land
+    const auto ref = [](int slot) { return PrefixStoreRef{(uint64_t)slot + 1, kTokens}; };
+    const auto run = [&](uint64_t id, const std::vector<int32_t> & prompt,
+                         const PrefixStorePlan & plan) {
+        const auto admitted = engine.admit_with_prefix(id, prompt, SamplerCfg{}, plan);
+        GPU_OFFLOAD_CHECK(admitted.status == SeqEngine::AdmitResult::Status::admitted);
+        GPU_OFFLOAD_CHECK(admitted.prefix_store.restored == plan.restore);
+        auto transcript = replay_continuation(engine, admitted.slot, false);
+        engine.retire(admitted.slot);
+        return transcript.tokens;
+    };
+    PrefixStorePlan capture_a;
+    capture_a.capture = {1, ref(kStaging)};
+    run(1, a, capture_a);   // pins A's pages for the staging slot
+    // The control: B prefilled with the same cut at kTokens that a restore
+    // makes (the engine's numerics depend on where a forward ends).
+    PrefixStorePlan capture_b;
+    capture_b.capture = {2, ref(1)};
+    const auto control = run(2, b, capture_b);
+    GPU_OFFLOAD_CHECK(backend->snapshot_cur_pos(kStaging) == kTokens);
+    GPU_OFFLOAD_CHECK(backend->snapshot_cur_pos(1) == kTokens);
+
+    backend->snapshot_free(kStaging);
+    OwnedSnapshot disk = backend->snapshot_detach(1);
+    GPU_OFFLOAD_CHECK(backend->snapshot_adopt(kStaging, disk.ctx(), disk.buf(),
+                                              disk.cur_pos(), disk.last_tok()));
+    disk.release();
+
+    PrefixStorePlan restore_b;
+    restore_b.restore = ref(kStaging);
+    GPU_OFFLOAD_CHECK(run(3, b, restore_b) == control);
+    std::printf("restored checkpoint matched %zu control tokens\n", control.size());
 }
 
 TEST_CASE(DecodeKvOffloadGpuFixture, QwenSeededContinuationMatchesControl) {

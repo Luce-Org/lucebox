@@ -99,7 +99,12 @@ public:
         busy_ = busy;
         kv_free_tokens_ = kv_free_tokens;
     }
-    void publish(int busy, int64_t kv_free_tokens) { vacate(nullptr, busy, kv_free_tokens); }
+    // Serving thread. An unchanged step takes no lock: only this thread writes
+    // busy_ and kv_free_tokens_, so it may read them unlocked.
+    void publish(int busy, int64_t kv_free_tokens) {
+        if (busy == busy_ && kv_free_tokens == kv_free_tokens_) return;
+        vacate(nullptr, busy, kv_free_tokens);
+    }
 
     // GET /props "load". The KV fields are null when the engine reports no
     // pool; queue_limit is null without a limit.

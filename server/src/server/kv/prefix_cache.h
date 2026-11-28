@@ -94,7 +94,13 @@ public:
     // Side-effect-free candidate for engines that must validate payloads.
     std::pair<int, int> lookup_candidate(
         const std::vector<int32_t> & prompt_ids,
-        int max_prefix_tokens);
+        int max_prefix_tokens,
+        const std::vector<int> * precomputed_boundaries = nullptr);
+
+    // Longest restorable entry that is a strict prefix of the prompt, without
+    // a boundary scan, hashing or allocation. Used by prefix-aware queue
+    // selection to batch warm-prefix requests without head-of-line delay.
+    int fast_cached_prefix_len(const std::vector<int32_t> & prompt_ids) const;
 
     // Promote and count only after an engine restored this checkpoint.
     void record_inline_hit(
@@ -198,7 +204,8 @@ public:
         bool forced_cut_learned = false,
         // The snapshot whose rows a state-only restore source takes
         // (kv_source_slot): never a victim either.
-        int restore_kv_slot = -1);
+        int restore_kv_slot = -1,
+        const std::vector<int> * precomputed_boundaries = nullptr);
 
     // Commit an already-materialized snapshot without a reservation. Used by
     // cache import/bootstrap paths and tests.
@@ -512,7 +519,8 @@ private:
     std::pair<int, int> lookup_impl(
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
-        bool record_hit);
+        bool record_hit,
+        const std::vector<int> * precomputed_boundaries = nullptr);
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
     // A capture in flight writes this slot or evicts its entry

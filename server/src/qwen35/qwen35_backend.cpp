@@ -10,9 +10,9 @@
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
-#include "dflash_feature_ring.h"
-#include "dflash_capture.h"
-#include "common/dflash_draft_graph.h"
+#include "common/dflash/dflash_feature_ring.h"
+#include "common/dflash/dflash_capture.h"
+#include "common/dflash/dflash_draft_graph.h"
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
@@ -22,7 +22,7 @@
 #include <random>
 #endif
 #include "common/dspark_head.h"
-#include "common/dflash2_head.h"
+#include "common/dflash/dflash2_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
@@ -194,7 +194,7 @@ static FILE * open_dflash_floor_log() {
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
         int64_t kv_bytes_per_token, int64_t scratch_tokens,
-        bool fixed_chain) {
+        bool fixed_chain, bool has_drafter) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -208,7 +208,8 @@ static int64_t concurrent_fixed_cache_bytes(
     const int64_t recurrent =
         state_per_layer * n_delta * (int64_t)n_slots;
     // Must match the target ring allocated in create_target_cache_partial.
-    const int64_t target_feat_cap = std::min(max_ctx, 4096);
+    const int64_t target_feat_cap = luce::common::dflash_feature_ring_cap(
+        max_ctx, has_drafter && w.is_moe);
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
         (fixed_chain ? target_feat_cap * n_slots + 1 : target_feat_cap) *
@@ -523,10 +524,22 @@ bool Qwen35Backend::init() {
               env_int_or_default("LUCE_MAX_CONCURRENT_PREFILLS", 8),
               1, std::min(n_slots, 8))
         : 1;
+    bool target_is_uma = false;
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    {
+        cudaDeviceProp prop{};
+        if (cfg_.device.gpu >= 0 &&
+            cudaGetDeviceProperties(&prop, cfg_.device.gpu) == cudaSuccess) {
+            target_is_uma = (prop.integrated != 0);
+        }
+    }
+#endif
+    const int default_mixed = target_is_uma ? 512 : 1024;
+    const int default_long_mixed = target_is_uma ? 1024 : 1536;
     const int mixed_prefill_tokens = std::max(
-        1, env_int_or_default("LUCE_MIXED_PREFILL_TOKENS", 2048));
+        1, env_int_or_default("LUCE_MIXED_PREFILL_TOKENS", default_mixed));
     const int long_mixed_prefill_tokens = std::max(
-        1, env_int_or_default("LUCE_LONG_MIXED_PREFILL_TOKENS", 4096));
+        1, env_int_or_default("LUCE_LONG_MIXED_PREFILL_TOKENS", default_long_mixed));
     const int long_prefill_threshold = std::max(
         1, env_int_or_default("LUCE_LONG_PREFILL_THRESHOLD", 768));
     const int idle_prefill_tokens = std::max(
@@ -577,7 +590,7 @@ bool Qwen35Backend::init() {
             kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
         budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
             w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-            scratch_tokens, fixed_chain.enabled);
+            scratch_tokens, fixed_chain.enabled, cfg_.draft_path.has_value());
         if (cfg_.kv_pool_tokens > 0) {
             const int64_t max_pool_tokens =
                 ((int64_t)INT32_MAX - scratch_tokens) /
@@ -690,7 +703,7 @@ bool Qwen35Backend::init() {
                 dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
-                idle_prefill_tokens, prefill_quantum);
+                idle_prefill_tokens, prefill_quantum, target_is_uma);
             if (fixed_chain.enabled) {
                 std::fprintf(stderr,
                     "[parallel-chain] fixed DFlash2 width=%d, "
@@ -1041,7 +1054,8 @@ bool Qwen35Backend::token_is_eos(int32_t token) const {
 }
 
 int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
-                                              size_t logits_row_offset) {
+                                              size_t logits_row_offset,
+                                              const ggml_tensor * logits_override) {
     // MIN_TOKENS_BEFORE_EOS (env LUCE_MIN_TOKENS, default off): same
     // policy as do_ar_decode — if the slot would stop before emitting the
     // floor, substitute the best non-EOS token. The logits row is fetched
@@ -1049,9 +1063,10 @@ int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
     // floor is off or not triggered.
     const int floor = dflash_min_tokens_floor();
     if (floor <= 0 || generated >= floor || !IS_EOS_TOK(tok, w_)) return tok;
+    const ggml_tensor * logits_t = logits_override ? logits_override : sg_.logits;
     const int vocab = w_.n_vocab;
     std::vector<float> buf((size_t)vocab);
-    ggml_backend_tensor_get(sg_.logits, buf.data(), logits_row_offset,
+    ggml_backend_tensor_get(logits_t, buf.data(), logits_row_offset,
                             sizeof(float) * (size_t)vocab);
     int alt = -1;
     float best = -1e30f;
@@ -1102,6 +1117,7 @@ bool Qwen35Backend::park(ParkTarget target) {
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
     if (want_target_model && !target_parked_) {
+        if (seq_engine_) seq_engine_->release_target_graphs();
         step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
         dflash2_selector_graph_invalidate();
@@ -1187,6 +1203,7 @@ bool Qwen35Backend::unpark(ParkTarget target) {
         // A reloaded drafter can select different target capture layers.
         // Rebuild any retained target graph against the refreshed mapping.
         step_graph_free(sg_);
+        if (seq_engine_) seq_engine_->release_target_graphs();
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }
@@ -1870,6 +1887,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     window.park = [&] {
         was_target_parked = target_parked_;
         was_draft_parked = draft_parked_;
+        if (seq_engine_) seq_engine_->release_target_graphs();
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -2035,6 +2053,7 @@ void Qwen35Backend::shutdown() {
 void Qwen35Backend::release_scratch() {
     // Target graph allocator: grows during large prefill batches, not needed
     // between requests. Will be lazily recreated on next build_target_step().
+    if (seq_engine_) seq_engine_->release_target_graphs();
     if (sg_.alloc) {
         ggml_gallocr_free(sg_.alloc);
         sg_.alloc = nullptr;

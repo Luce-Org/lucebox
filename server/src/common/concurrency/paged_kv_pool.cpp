@@ -61,6 +61,47 @@ PagedKvPool::PagedKvPool(uint32_t physical_block_count,
     sequences_.resize(max_sequences);
     refill(free_sequence_slots_, max_sequences);
     refill(free_blocks_, physical_block_count);
+    seq_refcounts_.assign(physical_block_count, 0);
+    pin_refcounts_.assign(physical_block_count, 0);
+}
+
+uint32_t PagedKvPool::take_free_block() {
+    const uint32_t block = take_lowest(free_blocks_);
+    seq_refcounts_[block] = 1;
+    return block;
+}
+
+void PagedKvPool::add_seq_ref(uint32_t block) {
+    if (seq_refcounts_[block] == 0 && pin_refcounts_[block] > 0) {
+        --pinned_only_blocks_;
+    }
+    ++seq_refcounts_[block];
+}
+
+void PagedKvPool::release_seq_ref(uint32_t block) {
+    if (seq_refcounts_[block] == 0) return;
+    if (--seq_refcounts_[block] == 0) {
+        if (pin_refcounts_[block] > 0) {
+            ++pinned_only_blocks_;
+        } else {
+            give_back(free_blocks_, block);
+        }
+    }
+}
+
+void PagedKvPool::add_pin_ref(uint32_t block) {
+    if (seq_refcounts_[block] == 0 && pin_refcounts_[block] == 0) {
+        ++pinned_only_blocks_;
+    }
+    ++pin_refcounts_[block];
+}
+
+void PagedKvPool::release_pin_ref(uint32_t block) {
+    if (pin_refcounts_[block] == 0) return;
+    if (--pin_refcounts_[block] == 0 && seq_refcounts_[block] == 0) {
+        --pinned_only_blocks_;
+        give_back(free_blocks_, block);
+    }
 }
 
 PagedKvStatus PagedKvPool::acquire(PagedKvRequestId request_id,
@@ -138,6 +179,15 @@ PagedKvAppendResult PagedKvPool::append(PagedKvSequenceHandle handle,
     }
 
     const uint32_t old_kv_seq_len = sequence.kv_seq_len;
+    // Copy-on-write invariant: never append into a partially filled shared block.
+    if (old_kv_seq_len % block_size_ != 0) {
+        const uint32_t partial_block =
+            sequence.block_table[old_kv_seq_len / block_size_];
+        if (is_block_shared(partial_block)) {
+            result.status = PagedKvStatus::InvalidArgument;
+            return result;
+        }
+    }
     const uint32_t new_kv_seq_len = old_kv_seq_len + token_count;
     result.status =
         extend_block_table(sequence, blocks_for_tokens(new_kv_seq_len));
@@ -181,6 +231,17 @@ PagedKvStatus PagedKvPool::rollback_append(
     }
     const uint32_t restored_length = sequence.kv_seq_len - token_count;
     const uint32_t restored_blocks = blocks_for_tokens(restored_length);
+    // Reject rewinding across or into a shared block so shared prefix pages
+    // remain immutable and never enter a sequence's private retry stack.
+    for (size_t i = restored_blocks; i < sequence.block_table.size(); ++i) {
+        if (is_block_shared(sequence.block_table[i])) {
+            return PagedKvStatus::InvalidArgument;
+        }
+    }
+    if (restored_length % block_size_ != 0 && restored_blocks > 0 &&
+        is_block_shared(sequence.block_table[restored_blocks - 1])) {
+        return PagedKvStatus::InvalidArgument;
+    }
     while (sequence.block_table.size() > restored_blocks) {
         const uint32_t block = sequence.block_table.back();
         sequence.block_table.pop_back();
@@ -194,9 +255,9 @@ PagedKvStatus PagedKvPool::clear(PagedKvSequenceHandle handle) {
     const PagedKvStatus status = validate(handle);
     if (status != PagedKvStatus::Ok) return status;
     SequenceState & sequence = sequences_[handle.slot];
-    for (uint32_t block : sequence.block_table) give_back(free_blocks_, block);
-    for (uint32_t block : sequence.reserved_blocks) give_back(free_blocks_, block);
-    for (uint32_t block : sequence.retry_blocks) give_back(free_blocks_, block);
+    for (uint32_t block : sequence.block_table) release_seq_ref(block);
+    for (uint32_t block : sequence.reserved_blocks) release_seq_ref(block);
+    for (uint32_t block : sequence.retry_blocks) release_seq_ref(block);
     sequence.kv_seq_len = 0;
     sequence.block_table.clear();
     sequence.reserved_blocks.clear();
@@ -227,6 +288,9 @@ void PagedKvPool::reset() {
         sequence.reserved_blocks.clear();
         sequence.retry_blocks.clear();
     }
+    std::fill(seq_refcounts_.begin(), seq_refcounts_.end(), 0u);
+    std::fill(pin_refcounts_.begin(), pin_refcounts_.end(), 0u);
+    pinned_only_blocks_ = 0;
     refill(free_sequence_slots_, static_cast<uint32_t>(sequences_.size()));
     refill(free_blocks_, physical_block_count_);
 }
@@ -257,6 +321,145 @@ PagedKvStatus PagedKvPool::owned_block_count(
     out_count = static_cast<uint32_t>(
         sequence.block_table.size() + sequence.retry_blocks.size() +
         sequence.reserved_blocks.size());
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::exclusive_block_count(
+        PagedKvSequenceHandle handle, uint32_t & out_count) const {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    const SequenceState & sequence = sequences_[handle.slot];
+    uint32_t exclusive = 0;
+    auto count_exclusive = [&](const std::vector<uint32_t> & blocks) {
+        for (uint32_t b : blocks) {
+            if (b < physical_block_count_ &&
+                seq_refcounts_[b] == 1 && pin_refcounts_[b] == 0) {
+                ++exclusive;
+            }
+        }
+    };
+    count_exclusive(sequence.block_table);
+    count_exclusive(sequence.retry_blocks);
+    count_exclusive(sequence.reserved_blocks);
+    out_count = exclusive;
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::pin_prefix_blocks(
+        PagedKvSequenceHandle handle, uint32_t full_block_count,
+        std::vector<uint32_t> & out_blocks) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    const SequenceState & sequence = sequences_[handle.slot];
+    const uint32_t available_full = sequence.kv_seq_len / block_size_;
+    if (full_block_count > available_full ||
+        full_block_count > sequence.block_table.size()) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    out_blocks.clear();
+    out_blocks.reserve(full_block_count);
+    for (uint32_t i = 0; i < full_block_count; ++i) {
+        const uint32_t block = sequence.block_table[i];
+        add_pin_ref(block);
+        out_blocks.push_back(block);
+    }
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::unpin_prefix_blocks(
+        const std::vector<uint32_t> & blocks) {
+    if (blocks.empty()) return PagedKvStatus::Ok;
+    std::vector<uint32_t> sorted(blocks.begin(), blocks.end());
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 0; i < sorted.size(); ) {
+        const uint32_t block = sorted[i];
+        size_t j = i + 1;
+        while (j < sorted.size() && sorted[j] == block) ++j;
+        const size_t req_count = j - i;
+        if (block >= physical_block_count_ || pin_refcounts_[block] < req_count) {
+            return PagedKvStatus::InvalidArgument;
+        }
+        i = j;
+    }
+    for (uint32_t block : blocks) {
+        release_pin_ref(block);
+    }
+    return PagedKvStatus::Ok;
+}
+
+uint32_t PagedKvPool::reclaimable_on_unpin(
+        const std::vector<uint32_t> & blocks) const {
+    uint32_t count = 0;
+    for (uint32_t b : blocks) {
+        if (b < physical_block_count_ &&
+            seq_refcounts_[b] == 0 && pin_refcounts_[b] == 1) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+uint32_t PagedKvPool::pinned_only_in(
+        const std::vector<uint32_t> & blocks) const {
+    uint32_t count = 0;
+    for (uint32_t b : blocks) {
+        if (b < physical_block_count_ &&
+            seq_refcounts_[b] == 0 && pin_refcounts_[b] > 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+PagedKvStatus PagedKvPool::seed_shared_prefix(
+        PagedKvSequenceHandle handle,
+        const uint32_t * shared_blocks,
+        uint32_t shared_block_count,
+        uint32_t token_count) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    SequenceState & sequence = sequences_[handle.slot];
+    if (token_count == 0 || sequence.kv_seq_len != 0 ||
+        !sequence.block_table.empty() || !sequence.retry_blocks.empty()) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    if (shared_block_count > token_count / block_size_ ||
+        (shared_block_count > 0 && !shared_blocks)) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    for (uint32_t i = 0; i < shared_block_count; ++i) {
+        const uint32_t b = shared_blocks[i];
+        if (b >= physical_block_count_ || pin_refcounts_[b] == 0) {
+            return PagedKvStatus::InvalidArgument;
+        }
+    }
+
+    const uint32_t total_blocks = blocks_for_tokens(token_count);
+    const uint32_t private_tail = total_blocks - shared_block_count;
+    const uint64_t avail_private =
+        static_cast<uint64_t>(sequence.reserved_blocks.size()) +
+        free_blocks_.size();
+    if (private_tail > avail_private) {
+        return PagedKvStatus::BlocksExhausted;
+    }
+
+    sequence.block_table.reserve(total_blocks);
+    for (uint32_t i = 0; i < shared_block_count; ++i) {
+        const uint32_t b = shared_blocks[i];
+        add_seq_ref(b);
+        sequence.block_table.push_back(b);
+    }
+    for (uint32_t i = 0; i < private_tail; ++i) {
+        if (!sequence.reserved_blocks.empty()) {
+            sequence.block_table.push_back(take_lowest(sequence.reserved_blocks));
+        } else {
+            sequence.block_table.push_back(take_free_block());
+        }
+    }
+    sequence.kv_seq_len = token_count;
     return PagedKvStatus::Ok;
 }
 
@@ -295,10 +498,10 @@ PagedKvStatus PagedKvPool::extend_block_table(SequenceState & sequence,
         if (!sequence.retry_blocks.empty()) {
             sequence.block_table.push_back(sequence.retry_blocks.back());
             sequence.retry_blocks.pop_back();
+        } else if (!sequence.reserved_blocks.empty()) {
+            sequence.block_table.push_back(take_lowest(sequence.reserved_blocks));
         } else {
-            std::vector<uint32_t> & source = sequence.reserved_blocks.empty()
-                ? free_blocks_ : sequence.reserved_blocks;
-            sequence.block_table.push_back(take_lowest(source));
+            sequence.block_table.push_back(take_free_block());
         }
     }
     return PagedKvStatus::Ok;
@@ -309,7 +512,7 @@ void PagedKvPool::take_reserved_blocks(SequenceState & sequence,
     sequence.reserved_blocks.reserve(
         sequence.reserved_blocks.size() + additional_blocks);
     for (uint32_t i = 0; i < additional_blocks; ++i) {
-        give_back(sequence.reserved_blocks, take_lowest(free_blocks_));
+        give_back(sequence.reserved_blocks, take_free_block());
     }
 }
 

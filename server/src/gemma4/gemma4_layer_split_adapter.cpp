@@ -3,7 +3,7 @@
 #include "gemma4_layer_split_adapter.h"
 
 #include "common/backend_precision.h"
-#include "common/dflash_layer_split_runtime.h"
+#include "common/dflash/dflash_layer_split_runtime.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/layer_split_runtime.h"
