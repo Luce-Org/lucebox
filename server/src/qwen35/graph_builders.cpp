@@ -388,7 +388,8 @@ bool build_target_step(
     int top_n,
     bool keep_base_ssm_state,
     ggml_tensor * single_replay_slot_ids,
-    TargetStepQueryCapture query_capture) {
+    TargetStepQueryCapture query_capture,
+    int kvflash_active_span) {
     step_graph_free(sg);
 
     // KEEP_BASE: only the single-sequence chain capture verify may
@@ -523,6 +524,9 @@ bool build_target_step(
         }
         static constexpr int kPagedGraphSlots = 64;
         graph_key_slot = 32 + (int)(hash % kPagedGraphSlots);
+    } else if (kvflash_mask && kvflash_active_span > 0) {
+        // Keep each 4K active-span bucket on its own CUDA/HIP graph cache key.
+        graph_key_slot = 96 + ((kvflash_active_span / 4096) % 32);
     }
     for (int i = 0; i < graph_key_slot; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
@@ -547,7 +551,12 @@ bool build_target_step(
         for (auto * t : cache.attn_k) {
             if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
         }
-        const int max_win_len = phys_ctx + n_tokens;
+        if (kvflash_mask && kvflash_active_span > 0) {
+            phys_ctx = std::min(phys_ctx, kvflash_active_span);
+        }
+        const int max_win_len = (kvflash_mask && kvflash_active_span > 0)
+            ? phys_ctx
+            : (phys_ctx + n_tokens);
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);

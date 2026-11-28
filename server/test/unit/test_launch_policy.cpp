@@ -245,7 +245,7 @@ struct LaunchPolicyFixture : CommonFixture {
     void test_rollback_charge_follows_the_resolved_rollback_mode() {
         using luce::common::RollbackMode;
         using luce::common::spec_rollback_checkpoints;
-        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Auto,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Auto,  /*tree=*/false));
         CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Fast,  /*tree=*/false));
         CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Exact, /*tree=*/false));
         CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Auto,  /*tree=*/false));
@@ -882,10 +882,11 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(kvflash_recall_env("").empty());
     }
 
-    void test_kvflash_recall_preamble_reserve_is_18_chunks() {
-        // The reserve grows the resident pool and every decode step attends the whole pool: 6144 rows (+37.5%) cost
-        // 4.7% decode, so the default is the 18 chunks of 64 that hold the measured 1064-token preamble pin.
-        CHECK(KvflashRecallProfile::preamble_rows == 18 * 64);
+    void test_kvflash_recall_preamble_reserve_is_64_chunks() {
+        // Dynamic pin_reserve_chunks charges only actually pinned chunks, so the
+        // 4096-token (64-chunk) cap protects full agent system+tools preambles
+        // without wasting tail room on shorter preambles.
+        CHECK(KvflashRecallProfile::preamble_rows == 64 * 64);
     }
 
     void test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size() {
@@ -894,7 +895,7 @@ struct LaunchPolicyFixture : CommonFixture {
         const int ct = 64, pool = 16384;
         const int reserve = kvflash_preamble_reserve_in_pool(pool, KvflashRecallProfile::preamble_rows, ct);
         CHECK(reserve == KvflashRecallProfile::preamble_rows);
-        CHECK(pool - reserve == 15232);
+        CHECK(pool - reserve == 12288);
     }
 
     void test_kvflash_preamble_reserve_that_leaves_no_history_is_off() {
@@ -915,10 +916,10 @@ struct LaunchPolicyFixture : CommonFixture {
         const std::vector<std::pair<std::string, std::string>> expected = {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "auto"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "4096"},
             {"LUCE_KVFLASH_UQ_QUERIES", "64"},
         };
         const std::vector<LaunchProfileEnv> env = kvflash_recall_env("qwen35");

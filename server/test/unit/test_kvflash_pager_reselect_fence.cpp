@@ -95,3 +95,24 @@ TEST_CASE(KvflashPagerReselectFenceFixture, reselect_recent_batches_and_keeps_th
     CHECK(p.stats().fence_points == fences0);
     CHECK(resident_set(p, 14) == resident_set(fresh, 14));
 }
+
+TEST_CASE(KvflashPagerReselectFenceFixture, active_span_buckets_and_bounded_slot_mask) {
+    Harness A;
+    KvFlashPager p;
+    p.set_pinned_host_backing(false);
+    REQUIRE(p.attach(cfg(), A.k, A.v));   // pool = 512 tokens (8 blocks of 64)
+    CHECK(p.max_resident_block() == -1);
+    CHECK(kvflash_active_span_tokens(p, -1, 256) == 256);
+
+    REQUIRE(p.alloc_span(0, 2 * kChunk));  // blocks 0, 1 resident (128 tokens)
+    CHECK(p.max_resident_block() == 1);
+    CHECK(kvflash_active_span_tokens(p, -1, 256) == 256);
+    CHECK(kvflash_active_span_tokens(p, 300, 256) == 512);  // clamped to pool
+
+    std::vector<uint16_t> mask(256, 0x1234);
+    p.fill_slot_mask(mask.data(), 100, /*max_tokens=*/256);
+    CHECK(mask[0] == 0x0000);
+    CHECK(mask[99] == 0x0000);
+    CHECK(mask[100] == 0xFC00);
+    CHECK(mask[255] == 0xFC00);
+}

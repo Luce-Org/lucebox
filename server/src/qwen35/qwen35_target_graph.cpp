@@ -1490,7 +1490,7 @@ static ggml_tensor * build_full_attn_block(
         // slots are readable. Detect the mode by the pair only slot-mapped
         // verify sets: a set_rows KV write together with an explicit mask.
         if (kv_write_rows != nullptr && attn_mask != nullptr) {
-            win_len_padded = (int)cache_k->ne[1];
+            win_len_padded = std::min((int)cache_k->ne[1], (int)attn_mask->ne[0]);
         }
 
         // K and V from cache: a windowed view starting at win_start.

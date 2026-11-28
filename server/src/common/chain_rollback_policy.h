@@ -32,11 +32,9 @@ inline bool split_chain_fast_rollback_enabled() {
 }
 
 // Caller-requested speculative rollback mode.
-// Under the KVFlash pager fast rollback is measured not token-identical to AR
-// (25/80 outputs differ), so Auto resolves to exact restore + replay when the
-// pager is active and fast rollback otherwise. Fast (--fast-rollback) opts in
-// under the pager too; Exact (--no-fast-rollback) forces exact restore
-// everywhere.
+// Auto resolves to fast rollback (even under KVFlash, where exact restore +
+// replay costs ~28% decode throughput). Pass Exact (--no-fast-rollback) when
+// strict bitwise AR equivalence or lower checkpoint VRAM is required.
 enum class RollbackMode {
     Auto,
     Fast,
@@ -44,10 +42,11 @@ enum class RollbackMode {
 };
 
 inline bool spec_fast_rollback_enabled(bool pager_on, RollbackMode mode) {
+    (void)pager_on;
     switch (mode) {
         case RollbackMode::Fast:  return true;
         case RollbackMode::Exact: return false;
-        case RollbackMode::Auto:  return !pager_on;
+        case RollbackMode::Auto:  return true;
     }
     return false;
 }

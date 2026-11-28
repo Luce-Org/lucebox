@@ -287,8 +287,12 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
     b.bytes_per_token = (int64_t)luce::kv_reservation_bytes_per_token(
         w.n_layer, w.full_attention_interval, w.n_head_kv,
         kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
-    b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+    const bool same_gpu_draft = cfg_.draft_path.has_value() && !cfg_.remote_draft.enabled() &&
+        !cfg_.device.is_tensor_parallel() && cfg_.device.gpu == cfg_.draft_gpu;
+    b.reserve_bytes   = (int64_t)(2.5 * 1073741824.0) +
+        (same_gpu_draft ? (int64_t)(3.0 * 1073741824.0) : 0) +
         (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    b.speed_cap_tokens = 49152;
     return b;
 }
 
@@ -433,11 +437,18 @@ bool Qwen35Backend::init() {
     // model (Spark's pattern). LRU is the fallback when nothing is found
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
+    bool kvflash_recall_auto = false;
     {
         kvflash_prefill_reselect_ = luce::common::kvflash_reselect_mode(env_int_or_default("LUCE_KVFLASH_PREFILL_RESELECT", 0), kvflash_qk_policy_);
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_m4_single_ = env_int_or_default("LUCE_KVFLASH_M4_SINGLE", 1) != 0;
-        kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
+        const char * rb_env = std::getenv("LUCE_KVFLASH_RECALL_BLOCKS");
+        if (rb_env && std::string(rb_env) == "auto") {
+            kvflash_recall_auto = true;
+            kvflash_recall_blocks_ = 6;
+        } else {
+            kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
+        }
         kvflash_select_queries_ = kvflash_prefill_reselect_ == 4 ? luce::common::kQueryCaptureTokens : 0;
         kvflash_select_unit_ = std::max(1, env_int_or_default("LUCE_KVFLASH_SELECT_UNIT", luce::common::kKvFlashRecallUnit));
     }
@@ -478,6 +489,13 @@ bool Qwen35Backend::init() {
                          rows, reserve, kvflash_tokens_, kvflash_tokens_ - reserve);
             kvflash_preamble_reserve_ = reserve;
             kvflash_preamble_rows_ = std::min(rows, reserve);
+        }
+        if (kvflash_recall_auto) {
+            const int ct = KvFlashConfig{}.chunk_tokens;
+            const int avail_chunks = std::max(0, kvflash_tokens_ / ct - kvflash_preamble_reserve_ / ct - 1);
+            kvflash_recall_blocks_ = std::max(6, avail_chunks / 30);
+            std::fprintf(stderr, "[kvflash] auto recall_blocks=%d (pool=%d, avail_chunks=%d)\n",
+                         kvflash_recall_blocks_, kvflash_tokens_, avail_chunks);
         }
     }
     kvflash_uq_queries_ = luce::common::kvflash_uq_queries();
@@ -2082,6 +2100,22 @@ void Qwen35Backend::trim_pools_at_ar_handoff(const char * reason) {
 
 // ── Generate (speculative decode) ───────────────────────────────────────
 
+void Qwen35Backend::kvflash_capture_gen_ckpt(bool has_images, int n_gen) {
+    if (!kvflash_session_enabled() || !kvflash_active() || cfg_.paged_attention ||
+        has_images || n_gen <= 0) {
+        return;
+    }
+    const int G = kvflash_gen_ckpt_pos(cache_.cur_pos, kvflash_history_.size());
+    if (G > 0 && state_ladder_capture(G)) {
+        kvflash_gen_ckpt_pos_ = G;
+        std::printf("[kvflash] gen ckpt @%d\n", G);
+        std::fflush(stdout);
+    } else {
+        std::fprintf(stderr, "[kvflash] gen ckpt skipped (cur_pos=%d history=%zu)\n",
+                     cache_.cur_pos, kvflash_history_.size());
+    }
+}
+
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     struct EosScope {
@@ -2279,18 +2313,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     // resumes after the answer. Speculative rollback and the early-stop repair
     // (EOS, cancel inside a verified block) leave cur_pos at the committed
     // position, where KV and state hold exactly history[0:G].
-    if (kvflash_session_enabled() && kvflash_active() && !cfg_.paged_attention &&
-        !has_images && req.n_gen > 0) {
-        const int G = kvflash_gen_ckpt_pos(cache_.cur_pos, kvflash_history_.size());
-        if (G > 0 && state_ladder_capture(G)) {
-            kvflash_gen_ckpt_pos_ = G;
-            std::printf("[kvflash] gen ckpt @%d\n", G);
-            std::fflush(stdout);
-        } else {
-            std::fprintf(stderr, "[kvflash] gen ckpt skipped (cur_pos=%d history=%zu)\n",
-                         cache_.cur_pos, kvflash_history_.size());
-        }
-    }
+    kvflash_capture_gen_ckpt(has_images, req.n_gen);
 
     result.succeed();
     return result;
@@ -2585,6 +2608,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // in ggml_backend_tensor_set. Build a single-token decode step graph at
         // the restored position now, mirroring do_ar_decode's per-step build.
         const bool pool = kvflash_active();
+        const int active_span = pool ? luce::common::kvflash_active_span_tokens(kvflash_pager_) : 0;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
                                /*with_mask=*/pool || w_.is_bailingmoe3,
@@ -2595,7 +2619,13 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_decode())) {
+                               /*capture_qk=*/pool && kvflash_qk_decode(),
+                               /*paged_attention=*/false, /*n_seqs=*/1, /*seq_slot=*/0,
+                               /*paged_max_kv_len=*/0, /*n_prefill_tokens=*/0,
+                               /*prefill_segments=*/nullptr, /*n_prefill_segments=*/0,
+                               /*n_logits_rows=*/0, /*compact_slots=*/false, /*top_n=*/0,
+                               /*keep_base_ssm_state=*/false, /*single_replay_slot_ids=*/nullptr,
+                               TargetStepQueryCapture{}, active_span)) {
             result.fail(GenerateErrorCode::BackendSpecific,
                              "restore step-graph build");
             return result;
@@ -2643,6 +2673,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
+
+    // S9: mirror generate_impl's generation-end checkpoint so continuing
+    // turns after a restored prompt also resume past the generated answer.
+    kvflash_capture_gen_ckpt(req.images != nullptr, req.n_gen);
 
     result.succeed();
     return result;
@@ -3002,6 +3036,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                               (uq_capturing && !uq_done && kv_pos < uqp.cut && kv_pos + n_tokens > uqp.win_lo);
         static const bool prefill_timing = std::getenv("LUCE_PREFILL_TIMING") != nullptr;
         const auto t_build0 = std::chrono::steady_clock::now();
+        const int active_span = [&]() {
+            if (!kvf_paged) return 0;
+            int max_slot = -1;
+            for (int s : kvf_slots) if (s > max_slot) max_slot = s;
+            return luce::common::kvflash_active_span_tokens(kvflash_pager_, max_slot);
+        }();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
@@ -3023,7 +3063,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                    /*q_all=*/luce::common::kvflash_capture_q_all(
                                        kvflash_prefill_reselect_ != 0, kvflash_uq_queries_ > 0,
                                        kvflash_tp_degree(), q_window),
-                                   /*q_stage=*/false})) {
+                                   /*q_stage=*/false},
+                               active_span)) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -3076,7 +3117,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                 if (blk < 0) continue;
                 for (int i = 0; i < ct; i++) {
                     if ((int64_t)c * ct + i >= kv_pos) break;
-                    mask_buf[(size_t)blk * ct + i] = F16_ZERO;
+                    const size_t col = (size_t)blk * ct + i;
+                    if (col < kvd) mask_buf[col] = F16_ZERO;
                 }
             }
             for (int q = 1; q < n_tokens; q++) {
@@ -3221,6 +3263,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                 }
                 next_prefill_pool_trim += prefill_pool_trim_tokens;
             }
+        }
+    }
+
+    // Mode 4 continuing turn: prefill ran once capturing fresh q_tail on the new
+    // tool output; now score exact K-mass and recall before decode starts.
+    if (recall.m4_post_prefill && kvf_paged && committed == kv_offset + prompt_len) {
+        double post_ms = 0.0;
+        if (kvflash_prefill_score(committed, post_ms)) {
+            kvflash_m4_last_.scores = kvflash_scores_;
+            kvflash_prefill_apply(committed, committed, committed - 1, post_ms, "; post-prefill");
         }
     }
 
@@ -3381,7 +3433,8 @@ void Qwen35Backend::kvflash_upload_mask(int cur_pos) {
     if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_ ||
         cur_pos != kvflash_mask_pos_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);
-        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data(), (int64_t)cur_pos + 1);   // q row 0
+        kvflash_pager_.fill_slot_mask(
+            kvflash_mask_buf_.data(), (int64_t)cur_pos + 1, (int)sg_.attn_mask->ne[0]);   // q row 0
         kvflash_mask_epoch_ = kvflash_pager_.epoch();
         kvflash_mask_pos_ = cur_pos;
     }
@@ -3465,12 +3518,15 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
         }
     }
     if (kvf_reselect) {
+        const int eff_pin_res = std::min(
+            kvflash_preamble_reserve_ / ctk,
+            luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ctk));
         auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id,
-            luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+            luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
                                                   luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_));
         p4.r = luce::common::kvflash_uq_snap_rewind(s.uqp, p4.r);
         const auto gate = luce::common::kvflash_recall_gate(
-            p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+            p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
             luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
         using Skip = luce::common::KvFlashRecallSkip;
         if (kvflash_prefill_reselect_ == 4 && p4.run) {
@@ -3482,13 +3538,15 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
                 std::fprintf(stderr, "[kvflash] prefill reselect mode=4: skip, %s (LRU)\n",
                              gate.skip == Skip::NoSealedChunk ? "no sealed chunk before R" : "pool too small for the recall plan");
             } else {
-                // A turn under the same human question runs once: from the last exact scores when they cover every
-                // recall candidate, else after a scoring with the queries the last request left (kvflash_m4_reuse.h).
+                // Continuing turns under the same human question skip stale pre-prefill
+                // Prescore/Reuse (which scored with the previous turn's q_tail), prefill
+                // the new tool output once to capture fresh q_tail, then score exact
+                // K-mass & recall right before decode starts.
                 using Path = luce::common::KvFlashM4Path;
                 Path path = Path::Full;
                 int first_window = 0;
                 if (s.m4_track && kvflash_recall_blocks_ > 0 &&
-                    luce::common::kvflash_recall_gate(true, kv_offset, end_abs, ctk, kvflash_pager_.n_pool_blocks(), kvflash_preamble_reserve_ / ctk,
+                    luce::common::kvflash_recall_gate(true, kv_offset, end_abs, ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
                                                       luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_).skip == Skip::None) {
                     luce::common::KvFlashM4Ask a;
                     a.uq_hi = kvflash_uq_req_hi_; a.uq_hash = kvflash_uq_req_hash_; a.uq_stored = uq_stored;
@@ -3496,31 +3554,16 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
                     a.first_window = first_window = luce::common::kvflash_recall_first_window(kvflash_recall_in(kv_offset, end_abs));
                     path = luce::common::kvflash_m4_path(m4_prev, a, kvf_ids);
                 }
-                if (path == Path::Prescore) {
-                    // the model's dims: the decode pooled-key pool is not sized under a recall mode
-                    const KvFlashQkDims qd = kvflash_exact_dims();
-                    const size_t qsize = (size_t)qd.n_layers * qd.n_q_heads * qd.head_dim;
-                    kvflash_q_tail_ = std::move(m4_prev.q_tail);
-                    // whole queries only: the scorer would otherwise fall back to the single query in q_cap, which is not this turn's
-                    if (qsize > 0 && kvflash_q_tail_.size() % qsize == 0 && kvflash_prefill_score(kv_offset, s.m5_ms))
-                        kvflash_m4_last_.scores = kvflash_scores_;
-                    else path = Path::Full;
-                } else if (path == Path::Reuse) {
-                    kvflash_scores_ = m4_prev.scores;
-                    kvflash_m4_last_.scores = std::move(m4_prev.scores);
-                }
                 if (path == Path::Full) {
                     s.rw = p4;
                     std::fprintf(stderr, "[kvflash] prefill reselect mode=4: R4=%d (end %d, re-prefill %d tokens)\n",
                                  p4.r, end_abs, end_abs - p4.r);
                 } else {
                     m4_single = true;
-                    s.m5_r = kv_offset;
-                    s.apply_note = path == Path::Reuse ? "; reused" : "; prescore";
-                    std::fprintf(stderr, "[kvflash] prefill reselect mode=4: same question, %s @%d (end %d, prefill %d tokens once; "
-                                         "%zu chunks scored, window from chunk %d)\n",
-                                 path == Path::Reuse ? "scores reused" : "scored before the pass", kv_offset, end_abs,
-                                 end_abs - kv_offset, kvflash_m4_last_.scores.size(), first_window);
+                    s.m4_post_prefill = true;
+                    std::fprintf(stderr, "[kvflash] prefill reselect mode=4: same question, post-prefill score @%d "
+                                         "(prefill %d tokens once, window from chunk %d)\n",
+                                 end_abs, end_abs - kv_offset, first_window);
                 }
             }
         }
@@ -3756,8 +3799,9 @@ luce::common::KvFlashRecallIn Qwen35Backend::kvflash_recall_in(int committed, in
     in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
     in.unit = kvflash_select_unit_;
     in.reserve = (end - committed + ct - 1) / ct + 1;
-    in.pin_reserve_chunks = kvflash_preamble_reserve_ / ct;   // the history budget never depends on k
     in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
+    // Dynamic preamble reserve: charge only actually pinned chunks (zero tail waste).
+    in.pin_reserve_chunks = std::min(kvflash_preamble_reserve_ / ct, in.pinned_chunks);
     return in;
 }
 
@@ -3971,10 +4015,23 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
         const int32_t rope_pos = committed + rope_delta_;
 
-        // kvflash: graph carries a slot-validity mask alongside the
-        // step-invariant set_rows write; the FA span clamps to the pool.
+        // kvflash: allocate this step's slot BEFORE graph build so active_span
+        // covers the new slot and clamps the FA window + mask to a 4K bucket.
         const bool pool = kvflash_active();
         const bool paged = cfg_.paged_attention;
+        int64_t pool_slot = -1;
+        int active_span = 0;
+        if (pool) {
+            pool_slot = (int64_t)kvflash_pager_.slot_for(committed);
+            if (pool_slot < 0) {
+                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                     "(pool %d exhausted)\n",
+                             committed, kvflash_tokens_);
+                set_last_error("kvflash: no evictable pool block");
+                return false;
+            }
+            active_span = luce::common::kvflash_active_span_tokens(kvflash_pager_, (int)pool_slot);
+        }
         if (!build_ar_step_with_inputs(sg_, [&] {
             return build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
@@ -3987,7 +4044,13 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
                                /*capture_qk=*/pool && kvflash_qk_decode(),
-                               /*paged_attention=*/paged);
+                               /*paged_attention=*/paged,
+                               /*n_seqs=*/1, /*seq_slot=*/0, /*paged_max_kv_len=*/0,
+                               /*n_prefill_tokens=*/0, /*prefill_segments=*/nullptr,
+                               /*n_prefill_segments=*/0, /*n_logits_rows=*/0,
+                               /*compact_slots=*/false, /*top_n=*/0,
+                               /*keep_base_ssm_state=*/false, /*single_replay_slot_ids=*/nullptr,
+                               TargetStepQueryCapture{}, active_span);
         }, embed_buf, hidden, rope_pos)) {
             return false;
         }
@@ -4002,14 +4065,7 @@ bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                     return false;
                 }
             } else if (pool) {
-                slot = (int64_t)kvflash_pager_.slot_for(committed);
-                if (slot < 0) {
-                    std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                         "(pool %d exhausted)\n",
-                                 committed, kvflash_tokens_);
-                    set_last_error("kvflash: no evictable pool block");
-                    return false;
-                }
+                slot = pool_slot;
             }
             const int n_head_kv = w_.n_head_kv;
             std::vector<int64_t> row_vals(n_head_kv, slot);
@@ -4725,7 +4781,10 @@ bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
     // Clamped to q_len: a checkpoint whose published block is below the
     // narrowing floor never widens past its own block. Acceptance accounting
     // uses the actual offered width, including confidence-trimmed drafts.
-    const int verify_cap = committed >= kLongCtxNarrowTokens
+    const int eff_ctx = kvflash_active()
+        ? std::max(committed, luce::common::kvflash_active_span_tokens(kvflash_pager_))
+        : committed;
+    const int verify_cap = eff_ctx >= kLongCtxNarrowTokens
                                ? std::min(q_len, std::max(kLongCtxMinVerify, q_len / 2))
                                : q_len;
     const bool shared_feedback_width =

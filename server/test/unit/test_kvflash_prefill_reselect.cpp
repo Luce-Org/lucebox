@@ -218,7 +218,20 @@ TEST_CASE(KvflashPrefillReselectFixture, recall_plan_unit_other_than_ten) {
     const KvFlashRecallPlan p = kvflash_recall_plan(ramp(600), in);
     CHECK(p.k_units == 30);
     CHECK((int)p.picked.size() == 30);
-    for (int b : p.picked) CHECK(b * 2 >= 10);               // the 10-chunk sink floor holds at every unit
+    for (int b : p.picked) CHECK(b * 2 >= 2);
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_plan_closes_low_chunk_dead_zone_for_small_units) {
+    // With pinned_chunks < 10 and unit = 2, chunks [2..9] ([128, 640)) are evictable
+    // and must be recallable instead of trapped below the legacy 10-chunk floor.
+    std::vector<float> scores(400, 0.1f);
+    scores[2] = scores[3] = 50.0f;  // unit 1 = chunks [2, 4)
+    KvFlashRecallIn in;
+    in.n_pool_blocks = 256; in.cur_chunk = 400; in.recall_chunks = 60;
+    in.unit = 2; in.reserve = 3; in.pinned_chunks = 2; in.pin_reserve_chunks = 2;
+    const KvFlashRecallPlan p = kvflash_recall_plan(scores, in);
+    CHECK(p.first_chunk == 2);
+    REQUIRE(!p.picked.empty());
+    CHECK(p.picked[0] == 1);
 }
 
 // ---- the eviction hook only ranks chunks that are already written ------------------------------------------

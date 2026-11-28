@@ -474,6 +474,12 @@ bool Qwen35DFlashTarget::verify_batch(
         gdn_materialize_snapshot();
     }
 
+    const int active_span = [&]() {
+        if (!pool) return 0;
+        int max_slot = -1;
+        for (int s : slots) if (s > max_slot) max_slot = s;
+        return luce::common::kvflash_active_span_tokens(*pager_, max_slot);
+    }();
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
                            need_mask, /*capture=*/true,
@@ -490,7 +496,8 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*compact_slots=*/false, verify_top_n_,
                            /*keep_base_ssm_state=*/keep_base,
                            replay_slot_ids,
-                           TargetStepQueryCapture{/*q_all=*/false, /*q_stage=*/stage_q})) {
+                           TargetStepQueryCapture{/*q_all=*/false, /*q_stage=*/stage_q},
+                           active_span)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -543,7 +550,8 @@ bool Qwen35DFlashTarget::verify_batch(
             if (blk < 0) continue;
             for (int i = 0; i < ct; i++) {
                 if ((int64_t)c * ct + i >= base_pos) break;
-                mask_buf[(size_t)blk * ct + i] = F16_ZERO;
+                const size_t col = (size_t)blk * ct + i;
+                if (col < kvd) mask_buf[col] = F16_ZERO;
             }
         }
         for (int q = 1; q < n_tokens; q++) {

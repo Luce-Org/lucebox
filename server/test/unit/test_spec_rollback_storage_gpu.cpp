@@ -118,9 +118,9 @@ void check_spec_matches_ar(bool kvflash, bool resumed = false) {
     args.device.backend = compiled_placement_backend();
     args.device.max_ctx = 20480;
     args.draft_device = args.device;
-    // KVFlash resolves Auto to exact restore unless --fast-rollback (Fast) is asked for;
-    // the non-KVFlash case requests Exact (--no-fast-rollback).
-    args.rollback_mode = kvflash ? luce::common::RollbackMode::Auto : luce::common::RollbackMode::Exact;
+    // Exact bitwise AR equivalence opts into Exact (--no-fast-rollback) both
+    // with and without the KVFlash pager.
+    args.rollback_mode = luce::common::RollbackMode::Exact;
     Tokenizer tokenizer;
     if (!tokenizer.load_from_gguf(model.c_str())) throw std::runtime_error("tokenizer load failed");
     const auto sentence = tokenizer.encode("The quick brown fox jumps over the lazy dog. ");

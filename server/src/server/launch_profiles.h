@@ -380,9 +380,10 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
 struct KvflashRecallProfile {
     static constexpr const char * policy         = "qk";
     static constexpr int          prefill_reselect = 4;      // mode 4: exact scorer
-    static constexpr int          recall_blocks    = 6;
+    static constexpr int          recall_blocks    = 6;      // floor for pool-proportional auto scaling
+    static constexpr const char * recall_blocks_env = "auto";
     static constexpr int          select_unit      = 2;      // chunks per recall unit
-    static constexpr int          preamble_rows    = 1152;   // pool rows reserved for the pinned preamble: 18 chunks of 64, out of --kvflash N
+    static constexpr int          preamble_rows    = 4096;   // cap for pinned preamble (dynamic reserve charges only pinned chunks)
     static constexpr int          uq_queries       = 64;
     static constexpr int          score_pool_recent = 1;     // mode 4 scores on the recency pool
 };
@@ -403,7 +404,7 @@ inline std::vector<LaunchProfileEnv> kvflash_recall_env(std::string_view arch) {
     return {
         {"LUCE_KVFLASH_POLICY", P::policy},
         {"LUCE_KVFLASH_PREFILL_RESELECT", std::to_string(P::prefill_reselect)},
-        {"LUCE_KVFLASH_RECALL_BLOCKS", std::to_string(P::recall_blocks)},
+        {"LUCE_KVFLASH_RECALL_BLOCKS", P::recall_blocks_env},
         {"LUCE_KVFLASH_SCORE_POOL_RECENT", std::to_string(P::score_pool_recent)},
         {"LUCE_KVFLASH_SELECT_UNIT", std::to_string(P::select_unit)},
         {"LUCE_KVFLASH_PREAMBLE_ROWS", std::to_string(P::preamble_rows)},

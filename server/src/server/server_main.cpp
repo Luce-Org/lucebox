@@ -2531,13 +2531,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n",
                      backend_speculation.ddtree_tau);
     }
-    const char * kvflash_env = std::getenv("LUCE_KVFLASH");
     const char * fast_rb_banner =
-        backend_speculation.rollback_mode == luce::common::RollbackMode::Fast  ? "ON" :
-        backend_speculation.rollback_mode == luce::common::RollbackMode::Exact ? "off" :
-        luce::common::kvflash_fixed_pool_requested(kvflash_env)                ? "off (kvflash)" :
-        luce::common::kvflash_pool_requested(kvflash_env)                      ? "auto (off if kvflash pages)" :
-                                                                                 "ON";
+        backend_speculation.rollback_mode == luce::common::RollbackMode::Exact ? "off" : "ON";
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", fast_rb_banner);
     if (backend_placement.target.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",

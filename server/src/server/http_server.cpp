@@ -6994,6 +6994,14 @@ void HttpServer::remember_agent_turn(
         return;
     }
     if (!config_.agent_turn_cache || has_pending_jobs()) return;
+    // Past KVFlash's resident pool (or --kvflash auto where save_generated_turn
+    // already refused a pooled snapshot), replaying through checkpoints_.prefill
+    // would only run a redundant prefill + rescore and fail snapshot_save again.
+    if (config_.kvflash_enabled &&
+        (config_.kvflash_pool_tokens == 0 ||
+         (int)canonical_tokens.size() > config_.kvflash_pool_tokens)) {
+        return;
+    }
 
     // Reuse the deepest checkpoint ordinary prefix caching already produced.
     // Matching at the checkpoint, instead of at the prompt end, tolerates the

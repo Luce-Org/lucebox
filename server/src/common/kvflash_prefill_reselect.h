@@ -210,6 +210,14 @@ inline int kvflash_pin_preamble(Pager & pager, int preamble_end, int reserve_row
 
 // Recall eligibility floor (chunks): v1's 10-chunk sink block, or past the pinned preamble.
 inline int kvflash_recall_first_chunk(int pinned_chunks) { return std::max(kKvFlashRecallUnit, pinned_chunks); }
+// Unit-aware floor: when unit < kKvFlashRecallUnit and pinned_chunks < 10,
+// chunks [max(1, pinned_chunks)..9] are evictable, so allow recall on them
+// instead of trapping [64, 640) in an unrecallable dead zone.
+inline int kvflash_recall_first_chunk(int pinned_chunks, int unit) {
+    return unit > 0 && unit < kKvFlashRecallUnit
+        ? std::max(1, pinned_chunks)
+        : std::max(kKvFlashRecallUnit, pinned_chunks);
+}
 
 // Chunks of exact tail window next to `recall_chunks` of recalled blocks and `reserve` chunks of room.
 // `pin_reserve_chunks` (the preamble reserve, rows of the pool held for the pins) is taken off the
@@ -246,7 +254,7 @@ inline int kvflash_recall_first_window(const KvFlashRecallIn & in) {
 inline KvFlashRecallPlan kvflash_recall_plan(const std::vector<float> & scores, const KvFlashRecallIn & in) {
     KvFlashRecallPlan r;
     r.k_units = in.unit > 0 ? in.recall_chunks / in.unit : 0;
-    r.first_chunk = kvflash_recall_first_chunk(in.pinned_chunks);
+    r.first_chunk = kvflash_recall_first_chunk(in.pinned_chunks, in.unit);
     r.first_window = kvflash_recall_first_window(in);
     r.tail = in.cur_chunk - r.first_window;
     r.picked = kvflash_recall_pick(scores, r.first_window, r.k_units, in.unit, r.first_chunk);

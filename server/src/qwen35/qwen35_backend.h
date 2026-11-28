@@ -369,6 +369,7 @@ protected:
         double m5_ms = 0.0;
         const char * apply_note = "";
         bool   m4_track = false;              // mode 4: keep this prefill's tail queries and prompt for the next request (kvflash_m4_last_)
+        bool   m4_post_prefill = false;       // mode 4 continuing turn: prefill once, then score fresh q_tail & recall before decode
         luce::common::KvFlashUqPlan uqp;
         bool   uq_capturing = false;
         int    uq_cut = -1;
@@ -411,6 +412,7 @@ protected:
     int  kvflash_live_cut_peek(const std::vector<int32_t> & prompt) const;
     bool kvflash_live_restore_active_ = false;   // set around the suffix do_prefill
     int  kvflash_gen_ckpt_pos_ = -1;             // S9: G of the last generation-end rung
+    void kvflash_capture_gen_ckpt(bool has_images, int n_gen);
     // Upload the slot-validity mask (host rebuild on epoch or decode-position change, device
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask(int cur_pos);
