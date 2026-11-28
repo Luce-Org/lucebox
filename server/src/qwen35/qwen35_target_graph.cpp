@@ -40,6 +40,7 @@
 #include "qwen35moe_ffn.h"
 #include "glue_fusions.h"
 #include "common/chain_rollback_policy.h"
+#include "common/concurrency/paged_kv_pool.h"
 #include "common/kv_rotation.h"
 #include "common/kvflash_query_capture.h"
 #include "common/specla_commit_cuda.h"
@@ -460,6 +461,7 @@ static void refresh_specla_state_ptrs(TargetCache & c) {
 void free_target_cache(TargetCache & c) {
     // SWAP_SNAPSHOT: hand each buffer back its own tensors first.
     gdn_commit::unswap_pairs(c.ssm_state, c.ssm_state_snap, c.ssm_state_swapped);
+    c.pinned_transfer.release();
     if (c.base_buf)     { ggml_backend_buffer_free(c.base_buf);     c.base_buf     = nullptr; }
     if (c.base_ctx)     { ggml_free(c.base_ctx);                   c.base_ctx     = nullptr; }
     if (c.rollback_buf) { ggml_backend_buffer_free(c.rollback_buf); c.rollback_buf = nullptr; }
@@ -3400,19 +3402,6 @@ size_t blocks_for_prefix(int tokens, int block_size) {
         ((size_t)tokens + (size_t)block_size - 1) / (size_t)block_size;
 }
 
-size_t contiguous_block_run(
-        const std::vector<uint32_t> & blocks,
-        size_t first,
-        size_t block_count) {
-    size_t run = 1;
-    while (first + run < block_count &&
-           (uint64_t)blocks[first + run] ==
-               (uint64_t)blocks[first + run - 1] + 1) {
-        ++run;
-    }
-    return run;
-}
-
 bool paged_tensor_layout_matches(
         const ggml_tensor * dense, const ggml_tensor * paged,
         int tokens, bool longer_ok = false) {
@@ -3452,11 +3441,11 @@ ggml_backend_buffer_type_t paged_snapshot_buffer_type() {
 enum class PagedCopyDirection { gather, scatter };
 
 void copy_paged_tensor(
-        ggml_backend_t backend,
+        PinnedTransfer & transfer,
         ggml_tensor * dense, ggml_tensor * paged,
         const std::vector<uint32_t> & blocks,
         int block_size, int tokens, PagedCopyDirection direction,
-        size_t start_block = 0) {
+        size_t start_block = 0, int dense_row_offset = 0) {
     const size_t block_count = blocks_for_prefix(tokens, block_size);
     for (int head = 0; head < (int)paged->ne[2]; ++head) {
         for (size_t logical = start_block; logical < block_count;) {
@@ -3472,15 +3461,13 @@ void copy_paged_tensor(
                 (size_t)head * paged->nb[2] + paged_row * paged->nb[1];
             const size_t dense_offset =
                 (size_t)head * dense->nb[2] +
-                (size_t)logical_row * dense->nb[1];
+                (size_t)(logical_row - dense_row_offset) * dense->nb[1];
             if (direction == PagedCopyDirection::gather) {
-                ggml_backend_tensor_get_async(
-                    backend, paged, (char *)dense->data + dense_offset,
-                    paged_offset, bytes);
+                transfer.d2h(paged, paged_offset,
+                             (char *)dense->data + dense_offset, bytes);
             } else {
-                ggml_backend_tensor_set_async(
-                    backend, paged, (const char *)dense->data + dense_offset,
-                    paged_offset, bytes);
+                transfer.h2d(paged, paged_offset,
+                             (const char *)dense->data + dense_offset, bytes);
             }
             logical += run;
         }
@@ -3569,25 +3556,33 @@ bool create_paged_snapshot_layout(
 bool paged_snapshot_matches(
         const TargetCache & cache, const PrefixSnapshot & snap,
         const std::vector<uint32_t> & blocks, int block_size, int tokens,
-        const PrefixSnapshot * kv_from = nullptr) {
+        const PrefixSnapshot * kv_from = nullptr,
+        bool check_kv_tensors = true) {
     const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
     if (!paged_cache_pairs_complete(cache) ||
-        kv.attn_k_snap.size() != cache.attn_k.size() ||
-        kv.attn_v_snap.size() != cache.attn_v.size() ||
         snap.ssm_state_snap.size() != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size()) return false;
+    if (check_kv_tensors &&
+        (kv.attn_k_snap.size() != cache.attn_k.size() ||
+         kv.attn_v_snap.size() != cache.attn_v.size())) return false;
 
     for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!check_kv_tensors) continue;
         const bool present = cache.attn_k[i] != nullptr;
+        if (present &&
+            (!paged_rows_fit(cache.attn_k[i], blocks, block_size, tokens) ||
+             !paged_rows_fit(cache.attn_v[i], blocks, block_size, tokens))) {
+            return false;
+        }
         if ((kv.attn_k_snap[i] != nullptr) != present ||
             (kv.attn_v_snap[i] != nullptr) != present) return false;
+        const int expected_rows = kv.kv_start > 0 ? (tokens - kv.kv_start) : tokens;
         if (present &&
-            (!paged_tensor_layout_matches(
-                 kv.attn_k_snap[i], cache.attn_k[i], tokens, kv_from != nullptr) ||
+            (expected_rows <= 0 ||
              !paged_tensor_layout_matches(
-                 kv.attn_v_snap[i], cache.attn_v[i], tokens, kv_from != nullptr) ||
-             !paged_rows_fit(cache.attn_k[i], blocks, block_size, tokens) ||
-             !paged_rows_fit(cache.attn_v[i], blocks, block_size, tokens))) {
+                 kv.attn_k_snap[i], cache.attn_k[i], expected_rows, kv_from != nullptr) ||
+             !paged_tensor_layout_matches(
+                 kv.attn_v_snap[i], cache.attn_v[i], expected_rows, kv_from != nullptr))) {
             return false;
         }
     }
@@ -3642,7 +3637,8 @@ bool snapshot_paged_target_cache(
         int block_size,
         int token_count,
         PrefixSnapshot & snap,
-        const PrefixSnapshot * base_kv) {
+        const PrefixSnapshot * base_kv,
+        size_t pinned_full_blocks) {
     if (!cache.backend || cache.n_seq_slots < 1 || seq_slot < 0 ||
         seq_slot >= cache.n_seq_slots || token_count <= 0 ||
         token_count > cache.max_ctx || block_size <= 0 ||
@@ -3651,16 +3647,24 @@ bool snapshot_paged_target_cache(
         set_last_error("snapshot_paged_target_cache: invalid arguments");
         return false;
     }
+    const bool force_state_only = (pinned_full_blocks == std::numeric_limits<size_t>::max());
+    const size_t full_blocks = (size_t)(token_count / block_size);
+    const size_t skip_full = force_state_only ? 0 : std::min(pinned_full_blocks, full_blocks);
+    const int kv_start_row = (int)(skip_full * (size_t)block_size);
+    const int kv_rows = force_state_only ? 0 : (token_count - kv_start_row);
+    const bool skip_kv = force_state_only || (kv_rows <= 0);
     const bool needs_alloc = !snap.ctx ||
         snap.layout != PrefixSnapshot::Layout::paged ||
         snap.cur_pos != token_count ||
+        snap.kv_start != kv_start_row ||
+        snap.state_only != skip_kv ||
         snap.attn_k_snap.size() != cache.attn_k.size() ||
         snap.attn_v_snap.size() != cache.attn_v.size() ||
         snap.ssm_state_snap.size() != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size();
     if (needs_alloc) {
         free_prefix_snapshot(snap);
-        if (!create_paged_snapshot_layout(cache, token_count, snap)) {
+        if (!create_paged_snapshot_layout(cache, skip_kv ? 1 : kv_rows, snap, skip_kv)) {
             set_last_error("paged PrefixSnapshot ggml_init failed");
             return false;
         }
@@ -3672,9 +3676,11 @@ bool snapshot_paged_target_cache(
             return false;
         }
     }
+    snap.kv_start = kv_start_row;
+    snap.state_only = skip_kv;
 
     if (!paged_snapshot_matches(
-            cache, snap, block_table, block_size, token_count)) {
+            cache, snap, block_table, block_size, token_count, nullptr, !skip_kv)) {
         set_last_error("paged snapshot layout mismatch");
         free_prefix_snapshot(snap);
         return false;
@@ -3683,7 +3689,7 @@ bool snapshot_paged_target_cache(
     // If an existing host-RAM paged ancestor snapshot covers [0 .. base_blocks * block_size),
     // DMA only the delta tail blocks from GPU and overlap host-RAM memcpy of the shared prefix.
     size_t base_blocks = 0;
-    if (base_kv && base_kv != &snap && base_kv->ctx &&
+    if (kv_start_row == 0 && base_kv && base_kv != &snap && base_kv->ctx && base_kv->kv_start == 0 &&
         base_kv->layout == PrefixSnapshot::Layout::paged && !base_kv->state_only &&
         base_kv->cur_pos > 0 && base_kv->cur_pos < token_count &&
         base_kv->kv_k_type == cache.kv_k_type &&
@@ -3710,50 +3716,55 @@ bool snapshot_paged_target_cache(
         }
     }
 
-    // Queue all async GPU->host DMAs first (delta tail K/V + recurrent states),
-    // then overlap host-RAM memcpy of shared prefix blocks before synchronizing once.
-    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
-        if (!cache.attn_k[i]) continue;
-        copy_paged_tensor(
-            cache.backend, snap.attn_k_snap[i], cache.attn_k[i],
-            block_table, block_size, token_count,
-            PagedCopyDirection::gather, base_blocks);
-        copy_paged_tensor(
-            cache.backend, snap.attn_v_snap[i], cache.attn_v[i],
-            block_table, block_size, token_count,
-            PagedCopyDirection::gather, base_blocks);
-    }
-    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
-        if (!cache.ssm_state[i]) continue;
-        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
-        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
-        ggml_backend_tensor_get_async(
-            cache.backend,
-            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
-            (size_t)seq_slot * ssm_bytes, ssm_bytes);
-        ggml_backend_tensor_get_async(
-            cache.backend,
-            cache.conv_state[i], snap.conv_state_snap[i]->data,
-            (size_t)seq_slot * conv_bytes, conv_bytes);
-    }
-    if (base_blocks > 0) {
-        const size_t prefix_rows = base_blocks * (size_t)block_size;
-        for (size_t i = 0; i < snap.attn_k_snap.size(); ++i) {
-            if (!snap.attn_k_snap[i]) continue;
-            auto copy_prefix = [&](const ggml_tensor * src, ggml_tensor * dst) {
-                const size_t head_bytes = prefix_rows * dst->nb[1];
-                for (int64_t h = 0; h < dst->ne[2]; ++h) {
-                    std::memcpy(
-                        (char *)dst->data + (size_t)h * dst->nb[2],
-                        (const char *)src->data + (size_t)h * src->nb[2],
-                        head_bytes);
-                }
-            };
-            copy_prefix(base_kv->attn_k_snap[i], snap.attn_k_snap[i]);
-            copy_prefix(base_kv->attn_v_snap[i], snap.attn_v_snap[i]);
+    // Stream all GPU->host DMAs through reusable double-buffered pinned staging
+    // (delta tail K/V + recurrent states), then overlap host-RAM memcpy of
+    // shared prefix blocks before finishing the final pinned slot.
+    {
+        auto xfer = cache.pinned_transfer.scope(cache.backend);
+        if (!skip_kv) {
+            const size_t gather_start = kv_start_row > 0 ? skip_full : base_blocks;
+            for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+                if (!cache.attn_k[i]) continue;
+                copy_paged_tensor(
+                    cache.pinned_transfer, snap.attn_k_snap[i], cache.attn_k[i],
+                    block_table, block_size, token_count,
+                    PagedCopyDirection::gather, gather_start, kv_start_row);
+                copy_paged_tensor(
+                    cache.pinned_transfer, snap.attn_v_snap[i], cache.attn_v[i],
+                    block_table, block_size, token_count,
+                    PagedCopyDirection::gather, gather_start, kv_start_row);
+            }
         }
+        for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+            if (!cache.ssm_state[i]) continue;
+            const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+            const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+            xfer.d2h(
+                cache.ssm_state[i], (size_t)seq_slot * ssm_bytes,
+                snap.ssm_state_snap[i]->data, ssm_bytes);
+            xfer.d2h(
+                cache.conv_state[i], (size_t)seq_slot * conv_bytes,
+                snap.conv_state_snap[i]->data, conv_bytes);
+        }
+        if (base_blocks > 0) {
+            const size_t prefix_rows = base_blocks * (size_t)block_size;
+            for (size_t i = 0; i < snap.attn_k_snap.size(); ++i) {
+                if (!snap.attn_k_snap[i]) continue;
+                auto copy_prefix = [&](const ggml_tensor * src, ggml_tensor * dst) {
+                    const size_t head_bytes = prefix_rows * dst->nb[1];
+                    for (int64_t h = 0; h < dst->ne[2]; ++h) {
+                        std::memcpy(
+                            (char *)dst->data + (size_t)h * dst->nb[2],
+                            (const char *)src->data + (size_t)h * src->nb[2],
+                            head_bytes);
+                    }
+                };
+                copy_prefix(base_kv->attn_k_snap[i], snap.attn_k_snap[i]);
+                copy_prefix(base_kv->attn_v_snap[i], snap.attn_v_snap[i]);
+            }
+        }
+        xfer.finish();
     }
-    ggml_backend_synchronize(cache.backend);
     snap.cur_pos = token_count;
     snap.last_tok = -1;
     snap.kv_k_type = cache.kv_k_type;
@@ -3772,11 +3783,12 @@ bool replace_paged_target_cache(
         int token_count,
         PrefixSnapshot & destination,
         PrefixSnapshot * displaced,
-        const PrefixSnapshot * base_kv) {
+        const PrefixSnapshot * base_kv,
+        size_t pinned_full_blocks) {
     PrefixSnapshot candidate;
     if (!snapshot_paged_target_cache(
             cache, seq_slot, block_table, block_size, token_count,
-            candidate, base_kv)) {
+            candidate, base_kv, pinned_full_blocks)) {
         free_prefix_snapshot(candidate);
         return false;
     }
@@ -3798,62 +3810,82 @@ bool restore_paged_target_cache(
         int seq_slot,
         const std::vector<uint32_t> & block_table,
         int block_size,
-        const PrefixSnapshot * kv_from) {
-    // A state-only checkpoint takes its attention rows [0, cur_pos) from a
-    // deeper whole checkpoint of the same cache geometry.
-    if (snap.state_only) {
-        if (!kv_from || kv_from == &snap || !kv_from->ctx || kv_from->state_only ||
-            kv_from->layout != PrefixSnapshot::Layout::paged ||
-            kv_from->cur_pos < snap.cur_pos ||
-            kv_from->max_ctx != snap.max_ctx || kv_from->kv_k_type != snap.kv_k_type) {
-            set_last_error("restore_paged_target_cache: state-only checkpoint without attention rows");
-            return false;
-        }
-    } else {
-        kv_from = nullptr;
-    }
-    const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
+        const PrefixSnapshot * kv_from,
+        size_t shared_prefix_blocks) {
     if (!snap.ctx || snap.layout != PrefixSnapshot::Layout::paged ||
         !cache.backend ||
         cache.n_seq_slots < 1 ||
         seq_slot < 0 || seq_slot >= cache.n_seq_slots || block_size <= 0 ||
         snap.cur_pos <= 0 || snap.cur_pos > cache.max_ctx ||
-        snap.max_ctx != cache.max_ctx || snap.kv_k_type != cache.kv_k_type ||
-        block_table.size() < blocks_for_prefix(snap.cur_pos, block_size) ||
-        !paged_snapshot_matches(
-            cache, snap, block_table, block_size, snap.cur_pos, kv_from)) {
+        snap.max_ctx != cache.max_ctx || snap.kv_k_type != cache.kv_k_type) {
         set_last_error("restore_paged_target_cache: incompatible checkpoint");
         return false;
     }
-    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
-        if (!cache.attn_k[i]) continue;
-        copy_paged_tensor(
-            cache.backend, kv.attn_k_snap[i], cache.attn_k[i],
-            block_table, block_size, snap.cur_pos,
-            PagedCopyDirection::scatter);
-        copy_paged_tensor(
-            cache.backend, kv.attn_v_snap[i], cache.attn_v[i],
-            block_table, block_size, snap.cur_pos,
-            PagedCopyDirection::scatter);
+    const size_t total_blocks = blocks_for_prefix(snap.cur_pos, block_size);
+    const size_t skip_blocks = std::min(shared_prefix_blocks, total_blocks);
+    const bool need_kv_copy = skip_blocks < total_blocks;
+    if (snap.kv_start > 0 && (int)(skip_blocks * (size_t)block_size) < snap.kv_start) {
+        set_last_error("restore_paged_target_cache: UMA pinned prefix blocks evicted");
+        return false;
     }
-    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
-        if (!cache.ssm_state[i]) continue;
-        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
-        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
-        ggml_backend_tensor_set_async(
-            cache.backend,
-            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
-            (size_t)seq_slot * ssm_bytes, ssm_bytes);
-        ggml_backend_tensor_set_async(
-            cache.backend,
-            cache.conv_state[i], snap.conv_state_snap[i]->data,
-            (size_t)seq_slot * conv_bytes, conv_bytes);
+    // A state-only checkpoint takes its attention rows [0, cur_pos) from a
+    // deeper whole checkpoint unless every KV block is already shared on GPU.
+    if (snap.state_only) {
+        if (need_kv_copy) {
+            if (!kv_from || kv_from == &snap || !kv_from->ctx || kv_from->state_only ||
+                kv_from->layout != PrefixSnapshot::Layout::paged ||
+                kv_from->cur_pos < snap.cur_pos ||
+                kv_from->max_ctx != snap.max_ctx || kv_from->kv_k_type != snap.kv_k_type) {
+                set_last_error("restore_paged_target_cache: state-only checkpoint without attention rows");
+                return false;
+            }
+        } else {
+            kv_from = nullptr;
+        }
+    } else {
+        kv_from = nullptr;
     }
-    ggml_backend_synchronize(cache.backend);
+    const PrefixSnapshot & kv = kv_from ? *kv_from : snap;
+    if (block_table.size() < total_blocks ||
+        !paged_snapshot_matches(
+            cache, snap, block_table, block_size, snap.cur_pos, kv_from,
+            need_kv_copy)) {
+        set_last_error("restore_paged_target_cache: incompatible checkpoint");
+        return false;
+    }
+    {
+        auto xfer = cache.pinned_transfer.scope(cache.backend);
+        if (need_kv_copy) {
+            for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+                if (!cache.attn_k[i]) continue;
+                copy_paged_tensor(
+                    cache.pinned_transfer, kv.attn_k_snap[i], cache.attn_k[i],
+                    block_table, block_size, snap.cur_pos,
+                    PagedCopyDirection::scatter, skip_blocks, kv.kv_start);
+                copy_paged_tensor(
+                    cache.pinned_transfer, kv.attn_v_snap[i], cache.attn_v[i],
+                    block_table, block_size, snap.cur_pos,
+                    PagedCopyDirection::scatter, skip_blocks, kv.kv_start);
+            }
+        }
+        for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+            if (!cache.ssm_state[i]) continue;
+            const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+            const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+            xfer.h2d(
+                cache.ssm_state[i], (size_t)seq_slot * ssm_bytes,
+                snap.ssm_state_snap[i]->data, ssm_bytes);
+            xfer.h2d(
+                cache.conv_state[i], (size_t)seq_slot * conv_bytes,
+                snap.conv_state_snap[i]->data, conv_bytes);
+        }
+        xfer.finish();
+    }
     return true;
 }
 
 void free_prefix_snapshot(PrefixSnapshot & snap) {
+    snap.generation = next_prefix_snapshot_generation();
     if (snap.buf) { ggml_backend_buffer_free(snap.buf); snap.buf = nullptr; }
     if (snap.ctx) { ggml_free(snap.ctx);                snap.ctx = nullptr; }
     snap.attn_k_snap.clear();

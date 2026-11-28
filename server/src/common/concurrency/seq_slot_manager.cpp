@@ -31,11 +31,13 @@ int SeqSlotManager::decoding_count() const {
 }
 
 uint32_t SeqSlotManager::decode_headroom_capacity(int logical_tokens) const {
+    const uint64_t cap = max_resident_tokens_ > 0
+        ? static_cast<uint64_t>(std::min(max_ctx_, max_resident_tokens_))
+        : static_cast<uint64_t>(max_ctx_);
     const uint64_t extended =
         static_cast<uint64_t>(std::max(0, logical_tokens)) +
         kv_.block_size();
-    return static_cast<uint32_t>(std::min<uint64_t>(
-        static_cast<uint64_t>(max_ctx_), extended));
+    return static_cast<uint32_t>(std::min<uint64_t>(cap, extended));
 }
 
 bool SeqSlotManager::capacity_fits_pool(uint32_t token_capacity) const {
@@ -106,7 +108,7 @@ bool SeqSlotManager::has_prefill_prompt_at_least(int tokens) const {
 
 SeqEngine::AdmitResult SeqSlotManager::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
-        const SamplerCfg & sampler) {
+        const SamplerCfg & sampler, uint32_t pre_shared_blocks) {
     using AdmitStatus = SeqEngine::AdmitResult::Status;
     SeqEngine::AdmitResult r;
     // Parked requests already own a response and must resume before new
@@ -127,13 +129,15 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
         return r;
     }
     const int prompt_len = static_cast<int>(prompt.size());
+    const int resident_prompt_len = max_resident_tokens_ > 0
+        ? std::min(prompt_len, max_resident_tokens_) : prompt_len;
 
     // A prompt larger than the whole pool can NEVER be admitted; waiting
     // for other sequences to drain would stall the queue forever and then
     // fail anyway. Hard-fail it up front instead of reporting busy.
     const uint64_t pool_capacity =
         (uint64_t)kv_.physical_block_count() * kv_.block_size();
-    if ((uint64_t)prompt_len > pool_capacity) {
+    if ((uint64_t)resident_prompt_len > pool_capacity) {
         r.status = AdmitStatus::capacity_exceeded;
         r.error = "prompt needs " + std::to_string(prompt_len) +
                   " KV tokens but the pool holds " +
@@ -166,15 +170,26 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
 
     PagedKvSequenceHandle handle;
     uint32_t reservation_capacity =
-        decode_headroom_capacity(prompt_len);
+        decode_headroom_capacity(resident_prompt_len);
     if (!capacity_fits_pool(reservation_capacity)) {
         // The prompt itself fits, but this physical pool can never hold its
         // following page. Preserve useful prompt-only behavior and report
         // decode exhaustion later if the sequence reaches that boundary.
-        reservation_capacity = static_cast<uint32_t>(prompt_len);
+        reservation_capacity = static_cast<uint32_t>(resident_prompt_len);
+    }
+    const uint32_t max_pre_shared =
+        static_cast<uint32_t>(resident_prompt_len) / kv_.block_size();
+    const uint32_t discount_blocks = std::min(pre_shared_blocks, max_pre_shared);
+    uint32_t acquire_capacity = reservation_capacity;
+    if (discount_blocks > 0) {
+        const uint32_t total_blocks = reservation_capacity == 0 ? 0 :
+            1 + (reservation_capacity - 1) / kv_.block_size();
+        const uint32_t private_blocks =
+            total_blocks > discount_blocks ? total_blocks - discount_blocks : 0;
+        acquire_capacity = private_blocks * kv_.block_size();
     }
     const PagedKvStatus status = kv_.acquire_reserved(
-        request_id, reservation_capacity, handle);
+        request_id, acquire_capacity, handle);
     if (status != PagedKvStatus::Ok) {
         r.status = status == PagedKvStatus::SequenceSlotsExhausted ||
                            status == PagedKvStatus::BlocksExhausted
@@ -192,14 +207,13 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     s.original_prompt_len = prompt_len;
     s.prompt_len = prompt_len;
     s.sampler = sampler;
-    s.sample_history = prompt;
+    s.sample_history.assign(prompt.begin(), prompt.end());
     // Same predicate the engine uses to pick CPU sampling over GPU argmax:
     // a seed only means anything when the sampler actually draws. Without
     // one, each request gets its own stream, as on the single-lane path.
+    // Greedy slots never draw, so skip the entropy syscall and MT19937 init.
     if (sampler.needs_logit_processing()) {
         s.rng.seed(request_rng_seed(sampler));
-    } else {
-        s.rng.seed(std::random_device{}());
     }
 
     r.status = AdmitStatus::admitted;
@@ -247,6 +261,22 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
     return out;
 }
 
+bool SeqSlotManager::rollback_prefill(int slot, int n_tokens) {
+    if (!is_prefilling(slot) || n_tokens < 1) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (n_tokens > s.cur_pos) return false;
+    const PagedKvStatus status =
+        kv_.rollback_append(s.handle, static_cast<uint32_t>(n_tokens));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr,
+            "[parallel] slot %d prefill rollback failed: %s\n",
+            slot, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos -= n_tokens;
+    return true;
+}
+
 SeqSlotManager::PrefillChunk SeqSlotManager::seed_restored_prefix(
         int slot, int restored_tokens) {
     if (!is_prefilling(slot) || slots_[(size_t)slot].cur_pos != 0 ||
@@ -255,6 +285,34 @@ SeqSlotManager::PrefillChunk SeqSlotManager::seed_restored_prefix(
         return {};
     }
     return append_prefill(slot, restored_tokens);
+}
+
+SeqSlotManager::PrefillChunk SeqSlotManager::seed_shared_prefix(
+        int slot, const uint32_t * shared_blocks, uint32_t shared_block_count,
+        int restored_tokens) {
+    PrefillChunk out;
+    if (!is_prefilling(slot) || slots_[(size_t)slot].cur_pos != 0 ||
+        restored_tokens <= 0 ||
+        restored_tokens >= slots_[(size_t)slot].prompt_len) {
+        return out;
+    }
+    SeqSlot & s = slots_[(size_t)slot];
+    if (kv_.seed_shared_prefix(s.handle, shared_blocks, shared_block_count,
+                               static_cast<uint32_t>(restored_tokens)) != PagedKvStatus::Ok) {
+        return out;
+    }
+    PagedKvSequenceSnapshot snap;
+    if (kv_.sequence(s.handle, snap) != PagedKvStatus::Ok) {
+        return out;
+    }
+    out.first_new_block = 0;
+    out.new_blocks.reserve(snap.block_table.size());
+    for (uint32_t b : snap.block_table) {
+        out.new_blocks.push_back(static_cast<int32_t>(b));
+    }
+    s.cur_pos = restored_tokens;
+    out.ok = true;
+    return out;
 }
 
 void SeqSlotManager::commit_prefill(int slot) {
@@ -322,7 +380,41 @@ SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
 
 SeqSlotManager::StepAppend SeqSlotManager::append_token(
         int slot, int32_t fed_token) {
-    return append_tokens(slot, &fed_token, 1);
+    StepAppend out;
+    if (!is_active(slot) || !slots_[(size_t)slot].decoding()) return out;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (!s.staged_tokens.empty() || s.cur_pos < 0 || s.cur_pos >= max_ctx_) {
+        return out;
+    }
+    // Single-token fast path: endpoint-only append avoids allocating
+    // write_slots, physical_rows, and new_blocks on every decode step.
+    PagedKvAppendResult app = kv_.append(
+        s.handle, 1u, /*only_first_last_slots=*/true);
+    if (!app || app.token_count != 1u) {
+        out.busy = app.status == PagedKvStatus::BlocksExhausted;
+        return out;
+    }
+    if (app.first.logical_position != static_cast<uint32_t>(s.cur_pos)) {
+        const PagedKvStatus rollback = kv_.rollback_append(s.handle, 1u);
+        if (rollback != PagedKvStatus::Ok) {
+            std::fprintf(stderr,
+                "[parallel] slot %d failed to roll back invalid append: %s\n",
+                slot, paged_kv_status_string(rollback));
+        }
+        return out;
+    }
+    s.staged_tokens.assign(1, fed_token);
+    out.ok = true;
+    out.count = 1;
+    out.physical_row = static_cast<int64_t>(app.first.physical_token_index);
+    out.position = s.cur_pos;
+    if (app.first.block_offset == 0) {
+        out.first_new_block = static_cast<int>(
+            app.first.logical_position / kv_.block_size());
+        out.new_block = static_cast<int32_t>(app.first.physical_block);
+        out.new_block_index = out.first_new_block;
+    }
+    return out;
 }
 
 void SeqSlotManager::commit_step(int slot) {
@@ -366,15 +458,23 @@ bool SeqSlotManager::reserve_decode(const std::vector<int> & growth) {
             tokens > max_ctx_ - s.cur_pos) return false;
         uint32_t owned = 0;
         if (kv_.owned_block_count(s.handle, owned) != PagedKvStatus::Ok) return false;
-        const uint64_t extent = static_cast<uint64_t>(s.cur_pos) + tokens;
+        const uint64_t cap = max_resident_tokens_ > 0
+            ? static_cast<uint64_t>(std::min(max_ctx_, max_resident_tokens_))
+            : static_cast<uint64_t>(max_ctx_);
+        const uint64_t extent = std::min<uint64_t>(
+            static_cast<uint64_t>(s.cur_pos) + tokens, cap);
         const uint64_t needed = (extent + kv_.block_size() - 1) / kv_.block_size();
         if (needed > owned) additional += needed - owned;
     }
     if (additional > kv_.free_block_count()) return false;
     for (size_t i = 0; i < slots_.size(); ++i) {
         const SeqSlot & s = slots_[i];
-        if (growth[i] && kv_.reserve_capacity(s.handle,
-                static_cast<uint32_t>(s.cur_pos + growth[i])) != PagedKvStatus::Ok) {
+        const uint64_t cap = max_resident_tokens_ > 0
+            ? static_cast<uint64_t>(std::min(max_ctx_, max_resident_tokens_))
+            : static_cast<uint64_t>(max_ctx_);
+        const uint32_t res_cap = static_cast<uint32_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(s.cur_pos) + growth[i], cap));
+        if (growth[i] && kv_.reserve_capacity(s.handle, res_cap) != PagedKvStatus::Ok) {
             return false; // preflight makes a capacity failure impossible
         }
     }
@@ -391,17 +491,16 @@ bool SeqSlotManager::detach_kv(int slot) {
 }
 
 uint32_t SeqSlotManager::resume_token_capacity(const SeqSlot & s) const {
+    const int cap = max_resident_tokens_ > 0
+        ? std::min(max_ctx_, max_resident_tokens_) : max_ctx_;
+    const int eff_prompt = std::min(s.prompt_len, cap);
     if (s.recomputing()) {
-        // Re-prefill replays the folded history and then decodes, so reserve
-        // the same rolling headroom an admission would.
-        const uint32_t headroom = decode_headroom_capacity(s.prompt_len);
+        const uint32_t headroom = decode_headroom_capacity(eff_prompt);
         return capacity_fits_pool(headroom) ? headroom
-                                            : (uint32_t)s.prompt_len;
+                                            : (uint32_t)eff_prompt;
     }
-    // A partial prefill must retain its entire prompt reservation. A decoder
-    // must have at least one next-token row, or restoring it cannot progress.
     return static_cast<uint32_t>(
-        std::max(s.prompt_len, std::min(max_ctx_, s.cur_pos + 1)));
+        std::max(eff_prompt, std::min(cap, s.cur_pos + 1)));
 }
 
 bool SeqSlotManager::attach_kv(int slot) {
@@ -472,13 +571,40 @@ bool SeqSlotManager::kv_restore_feasible(int slot) const {
     const uint64_t capacity = resume_token_capacity(s);
     const uint64_t needed = capacity == 0 ? 0 :
         1 + (capacity - 1) / kv_.block_size();
-    // Restoring into a tight pool would re-trigger parking on the next
-    // step: keep one growth block per resident plus the resumed slot itself.
-    uint64_t margin = 1;
+    uint64_t active_residents = 0;
     for (const SeqSlot & o : slots_) {
-        margin += o.active() && !o.parked() ? 1 : 0;
+        active_residents += o.active() && !o.parked() ? 1 : 0;
     }
-    return needed + margin <= kv_.free_block_count();
+    // Restoring into a tight pool while peers are actively decoding (especially
+    // with speculative bursts) would immediately re-trigger suspension. Keep
+    // hysteresis headroom proportional to resident count and resumed footprint;
+    // when alone (active_residents == 0), a single growth block suffices.
+    uint64_t margin = 1;
+    if (active_residents > 0) {
+        const uint64_t cohort = active_residents + 1;
+        margin = std::max<uint64_t>(
+            2 * cohort,
+            std::min<uint64_t>(needed / 8, 64 * cohort));
+    }
+    return needed + margin <=
+        static_cast<uint64_t>(kv_.free_block_count()) +
+        kv_.reclaimable_block_count();
+}
+
+SeqEngine::KvOffloadFootprint SeqSlotManager::kv_offload_footprint(int slot) const {
+    if (!is_active(slot)) return {0, 0};
+    const SeqSlot & s = slots_[(size_t)slot];
+    if (s.parked()) return {0, 0};
+    uint32_t owned = 0, exclusive = 0;
+    if (kv_.owned_block_count(s.handle, owned) != PagedKvStatus::Ok ||
+        kv_.exclusive_block_count(s.handle, exclusive) != PagedKvStatus::Ok) {
+        return {};
+    }
+    const int64_t block = static_cast<int64_t>(kv_.block_size());
+    return {
+        static_cast<int64_t>(owned) * block,
+        static_cast<int64_t>(exclusive) * block,
+    };
 }
 
 void SeqSlotManager::retire(int slot) {
@@ -490,7 +616,47 @@ void SeqSlotManager::retire(int slot) {
         std::fprintf(stderr, "[parallel] slot %d release failed: %s\n",
                      slot, paged_kv_status_string(status));
     }
+    // The history buffer is kept for the slot's next request unless one long
+    // conversation grew it past kMaxRetainedHistory tokens.
+    constexpr size_t kMaxRetainedHistory = 65536;
+    std::vector<int32_t> history = std::move(s.sample_history);
+    history.clear();
+    if (history.capacity() > kMaxRetainedHistory) history = {};
     s = SeqSlot{};
+    s.sample_history = std::move(history);
+}
+
+
+bool SeqSlotManager::rewind_to_prefill(int slot, int r_pos) {
+    if (slot < 0 || slot >= (int)slots_.size()) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (!s.decoding() || r_pos < 0 || r_pos > s.original_prompt_len) return false;
+    s.cur_pos = r_pos;
+    s.prompt_len = s.original_prompt_len;
+    if ((int)s.sample_history.size() > s.original_prompt_len) {
+        s.sample_history.resize((size_t)s.original_prompt_len);
+    }
+    s.staged_tokens.clear();
+    s.phase = SeqSlotPhase::prefill;
+    return true;
+}
+
+
+bool SeqSlotManager::seed_evicted_prefix(
+        int slot, int restored_tokens,
+        const std::vector<uint8_t> & resident_mask,
+        std::vector<uint32_t> & out_block_table) {
+    if (!is_prefilling(slot) || slots_[(size_t)slot].cur_pos != 0 ||
+        restored_tokens <= 0 || restored_tokens >= slots_[(size_t)slot].prompt_len) {
+        return false;
+    }
+    SeqSlot & s = slots_[(size_t)slot];
+    if (kv_.seed_evicted_prefix(s.handle, static_cast<uint32_t>(restored_tokens),
+                                resident_mask, out_block_table) != PagedKvStatus::Ok) {
+        return false;
+    }
+    s.cur_pos = restored_tokens;
+    return true;
 }
 
 }  // namespace luce::common

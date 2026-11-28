@@ -3,7 +3,7 @@
 #include "backend_ipc.h"
 #include "moe_expert_compute.h"
 
-#include "dflash_draft_ipc.h"
+#include "common/dflash/dflash_draft_ipc.h"
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"

@@ -9,9 +9,9 @@
 #include "common/sampler.h"
 #include "common/adaptive_spec_width.h"
 #include "common/spec_acceptance.h"
-#include "common/dflash_spec_decode.h"
-#include "dflash_draft_graph.h"
-#include "dflash_feature_ring.h"
+#include "common/dflash/dflash_spec_decode.h"
+#include "common/dflash/dflash_draft_graph.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "graph_builders.h"
 #include "kv_quant.h"
 

@@ -92,34 +92,35 @@ struct StepPlanLimits {
 // capacity in engine-owned quanta. Strict FIFO determines cohort membership;
 // a rotating cursor prevents the oldest member from always winning a partial
 // final round.
-inline std::vector<PrefillSlice> plan_prefill_slices(
+inline void plan_prefill_slices_into(
         const std::vector<PrefillCandidate> & candidates,
         const StepPlanLimits & limits,
+        std::vector<PrefillSlice> & slices,
         size_t round_robin_start = 0) {
-    std::vector<PrefillSlice> slices;
+    slices.clear();
     if (candidates.empty() || limits.max_prefill_sequences <= 0 ||
         limits.max_prefill_tokens_per_sequence <= 0 ||
         limits.max_prefill_tokens_total <= 0 ||
         limits.prefill_allocation_quantum <= 0) {
-        return slices;
+        return;
     }
 
-    std::vector<PrefillCandidate> ordered = candidates;
-    std::stable_sort(ordered.begin(), ordered.end(),
+    std::vector<PrefillCandidate> sorted(candidates.begin(), candidates.end());
+    std::stable_sort(sorted.begin(), sorted.end(),
         [](const PrefillCandidate & a, const PrefillCandidate & b) {
             if (a.order != b.order) return a.order < b.order;
             return a.slot < b.slot;
         });
 
     const int selected = std::min(
-        (int)ordered.size(), limits.max_prefill_sequences);
+        (int)sorted.size(), limits.max_prefill_sequences);
     const int64_t selected_capacity =
         (int64_t)selected * limits.max_prefill_tokens_per_sequence;
     int budget = (int)std::min<int64_t>(
         limits.max_prefill_tokens_total, selected_capacity);
     slices.reserve((size_t)selected);
     for (int i = 0; i < selected; ++i) {
-        slices.push_back({ordered[(size_t)i].slot, 0});
+        slices.push_back({sorted[(size_t)i].slot, 0});
     }
 
     while (budget > 0) {
@@ -146,6 +147,14 @@ inline std::vector<PrefillSlice> plan_prefill_slices(
         std::remove_if(slices.begin(), slices.end(),
             [](const PrefillSlice & slice) { return slice.max_tokens <= 0; }),
         slices.end());
+}
+
+inline std::vector<PrefillSlice> plan_prefill_slices(
+        const std::vector<PrefillCandidate> & candidates,
+        const StepPlanLimits & limits,
+        size_t round_robin_start = 0) {
+    std::vector<PrefillSlice> slices;
+    plan_prefill_slices_into(candidates, limits, slices, round_robin_start);
     return slices;
 }
 
@@ -251,6 +260,7 @@ public:
 
     // Release engine-owned payload without touching server policy metadata.
     virtual void discard_prefix_store(PrefixStoreRef) {}
+    virtual bool arm_followup_capture(int /*slot*/, PrefixCaptureTicket /*ticket*/, int /*restored_tokens*/) { return false; }
     // State-only checkpoints. A checkpoint that a deeper one extends repeats
     // its attention rows: drop_prefix_kv() frees them and keeps what the
     // position alone determines, and a restore of it names the deeper
@@ -324,8 +334,13 @@ public:
         // no usable row output. Validation
         // failures occur before mutation; a device/build/compute failure may
         // leave backend state partially advanced, so the caller must retire
-        // every live sequence before invoking step() again.
+        // every live sequence before invoking step() again — unless
+        // `state_clean` is true, meaning the engine guarantees no live slot's
+        // device or host state was mutated (e.g. pre-compute staging/graph
+        // allocation failure cleanly rolled back), allowing the scheduler to
+        // shed prefills and retry decode-only.
         std::string error;
+        bool state_clean = false;
 
         bool ok() const { return error.empty(); }
     };
@@ -357,6 +372,18 @@ public:
         size_t bytes = 0;        // checkpoint payload bytes (0 when recompute)
     };
     virtual KvOffloadState kv_offload_state(int) const { return {}; }
+
+    // Physical KV pool footprint for offload victim ranking: `total_tokens`
+    // counts all blocks held by the slot (including shared prefix blocks);
+    // `reclaimable_tokens` counts only exclusive blocks immediately returned
+    // to the free list if this slot is suspended or evicted. Negative values
+    // mean the engine does not report per-slot block sharing (fall back to
+    // admission order).
+    struct KvOffloadFootprint {
+        int64_t total_tokens = -1;
+        int64_t reclaimable_tokens = -1;
+    };
+    virtual KvOffloadFootprint kv_offload_footprint(int) const { return {}; }
 
     // Suspend in place: retain the slot, sampler, recurrent/draft state and
     // request identity, but save paged KV to bounded host RAM and release its
@@ -433,34 +460,35 @@ inline std::string validate_step_result(
                              : "fatal result exposes partial payload";
     }
 
-    std::vector<uint8_t> decode_planned((size_t)slot_count, 0);
-    std::vector<uint8_t> speculation_allowed((size_t)slot_count, 0);
-    std::vector<uint8_t> prefill_planned((size_t)slot_count, 0);
+    std::vector<uint8_t> flags((size_t)std::max(slot_count, 0), 0);
+    constexpr uint8_t kDecodePlanned  = 1u << 0;
+    constexpr uint8_t kSpecAllowed    = 1u << 1;
+    constexpr uint8_t kPrefillPlanned = 1u << 2;
+    constexpr uint8_t kDecodeSeen     = 1u << 3;
+    constexpr uint8_t kPrefillSeen    = 1u << 4;
+
     for (const SeqEngine::StepInput & input : plan.decode) {
         if (input.slot < 0 || input.slot >= slot_count || input.token < 0)
             return "decode plan contains an invalid row";
-        if (decode_planned[(size_t)input.slot])
+        if (flags[(size_t)input.slot] & kDecodePlanned)
             return "decode plan contains a duplicate slot";
-        decode_planned[(size_t)input.slot] = 1;
-        speculation_allowed[(size_t)input.slot] =
-            input.allow_speculation ? 1 : 0;
+        flags[(size_t)input.slot] |=
+            kDecodePlanned | (input.allow_speculation ? kSpecAllowed : 0);
     }
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= slot_count ||
             slice.max_tokens <= 0)
             return "prefill plan contains an invalid slice";
-        if (decode_planned[(size_t)slice.slot] ||
-            prefill_planned[(size_t)slice.slot])
+        if (flags[(size_t)slice.slot] & (kDecodePlanned | kPrefillPlanned))
             return "step plan assigns a slot more than once";
-        prefill_planned[(size_t)slice.slot] = 1;
+        flags[(size_t)slice.slot] |= kPrefillPlanned;
     }
 
-    std::vector<uint8_t> decode_seen((size_t)slot_count, 0);
     for (const SeqEngine::DecodeOutput & output : result.decode) {
         if (output.slot < 0 || output.slot >= slot_count ||
-            !decode_planned[(size_t)output.slot])
+            !(flags[(size_t)output.slot] & kDecodePlanned))
             return "decode output names an unplanned slot";
-        if (decode_seen[(size_t)output.slot])
+        if (flags[(size_t)output.slot] & kDecodeSeen)
             return "step returned duplicate decode outputs";
         if (output.failed) {
             if (output.token >= 0 || !output.committed_tokens.empty() ||
@@ -469,7 +497,7 @@ inline std::string validate_step_result(
         } else {
             if (output.token < 0 || !output.error.empty())
                 return "successful decode has invalid payload";
-            if (!speculation_allowed[(size_t)output.slot] &&
+            if (!(flags[(size_t)output.slot] & kSpecAllowed) &&
                 !output.committed_tokens.empty())
                 return "decode output burst violates disabled speculation";
             if (std::any_of(
@@ -478,16 +506,15 @@ inline std::string validate_step_result(
                     [](int32_t token) { return token < 0; }))
                 return "decode output burst contains an invalid token";
         }
-        decode_seen[(size_t)output.slot] = 1;
+        flags[(size_t)output.slot] |= kDecodeSeen;
     }
 
     using PrefillStatus = SeqEngine::PrefillOutput::Status;
-    std::vector<uint8_t> prefill_seen((size_t)slot_count, 0);
     for (const SeqEngine::PrefillOutput & output : result.prefills) {
         if (output.slot < 0 || output.slot >= slot_count ||
-            !prefill_planned[(size_t)output.slot])
+            !(flags[(size_t)output.slot] & kPrefillPlanned))
             return "prefill output names an unselected slot";
-        if (prefill_seen[(size_t)output.slot])
+        if (flags[(size_t)output.slot] & kPrefillSeen)
             return "step returned duplicate prefill outputs";
         if (output.status != PrefillStatus::advanced &&
             output.status != PrefillStatus::completed &&
@@ -531,14 +558,14 @@ inline std::string validate_step_result(
                 store.bytes != 0)
                 return "failed prefix capture carries committed bytes";
         }
-        prefill_seen[(size_t)output.slot] = 1;
+        flags[(size_t)output.slot] |= kPrefillSeen;
     }
 
     for (const SeqEngine::StepInput & input : plan.decode)
-        if (!decode_seen[(size_t)input.slot])
+        if (!(flags[(size_t)input.slot] & kDecodeSeen))
             return "step omitted an output for a decode slot";
     for (const PrefillSlice & slice : plan.prefills)
-        if (!prefill_seen[(size_t)slice.slot])
+        if (!(flags[(size_t)slice.slot] & kPrefillSeen))
             return "step omitted an output for a selected prefill";
     if (payload_empty && (!plan.decode.empty() || !plan.prefills.empty()))
         return "valid planned work returned no output";

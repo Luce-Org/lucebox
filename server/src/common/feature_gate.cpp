@@ -285,8 +285,10 @@ std::string check_feature_compatibility(
                    "only for concurrent dense Qwen3.5 serving "
                    "(--max-concurrency > 1)";
         }
-        if (admission.fixed_kvflash_requested()) {
-            return "--paged-attention cannot be combined with KVFlash";
+        if (admission.fixed_kvflash_requested() &&
+            (args.max_concurrency <= 1 || arch != "qwen35")) {
+            return "--paged-attention cannot be combined with KVFlash "
+                   "(requires dense Qwen3.5 with --max-concurrency > 1)";
         }
         if (arch_is_deepseek4_family(arch)) {
             if (target_backend != PlacementBackend::Hip) {

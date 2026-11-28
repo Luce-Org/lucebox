@@ -23,19 +23,26 @@
 
 #include "common/adaptive_spec_width.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/kv_slot_residency.h"
 #include "common/concurrency/paged_kv_offload.h"
-#include "common/dflash_draft_kv.h"
-#include "common/dflash_feature_ring.h"
+#include "common/dflash/dflash2_head.h"
+#include "common/dflash/dflash_draft_kv.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "common/pinned_stage.h"
+#include "common/step_graph.h"
 #include "qwen35_slot_manager.h"
 #include "../qwen35_image_request.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace luce::common {
@@ -65,13 +72,18 @@ public:
                     int long_mixed_prefill_tokens = 4096,
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
-                    int prefill_quantum = 512);
+                    int prefill_quantum = 512,
+                    bool target_is_uma = false,
+                    int kvflash_tokens = 0);
     ~Qwen35SeqEngine() override;
 
     // Destroy every graph that captures draft-weight tensors. Qwen35Backend
     // calls this before freeing draft weights during park; states rebuild
     // lazily after unpark.
     void release_draft_graphs();
+    // Destroy the cached paged-tree target graph (called before freeing target
+    // weights/scratch during park, compress_batch or release_scratch).
+    void release_target_graphs();
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -81,6 +93,7 @@ public:
     size_t estimate_prefix_store_bytes(int tokens) const override;
 
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
+    bool arm_followup_capture(int slot, PrefixCaptureTicket ticket, int restored_tokens) override;
     size_t estimate_prefix_state_bytes(int tokens) const override;
     bool drop_prefix_kv(PrefixStoreRef checkpoint) override;
 
@@ -116,13 +129,16 @@ public:
             std::min(max_prefills_ * per_sequence, total_cap),
             prefill_quantum_,
             /*prefill_time_share=*/mixed ? 0.5 : 1.0,
-            /*time_share_prompt_tokens=*/8192,
+            /*time_share_prompt_tokens=*/2048,
         };
     }
 
     bool reserve_decode(const StepPlan & plan) override;
     size_t kv_offload_capacity() const override { return offload_.capacity(); }
     KvOffloadState kv_offload_state(int slot) const override { return offload_.state(slot); }
+    KvOffloadFootprint kv_offload_footprint(int slot) const override {
+        return slots_.kv_offload_footprint(slot);
+    }
     bool offload_kv(int slot, size_t bytes, std::string & error) override {
         return offload_.suspend(slot, bytes, error);
     }
@@ -150,6 +166,8 @@ private:
         int kv_pos = 0;
         int chunk = 0;
         bool commit = false;
+        int res_tokens = 0;
+        int prefix_res_tokens = 0;
         std::vector<int64_t> rows;
         // Axis-major [4 x chunk] rotary positions when the slot holds images;
         // empty means the plain kv_pos + i positions.
@@ -192,25 +210,44 @@ private:
     int long_prefill_threshold_;
     int idle_prefill_tokens_;
     int prefill_quantum_;
+    bool target_is_uma_ = false;
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
+    void kvflash_init_slot(int slot, const std::vector<int32_t> & prompt,
+                           const uint32_t * shared_blocks,
+                           uint32_t shared_block_count, int shared_tokens);
+    bool kvflash_sync_slot_table(int slot, int cur_pos, int chunk_start_pos,
+                                 int & out_res_tokens, int & out_prefix_res_tokens);
+    void kvflash_clear_slot(int slot);
+    void kvflash_enqueue_score(int slot, const std::vector<int32_t> & prompt);
+    bool kvflash_take_score(int slot, std::vector<float> & out_scores,
+                            double & out_ms, int & out_segs);
+    void kvflash_stop_scorer_thread();
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
     // Stages one prompt chunk; its input embeddings go to `embeddings`.
     PrefillStage stage_prefill_chunk(int slot, int max_tokens, float * embeddings,
                                      std::vector<PrefillOutput> & outputs);
-    int32_t sample_graph_row(int slot, int logits_row,
-                             const int32_t * cached_argmax = nullptr,
-                             std::vector<float> * logits_scratch = nullptr);
+    // Samples logits row `logits_row` of `src_logits` for `slot`: the graph's
+    // argmax when greedy, else the row's top-N candidates when they suffice,
+    // else the full row read into `logits`.
+    int32_t sample_graph_row(int slot, int logits_row, int32_t argmax,
+                             std::vector<float> & logits,
+                             const ggml_tensor * src_logits,
+                             const int32_t * top_ids, const float * top_vals,
+                             int top_n);
     std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
     // width: the block the round drafts (0 = the configured block).
     bool chain_spec_input_capable(const StepInput & input, int width = 0) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
-    DraftKvState * ensure_slot_draft_kv(int slot, bool batched = false);
+    DraftKvState * ensure_slot_draft_kv(int slot);
     void reset_slot_draft_kv(int slot);
+    StepGraph * acquire_paged_tree_graph(
+        int tree_width, int tree_bucket, int max_prefix,
+        int ar_count, int top_n, bool & rebuilt);
     // The longest block a round with these selected lanes drafts.
     int chain_draft_width(const std::vector<uint8_t> & selected) const;
     std::optional<PreparedChainRound> prepare_chain_drafts(
@@ -234,14 +271,67 @@ private:
                              double walk_ms);
     PrefixStoreEvent capture_prefix(
         int slot, PrefixCaptureTicket ticket);
-    bool arm_capture(
-        int slot, PrefixCaptureTicket ticket, int restored_tokens);
     int checkpoint_index(PrefixStoreRef checkpoint) const;
+    void unpin_gpu_prefix(int index);
+    void unpin_all_gpu_prefixes();
+    // Unpins the least recently used pin that is not `skip_index`; false when
+    // no block is held by pins alone, since unpinning would then free nothing.
+    bool evict_one_gpu_prefix(int skip_index = -1);
+    // An admission that is busy only for want of KV blocks: unpinning frees
+    // blocks, which cannot help when a request is parked or every slot is taken.
+    bool short_of_blocks(const AdmitResult & result) const;
+
+    // Per-checkpoint GPU-resident shared physical blocks (whole blocks only).
+    // Pinned blocks are shared zero-copy across concurrent requests matching
+    // the prefix and evicted LRU under pool pressure so they never reduce
+    // usable KV capacity.
+    struct GpuPinnedPrefix {
+        int tokens = 0;
+        std::vector<uint32_t> blocks;
+        uint64_t last_use = 0;
+        // PrefixSnapshot::generation of the checkpoint the blocks hold.
+        uint64_t snapshot_generation = 0;
+    };
+    // The pin of checkpoint `index` while that checkpoint still holds the
+    // payload it was pinned for; a pin left from an older payload is dropped.
+    const GpuPinnedPrefix * live_gpu_prefix(int index);
+    bool pin_gpu_prefix(int index, int slot, int tokens);
+    std::vector<GpuPinnedPrefix> gpu_prefix_pins_;
+    uint64_t gpu_prefix_clock_ = 0;
 
     PagedKvPool & pool_;
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     PagedKvOffload offload_;
+    std::unique_ptr<KvSlotResidency> kvflash_;
+    std::vector<uint64_t> kvflash_uploaded_epoch_;
+    std::vector<int>      kvflash_res_tokens_;
+    std::vector<int>      kvflash_slot_r_;
+    std::vector<uint8_t>  kvflash_recalled_;
+    std::vector<int32_t>  kvflash_active_blocks_;
+    std::vector<KvSlotResidency::Snapshot> kvflash_prefix_snapshots_;
+    struct KvFlashScoreJob {
+        int slot = -1;
+        uint64_t gen = 0;
+        int chunk_tokens = 64;
+        std::vector<int32_t> prompt;
+    };
+    struct KvFlashScoreSlot {
+        uint64_t gen = 0;
+        bool pending = false;
+        bool ready = false;
+        bool ok = false;
+        double ms = 0.0;
+        int segs = 0;
+        std::vector<float> scores;
+    };
+    std::mutex kvflash_score_mu_;
+    std::condition_variable kvflash_score_cv_;
+    std::deque<KvFlashScoreJob> kvflash_score_q_;
+    std::vector<KvFlashScoreSlot> kvflash_score_slots_;
+    std::thread kvflash_score_thread_;
+    bool kvflash_score_stop_ = false;
+    bool kvflash_async_enabled_ = false;
     int64_t         scratch_row_ = 0;
     FixedChainConfig fixed_chain_;
     bool            fixed_chain_ready_ = false;
@@ -284,36 +374,40 @@ private:
     std::chrono::steady_clock::time_point chain_round_t0_{};
     std::vector<size_t> chain_accepted_scratch_;
     std::vector<uint8_t> chain_sampled_scratch_;
-    // Sampled chain lanes (sampled verify on): each lane's verify rows,
-    // copied to the host, and the pool their walks run on (made on the
-    // first round with two sampled lanes).
+    // Logits rows sampled on the host: each sampled chain lane's verify rows,
+    // or the full rows a plain step() samples, and the pool those walks run
+    // on (made on the first round with two such rows).
     std::vector<float> chain_sampled_rows_;
     std::unique_ptr<BlockingRowPool> chain_sampled_pool_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
+    // Per-slot draft KV state sized for fixed_chain_.width; narrower batched
+    // rounds use views of its leading noise/append rows.
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
-    DraftKvBatchGraph batch_draft_graph_;
+    std::vector<std::unique_ptr<DraftKvBatchGraph>> batch_draft_graphs_;
+    DFlash2BatchSelectorCache dflash2_selector_cache_;
     // Rounds with two or more lanes draft a shorter block than the configured
     // one: a long block pays for itself only when one request decodes alone
     // (verify cost grows with lanes x width, acceptance stays per lane).
     // Such a round drafts exactly the verify width its bucket's controller
     // picks, at most batched_draft_width_. 0 = every round drafts the
     // configured block.
-    // batched_dw_ is b_.dw_ with block size batched_draft_width_, copied
-    // again at every batched round so it always holds the live tensors (a
-    // draft park and unpark reloads b_.dw_); it is never freed. Each slot
-    // keeps one state sized for that block whatever width it drafts, so its
-    // context never lags; a narrower round reads the leading positions of
-    // the state through its width's own packed graph.
     int batched_draft_width_ = 0;
-    DraftWeights batched_dw_;
-    std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_batched_;
-    std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_batched_;
-    std::map<int, DraftKvBatchGraph> batch_draft_graphs_batched_;  // by width
+    std::vector<float> mask_embed_;
+    int32_t mask_embed_token_id_ = -1;
+    PinnedStage draft_io_stage_;
 
-    // Hoisted per-step buffers (reused across step() calls).
+    // Dedicated paged-tree target graph with its own gallocr so mixed
+    // prefill+decode steps on b_.sg_ never clobber the active verify graph or
+    // its captured HIP graph, without aliasing gallocr buffers across graphs.
+    StepGraph paged_tree_sg_;
+    PinnedStage target_io_stage_;
+    PinnedStage commit_io_stage_;
+
+    // Hoisted per-step buffers (reused across step() and step_chain_spec()).
     std::vector<int>         reserve_growth_;
+    std::vector<uint8_t>     step_seen_;   // step(): rows seen per slot
     std::vector<int>         output_rows_;
     std::vector<int32_t>     live_tokens_;
     std::vector<int32_t>     live_positions_;
@@ -345,6 +439,30 @@ private:
     std::vector<int64_t>     rows_buf_;
     std::vector<int32_t>     argmax_buf_;
     std::vector<float>       logits_buf_;
+    std::vector<int32_t>     top_ids_buf_;
+    std::vector<float>       top_vals_buf_;
+
+    // Hoisted scratch buffers for step_chain_spec().
+    std::vector<int32_t>     chain_tokens_;
+    std::vector<int32_t>     chain_parents_;
+    std::vector<int32_t>     chain_tree_sizes_;
+    std::vector<int32_t>     chain_mapped_slots_;
+    std::vector<int32_t>     chain_state_slots_;
+    std::vector<int32_t>     chain_query_slots_;
+    std::vector<int32_t>     chain_query_positions_;
+    std::vector<int64_t>     chain_write_rows_;
+    std::vector<int32_t>     chain_positions_;
+    std::vector<float>       chain_embeddings_;
+    std::vector<int32_t>     chain_posterior_;
+    std::vector<int32_t>     chain_accepted_prefixes_;
+    std::vector<int32_t>     chain_commit_slots_;
+    std::vector<int64_t>     chain_commit_rows_;
+    std::vector<int32_t>     chain_feature_commit_rows_;
+    std::vector<const ggml_tensor *> chain_replay_logs_;
+    std::vector<ggml_tensor *>       chain_states_;
+    std::vector<const ggml_tensor *> chain_conv_inputs_;
+    std::vector<ggml_tensor *>       chain_conv_states_;
+    std::vector<ggml_tensor *>       chain_caches_;
 };
 
 }  // namespace luce::common

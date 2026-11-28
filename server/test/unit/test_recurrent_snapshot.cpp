@@ -13,6 +13,7 @@ using namespace CppUnitTestFramework;
 
 using luce::common::PrefixSnapshot;
 using luce::common::TargetCache;
+using luce::common::TargetPagedDecodeGraphKey;
 using luce::common::TargetPagedTreeGraphKey;
 using luce::common::StepGraph;
 using luce::common::estimate_paged_target_cache_snapshot_bytes;
@@ -158,9 +159,14 @@ TEST_CASE(RecurrentSnapshotFixture, invalidates_paged_tree_graph_cache_key) {
     graph.paged_tree_meta_arena.reset(
         new uint8_t[1], std::default_delete<uint8_t[]>());
     graph.paged_tree_key = TargetPagedTreeGraphKey{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0};
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 0};
+    graph.paged_decode_key = TargetPagedDecodeGraphKey{
+        nullptr, nullptr, nullptr, 1, 256, false, 0, 0, 0};
+    graph.step_arena_gen = 1;
     step_graph_free(graph);
     CHECK(!graph.paged_tree_key);
+    CHECK(!graph.paged_decode_key);
+    CHECK(graph.step_arena_gen == 0);
     CHECK(graph.paged_tree_meta_arena);
     step_graph_destroy(graph);
     CHECK(!graph.paged_tree_meta_arena);

@@ -181,7 +181,7 @@ using luce::common::step_graph_destroy;
 
 // ─── Peer access + DraftFeatureMirror — extracted to src/qwen35/ ──
 #include "peer_access.h"
-#include "dflash_feature_ring.h"
+#include "common/dflash/dflash_feature_ring.h"
 using luce::common::g_peer_access_opt_in;
 using luce::common::g_peer_pair_ok_cache;
 using luce::common::enable_peer_access_one_way;
@@ -200,7 +200,7 @@ using luce::common::draft_feature_mirror_sync_tail;
 
 // ─── Graph builders — extracted to src/qwen35/graph_builders.{h,cpp} ──
 #include "graph_builders.h"
-#include "dflash_draft_graph.h"
+#include "common/dflash/dflash_draft_graph.h"
 using luce::common::build_layer_step;
 using luce::common::build_target_step;
 using luce::common::build_target_step_tree;
@@ -249,7 +249,7 @@ static bool parse_float_list(const char * text, std::vector<double> & out) {
 }
 
 // ─── Draft IPC — extracted to src/qwen35/draft_ipc.{h,cpp} ──
-#include "dflash_draft_ipc.h"
+#include "common/dflash/dflash_draft_ipc.h"
 using luce::common::DFlashDraftIpcClient;
 using luce::common::copy_capture_slice_to_remote_draft;
 using luce::common::stream_status;
@@ -263,7 +263,7 @@ using luce::common::run_dflash_draft_ipc_daemon;
 using luce::common::compute_layer_ranges;
 
 // ─── Feature copy helpers — extracted to src/qwen35/feature_copy.{h,cpp} ──
-#include "dflash_capture.h"
+#include "common/dflash/dflash_capture.h"
 using luce::common::target_capture_index;
 using luce::common::copy_capture_slice_to_draft_ring;
 using luce::common::copy_feature_ring_range_to_tensor;
@@ -277,7 +277,7 @@ using luce::common::free_qwen35_layer_split_shards;
 
 // ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
 #include "qwen35_layer_split_dflash_target.h"
-#include "common/dflash_spec_decode.h"
+#include "common/dflash/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
 #include "common/geometric_draft_topk_cuda.h"
 using luce::common::is_eos_tok;

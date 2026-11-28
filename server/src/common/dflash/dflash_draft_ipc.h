@@ -97,7 +97,7 @@ inline bool stream_status(int stream_fd, int32_t status) {
 
 // ── IPC Daemon entry point ──────────────────────────────────────────
 //
-// Implemented in common/dflash_draft_ipc_daemon.cpp. The DFlash draft model
+// Implemented in common/dflash/dflash_draft_ipc_daemon.cpp. The DFlash draft model
 // is a single universal network shared across all target architectures, so
 // the daemon body is target-agnostic.
 int run_dflash_draft_ipc_daemon(const char * draft_path,

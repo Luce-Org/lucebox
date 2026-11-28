@@ -666,22 +666,23 @@ add_library(luce_common STATIC
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
-    src/common/dflash2_head.cpp
-    src/common/dflash2_batch.cpp
+    src/common/dflash/dflash2_head.cpp
+    src/common/dflash/dflash2_batch.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp
-    src/common/dflash_feature_ring.cpp
-    src/common/dflash_capture.cpp
-    src/common/dflash_draft_ipc.cpp
-    src/common/dflash_draft_ipc_daemon.cpp
+    src/common/dflash/dflash_feature_ring.cpp
+    src/common/dflash/dflash_capture.cpp
+    src/common/dflash/dflash_draft_ipc.cpp
+    src/common/dflash/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
-    src/common/dflash_draft_graph.cpp
-    src/common/dflash_draft_kv.cpp
+    src/common/dflash/dflash_draft_graph.cpp
+    src/common/dflash/dflash_draft_kv.cpp
     src/common/draft_swa.cpp
-    src/common/dflash_spec_decode.cpp
+    src/common/dflash/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/common/concurrency/seq_slot_manager.cpp
     src/common/concurrency/paged_kv_offload.cpp
+    src/common/concurrency/kv_slot_residency.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -2794,6 +2795,7 @@ if(LUCE_TESTS)
             test/unit/test_model_routing.cpp
             test/unit/test_luce_engine.cpp
             test/unit/test_paged_kv_offload.cpp
+            test/unit/test_kv_slot_residency.cpp
             test/unit/test_anchor_params.cpp
             test/unit/test_derived_scalars.cpp
             test/unit/test_adaptive_spec_width.cpp

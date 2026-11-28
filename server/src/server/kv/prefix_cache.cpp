@@ -174,6 +174,19 @@ int PrefixCache::kv_source_slot(int slot) const {
     return source < 0 ? -1 : entries_[(size_t)source].slot;
 }
 
+int PrefixCache::fast_cached_prefix_len(
+        const std::vector<int32_t> & prompt_ids) const {
+    if (disabled()) return 0;
+    int best = 0;
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        const LruEntry & e = entries_[(size_t)i];
+        if ((int)e.ids.size() <= best || !is_strict_prefix(e.ids, prompt_ids)) continue;
+        if (e.state_only && kv_source_index(i) < 0) continue;
+        best = (int)e.ids.size();
+    }
+    return best;
+}
+
 int PrefixCache::tokens(int slot) const {
     const int idx = find_slot_entry(slot);
     return idx < 0 ? 0 : (int)entries_[(size_t)idx].ids.size();
@@ -273,17 +286,24 @@ std::pair<int, int> PrefixCache::lookup(
 
 std::pair<int, int> PrefixCache::lookup_candidate(
         const std::vector<int32_t> & prompt_ids,
-        int max_prefix_tokens) {
-    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false);
+        int max_prefix_tokens,
+        const std::vector<int> * precomputed_boundaries) {
+    return lookup_impl(
+        prompt_ids, max_prefix_tokens, /*record_hit=*/false,
+        precomputed_boundaries);
 }
 
 std::pair<int, int> PrefixCache::lookup_impl(
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
-        bool record_hit) {
+        bool record_hit,
+        const std::vector<int> * precomputed_boundaries) {
     if (disabled_ || max_prefix_tokens <= 0) return {-1, 0};
 
-    auto boundaries = find_all_boundaries(prompt_ids, markers_);
+    std::vector<int> computed_boundaries;
+    const std::vector<int> & boundaries = precomputed_boundaries
+        ? *precomputed_boundaries
+        : (computed_boundaries = find_all_boundaries(prompt_ids, markers_));
     int best_slot = -1, best_len = 0;
     int best_idx = -1;
     // A state-only entry restores with the rows of a deeper resident one.
@@ -522,7 +542,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int reachable_from,
         int restore_point_spacing,
         bool forced_cut_learned,
-        int restore_kv_slot) {
+        int restore_kv_slot,
+        const std::vector<int> * precomputed_boundaries) {
     if (disabled_) return {};
     // The rows this request restores with stay where they are while it is
     // planned: slot_reserved() answers for them until the plan is made.
@@ -532,7 +553,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     } planning_scope{planning_kv_slot_};
     planning_kv_slot_ = restore_kv_slot;
 
-    const auto candidates = find_all_boundaries(prompt_ids, markers_);
+    std::vector<int> computed_candidates;
+    const std::vector<int> & candidates = precomputed_boundaries
+        ? *precomputed_boundaries
+        : (computed_candidates = find_all_boundaries(prompt_ids, markers_));
     // A conversation's first turn (one message past a head it did not
     // restore) saves its system head, which every new conversation on that
     // head restores; each later turn saves its end. Tool requests keep their
@@ -604,10 +628,26 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         return {};
     }
 
-    const auto key = hash_prefix(prompt_ids.data(), target_cut);
-    if (find_entry(key) >= 0) return {};
-    for (const auto & active : active_reservations_) {
-        if (active.key == key) return {};
+    auto already_present = [&](const PrefixHash & h) {
+        if (find_entry(h) >= 0) return true;
+        for (const auto & active : active_reservations_) {
+            if (active.key == h) return true;
+        }
+        return false;
+    };
+    auto key = hash_prefix(prompt_ids.data(), target_cut);
+    if (already_present(key)) {
+        if (!prefer_tools_boundary) return {};
+        // Another request already cached or is capturing the shared system+tools head:
+        // fall back to this conversation's deeper boundary so its next turn hits.
+        const int deep_cut = select_inline_snapshot_boundary(
+            candidates, std::max(restored_prefix_len, target_cut),
+            /*prefer_head=*/false, reachable_from);
+        if (deep_cut <= target_cut) return {};
+        target_cut = deep_cut;
+        forced = false;
+        key = hash_prefix(prompt_ids.data(), target_cut);
+        if (already_present(key)) return {};
     }
 
     const bool protect = prefer_tools_boundary &&

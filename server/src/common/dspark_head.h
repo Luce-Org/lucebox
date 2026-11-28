@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dflash_target.h"
+#include "common/dflash/dflash_target.h"
 #include "internal.h"
 
 #include <cstdint>

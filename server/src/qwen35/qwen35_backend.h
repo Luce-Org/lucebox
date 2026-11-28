@@ -12,8 +12,8 @@
 #pragma once
 
 #include "common/model_backend.h"
-#include "common/dflash_target.h"
-#include "common/dflash_draft_ipc.h"
+#include "common/dflash/dflash_target.h"
+#include "common/dflash/dflash_draft_ipc.h"
 #include "common/specla_mode.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
@@ -23,8 +23,8 @@
 #include <chrono>
 #include <limits>
 #include <map>
-#include "dflash_feature_ring.h"
-#include "common/dflash_draft_kv.h"
+#include "common/dflash/dflash_feature_ring.h"
+#include "common/dflash/dflash_draft_kv.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
@@ -416,6 +416,8 @@ protected:
     // after a residency release frees it). No-op without a path.
     void kvflash_ensure_scorer();
     bool kvflash_load_drafter();
+    bool kvflash_score_pflash2(const std::vector<int32_t> & ids, int chunk_tokens,
+                               std::vector<float> & out, double & ms_out, int & segs_out);
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────
@@ -457,7 +459,7 @@ private:
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
-    // LUCE_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
+    // LUCE_DRAFT_KV=0). Shared module: common/dflash/dflash_draft_kv.h.
     DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
@@ -542,7 +544,8 @@ private:
     // LUCE_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
     // EOS suppression); fetches the slot's logits row on demand.
     int32_t apply_min_tokens_floor(int32_t tok, int generated,
-                                   size_t logits_row_offset);
+                                   size_t logits_row_offset,
+                                   const ggml_tensor * logits_override = nullptr);
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;

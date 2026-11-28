@@ -65,15 +65,42 @@ struct SeqSlot {
             : 0;
     }
 
+    struct PenaltyHistoryView {
+        const int32_t * data = nullptr;
+        size_t size = 0;
+    };
+
+    // Zero-copy view of the penalty history window (valid while sample_history
+    // is not mutated).
+    PenaltyHistoryView penalty_history_view() const {
+        const int gen = generated_tokens();
+        const int keep = std::max(0, std::min(gen, sampler.rep_window));
+        return {
+            keep > 0 ? sample_history.data() + (sample_history.size() - (size_t)keep) : nullptr,
+            (size_t)keep,
+        };
+    }
+
+    // Fill a caller-owned vector with the penalty history window, reusing its
+    // capacity across steps.
+    void copy_penalty_history(std::vector<int32_t> & out) const {
+        const PenaltyHistoryView v = penalty_history_view();
+        if (v.size == 0) {
+            out.clear();
+        } else {
+            out.assign(v.data, v.data + v.size);
+        }
+    }
+
     // What the sampler's penalties read: the tokens generated for this
     // request (the prompt excluded, as on the single-lane path and in the
     // OpenAI meaning of presence/frequency penalties), cut to the sampler's
     // rep_window, which the sampler would apply anyway.
     std::vector<int32_t> penalty_history() const {
-        const int gen = generated_tokens();
-        const int keep = std::max(0, std::min(gen, sampler.rep_window));
-        return std::vector<int32_t>(sample_history.end() - keep,
-                                    sample_history.end());
+        const PenaltyHistoryView v = penalty_history_view();
+        return v.size > 0
+            ? std::vector<int32_t>(v.data, v.data + v.size)
+            : std::vector<int32_t>{};
     }
 
     bool active() const { return phase != SeqSlotPhase::free; }
@@ -105,9 +132,13 @@ public:
     // Prompts larger than the whole pool hard-fail; temporary capacity pressure
     // reports busy. Seeds sampling from sampler.seed, including zero. Greedy
     // slots never draw, so their RNG state is intentionally unspecified.
+    // When `pre_shared_blocks > 0`, the caller will immediately bind that many
+    // already-pinned shared full prefix blocks via seed_shared_prefix(), so
+    // admission reserves only the remaining private blocks.
     SeqEngine::AdmitResult admit(uint64_t request_id,
                                  const std::vector<int32_t> & prompt,
-                                 const SamplerCfg & sampler);
+                                 const SamplerCfg & sampler,
+                                 uint32_t pre_shared_blocks = 0);
 
     struct PrefillChunk {
         bool ok = false;
@@ -122,6 +153,10 @@ public:
     // admitted prompt is guaranteed not to wait on another sequence.
     PrefillChunk append_prefill(int slot, int n_tokens);
 
+    // Rewind the most recent `n_tokens` prefill rows on a prefilling slot
+    // after a failed forward, keeping the rewound pages reserved on the slot.
+    bool rollback_prefill(int slot, int n_tokens);
+
     // Record a finished prefill and expose the slot to decode.
     // Materialize a copied checkpoint into this request's freshly-reserved
     // physical pages. Valid only before ordinary prefill has advanced. The
@@ -129,6 +164,13 @@ public:
     // engine scatters the checkpoint's logical K/V rows. The slot remains in
     // prefill so the uncached suffix can continue normally.
     PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
+
+    // Zero-copy prefix restore: bind `shared_blocks[0..shared_block_count-1]`
+    // directly into the slot's page table and allocate a private partial tail
+    // block if `restored_tokens % block_size != 0`.
+    PrefillChunk seed_shared_prefix(int slot, const uint32_t * shared_blocks,
+                                    uint32_t shared_block_count,
+                                    int restored_tokens);
 
     void commit_prefill(int slot);
 
@@ -157,6 +199,34 @@ public:
 
     bool rollback_step(int slot);
 
+    // A step's appends, undone unless committed: a step that fails before its
+    // compute leaves every slot as it was (StepResult::state_clean).
+    class StagedAppends {
+    public:
+        StagedAppends(SeqSlotManager & slots, size_t decode, size_t prefills) : slots_(slots) {
+            decode_.reserve(decode);
+            prefill_.reserve(prefills);
+        }
+        StagedAppends(const StagedAppends &) = delete;
+        StagedAppends & operator=(const StagedAppends &) = delete;
+        ~StagedAppends() {
+            if (committed_) return;
+            for (auto it = prefill_.rbegin(); it != prefill_.rend(); ++it) {
+                slots_.rollback_prefill(it->first, it->second);
+            }
+            for (auto it = decode_.rbegin(); it != decode_.rend(); ++it) slots_.rollback_step(*it);
+        }
+        void decode(int slot) { decode_.push_back(slot); }
+        void prefill(int slot, int n_tokens) { prefill_.emplace_back(slot, n_tokens); }
+        void commit() { committed_ = true; }
+
+    private:
+        SeqSlotManager & slots_;
+        std::vector<int> decode_;
+        std::vector<std::pair<int, int>> prefill_;
+        bool committed_ = false;
+    };
+
     // Tokens per slot for one decode step (zero for non-decoders). Preflight
     // the entire cohort before reserving anything; excludes parked slots.
     bool reserve_decode(const std::vector<int> & growth);
@@ -177,9 +247,12 @@ public:
     // False means insufficient pool capacity; the slot stays parked.
     bool resume_recompute(int slot);
     // True when the parked slot's resume reservation fits free pool blocks
-    // with one growth block of headroom per resident sequence — the
-    // scheduler's early-resume probe ahead of a full drain.
+    // with hysteresis headroom for active residents — the scheduler's
+    // early-resume probe ahead of a full drain.
     bool kv_restore_feasible(int slot) const;
+    // Physical KV footprint (total vs. exclusive reclaimable tokens) for
+    // shared-block-aware offload victim selection.
+    SeqEngine::KvOffloadFootprint kv_offload_footprint(int slot) const;
 
     // Release the slot's blocks and clear its state. Safe on inactive slots
     // and after a failed admission/prefill.
@@ -187,12 +260,24 @@ public:
 
     int slot_count() const { return (int)slots_.size(); }
     int max_context() const { return max_ctx_; }
-    // Free counts the blocks neither appended nor reserved by any slot; a
-    // parked slot holds none until it resumes.
+    void set_max_resident_tokens(int tokens) { max_resident_tokens_ = std::max(0, tokens); }
+    int max_resident_tokens() const { return max_resident_tokens_; }
+    // Rewind a decoding slot back to prefill at `r_pos` (used by KVFlash Think-Rewind).
+    // Caller must truncate KV residency / pool blocks to `r_pos` first.
+    bool rewind_to_prefill(int slot, int r_pos);
+
+    // Seed a newly admitted prefilling slot to `restored_tokens` with only the
+    // blocks marked in `resident_mask` allocated in GPU VRAM.
+    bool seed_evicted_prefix(int slot, int restored_tokens,
+                             const std::vector<uint8_t> & resident_mask,
+                             std::vector<uint32_t> & out_block_table);
+    // Free counts the blocks neither appended nor reserved by any slot, plus
+    // those only cached prefix pins hold (dropped on demand); a parked slot
+    // holds none until it resumes.
     SeqEngine::KvPoolTokens kv_pool_tokens() const {
         const int64_t block = (int64_t)kv_.block_size();
         return {(int64_t)kv_.physical_block_count() * block,
-                (int64_t)kv_.free_block_count() * block};
+                (int64_t)(kv_.free_block_count() + kv_.reclaimable_block_count()) * block};
     }
     int decoding_count() const;
     bool is_active(int slot) const;
@@ -216,6 +301,7 @@ private:
     std::unique_ptr<SlotKv> owned_kv_;   // set by the PagedKvPool & constructor
     SlotKv & kv_;
     int max_ctx_ = 0;
+    int max_resident_tokens_ = 0;
     std::vector<SeqSlot> slots_;
 };
 

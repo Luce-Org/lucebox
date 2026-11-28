@@ -2,12 +2,12 @@
 
 #pragma once
 
-#include "common/dflash_draft_ipc.h"
+#include "common/dflash/dflash_draft_ipc.h"
 #include "common/kvflash_pager.h"
 #include "common/kvflash_scorer.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_kvflash.h"
-#include "dflash_feature_ring.h"
+#include "common/dflash/dflash_feature_ring.h"
 #include "layer_split_types.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
