@@ -570,6 +570,7 @@ struct ParsedRequest {
     std::string               prompt_context;
     int                       max_output   = 4096;
     bool                      max_output_from_client = false;  // else the card's default
+    bool                      routed       = false;            // router admission path (keep client-sized reply whole)
     bool                      stream       = true;
     SamplerCfg                sampler;
     std::string               model;
@@ -859,6 +860,7 @@ private:
         // the view is kept on disk too, so a resumed conversation serves the same tokens again.
         bool unified_view = false;
         int error_status = 0;
+        int max_output = 0;
         std::string error;
         // The drafter's own error when compression failed in the backend
         // (luce_last_error at that moment), for the fallback record.

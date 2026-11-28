@@ -1571,11 +1571,27 @@ static std::vector<int32_t> strict_score_impl(
 
     // Candidates: probe segments cut at the pinned spans' edges, or fixed
     // chunks when the probe is off or finds too few boundaries.
+    // Memoized by `pins` so query-unit discovery, fit_pin, and final selection
+    // reuse identical segmentations instead of recomputing and re-logging.
+    struct CachedSeg {
+        std::vector<PFlashTokenSpan> segments;
+        bool density = false;
+    };
+    std::map<std::vector<std::pair<int, int>>, CachedSeg> segment_cache;
     const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
                              std::vector<PFlashTokenSpan> & segments, bool & density) {
         segments.clear();
         density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
         if (!use_probe) return;
+        std::vector<std::pair<int, int>> key;
+        key.reserve(pins.size());
+        for (const auto & span : pins) key.emplace_back(span.begin, span.end);
+        auto it = segment_cache.find(key);
+        if (it != segment_cache.end()) {
+            segments = it->second.segments;
+            density = it->second.density;
+            return;
+        }
         std::vector<int> forced{seg_query_begin, seg_query_end};
         for (const auto & span : pins) {
             forced.push_back(span.begin);
@@ -1589,15 +1605,20 @@ static std::vector<int32_t> strict_score_impl(
                 st.probe_max_segment, forced, probe_split_scores,
                 have_probe_lines ? &probe_lines : nullptr);
         }
+        if (!segments.empty() &&
+            experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
+            density = true;
+        }
+        segment_cache.emplace(std::move(key), CachedSeg{segments, density});
+    };
+    const auto log_segment = [&](const std::vector<PFlashTokenSpan> & segments, bool density) {
+        if (!use_probe) return;
         if (segments.empty()) {
             std::fprintf(stderr,
                 "[qwen35-segment-probe] %d boundaries in the context, "
                 "falling back to fixed %d-token chunks\n",
                 probe_boundaries_in_context, experiment.chunk_size);
         } else {
-            if (experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
-                density = true;
-            }
             std::fprintf(stderr,
                 "[qwen35-segment-probe] %d boundaries in the context -> %zu segments "
                 "(threshold %.2f, %d-%d tokens), score=%s\n",
@@ -1765,12 +1786,18 @@ static std::vector<int32_t> strict_score_impl(
             std::vector<PFlashTokenSpan> unit_segments;
             bool unit_density = false;
             segment(required_instruction_spans, unit_segments, unit_density);
-            if (unit_segments.empty()) return fail("query step: the segment probe gave no segments");
+            auto fail_qstep = [&](const char * msg) {
+                log_segment(unit_segments, unit_density);
+                return fail(msg);
+            };
+            if (unit_segments.empty()) {
+                return fail_qstep("query step: the segment probe gave no segments");
+            }
             qunits = luce::pflash::pflash_query_units(unit_segments, experiment.request_messages_all,
                                                       session->request_raw);
             if (!qunits.error.empty()) {
                 const std::string message = "query step: units: " + qunits.error;
-                return fail(message.c_str());
+                return fail_qstep(message.c_str());
             }
             query_trace.evaluated = qcand || qpin;
             query_trace.config = qcfg;
@@ -1779,7 +1806,7 @@ static std::vector<int32_t> strict_score_impl(
             std::vector<std::vector<int>> wanted;
             if (qcand) {
                 query_trace.set = luce::pflash::pflash_query_candidate_set(qunits, session->request_raw, qcfg);
-                if (query_trace.set.candidates.empty()) return fail("query step: no message content to rank");
+                if (query_trace.set.candidates.empty()) return fail_qstep("query step: no message content to rank");
                 for (const auto & c : query_trace.set.candidates) {
                     wanted.push_back(c.tokens);
                     query_trace.query_tokens += (int) c.tokens.size();
@@ -1796,11 +1823,11 @@ static std::vector<int32_t> strict_score_impl(
                 int stored = 0;
                 if (tokens.front() >= resume) {
                     if (!gather(tokens, rows, fresh, stored) || stored != 0) {
-                        return fail("query step: query rows unavailable");
+                        return fail_qstep("query step: query rows unavailable");
                     }
                 } else if (tokens.back() >= resume || !session->query_sets.lookup(tokens, hidden, rows)) {
                     redo = tokens.back() >= resume ? "query_set_spans_resume" : "query_set_not_stored";
-                    return fail("query step: query rows not exactly available; redo from token 0");
+                    return fail_qstep("query step: query rows not exactly available; redo from token 0");
                 }
                 qrows.emplace(tokens, std::move(rows));
             }
@@ -1937,7 +1964,15 @@ static std::vector<int32_t> strict_score_impl(
         }
         if (!ensure_k_perm()) return false;
 
-        const int kTile = (S <= 131072) ? 64 : 32;
+        // Bound the two live [S, n*H] F32 scoring scratch tensors (logits, updated
+        // in place by softmax, plus the transposed cont copy) to ~128 MiB with a
+        // 1-query minimum floor so long contexts do not spike >1 GiB VRAM.
+        // Keeps kTile=64 up to 16K tokens.
+        constexpr int64_t kMaxScoreScratchBytes = 128LL * 1024 * 1024;
+        const int64_t per_q_bytes =
+            std::max<int64_t>(1, (int64_t) S * H * 2 * (int64_t) sizeof(float));
+        const int kTile =
+            std::max(1, std::min(64, (int) (kMaxScoreScratchBytes / per_q_bytes)));
         const bool gqa_fold = (H != Hk) && ((H % Hk) == 0);
         const float sm_scale = 1.0f / std::sqrt((float) D);
 
@@ -2405,6 +2440,7 @@ static std::vector<int32_t> strict_score_impl(
                 // The windows' query replaces the request set's, for the reranker too.
                 std::vector<double> window_qv;
                 if (!score_windows(st.seg_reranker.loaded ? &window_qv : nullptr)) {
+                    log_segment(segments, density);
                     session->ids.clear();
                     return {};
                 }
@@ -2421,6 +2457,9 @@ static std::vector<int32_t> strict_score_impl(
             if (request_trace.recency_pin.begin >= 0) probe_pins.push_back(request_trace.recency_pin);
             pflash_set_probe_pins(std::move(probe_pins));
         }
+    }
+    log_segment(segments, density);
+    if (request_probe) {
         std::string policy_note;
         if (request_trace.policy_evaluated) {
             char buf[256];

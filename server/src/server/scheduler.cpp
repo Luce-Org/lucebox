@@ -853,6 +853,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return;
         }
         job->pflash_stats = std::move(prepared.pflash_stats);
+        if (prepared.max_output > 0) {
+            job->req.max_output = prepared.max_output;
+        }
         if (prepared.compressed) {
             job->req.client_prompt_tokens = raw_tokens;
             job->req.prompt_tokens = std::move(prepared.tokens);
@@ -918,6 +921,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // No response bytes are committed before admission, so a failed
     // preparation answers like a failed admission.
     auto fail_preparation = [&](ServerJob * job) {
+        if (job->report_admission && job->pflash_error_status == 400) {
+            job->admission = RoutingAdmission::unfit;
+            finish_job(job);
+            return;
+        }
         const ParsedRequest & req = job->req;
         std::fprintf(stderr, "[server] request failed: %s\n",
                      job->pflash_error.c_str());

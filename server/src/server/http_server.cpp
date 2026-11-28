@@ -3465,6 +3465,7 @@ bool HttpServer::render_and_tokenize_request(
 // (pflash) will run — the post-compress check is the real gate.
 bool HttpServer::validate_request_context(
         SocketHandle fd, ParsedRequest & req, bool routed) {
+    req.routed = routed;
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
         !req.images && config_.pflash &&
@@ -5201,8 +5202,17 @@ std::string HttpServer::apply_unified_view(
             has_view = false;
         }
     }
+    const int pflash_reserve = pflash_reply_reserve(
+        req.max_output_from_client, req.max_output, config_.max_ctx,
+        config_.hard_limit_reply_budget);
     const bool found_view = has_view;
-    if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids) {
+    const bool repeat_fits =
+        config_.max_ctx <= 0 ||
+        (int) view.view_tokens.size() + pflash_reserve <= config_.max_ctx ||
+        (view.view_tokens != raw &&
+         trims_reply_after_pflash(req.routed, req.max_output_from_client,
+                                  req.max_output, config_.max_ctx));
+    if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids && repeat_fits) {
         // The same request again: what was served.
         count("repeat");
         stats["decision"] = "repeat";
@@ -5532,7 +5542,7 @@ std::string HttpServer::apply_unified_view(
         // The adaptive keep ratio only widens the curve: a prompt whose relevance spreads over a share eff of its
         // optional tokens keeps that share from kPFlashAdaptiveWidenEff (or the Stage-1 mass floor), and from
         // kPFlashAdaptiveBypassEff it is served uncompressed when the raw prompt fits max_ctx.
-        const bool raw_fits_ctx = config_.max_ctx <= 0 || prompt_tokens + req.max_output <= config_.max_ctx;
+        const bool raw_fits_ctx = config_.max_ctx <= 0 || prompt_tokens + pflash_reserve <= config_.max_ctx;
         const bool adaptive_active = config_.pflash_adaptive_keep && scored && result.adaptive_valid;
         const bool adaptive_full = adaptive_active && result.adaptive_full_bypass && raw_fits_ctx;
         const float adaptive_widen_ratio = adaptive_active
@@ -6124,7 +6134,7 @@ std::string HttpServer::apply_unified_view(
         add_raw(position, raw_gen_begin, "raw");
         add_raw(raw_gen_begin, prompt_tokens, "generation");
 
-        if (continues && config_.max_ctx > 0 && (int) served.size() + req.max_output > config_.max_ctx) {
+        if (continues && config_.max_ctx > 0 && (int) served.size() + pflash_reserve > config_.max_ctx) {
             // A view that cannot continue is reset to admission on the raw prompt.
             count("reset.context");
             stats["reset"] = "context";
@@ -6134,7 +6144,7 @@ std::string HttpServer::apply_unified_view(
         // A turn served raw instead of continuing a stored view leaves a raw view (no regions), so its
         // descendants continue what it served rather than the view it replaced. Not when the raw prompt does
         // not fit either: a retry with a smaller output allowance may still continue that view.
-        const bool raw_fits = config_.max_ctx <= 0 || prompt_tokens + req.max_output <= config_.max_ctx;
+        const bool raw_fits = config_.max_ctx <= 0 || prompt_tokens + pflash_reserve <= config_.max_ctx;
         if (!continues && new_regions.empty() && !(found_view && raw_fits)) {
             stats["admission"] = listed(admission);
             std::string raw_err = serve_raw(region_candidates.empty()
@@ -6257,6 +6267,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const ParsedRequest & req) {
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
+    prepared.max_output = req.max_output;
     if (req.images) {
         if (!config_.image_input_enabled || !req.images->matches(prepared.tokens)) {
             prepared.error_status = 400;
@@ -6279,9 +6290,16 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
                 // Failure policy D5: serve the raw prompt when it is admissible,
                 // and record the fallback; PFLASH_FAIL_CLOSED=1 keeps the error.
                 const bool fail_closed = http_detail::pflash_fail_closed_from_env();
+                const bool can_trim_fallback = trims_reply_after_pflash(
+                    req.routed, req.max_output_from_client, req.max_output, config_.max_ctx);
+                const int fallback_fitted =
+                    fit_reply_to_context(prompt_tokens, req.max_output, config_.max_ctx);
+                const int fallback_max_output =
+                    (can_trim_fallback && fallback_fitted > 0)
+                        ? fallback_fitted : req.max_output;
                 const auto decision = http_detail::pflash_fallback_decision(
                     prepared.error, fail_closed, prompt_tokens,
-                    req.max_output, config_.max_ctx);
+                    fallback_max_output, config_.max_ctx);
                 const std::string reason = http_detail::pflash_failure_reason(
                     prepared.error, prepared.pflash_failure_detail);
                 {
@@ -6339,11 +6357,25 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
     if (!prepared.compressed && prepared.error.empty()) trace_pflash_served(req, prepared);
 
     const int prompt_length = (int) prepared.tokens.size();
+    // validate_request_context defers reply trimming while PFlash may run;
+    // apply the matching post-PFlash trim now (admission.h).
+    if (trims_reply_after_pflash(
+            req.routed, req.max_output_from_client, prepared.max_output, config_.max_ctx)) {
+        const int fitted =
+            fit_reply_to_context(prompt_length, prepared.max_output, config_.max_ctx);
+        if (fitted > 0 && fitted < prepared.max_output) {
+            std::fprintf(stderr,
+                "[server] max_tokens=%d trimmed to %d: the prompt takes %d of "
+                "the %d-token context\n",
+                prepared.max_output, fitted, prompt_length, config_.max_ctx);
+            prepared.max_output = fitted;
+        }
+    }
     if (effective_prompt_overflows(
-            prompt_length, -1, req.max_output, config_.max_ctx)) {
+            prompt_length, -1, prepared.max_output, config_.max_ctx)) {
         prepared.error_status = 400;
         prepared.error = context_overflow_message(
-            config_.max_ctx, prompt_length, req.max_output);
+            config_.max_ctx, prompt_length, prepared.max_output);
     }
     return prepared;
 }
@@ -6369,10 +6401,12 @@ bool HttpServer::forward_upstream(
         body["model"] = upstream_model;
         body["prompt"] = compressed_text;
         body["stream"] = req.stream;
-        if (req.raw_body.contains("max_tokens")) {
+        const int effective_max_output =
+            prepared.max_output > 0 ? prepared.max_output : req.max_output;
+        if (effective_max_output > 0) {
+            body["max_tokens"] = effective_max_output;
+        } else if (req.raw_body.contains("max_tokens")) {
             body["max_tokens"] = req.raw_body["max_tokens"];
-        } else {
-            body["max_tokens"] = req.max_output;
         }
         for (const char * key : {
                  "temperature", "top_p", "top_k", "min_p",
@@ -6398,6 +6432,13 @@ bool HttpServer::forward_upstream(
     } else {
         json body = req.raw_body;
         body["model"] = upstream_model;
+        const int effective_max_output =
+            prepared.max_output > 0 ? prepared.max_output : req.max_output;
+        if (effective_max_output > 0 && effective_max_output < req.max_output) {
+            body["max_tokens"] = effective_max_output;
+            body.erase("max_completion_tokens");
+            body.erase("max_output_tokens");
+        }
 
         std::fprintf(stderr,
             "[pflash-proxy] passthrough → %s/chat/completions  model=%s\n",
@@ -7085,13 +7126,15 @@ void HttpServer::prepare_generation_inputs(
     const int thinking_ceiling = req.per_req_phase1_cap >= 0
         ? req.per_req_phase1_cap
         : config_.think_max_tokens;
+    const int max_output =
+        prepared.max_output > 0 ? prepared.max_output : req.max_output;
     const int reply_budget = luce::common::reply_reserve_within(
         req.per_req_reply_budget >= 0 ? req.per_req_reply_budget
                                       : config_.hard_limit_reply_budget,
-        req.max_output);
+        max_output);
     inputs.generation_cap = budget_active
-        ? (std::min)(thinking_ceiling + reply_budget, req.max_output)
-        : req.max_output;
+        ? (std::min)(thinking_ceiling + reply_budget, max_output)
+        : max_output;
 
     inputs.request.prompt = prepared.tokens;
     inputs.request.images = prepared.images;
@@ -7364,6 +7407,21 @@ void HttpServer::process_job(ServerJob * job) {
         req.max_output,
         json_array_size(req.tools));
 
+    // For routed requests, run prompt preparation before committing any SSE
+    // response bytes so a post-PFlash context overflow reports unfit and lets
+    // the router try another model with a larger context.
+    PreparedPrompt prepared;
+    bool prepared_early = false;
+    if (job->report_admission) {
+        prepared = prepare_prompt(req);
+        prepared_early = true;
+        if (prepared.error_status == 400) {
+            job->admission = RoutingAdmission::unfit;
+            finish_job();
+            return;
+        }
+    }
+
     // The server owns the downstream SSE transport for local and proxied
     // generation so both paths share heartbeat and disconnect handling.
     if (req.stream) {
@@ -7427,7 +7485,9 @@ void HttpServer::process_job(ServerJob * job) {
         finish_job();
     };
 
-    PreparedPrompt prepared = prepare_prompt(req);
+    if (!prepared_early) {
+        prepared = prepare_prompt(req);
+    }
     if (prepared.error_status != 0) {
         fail_request(prepared.error_status, prepared.error);
         return;
