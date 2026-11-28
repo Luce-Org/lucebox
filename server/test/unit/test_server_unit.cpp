@@ -434,6 +434,13 @@ struct HttpServerTestAccess {
             HttpServer & server, const ParsedRequest & req) {
         return server.prepare_prompt(req);
     }
+    static HttpServer::GenerationInputs prepare_generation_inputs(
+            HttpServer & server, const ParsedRequest & req,
+            const HttpServer::PreparedPrompt & prepared) {
+        HttpServer::GenerationInputs inputs;
+        server.prepare_generation_inputs(req, prepared, inputs);
+        return inputs;
+    }
     static json pflash_failure_counters(const HttpServer & server) {
         return server.pflash_failure_counters_json();
     }
@@ -19596,6 +19603,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
             if (tools.is_array() && !tools.empty()) request.tools = tools;
             request.prompt_tokens = run.ids[index];
             request.max_output = index < options.max_outputs.size() ? options.max_outputs[index] : 16;
+            request.max_output_from_client = index < options.max_outputs.size();
             if (index < options.required.size()) request.pflash_required = options.required[index];
             request.tool_checks_note = index < options.tool_checks_note.size() && options.tool_checks_note[index];
             request.disk_cache_policy = config.disk_cache_policy;   // as the request parser sets it
@@ -21243,6 +21251,160 @@ TEST_CASE(ServerUnitFixture, test_unified_reset_pages_the_history_again) {
     TEST_ASSERT(!retried.prepared[over].error.empty());
     TEST_ASSERT_MSG(retried.prepared[over + 1].unified_view,
                     retried.prepared[over + 1].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_prepare_prompt_trims_max_output_after_pflash) {
+    // Post-PFlash prompt preparation trims max_output against the compressed prompt
+    // length, reserves hard_limit_reply_budget (not default_max_tokens) when continuing
+    // unified views, propagates the trimmed cap to GenerationInputs, refuses explicit
+    // >= max_ctx and routed client-sized overflows, and trims on fail-open raw fallback.
+    luce_test::ScopedEnvVar region{"PFLASH_REGION_TOOLS", ""};
+    luce_test::ScopedEnvVar recall_gate{"PFLASH_RECALL_GATE", "off"};
+    const std::string doc = unified_doc(40, {});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Question 0?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Ok."}});
+    turn2.push_back({{"role", "user"}, {"content", "Question 1?"}});
+
+    auto render = [](const json & messages) {
+        ToolMemory tool_memory;
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+        return codec_text("qwen3.5", chat, /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    };
+    const std::string raw1 = render(turn1);
+    const std::string raw2 = render(turn2);
+    const std::string path = write_pflash_bpe_tokenizer_fixture({}, raw1 + raw2);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    const std::vector<int32_t> ids1 = tokenizer.encode(raw1);
+    const std::vector<int32_t> ids2 = tokenizer.encode(raw2);
+    const int raw1_len = (int) ids1.size();
+    const int max_ctx = raw1_len + 16;
+
+    auto backend_owner = std::make_unique<MockUnifiedBackend>();
+    MockUnifiedBackend & backend = *backend_owner;
+    backend.tokenizer = &tokenizer;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash = true;
+    config.pflash_threshold = 64;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = max_ctx;
+    config.hard_limit_reply_budget = 8;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest req1;
+        req1.format = ApiFormat::OPENAI_CHAT;
+        req1.messages = turn1;
+        req1.prompt_tokens = ids1;
+        req1.max_output = max_ctx;
+        req1.max_output_from_client = false;
+
+        // Case 1: omitted max_tokens (default == max_ctx) compresses, trims to compressed fit,
+        // and propagates into prepare_generation_inputs.
+        const auto prep1 = HttpServerTestAccess::prepare_prompt(server, req1);
+        TEST_ASSERT_MSG(prep1.error.empty(), prep1.error);
+        TEST_ASSERT(prep1.error_status == 0);
+        TEST_ASSERT(backend.compress_calls == 1);
+        TEST_ASSERT(prep1.compressed);
+        TEST_ASSERT(!prep1.pflash_stats.contains("pflash_fallback"));
+        const int comp1_len = (int) prep1.tokens.size();
+        TEST_ASSERT(comp1_len < raw1_len);
+        TEST_ASSERT(prep1.max_output == max_ctx - comp1_len);
+        TEST_ASSERT(prep1.max_output > max_ctx - raw1_len);
+
+        const auto gen_inputs = HttpServerTestAccess::prepare_generation_inputs(server, req1, prep1);
+        TEST_ASSERT(gen_inputs.generation_cap == prep1.max_output);
+        TEST_ASSERT(gen_inputs.request.n_gen == prep1.max_output);
+
+        // Case 2: continuing turn with omitted default (== max_ctx) keeps the view instead of
+        // triggering reset.context, and trims to remaining context.
+        ParsedRequest req2 = req1;
+        req2.messages = turn2;
+        req2.prompt_tokens = ids2;
+        const auto prep2 = HttpServerTestAccess::prepare_prompt(server, req2);
+        TEST_ASSERT_MSG(prep2.error.empty(), prep2.error);
+        TEST_ASSERT(prep2.compressed);
+        TEST_ASSERT_MSG(prep2.pflash_stats["unified"].value("continued", false),
+                        prep2.pflash_stats.dump());
+        TEST_ASSERT(HttpServerTestAccess::pflash_unified(server)["counts"].value("reset.context", 0) == 0);
+        TEST_ASSERT(prep2.max_output == max_ctx - (int) prep2.tokens.size());
+
+        // Case 3: direct client cap < max_ctx that overflows remaining room -> trimmed to compressed fit.
+        ParsedRequest req_client = req1;
+        req_client.max_output = max_ctx - 1;
+        req_client.max_output_from_client = true;
+        const auto prep_client = HttpServerTestAccess::prepare_prompt(server, req_client);
+        TEST_ASSERT_MSG(prep_client.error.empty(), prep_client.error);
+        TEST_ASSERT(prep_client.compressed);
+        TEST_ASSERT(prep_client.max_output == max_ctx - (int) prep_client.tokens.size());
+
+        // Case 4: explicit client cap >= max_ctx -> refused with 400.
+        ParsedRequest req_too_big = req1;
+        req_too_big.max_output = max_ctx;
+        req_too_big.max_output_from_client = true;
+        const auto prep_too_big = HttpServerTestAccess::prepare_prompt(server, req_too_big);
+        TEST_ASSERT(prep_too_big.error_status == 400);
+        TEST_ASSERT(!prep_too_big.error.empty());
+
+        // Case 5: routed client-sized request that overflows after compression -> refused with 400.
+        ParsedRequest req_routed = req1;
+        req_routed.routed = true;
+        req_routed.max_output = max_ctx - 1;
+        req_routed.max_output_from_client = true;
+        const auto prep_routed = HttpServerTestAccess::prepare_prompt(server, req_routed);
+        TEST_ASSERT(prep_routed.error_status == 400);
+        TEST_ASSERT(!prep_routed.error.empty());
+
+        // Case 6: drafter failure on an uncached prompt falls back to raw and trims omitted default.
+        backend.fail = true;
+        HttpServer fallback_server(engine, tokenizer, config);
+        fallback_server.set_drafter_tokenizer(&tokenizer);
+        const auto prep_raw = HttpServerTestAccess::prepare_prompt(fallback_server, req1);
+        TEST_ASSERT_MSG(prep_raw.error.empty(), prep_raw.error);
+        TEST_ASSERT(prep_raw.error_status == 0);
+        TEST_ASSERT(!prep_raw.compressed);
+        TEST_ASSERT_MSG(prep_raw.pflash_stats["unified"].value("reason", "") == "no_region_paged",
+                        prep_raw.pflash_stats.dump());
+        TEST_ASSERT((int) prep_raw.tokens.size() == raw1_len);
+        TEST_ASSERT(prep_raw.max_output == max_ctx - raw1_len);
+
+        // Case 7: disabled thinking reply reserve (hard_limit_reply_budget == 0) with omitted
+        // default (== max_ctx) still continues Turn 2 without spurious reset.context.
+        backend.fail = false;
+        ServerConfig no_budget_cfg = config;
+        no_budget_cfg.hard_limit_reply_budget = 0;
+        HttpServer no_budget_server(engine, tokenizer, no_budget_cfg);
+        no_budget_server.set_drafter_tokenizer(&tokenizer);
+        const auto nb1 = HttpServerTestAccess::prepare_prompt(no_budget_server, req1);
+        TEST_ASSERT_MSG(nb1.error.empty(), nb1.error);
+        TEST_ASSERT(nb1.compressed);
+        const auto nb2 = HttpServerTestAccess::prepare_prompt(no_budget_server, req2);
+        TEST_ASSERT_MSG(nb2.error.empty(), nb2.error);
+        TEST_ASSERT_MSG(nb2.pflash_stats["unified"].value("continued", false),
+                        nb2.pflash_stats.dump());
+        TEST_ASSERT(HttpServerTestAccess::pflash_unified(no_budget_server)["counts"].value("reset.context", 0) == 0);
+    }
+    unlink(path.c_str());
+
+    // Case 8: fail-open raw fallback in prepare_prompt trims omitted default (== max_ctx)
+    // before pflash_fallback_decision so admissible prompts are served rather than HTTP 500.
+    {
+        luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+        const auto fb = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 8192);
+        TEST_ASSERT_MSG(fb.prepared.error.empty(), fb.prepared.error);
+        TEST_ASSERT(fb.prepared.error_status == 0);
+        TEST_ASSERT(!fb.prepared.compressed);
+        TEST_ASSERT(fb.prepared.max_output == 8192 - (int) fb.ids.size());
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_distinct_tokenizers_keep_lines_whole) {

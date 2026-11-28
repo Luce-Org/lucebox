@@ -51,6 +51,28 @@ TEST_CASE(AdmissionFixture, test_a_default_reply_is_trimmed_even_when_routed) {
     CHECK(!trims_reply(false, false, true));
 }
 
+TEST_CASE(AdmissionFixture, test_pflash_reply_trim_and_reserve_rules) {
+    // Post-PFlash trim mirrors trims_reply, except an explicit client cap >= max_ctx is refused.
+    CHECK(trims_reply_after_pflash(/*routed=*/false, /*client_sized=*/false, 131072, 131072));
+    CHECK(trims_reply_after_pflash(/*routed=*/false, /*client_sized=*/true, 32000, 131072));
+    CHECK(!trims_reply_after_pflash(/*routed=*/false, /*client_sized=*/true, 131072, 131072));
+    CHECK(!trims_reply_after_pflash(/*routed=*/false, /*client_sized=*/true, 262144, 131072));
+    CHECK(trims_reply_after_pflash(/*routed=*/true, /*client_sized=*/false, 262144, 131072));
+    CHECK(!trims_reply_after_pflash(/*routed=*/true, /*client_sized=*/true, 32000, 131072));
+
+    // Only omitted defaults >= max_ctx cap their PFlash reserve (to hard_limit_reply_budget,
+    // or a bounded fallback when the thinking budget hook is disabled); normal defaults
+    // (< max_ctx) and client-sized caps stay whole so thinking/output budgets hold.
+    CHECK(pflash_reply_reserve(/*client_sized=*/false, 131072, 131072, 4096) == 4096);
+    CHECK(pflash_reply_reserve(/*client_sized=*/false, 262144, 204800, 4096) == 4096);
+    CHECK(pflash_reply_reserve(/*client_sized=*/false, 32768, 131072, 4096) == 32768);
+    CHECK(pflash_reply_reserve(/*client_sized=*/false, 131072, 131072, 0) == 4096);
+    CHECK(pflash_reply_reserve(/*client_sized=*/false, 100, 100, 0) == 25);
+    CHECK(pflash_reply_reserve(/*client_sized=*/true, 32000, 131072, 4096) == 32000);
+    CHECK(pflash_reply_reserve(/*client_sized=*/true, 131072, 131072, 4096) == 131072);
+    CHECK(pflash_reply_reserve(/*client_sized=*/true, -1, 131072, 4096) == 0);
+}
+
 // With compression on, --max-ctx is the longest raw prompt PFlash takes (the drafter scores it whole): a prompt
 // that fills the context passes even when its reply would not fit, since compression makes room; a longer one is
 // refused.

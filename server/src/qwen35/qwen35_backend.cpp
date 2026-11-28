@@ -1910,18 +1910,18 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     if (req.drafter_path.empty()) {
         req.drafter_path = "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
     }
-    {
+    const bool shares_target_gpu = req.drafter_gpu == cfg_.device.gpu;
+    const bool shares_draft_gpu = draft_backend_ != nullptr && req.drafter_gpu == cfg_.draft_gpu;
+    if (req.skip_park && (shares_target_gpu || shares_draft_gpu)) {
         size_t total_vram = 0;
-        int dev = 0;
-        cudaGetDevice(&dev);
         cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+        if (cudaGetDeviceProperties(&prop, req.drafter_gpu) == cudaSuccess)
             total_vram = prop.totalGlobalMem;
         const bool allowed = luce::common::skip_park_allowed(
             req.skip_park, total_vram, cfg_.device.max_ctx);
-        if (req.skip_park && !allowed) {
+        if (!allowed) {
             std::fprintf(stderr,
-                "[server] --prefill-skip-park downgraded: <32GB GPU with max_ctx>65536"
+                "[server] --prefill-skip-park downgraded: <30 GiB usable VRAM with max_ctx>65536"
                 " (VMM VA-fragmentation guard)\n");
         }
         req.skip_park = allowed;

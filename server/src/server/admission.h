@@ -51,6 +51,37 @@ inline bool trims_reply(bool routed, bool client_sized_reply, bool pflash_will_r
     return !pflash_will_run && (!routed || !client_sized_reply);
 }
 
+// Whether a request's reply may be trimmed after PFlash prompt preparation.
+// Mirrors trims_reply() for direct and routed requests, except an explicit
+// client request for >= max_ctx tokens alone is refused rather than silently
+// shrunk (preserving context-overflow refusal when nothing can fit).
+inline bool trims_reply_after_pflash(bool routed, bool client_sized_reply,
+                                     int max_output, int max_ctx)
+{
+    if (!trims_reply(routed, client_sized_reply, /*pflash_will_run=*/false)) {
+        return false;
+    }
+    return !client_sized_reply || max_output < max_ctx;
+}
+
+// Output allowance PFlash reserves when deciding whether raw or continued views
+// fit max_ctx. Client-sized replies and card defaults below max_ctx stay whole
+// so PFlash compresses to preserve full thinking/output budgets; only an omitted
+// card default >= max_ctx (e.g., 262144 on 204800, or default == max_ctx) caps
+// its reserve to hard_limit_reply_budget (or a bounded fallback when disabled).
+inline int pflash_reply_reserve(bool client_sized_reply, int max_output,
+                                int max_ctx, int hard_limit_reply_budget)
+{
+    const int clamped = (std::max)(0, max_output);
+    if (client_sized_reply || max_ctx <= 0 || clamped < max_ctx) {
+        return clamped;
+    }
+    const int budget = hard_limit_reply_budget > 0
+        ? hard_limit_reply_budget
+        : (std::max)(1, (std::min)(4096, max_ctx / 4));
+    return image_output_reserve(clamped, budget);
+}
+
 inline bool should_reject_oversized(int prompt_tokens, int max_output,
                                     int max_ctx, bool compression_enabled)
 {

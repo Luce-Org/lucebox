@@ -302,6 +302,7 @@ struct RoutedBackend : ModelBackend {
     int snapshot_cur_pos(int) const override { return 0; }
     GenerateResult restore_and_generate_impl(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
+    bool pflash_gives_candidate_scores() const override { return true; }
     void free_drafter() override {}
     void shutdown() override {}
 };
@@ -354,13 +355,20 @@ struct HeldSingleBackend final : RoutedBackend {
     std::vector<float> temperatures;
 };
 
-void load_tokenizer(Tokenizer & tokenizer, bool second, const char * first_output) {
+void load_tokenizer(Tokenizer & tokenizer, bool second, const char * first_output,
+                    bool pflash_chat_tokens = false) {
     gguf_context * ctx = gguf_init_empty();
     const char * first[] = {first_output, "x", "<eos>", "y", "s"};
+    const char * pflash_first[] = {first_output, "x", "<eos>", "y", "s",
+                                   "<|im_start|>", "<|im_end|>", "\xC4\x8A",
+                                   "u", "e", "r", "a", "i", "t", "n",
+                                   "<", ">", "/", "h", "k"};
     const char * other[] = {"s", "y", "<eos>", "x", "q"};
-    const uint32_t types[] = {1, 1, 3, 1, 1};
-    gguf_set_arr_str(ctx, "tokenizer.ggml.tokens", second ? other : first, 5);
-    gguf_set_arr_data(ctx, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32, types, 5);
+    const uint32_t types[] = {1, 1, 3, 1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    const int n_tokens = (!second && pflash_chat_tokens) ? 20 : 5;
+    gguf_set_arr_str(ctx, "tokenizer.ggml.tokens",
+                     second ? other : (pflash_chat_tokens ? pflash_first : first), n_tokens);
+    gguf_set_arr_data(ctx, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32, types, n_tokens);
     gguf_set_val_str(ctx, "tokenizer.ggml.model", "gpt2");
     gguf_set_val_u32(ctx, "tokenizer.ggml.eos_token_id", 2);
     const auto path = std::filesystem::temp_directory_path() /
@@ -398,8 +406,9 @@ public:
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
                            bool reverse_priority = false, size_t offload_bytes = 0,
-                           const char * first_output = "q", int model_queue_limit = -1) {
-        load_tokenizer(first_tok, false, first_output);
+                           const char * first_output = "q", int model_queue_limit = -1,
+                           int first_max_ctx = 64, bool first_pflash = false) {
+        load_tokenizer(first_tok, false, first_output, first_pflash);
         load_tokenizer(second_tok, true, "s");
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
         Socket reservation(socket(AF_INET, SOCK_STREAM, 0));
@@ -414,15 +423,20 @@ public:
         config.host = "127.0.0.1";
         config.port = port;
         config.model_name = "qwen";
-        config.max_ctx = 64;
+        config.max_ctx = first_max_ctx;
+        config.pflash = first_pflash;
+        if (first_pflash) {
+            config.pflash_threshold = 4;
+        }
         config.routing_queue_limit = queue_limit;
         config.queue_limit = model_queue_limit;
         config.decode_kv_offload_bytes = offload_bytes;
-        config.default_max_tokens = 4;
+        config.default_max_tokens = first_pflash ? first_max_ctx : 4;
         config.prefix_cache_cap = 0;
         config.shared_prefix = SharedPrefixMode::off;
         config.admission_coalesce_ms = 0;
-        config.chat_template_src = "{{ messages[0]['content'] }}";
+        config.chat_template_src = first_pflash ? "" : "{{ messages[0]['content'] }}";
+        config.chat_codec = first_pflash ? "qwen3.5" : "";
         config.sampler_defaults.has_temperature = true;
         config.sampler_defaults.temperature = 0.2f;
         listener_engine = std::make_unique<LuceEngine>(
@@ -430,7 +444,14 @@ public:
                             : std::move(first_owned));
         listener =
             std::make_unique<HttpServer>(*listener_engine, first_tok, config);
+        if (first_pflash) {
+            listener->set_drafter_tokenizer(&first_tok);
+        }
         config.model_name = "ds4";
+        config.max_ctx = 64;
+        config.pflash = false;
+        config.default_max_tokens = 4;
+        config.chat_codec = "";
         config.chat_template_src = "y{{ messages[0]['content'] }}";
         config.sampler_defaults.temperature = 0.7f;
         peer_engine = std::make_unique<LuceEngine>(
@@ -1458,6 +1479,38 @@ TEST_CASE(ModelRoutingFixture, test_load_answers_while_a_step_runs) {
     ROUTING_CHECK(load["slots_busy"] == 1 && load["kv_free_tokens"] == 96);
     engine.finish();
     ROUTING_CHECK(response_body(a.read())["model"] == "qwen");
+}
+
+// When PFlash preparation on the first routed model still overflows a client-sized
+// reply cap, it reports RoutingAdmission::unfit (without committing SSE bytes) so
+// automatic routing falls through to a peer model with enough context.
+TEST_CASE(ModelRoutingFixture, test_routed_post_pflash_overflow_falls_through_to_next_model) {
+    RunningModels models(/*single_peer=*/false, /*single_listener=*/true,
+                         /*load_balancing=*/true, /*queue_limit=*/0,
+                         /*reverse_priority=*/false, /*offload_bytes=*/0,
+                         /*first_output=*/"q", /*model_queue_limit=*/-1,
+                         /*first_max_ctx=*/48, /*first_pflash=*/true);
+    models.second.engine.finish();
+
+    for (bool stream : {false, true}) {
+        const json body = {
+            {"model", "auto"},
+            {"messages", {{{"role", "user"}, {"content", "xxxxxxxx"}}}},
+            {"max_tokens", 24},
+            {"stream", stream},
+            {"chat_template_kwargs", {{"enable_thinking", false}}},
+        };
+        const std::string resp = models.post(body).read();
+        ROUTING_CHECK(resp.rfind("HTTP/1.1 200 ", 0) == 0);
+        if (stream) {
+            ROUTING_CHECK(resp.find("\"model\":\"ds4\"") != std::string::npos);
+            ROUTING_CHECK(resp.find("data: [DONE]") != std::string::npos);
+        } else {
+            ROUTING_CHECK(response_body(resp)["model"] == "ds4");
+        }
+    }
+    ROUTING_CHECK(models.first_single.calls == 0);
+    ROUTING_CHECK(models.second.engine.admissions == 2);
 }
 
 #undef ROUTING_CHECK
