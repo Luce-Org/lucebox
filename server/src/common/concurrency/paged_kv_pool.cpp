@@ -79,7 +79,7 @@ void PagedKvPool::add_seq_ref(uint32_t block) {
 }
 
 void PagedKvPool::release_seq_ref(uint32_t block) {
-    if (seq_refcounts_[block] == 0) return;
+    if (block >= physical_block_count_ || seq_refcounts_[block] == 0) return;
     if (--seq_refcounts_[block] == 0) {
         if (pin_refcounts_[block] > 0) {
             ++pinned_only_blocks_;
@@ -148,8 +148,10 @@ PagedKvStatus PagedKvPool::reserve_capacity(
 
     SequenceState & sequence = sequences_[handle.slot];
     const uint32_t target_blocks = blocks_for_tokens(token_capacity);
+    const uint64_t resident_blocks =
+        (uint64_t)sequence.block_table.size() - sequence.evicted_block_count;
     const uint64_t owned_blocks =
-        (uint64_t)sequence.block_table.size() +
+        resident_blocks +
         sequence.retry_blocks.size() +
         sequence.reserved_blocks.size();
     if (target_blocks <= owned_blocks) return PagedKvStatus::Ok;
@@ -245,7 +247,11 @@ PagedKvStatus PagedKvPool::rollback_append(
     while (sequence.block_table.size() > restored_blocks) {
         const uint32_t block = sequence.block_table.back();
         sequence.block_table.pop_back();
-        sequence.retry_blocks.push_back(block);
+        if (block == kEvictedBlock) {
+            if (sequence.evicted_block_count > 0) --sequence.evicted_block_count;
+        } else {
+            sequence.retry_blocks.push_back(block);
+        }
     }
     sequence.kv_seq_len = restored_length;
     return PagedKvStatus::Ok;
@@ -259,6 +265,7 @@ PagedKvStatus PagedKvPool::clear(PagedKvSequenceHandle handle) {
     for (uint32_t block : sequence.reserved_blocks) release_seq_ref(block);
     for (uint32_t block : sequence.retry_blocks) release_seq_ref(block);
     sequence.kv_seq_len = 0;
+    sequence.evicted_block_count = 0;
     sequence.block_table.clear();
     sequence.reserved_blocks.clear();
     sequence.retry_blocks.clear();
@@ -283,6 +290,7 @@ void PagedKvPool::reset() {
     for (SequenceState & sequence : sequences_) {
         sequence.request_id = 0;
         sequence.kv_seq_len = 0;
+        sequence.evicted_block_count = 0;
         sequence.active = false;
         sequence.block_table.clear();
         sequence.reserved_blocks.clear();
@@ -319,7 +327,8 @@ PagedKvStatus PagedKvPool::owned_block_count(
 
     const SequenceState & sequence = sequences_[handle.slot];
     out_count = static_cast<uint32_t>(
-        sequence.block_table.size() + sequence.retry_blocks.size() +
+        (sequence.block_table.size() - sequence.evicted_block_count) +
+        sequence.retry_blocks.size() +
         sequence.reserved_blocks.size());
     return PagedKvStatus::Ok;
 }
@@ -360,6 +369,11 @@ PagedKvStatus PagedKvPool::pin_prefix_blocks(
     }
     out_blocks.clear();
     out_blocks.reserve(full_block_count);
+    for (uint32_t i = 0; i < full_block_count; ++i) {
+        if (sequence.block_table[i] >= physical_block_count_) {
+            return PagedKvStatus::InvalidArgument;
+        }
+    }
     for (uint32_t i = 0; i < full_block_count; ++i) {
         const uint32_t block = sequence.block_table[i];
         add_pin_ref(block);
@@ -514,6 +528,145 @@ void PagedKvPool::take_reserved_blocks(SequenceState & sequence,
     for (uint32_t i = 0; i < additional_blocks; ++i) {
         give_back(sequence.reserved_blocks, take_free_block());
     }
+}
+
+
+PagedKvStatus PagedKvPool::evict_logical_blocks(
+        PagedKvSequenceHandle handle, uint32_t first_lb, uint32_t count) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+    if (count == 0) return PagedKvStatus::Ok;
+    SequenceState & sequence = sequences_[handle.slot];
+    const uint32_t sealed_blocks = sequence.kv_seq_len / block_size_;
+    if (first_lb > sealed_blocks || count > sealed_blocks - first_lb ||
+        first_lb + count > sequence.block_table.size()) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t & entry = sequence.block_table[first_lb + i];
+        if (entry == kEvictedBlock) continue;
+        release_seq_ref(entry);
+        entry = kEvictedBlock;
+        ++sequence.evicted_block_count;
+    }
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::restore_logical_blocks(
+        PagedKvSequenceHandle handle, uint32_t first_lb, uint32_t count,
+        std::vector<uint32_t> & out_blocks, const uint32_t * shared_reattach) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+    out_blocks.clear();
+    if (count == 0) return PagedKvStatus::Ok;
+    SequenceState & sequence = sequences_[handle.slot];
+    if (first_lb > sequence.block_table.size() ||
+        count > sequence.block_table.size() - first_lb) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    uint32_t need_fresh = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (sequence.block_table[first_lb + i] != kEvictedBlock) continue;
+        const bool can_reattach = shared_reattach &&
+            shared_reattach[i] < physical_block_count_ &&
+            pin_refcounts_[shared_reattach[i]] > 0;
+        if (!can_reattach) ++need_fresh;
+    }
+    const uint64_t avail = (uint64_t)sequence.retry_blocks.size() +
+        sequence.reserved_blocks.size() + free_blocks_.size();
+    if (need_fresh > avail) return PagedKvStatus::BlocksExhausted;
+
+    out_blocks.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t & entry = sequence.block_table[first_lb + i];
+        if (entry == kEvictedBlock) {
+            const bool can_reattach = shared_reattach &&
+                shared_reattach[i] < physical_block_count_ &&
+                pin_refcounts_[shared_reattach[i]] > 0;
+            if (can_reattach) {
+                entry = shared_reattach[i];
+                add_seq_ref(entry);
+            } else if (!sequence.retry_blocks.empty()) {
+                entry = sequence.retry_blocks.back();
+                sequence.retry_blocks.pop_back();
+            } else if (!sequence.reserved_blocks.empty()) {
+                entry = take_lowest(sequence.reserved_blocks);
+            } else {
+                entry = take_free_block();
+            }
+            if (sequence.evicted_block_count > 0) --sequence.evicted_block_count;
+        }
+        out_blocks.push_back(entry);
+    }
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::truncate_logical_blocks(
+        PagedKvSequenceHandle handle, uint32_t new_tokens) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+    SequenceState & sequence = sequences_[handle.slot];
+    if (new_tokens > sequence.kv_seq_len) return PagedKvStatus::InvalidArgument;
+    const uint32_t keep_blocks = blocks_for_tokens(new_tokens);
+    if (new_tokens % block_size_ != 0 && keep_blocks > 0 &&
+        sequence.block_table[keep_blocks - 1] < physical_block_count_ &&
+        is_block_shared(sequence.block_table[keep_blocks - 1])) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    while (sequence.block_table.size() > keep_blocks) {
+        const uint32_t block = sequence.block_table.back();
+        sequence.block_table.pop_back();
+        if (block == kEvictedBlock) {
+            if (sequence.evicted_block_count > 0) --sequence.evicted_block_count;
+        } else {
+            release_seq_ref(block);
+        }
+    }
+    sequence.kv_seq_len = new_tokens;
+    return PagedKvStatus::Ok;
+}
+
+
+PagedKvStatus PagedKvPool::seed_evicted_prefix(
+        PagedKvSequenceHandle handle, uint32_t logical_tokens,
+        const std::vector<uint8_t> & resident_mask,
+        std::vector<uint32_t> & out_block_table) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+    out_block_table.clear();
+    SequenceState & sequence = sequences_[handle.slot];
+    if (sequence.kv_seq_len != 0 || !sequence.block_table.empty() || logical_tokens == 0) {
+        return PagedKvStatus::InvalidArgument;
+    }
+    const uint32_t total_blocks = blocks_for_tokens(logical_tokens);
+    if (resident_mask.size() < total_blocks) return PagedKvStatus::InvalidArgument;
+    uint32_t need_blocks = 0;
+    for (uint32_t lb = 0; lb < total_blocks; ++lb) {
+        if (resident_mask[lb]) ++need_blocks;
+    }
+    const uint64_t avail = (uint64_t)sequence.retry_blocks.size() +
+        sequence.reserved_blocks.size() + free_blocks_.size();
+    if (need_blocks > avail) return PagedKvStatus::BlocksExhausted;
+
+    sequence.block_table.reserve(total_blocks);
+    uint32_t evicted = 0;
+    for (uint32_t lb = 0; lb < total_blocks; ++lb) {
+        if (!resident_mask[lb]) {
+            sequence.block_table.push_back(kEvictedBlock);
+            ++evicted;
+        } else if (!sequence.retry_blocks.empty()) {
+            sequence.block_table.push_back(sequence.retry_blocks.back());
+            sequence.retry_blocks.pop_back();
+        } else if (!sequence.reserved_blocks.empty()) {
+            sequence.block_table.push_back(take_lowest(sequence.reserved_blocks));
+        } else {
+            sequence.block_table.push_back(take_free_block());
+        }
+    }
+    sequence.kv_seq_len = logical_tokens;
+    sequence.evicted_block_count = evicted;
+    out_block_table = sequence.block_table;
+    return PagedKvStatus::Ok;
 }
 
 }  // namespace luce::common

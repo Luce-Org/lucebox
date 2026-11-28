@@ -682,6 +682,7 @@ add_library(luce_common STATIC
     src/common/concurrency/paged_kv_pool.cpp
     src/common/concurrency/seq_slot_manager.cpp
     src/common/concurrency/paged_kv_offload.cpp
+    src/common/concurrency/kv_slot_residency.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -2794,6 +2795,7 @@ if(LUCE_TESTS)
             test/unit/test_model_routing.cpp
             test/unit/test_luce_engine.cpp
             test/unit/test_paged_kv_offload.cpp
+            test/unit/test_kv_slot_residency.cpp
             test/unit/test_anchor_params.cpp
             test/unit/test_derived_scalars.cpp
             test/unit/test_adaptive_spec_width.cpp

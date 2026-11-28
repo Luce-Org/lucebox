@@ -260,6 +260,17 @@ public:
 
     int slot_count() const { return (int)slots_.size(); }
     int max_context() const { return max_ctx_; }
+    void set_max_resident_tokens(int tokens) { max_resident_tokens_ = std::max(0, tokens); }
+    int max_resident_tokens() const { return max_resident_tokens_; }
+    // Rewind a decoding slot back to prefill at `r_pos` (used by KVFlash Think-Rewind).
+    // Caller must truncate KV residency / pool blocks to `r_pos` first.
+    bool rewind_to_prefill(int slot, int r_pos);
+
+    // Seed a newly admitted prefilling slot to `restored_tokens` with only the
+    // blocks marked in `resident_mask` allocated in GPU VRAM.
+    bool seed_evicted_prefix(int slot, int restored_tokens,
+                             const std::vector<uint8_t> & resident_mask,
+                             std::vector<uint32_t> & out_block_table);
     // Free counts the blocks neither appended nor reserved by any slot, plus
     // those only cached prefix pins hold (dropped on demand); a parked slot
     // holds none until it resumes.
@@ -290,6 +301,7 @@ private:
     std::unique_ptr<SlotKv> owned_kv_;   // set by the PagedKvPool & constructor
     SlotKv & kv_;
     int max_ctx_ = 0;
+    int max_resident_tokens_ = 0;
     std::vector<SeqSlot> slots_;
 };
 

@@ -84,6 +84,8 @@ struct PagedKvSequenceSnapshot {
 // Allocator front-end: hands out sequence slots and physical block indices.
 class PagedKvPool {
 public:
+    // Sentinel stored in logical block_table entries paged out by KVFlash.
+    static constexpr uint32_t kEvictedBlock = std::numeric_limits<uint32_t>::max();
     // `block_size` is the number of tokens per physical block. Throws
     // std::invalid_argument if any dimension is zero or the total token
     // capacity (physical_block_count * block_size) overflows uint32_t.
@@ -124,6 +126,36 @@ public:
     bool is_block_shared(uint32_t block) const {
         return block_refcount(block) > 1;
     }
+    bool is_block_pinned(uint32_t block) const {
+        return block < physical_block_count_ && pin_refcounts_[block] > 0;
+    }
+
+    // Evict `count` sealed logical blocks starting at `first_lb`: releases
+    // sequence refs (preserving shared/pinned blocks) and marks entries with
+    // `kEvictedBlock`. Caller must copy out any dirty KV before evicting.
+    PagedKvStatus evict_logical_blocks(PagedKvSequenceHandle handle,
+                                       uint32_t first_lb, uint32_t count);
+
+    // Restore `count` evicted logical blocks starting at `first_lb`: allocates
+    // fresh physical blocks (or re-attaches still-pinned `shared_reattach[i]`
+    // blocks zero-copy) and writes the resulting physical IDs to `out_blocks`.
+    PagedKvStatus restore_logical_blocks(PagedKvSequenceHandle handle,
+                                         uint32_t first_lb, uint32_t count,
+                                         std::vector<uint32_t> & out_blocks,
+                                         const uint32_t * shared_reattach = nullptr);
+
+    // Truncate sequence logical length back to `new_tokens` (e.g. Think-Rewind),
+    // releasing all blocks strictly beyond `blocks_for_tokens(new_tokens)`.
+    PagedKvStatus truncate_logical_blocks(PagedKvSequenceHandle handle,
+                                          uint32_t new_tokens);
+
+    // Seed an empty sequence to `logical_tokens` allocating physical blocks ONLY
+    // where `resident_mask[lb] != 0` and marking all other logical blocks with
+    // `kEvictedBlock` (used by KVFlash bounded prefix-cache restore).
+    PagedKvStatus seed_evicted_prefix(PagedKvSequenceHandle handle,
+                                      uint32_t logical_tokens,
+                                      const std::vector<uint8_t> & resident_mask,
+                                      std::vector<uint32_t> & out_block_table);
 
     // Claim a free sequence slot for `request_id`. The new sequence starts
     // empty; no blocks are allocated until append().
@@ -231,6 +263,7 @@ private:
         // visible by append(). Reserved blocks are excluded from the global
         // free list and returned by release()/reset().
         std::vector<uint32_t> reserved_blocks;
+        uint32_t evicted_block_count = 0;
     };
 
     // Blocks needed to hold `token_count` tokens (ceiling division).

@@ -33,6 +33,11 @@ public:
                                              uint32_t) {
         return PagedKvStatus::InvalidArgument;
     }
+    virtual PagedKvStatus seed_evicted_prefix(PagedKvSequenceHandle, uint32_t,
+                                              const std::vector<uint8_t> &,
+                                              std::vector<uint32_t> &) {
+        return PagedKvStatus::InvalidArgument;
+    }
     virtual PagedKvStatus sequence(PagedKvSequenceHandle, PagedKvSequenceSnapshot &) const {
         return PagedKvStatus::InvalidArgument;
     }
@@ -70,6 +75,11 @@ public:
     PagedKvStatus seed_shared_prefix(PagedKvSequenceHandle h, const uint32_t * shared,
                                      uint32_t shared_count, uint32_t tokens) override {
         return pool_.seed_shared_prefix(h, shared, shared_count, tokens);
+    }
+    PagedKvStatus seed_evicted_prefix(PagedKvSequenceHandle h, uint32_t tokens,
+                                      const std::vector<uint8_t> & resident_mask,
+                                      std::vector<uint32_t> & out_block_table) override {
+        return pool_.seed_evicted_prefix(h, tokens, resident_mask, out_block_table);
     }
     PagedKvStatus sequence(PagedKvSequenceHandle h, PagedKvSequenceSnapshot & out) const override {
         return pool_.sequence(h, out);
