@@ -1,4 +1,5 @@
 #include "graph_builders.h"
+#include "spec_rollback_policy.h"
 
 #include "delta_net_specla.h"
 
@@ -387,7 +388,8 @@ bool build_target_step(
     int top_n,
     bool keep_base_ssm_state,
     ggml_tensor * single_replay_slot_ids,
-    bool capture_q_all) {
+    TargetStepQueryCapture query_capture,
+    int kvflash_active_span) {
     step_graph_free(sg);
 
     // KEEP_BASE: only the single-sequence chain capture verify may
@@ -522,6 +524,9 @@ bool build_target_step(
         }
         static constexpr int kPagedGraphSlots = 64;
         graph_key_slot = 32 + (int)(hash % kPagedGraphSlots);
+    } else if (kvflash_mask && kvflash_active_span > 0) {
+        // Keep each 4K active-span bucket on its own CUDA/HIP graph cache key.
+        graph_key_slot = 96 + ((kvflash_active_span / 4096) % 32);
     }
     for (int i = 0; i < graph_key_slot; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
@@ -546,7 +551,12 @@ bool build_target_step(
         for (auto * t : cache.attn_k) {
             if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
         }
-        const int max_win_len = phys_ctx + n_tokens;
+        if (kvflash_mask && kvflash_active_span > 0) {
+            phys_ctx = std::min(phys_ctx, kvflash_active_span);
+        }
+        const int max_win_len = (kvflash_mask && kvflash_active_span > 0)
+            ? phys_ctx
+            : (phys_ctx + n_tokens);
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
@@ -634,12 +644,9 @@ bool build_target_step(
     // region is reused by graph execution) and set_rows carries per-token
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
-    const bool use_kv_write_rows =
-        paged_attention ||
-        (!g_no_kvpad && !capture_delta_intermediate &&
-         (kvflash_mask
-              ? (fa_window == 0)
-              : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture)));
+    const bool use_kv_write_rows = luce::qwen35::use_kv_write_rows(
+        paged_attention, g_no_kvpad, capture_delta_intermediate, kvflash_mask,
+        fa_window, n_tokens, with_mask, capture);
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
                                               n_tokens, w.n_head_kv);
@@ -679,7 +686,8 @@ bool build_target_step(
     gi.active_slot_ids            = sg.active_slot_ids;
     gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
-    gi.q_capture_all              = capture_qk && capture_q_all;
+    gi.q_capture_all              = capture_qk && query_capture.q_all;
+    gi.q_stage                    = query_capture.q_stage;
     gi.n_seqs                     = n_seqs;
     gi.seq_slot                   = seq_slot;
     gi.paged_max_kv_len           = paged_max_kv_len;

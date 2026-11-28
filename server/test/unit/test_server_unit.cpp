@@ -17332,13 +17332,15 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
 
 TEST_CASE(ServerUnitFixture, test_kvflash_recall_mode_is_the_backends_reselect_mode) {
     using luce::server::kvflash_recall_mode;
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "exact") == "prefill-reselect=4");  // the default profile
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", "exact").empty());   // --kvflash-policy lru turns recall off
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", "pflash2").empty());  // mode 4 needs the exact scorer
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", "exact").empty());    // retired mode
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", "exact").empty());    // the user turned recall off
-    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", "exact").empty());
-    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", "exact").empty());    // no recall on other architectures
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 1) == "prefill-reselect=4");  // the default profile
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "lru", 1).empty());   // --kvflash-policy lru turns recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "5", "qk", 1).empty());    // retired mode
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "0", "qk", 1).empty());    // the user turned recall off
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "", "qk", 1).empty());
+    TEST_ASSERT(kvflash_recall_mode("gemma4", "4", "qk", 1).empty());    // no recall on other architectures
+    // Tensor parallelism: the backend turns recall off at load (kvflash_recall_features), so /props says off.
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 2).empty());
+    TEST_ASSERT(kvflash_recall_mode("qwen35", "4", "qk", 4).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_props_kvflash_disabled_without_the_flag) {
@@ -17360,7 +17362,7 @@ TEST_CASE(ServerUnitFixture, test_props_kvflash_reports_pool_and_recall) {
     cfg.arch                = "qwen35";
     cfg.kvflash_enabled     = true;
     cfg.kvflash_pool_tokens = 16384;
-    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk", "exact");
+    cfg.kvflash_recall_mode = luce::server::kvflash_recall_mode("qwen35", "4", "qk", 1);
     Tokenizer   tok;
     PrefixCache pc(0, tok);
     ToolMemory  tm;

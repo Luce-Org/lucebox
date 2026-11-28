@@ -72,13 +72,9 @@
 #if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "gpu_runtime_compat.h"
 #define KVFLASH_HAS_ASYNC_DMA 1
-// ponytail: the device-side fence re-records one event per fence, which CUDA
-// allows and HIP documents as undefined while an earlier record is pending. HIP
-// builds therefore stay on the host wait (one stall per reused block after a
-// page-out on AMD). Upgrade: an event per pending record, or a HIP-verified reuse.
-#if !defined(LUCE_BACKEND_HIP) && !defined(GGML_USE_HIP)
+// Device-side fence using a fixed ring of events (checked with cudaEventQuery
+// before reuse so neither CUDA nor HIP ever re-records a pending event).
 #define KVFLASH_EVENT_FENCE 1
-#endif
 #endif
 
 // serialize()/deserialize() write and read integers and floats in host byte
@@ -187,9 +183,12 @@ public:
             page_stream_ = nullptr;
         }
 #ifdef KVFLASH_EVENT_FENCE
-        if (cudaEventCreateWithFlags(&page_event_, cudaEventDisableTiming) != cudaSuccess) {
-            page_event_ = nullptr;   // set_compute_stream() then keeps the host wait
-            cudaGetLastError();
+        page_event_next_ = 0;
+        for (int i = 0; i < kPageEventPoolSize; ++i) {
+            if (cudaEventCreateWithFlags(&page_events_[i], cudaEventDisableTiming) != cudaSuccess) {
+                page_events_[i] = nullptr;   // set_compute_stream() falls back to host wait if ring unavailable
+                (void)cudaGetLastError();
+            }
         }
 #endif
 #endif
@@ -793,22 +792,36 @@ public:
     // Callers cache the slot mask and refill only when the epoch moves.
     uint64_t epoch() const { return epoch_; }
 
+    // Highest physical block index currently holding a resident chunk (-1 if none).
+    int max_resident_block() const {
+        int hi = -1;
+        for (const auto & st : chunks_) {
+            if (st.block > hi) hi = st.block;
+        }
+        return hi;
+    }
+
     // F16 slot-validity mask for one query row: 0 for slots belonging to a
     // resident chunk, -inf for free / paged-out blocks. `dst` must hold
-    // arena_tokens() entries. Used as the FA mask so non-resident slots are
-    // excluded exactly instead of via the zero-row ~exp(-max) approximation.
+    // `max_tokens` (when > 0 and < arena_tokens()) or arena_tokens() entries.
+    // Used as the FA mask so non-resident slots are excluded exactly instead of
+    // via the zero-row ~exp(-max) approximation.
     // valid_upto bounds the logical positions that may be attended: rows of a
     // resident chunk at positions >= valid_upto (rejected drafts, a previous
     // turn's tokens above a rewind) are masked off. A decode step at position p
     // passes p + 1: it attends the rows below p and its own row. The default
     // leaves every resident row visible, as before.
-    void fill_slot_mask(uint16_t * dst, int64_t valid_upto = INT64_MAX) const {
+    void fill_slot_mask(uint16_t * dst, int64_t valid_upto = INT64_MAX, int max_tokens = 0) const {
         constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
-        for (int i = 0; i < arena_tokens(); i++) dst[i] = F16_NEG_INF;
+        const int span = (max_tokens > 0 && max_tokens < arena_tokens()) ? max_tokens : arena_tokens();
+        for (int i = 0; i < span; i++) dst[i] = F16_NEG_INF;
         for (int c = 0; c < (int)chunks_.size(); c++) {
             if (chunks_[c].block < 0) continue;
-            uint16_t * p = dst + (size_t)row_base_ + (size_t)chunks_[c].block * cfg_.chunk_tokens;
-            for (int i = 0; i < cfg_.chunk_tokens; i++)
+            const int base = row_base_ + chunks_[c].block * cfg_.chunk_tokens;
+            if (base >= span) continue;
+            uint16_t * p = dst + (size_t)base;
+            const int lim = std::min(cfg_.chunk_tokens, span - base);
+            for (int i = 0; i < lim; i++)
                 if ((int64_t)c * cfg_.chunk_tokens + i < valid_upto) p[i] = F16_ZERO;
         }
     }
@@ -1431,11 +1444,18 @@ private:
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (!page_work_queued_) return;
 #ifdef KVFLASH_EVENT_FENCE
-        if (compute_stream_ && page_event_) {
-            check_(cudaEventRecord(page_event_, page_stream_), "cudaEventRecord(page)");
-            check_(cudaStreamWaitEvent(compute_stream_, page_event_, 0), "cudaStreamWaitEvent(compute)");
-            page_work_queued_ = false;
-            return;
+        if (compute_stream_) {
+            cudaEvent_t ev = page_events_[page_event_next_];
+            // Only record onto an idle event (required on HIP where re-recording
+            // a pending event is undefined); fall back to host sync if all ring
+            // slots are simultaneously in flight.
+            if (ev && cudaEventQuery(ev) == cudaSuccess) {
+                check_(cudaEventRecord(ev, page_stream_), "cudaEventRecord(page)");
+                check_(cudaStreamWaitEvent(compute_stream_, ev, 0), "cudaStreamWaitEvent(compute)");
+                page_event_next_ = (page_event_next_ + 1) % kPageEventPoolSize;
+                page_work_queued_ = false;
+                return;
+            }
         }
 #endif
         sync_page_stream_();
@@ -1500,10 +1520,13 @@ private:
         if (page_stream_ && page_stream_ != ext_page_stream_) cudaStreamDestroy(page_stream_);
         page_stream_ = nullptr;
 #ifdef KVFLASH_EVENT_FENCE
-        if (page_event_) {
-            cudaEventDestroy(page_event_);
-            page_event_ = nullptr;
+        for (int i = 0; i < kPageEventPoolSize; ++i) {
+            if (page_events_[i]) {
+                (void)cudaEventDestroy(page_events_[i]);
+                page_events_[i] = nullptr;
+            }
         }
+        page_event_next_ = 0;
         compute_stream_ = nullptr;   // a reattach must not wait on a stream the caller has since destroyed
 #endif
         page_work_queued_ = false;
@@ -1552,13 +1575,31 @@ private:
     cudaStream_t ext_page_stream_ = nullptr;   // arena-owned; see set_external_page_stream()
     bool         page_work_queued_ = false;   // work on page_stream_ no consumer has waited for
 #ifdef KVFLASH_EVENT_FENCE
+    static constexpr int kPageEventPoolSize = 16;
     cudaStream_t compute_stream_ = nullptr;   // consumer of the pool; see set_compute_stream()
-    cudaEvent_t  page_event_ = nullptr;
+    cudaEvent_t  page_events_[kPageEventPoolSize] = {};
+    int          page_event_next_ = 0;
 #endif
 #endif
     bool has_pending_page_in_ = false;
     bool pinned_host_ = true;
 };
+
+// 4K-bucketed active physical span (tokens) covering all resident blocks of
+// `pager` plus an optional just-allocated slot. Keeps CUDA/HIP graph shapes
+// stable within each bucket while avoiding full-pool FA scans on large pools.
+inline int kvflash_active_span_tokens(const KvFlashPager & pager,
+                                      int max_slot = -1,
+                                      int bucket = 4096) {
+    const int pool = pager.pool_tokens();
+    if (pool <= 0) return 0;
+    const int ct = std::max(1, pager.chunk_tokens());
+    const int hi_blk = pager.max_resident_block();
+    int hi_tok = hi_blk >= 0 ? (hi_blk + 1) * ct : ct;
+    if (max_slot >= 0) hi_tok = std::max(hi_tok, max_slot + 1);
+    if (bucket > 0) hi_tok = ((hi_tok + bucket - 1) / bucket) * bucket;
+    return std::min(pool, std::max(ct, hi_tok));
+}
 
 // ── Shared backend helpers ─────────────────────────────────────────────
 //

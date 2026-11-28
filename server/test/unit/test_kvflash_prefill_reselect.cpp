@@ -18,22 +18,26 @@ std::vector<float> ramp(int n) { std::vector<float> s((size_t)n); for (int i = 0
 // ---- the mode gate: only 0 and 4 exist -----------------------------------------------------------------
 
 TEST_CASE(KvflashPrefillReselectFixture, modes_one_to_three_are_off) {
-    std::string why;
-    for (int m : {1, 2, 3, 5, 6, -1, 100}) {
-        CHECK(kvflash_reselect_mode(m, true, "exact", &why) == 0);
-        CHECK(kvflash_reselect_mode(m, true, "pflash2", &why) == 0);
-    }
-    CHECK(kvflash_reselect_mode(0, true, "exact", &why) == 0);
+    for (int m : {0, 1, 2, 3, 5, 6, -1, 100}) CHECK(kvflash_reselect_mode(m, true) == 0);
 }
-TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy_and_the_exact_scorer) {
-    std::string why;
-    CHECK(kvflash_reselect_mode(4, true, "exact", &why) == 4);
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, false, "exact", &why) == 0);   // LRU policy: no recall, and nothing to complain about
-    CHECK(why.empty());
-    CHECK(kvflash_reselect_mode(4, true, "pflash2", &why) == 0);  // the scorer must match the mode
-    CHECK(why == "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact");
-    CHECK(kvflash_reselect_mode(4, true, "cosine", nullptr) == 0);   // the cosine scorer is gone
+TEST_CASE(KvflashPrefillReselectFixture, mode_four_needs_the_qk_policy) {
+    CHECK(kvflash_reselect_mode(4, true) == 4);    // exact attention mass
+    CHECK(kvflash_reselect_mode(4, false) == 0);   // LRU policy: no recall
+}
+
+// ---- a recall mode holds the turn's plan while the answer decodes ------------------------------------------
+
+TEST_CASE(KvflashPrefillReselectFixture, a_recall_mode_has_no_decode_time_reselect) {
+    // The slot engine never reselects while it decodes. A serial reselect after tau tokens would swap the turn's
+    // recall picks for single-query QK picks, so the pool would depend on the engine and on the answer's length.
+    CHECK(kvflash_decode_reselect_tau(4, 64) == 0);
+    CHECK(kvflash_decode_reselect_tau(4, 1) == 0);
+}
+TEST_CASE(KvflashPrefillReselectFixture, without_a_recall_mode_the_decode_time_reselect_keeps_its_interval) {
+    CHECK(kvflash_decode_reselect_tau(0, 64) == 64);
+    CHECK(kvflash_decode_reselect_tau(0, 256) == 256);
+    CHECK(kvflash_decode_reselect_tau(0, 0) == 1);       // the interval floor
+    CHECK(kvflash_decode_reselect_tau(0, -5) == 1);
 }
 
 TEST_CASE(KvflashPrefillReselectFixture, recall_plan_keeps_features_for_one_device_and_drops_them_under_tp) {
@@ -214,7 +218,20 @@ TEST_CASE(KvflashPrefillReselectFixture, recall_plan_unit_other_than_ten) {
     const KvFlashRecallPlan p = kvflash_recall_plan(ramp(600), in);
     CHECK(p.k_units == 30);
     CHECK((int)p.picked.size() == 30);
-    for (int b : p.picked) CHECK(b * 2 >= 10);               // the 10-chunk sink floor holds at every unit
+    for (int b : p.picked) CHECK(b * 2 >= 2);
+}
+TEST_CASE(KvflashPrefillReselectFixture, recall_plan_closes_low_chunk_dead_zone_for_small_units) {
+    // With pinned_chunks < 10 and unit = 2, chunks [2..9] ([128, 640)) are evictable
+    // and must be recallable instead of trapped below the legacy 10-chunk floor.
+    std::vector<float> scores(400, 0.1f);
+    scores[2] = scores[3] = 50.0f;  // unit 1 = chunks [2, 4)
+    KvFlashRecallIn in;
+    in.n_pool_blocks = 256; in.cur_chunk = 400; in.recall_chunks = 60;
+    in.unit = 2; in.reserve = 3; in.pinned_chunks = 2; in.pin_reserve_chunks = 2;
+    const KvFlashRecallPlan p = kvflash_recall_plan(scores, in);
+    CHECK(p.first_chunk == 2);
+    REQUIRE(!p.picked.empty());
+    CHECK(p.picked[0] == 1);
 }
 
 // ---- the eviction hook only ranks chunks that are already written ------------------------------------------

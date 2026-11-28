@@ -181,6 +181,12 @@ bool build_hybrid_full_layer_step(
 // DeltaNet op becomes a mapped verify over it that writes neither
 // intermediates nor a final state and records the replay log into
 // sg.delta_captures[i].replay_log (ssm_intermediate_states stays null).
+// KVFlash query captures for build_target_step().
+struct TargetStepQueryCapture {
+    bool q_all = false;    // last kQueryCaptureTokens queries into cache.q_cap_all
+    bool q_stage = false;  // per-row verify queries into cache.q_stage
+};
+
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -209,7 +215,8 @@ bool build_target_step(
     int top_n = 0,
     bool keep_base_ssm_state = false,
     ggml_tensor * single_replay_slot_ids = nullptr,
-    bool capture_q_all = false);
+    TargetStepQueryCapture query_capture = {},
+    int kvflash_active_span = 0);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

@@ -240,6 +240,28 @@ struct LaunchPolicyFixture : CommonFixture {
         return dims;
     }
 
+    // Auto placement charges what attach_rollback_storage() attaches: Auto
+    // resolves to fast rollback (even under KVFlash), while Exact
+    // (--no-fast-rollback) uses the two snapshots only.
+    void test_rollback_charge_follows_the_resolved_rollback_mode() {
+        using luce::common::RollbackMode;
+        using luce::common::spec_rollback_checkpoints;
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Auto,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Fast,  /*tree=*/false));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/true,  RollbackMode::Exact, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Auto,  /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Fast,  /*tree=*/false));
+        CHECK(!spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Exact, /*tree=*/false));
+        CHECK( spec_rollback_checkpoints(/*pager_on=*/false, RollbackMode::Exact, /*tree=*/true));
+
+        const RollbackCacheDims dims = qwen38_27b_dims();
+        // 48 layers x (128 x 128 x 48 state + 3 x 10240 conv taps) floats.
+        const uint64_t snapshots = rollback_cache_bytes(dims, 8, true, false, /*checkpoints=*/false);
+        CHECK(snapshots == 48ull * (128 * 128 * 48 + 3 * 10240) * 4);
+        CHECK(snapshots == 156893184ull);
+        CHECK(rollback_cache_bytes(dims, 8, true, false, /*checkpoints=*/true) == 1386479616ull);
+    }
+
     void test_rollback_cache_bytes_match_the_backend_allocation() {
         const RollbackCacheDims dims = qwen38_27b_dims();
         // The size a T4 refused for this model with its 8-token DFlash 2
@@ -990,6 +1012,22 @@ struct LaunchPolicyFixture : CommonFixture {
         CHECK(kvflash_recall_env("").empty());
     }
 
+    void test_kvflash_recall_preamble_reserve_is_64_chunks() {
+        // Dynamic pin_reserve_chunks charges only actually pinned chunks, so the
+        // 4096-token (64-chunk) cap protects full agent system+tools preambles
+        // without wasting tail room on shorter preambles.
+        CHECK(KvflashRecallProfile::preamble_rows == 64 * 64);
+    }
+
+    void test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size() {
+        // --kvflash N sets the decode cost (every step attends the whole pool), so the profile's reserve comes out of N
+        // and leaves N - reserve history rows; it never grows the pool.
+        const int ct = 64, pool = 16384;
+        const int reserve = kvflash_preamble_reserve_in_pool(pool, KvflashRecallProfile::preamble_rows, ct);
+        CHECK(reserve == KvflashRecallProfile::preamble_rows);
+        CHECK(pool - reserve == 12288);
+    }
+
     void test_kvflash_preamble_reserve_that_leaves_no_history_is_off() {
         // Like a missing <|im_start|> id, a reserve the pool cannot hold turns the pin off (the backend logs why).
         const int ct = 64;
@@ -1008,11 +1046,10 @@ struct LaunchPolicyFixture : CommonFixture {
         const std::vector<std::pair<std::string, std::string>> expected = {
             {"LUCE_KVFLASH_POLICY", "qk"},
             {"LUCE_KVFLASH_PREFILL_RESELECT", "4"},
-            {"LUCE_KVFLASH_RESELECT_SCORER", "exact"},
-            {"LUCE_KVFLASH_RECALL_BLOCKS", "6"},
+            {"LUCE_KVFLASH_RECALL_BLOCKS", "auto"},
             {"LUCE_KVFLASH_SCORE_POOL_RECENT", "1"},
             {"LUCE_KVFLASH_SELECT_UNIT", "2"},
-            {"LUCE_KVFLASH_PREAMBLE_ROWS", "1152"},
+            {"LUCE_KVFLASH_PREAMBLE_ROWS", "4096"},
             {"LUCE_KVFLASH_UQ_QUERIES", "64"},
         };
         const std::vector<LaunchProfileEnv> env = kvflash_recall_env("qwen35");
@@ -1059,6 +1096,7 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_auto_placement_splits_only_what_one_discrete_gpu_cannot_hold();
     test_auto_placement_never_uses_exhausted_devices();
     test_rollback_cache_bytes_match_the_backend_allocation();
+    test_rollback_charge_follows_the_resolved_rollback_mode();
     test_auto_placement_moves_a_drafter_that_does_not_fit_beside_the_target();
     test_auto_placement_keeps_a_drafter_that_fits_beside_the_target();
     test_auto_placement_moves_a_drafter_only_to_a_gpu_that_holds_it();
@@ -1082,6 +1120,8 @@ TEST_CASE(LaunchPolicyFixture, launch_policy_suite) {
     test_ds41_gorgon_profile_keeps_the_model_resident();
     test_qwen_next_split_profile_fits_its_context();
     test_kvflash_recall_defaults_need_a_qwen35_target();
+    test_kvflash_recall_preamble_reserve_is_64_chunks();
+    test_kvflash_recall_profile_leaves_the_pool_at_the_requested_size();
     test_kvflash_preamble_reserve_that_leaves_no_history_is_off();
     test_kvflash_recall_defaults_are_the_shipped_profile();
     test_pflash_curve_arg_accepts_quoted_and_split_points();

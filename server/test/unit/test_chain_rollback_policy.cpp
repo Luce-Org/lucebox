@@ -270,3 +270,16 @@ TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract
     CHECK(print_to_string(diag).empty());
     clear_policy_env();
 }
+
+// KVFlash spec decode defaults to fast rollback (exact restore + replay costs
+// ~28% decode throughput); --no-fast-rollback (Exact) opts into exact restore.
+TEST_CASE(ChainRollbackPolicyFixture, kvflash_default_is_fast_rollback_and_exact_is_opt_in) {
+    using luce::common::RollbackMode;
+    using luce::common::spec_fast_rollback_enabled;
+    CHECK( spec_fast_rollback_enabled(/*pager_on=*/true,  RollbackMode::Auto));
+    CHECK( spec_fast_rollback_enabled(/*pager_on=*/true,  RollbackMode::Fast));
+    CHECK(!spec_fast_rollback_enabled(/*pager_on=*/true,  RollbackMode::Exact));
+    CHECK( spec_fast_rollback_enabled(/*pager_on=*/false, RollbackMode::Auto));
+    CHECK( spec_fast_rollback_enabled(/*pager_on=*/false, RollbackMode::Fast));
+    CHECK(!spec_fast_rollback_enabled(/*pager_on=*/false, RollbackMode::Exact));
+}

@@ -113,14 +113,15 @@ bool create_target_cache(const TargetWeights & w,
                          int n_seq_slots,
                          bool concurrent_tree,
                          ggml_type cache_type_k, ggml_type cache_type_v,
-                         int target_feat_cap) {
+                         int target_feat_cap,
+                         bool allocate_q_stage) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
                                        paged_attention, n_seq_slots,
                                        concurrent_tree, cache_type_k, cache_type_v,
-                                       target_feat_cap);
+                                       target_feat_cap, allocate_q_stage);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -141,7 +142,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int n_seq_slots,
                                  bool concurrent_tree,
                          ggml_type cache_type_k, ggml_type cache_type_v,
-                         int target_feat_cap) {
+                         int target_feat_cap,
+                         bool allocate_q_stage) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -301,6 +303,14 @@ bool create_target_cache_partial(const TargetWeights & w,
             out.q_cap_all = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
                                                head_dim, T, w.n_head, n_full_attn);
             ggml_set_name(out.q_cap_all, "q_cap_all");
+        }
+        // Spec verify query stage: only when the caller asks for it (serial
+        // KVFlash with the target-QK policy and a draft model).
+        if (const int R = luce::common::kvflash_q_stage_rows(max_verify_tokens, allocate_q_stage); R > 0) {
+            out.q_stage_rows = R;
+            out.q_stage = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                             head_dim, w.n_head, R, n_full_attn);
+            ggml_set_name(out.q_stage, "q_stage");
         }
 
         // Paged-attention metadata is persistent like the K/V pool itself so
@@ -497,6 +507,10 @@ void free_target_cache(TargetCache & c) {
     c.q_cap = nullptr;
     c.q_cap_all = nullptr;
     c.q_cap_all_tokens = 0;
+    c.q_stage = nullptr;
+    c.q_stage_rows = 0;
+    c.q_stage_base = -1;
+    c.q_stage_n = 0;
     c.cur_pos = 0;
 }
 
@@ -1476,7 +1490,7 @@ static ggml_tensor * build_full_attn_block(
         // slots are readable. Detect the mode by the pair only slot-mapped
         // verify sets: a set_rows KV write together with an explicit mask.
         if (kv_write_rows != nullptr && attn_mask != nullptr) {
-            win_len_padded = (int)cache_k->ne[1];
+            win_len_padded = std::min((int)cache_k->ne[1], (int)attn_mask->ne[0]);
         }
 
         // K and V from cache: a windowed view starting at win_start.
@@ -2541,6 +2555,7 @@ QwenGraphOutputs build_qwen35_graph(
 
         if (is_attn) {
             const bool want_q_cap = in.q_capture && cache.q_cap;
+            const bool want_q_stage = in.q_stage && cache.q_stage && n_tokens <= cache.q_stage_rows;
             ggml_tensor * q_fa = nullptr;
             if (w.is_bailingmoe3) {
                 GGML_ASSERT(!in.kv_write_rows && !in.paged_block_table &&
@@ -2560,7 +2575,7 @@ QwenGraphOutputs build_qwen35_graph(
                                             /*q_tail_capture=*/nullptr,
                                             /*q_tail_start=*/0,
                                             in.kv_write_rows,
-                                            want_q_cap ? &q_fa : nullptr,
+                                            (want_q_cap || want_q_stage) ? &q_fa : nullptr,
                                             in.paged_block_table,
                                             in.paged_kv_seq_lens,
                                             in.paged_query_seq_ids,
@@ -2573,6 +2588,14 @@ QwenGraphOutputs build_qwen35_graph(
                                             in.tree_scratch_base,
                                             in.tree_scratch_stride,
                                             cache.max_ctx);
+            }
+            if (want_q_stage && q_fa) {
+                // Every row's query, [head_dim, n_tokens, n_head] permuted to
+                // [head_dim, n_head, n_tokens], into layer fa_idx's plane of the stage.
+                ggml_tensor * qp = ggml_permute(ctx, q_fa, 0, 2, 1, 3);
+                ggml_tensor * qd = luce::common::kvflash_q_stage_view(
+                    ctx, cache.q_stage, fa_idx, n_tokens);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, qp, qd));
             }
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of

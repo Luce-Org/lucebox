@@ -90,7 +90,7 @@ BackendPreparation BackendPlanBuilder::resolve(
                 "' with placement " + placement_device_name(args.device) +
                 "; using the architecture's normal decode path");
             args.specla_mode = false;
-        } else if (!args.fast_rollback) {
+        } else if (args.rollback_mode == RollbackMode::Exact) {
             // The CLI rejects --specla with --no-fast-rollback before
             // admission; this guard covers callers that build BackendArgs
             // directly.
@@ -104,13 +104,15 @@ BackendPreparation BackendPlanBuilder::resolve(
                 "Qwen3.6 SpecLA requires --draft <path>",
                 std::move(warnings));
         } else {
-            args.ddtree_mode = true;
+            // SpecLA verifies through DDTree, which KVFlash refuses.
             if (admission.kvflash_requested()) {
-                warnings.push_back(
-                    "--specla is unavailable with KVFlash; using ordinary "
-                    "DDTree verification");
-                args.specla_mode = false;
+                return failure(
+                    BackendPreparationError::FeatureCompatibility,
+                    "--specla cannot run with --kvflash (LUCE_KVFLASH): SpecLA verifies "
+                    "with the DDTree loop, which does not settle terminal steps like AR; "
+                    "drop --specla");
             }
+            args.ddtree_mode = true;
         }
         if (!args.specla_mode && !args.ddtree_tau_explicit) {
             args.ddtree_tau = std::numeric_limits<float>::infinity();
@@ -156,7 +158,7 @@ BackendPreparation BackendPlanBuilder::resolve(
 
     plan.speculation_.draft_path = std::move(args.draft_path);
     plan.speculation_.draft_block_size = args.draft_block_size;
-    plan.speculation_.fast_rollback = args.fast_rollback;
+    plan.speculation_.rollback_mode = args.rollback_mode;
     plan.speculation_.seq_verify = args.seq_verify;
     plan.speculation_.specla_mode = args.specla_mode;
     plan.speculation_.specla_top_k = args.specla_top_k;

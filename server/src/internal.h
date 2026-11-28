@@ -595,6 +595,16 @@ struct TargetCache {
     // (selector v2 and the user-question queries). Only a KVFlash process allocates it.
     ggml_tensor * q_cap_all = nullptr;
     int q_cap_all_tokens = 0;
+    // Spec verify query stage (KVFlash only): the query of each verify row,
+    // F32 [head_dim, n_head, q_stage_rows, n_fa]; row r of layer l is one
+    // contiguous q_cap plane (see kvflash_q_stage_view). After acceptance the backend copies the last
+    // accepted row into q_cap, so q_cap holds what AR holds. q_stage_base/n
+    // are the position and row count of the last staged pass.
+    ggml_tensor * q_stage = nullptr;
+    int q_stage_rows = 0;
+    int q_stage_base = -1;
+    int q_stage_n = 0;
+    bool q_stage_on = false;   // the backend wants verify passes to stage
 
     // Paged-attention metadata, resident next to the K/V pool (only when the
     // cache was created with paged_attention). Living here instead of as
@@ -854,7 +864,8 @@ bool create_target_cache(const TargetWeights & w,
                          bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool allocate_q_stage = false);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -875,7 +886,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool concurrent_tree = false,
                          ggml_type cache_type_k = GGML_TYPE_COUNT,
                          ggml_type cache_type_v = GGML_TYPE_COUNT,
-                         int target_feat_cap = 4096);
+                         int target_feat_cap = 4096,
+                         bool allocate_q_stage = false);
 
 void free_target_cache(TargetCache & c);
 
@@ -1069,6 +1081,8 @@ struct QwenGraphInputs {
     bool q_capture = false;
     // Also copy the last min(n_tokens, 64) tokens' Q into cache.q_cap_all (recall / UQ prefill only).
     bool q_capture_all = false;
+    // Stage every row's query into cache.q_stage (spec verify under KVFlash).
+    bool q_stage = false;
 
     // SpecLA topology masks for the fully factorized compatibility route.
     ggml_tensor * specla_m_strict = nullptr;

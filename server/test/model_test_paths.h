@@ -11,6 +11,8 @@ namespace luce_test {
 
 inline constexpr std::string_view kQwen35ModelEnv = "LUCE_TEST_MODEL_QWEN35";
 inline constexpr std::string_view kDraftModelEnv = "LUCE_TEST_MODEL_DRAFT";
+inline constexpr std::string_view kQwen38ModelEnv = "LUCE_TEST_MODEL_QWEN38";
+inline constexpr std::string_view kQwen38DraftModelEnv = "LUCE_TEST_MODEL_QWEN38_DRAFT";
 inline constexpr std::string_view kDeepSeek4ModelEnv = "LUCE_TEST_MODEL_DEEPSEEK4";
 inline constexpr std::string_view kLagunaModelEnv = "LUCE_TEST_MODEL_LAGUNA";
 

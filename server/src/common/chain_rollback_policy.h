@@ -31,6 +31,34 @@ inline bool split_chain_fast_rollback_enabled() {
     return env_flag_enabled("LUCE_SPLIT_FAST_ROLLBACK");
 }
 
+// Caller-requested speculative rollback mode.
+// Auto resolves to fast rollback (even under KVFlash, where exact restore +
+// replay costs ~28% decode throughput). Pass Exact (--no-fast-rollback) when
+// strict bitwise AR equivalence or lower checkpoint VRAM is required.
+enum class RollbackMode {
+    Auto,
+    Fast,
+    Exact,
+};
+
+inline bool spec_fast_rollback_enabled(bool pager_on, RollbackMode mode) {
+    (void)pager_on;
+    switch (mode) {
+        case RollbackMode::Fast:  return true;
+        case RollbackMode::Exact: return false;
+        case RollbackMode::Auto:  return true;
+    }
+    return false;
+}
+
+// What the Qwen3.5 target attaches for a drafter
+// (Qwen35Backend::attach_rollback_storage): the per-token checkpoints of
+// migrate_prefill_cache() with fast rollback or a tree, else only the two
+// snapshots of ensure_ssm_snapshot() (exact restore + replay).
+inline bool spec_rollback_checkpoints(bool pager_on, RollbackMode mode, bool tree) {
+    return tree || spec_fast_rollback_enabled(pager_on, mode);
+}
+
 inline ChainRollbackPolicy resolve_chain_rollback_policy(
         bool tensor_parallel = false,
         bool exact_fast_rollback = false) {
@@ -88,10 +116,13 @@ struct RollbackCacheDims {
 // banks. Placement counts them because nothing else reserves them: Qwen3.8-27B
 // with an 8-token drafter allocates 1,386,479,616 bytes (1322.25 MiB) here.
 // Keep in step with migrate_prefill_cache() (qwen35_target_graph.cpp).
+// checkpoints=false: the two snapshots only, what ensure_ssm_snapshot()
+// allocates when spec_rollback_checkpoints() is false.
 inline uint64_t rollback_cache_bytes(const RollbackCacheDims & d,
                                      int max_verify_tokens,
                                      bool checkpoint_f32,
-                                     bool specla) {
+                                     bool specla,
+                                     bool checkpoints = true) {
     if (d.n_delta_layers <= 0 || d.ssm_dt_rank <= 0 || d.ssm_d_inner <= 0 ||
         d.ssm_d_conv <= 0 || max_verify_tokens <= 0) {
         return 0;
@@ -107,6 +138,7 @@ inline uint64_t rollback_cache_bytes(const RollbackCacheDims & d,
 
     const uint64_t ssm_state = head_v * head_v * rank * f32;
     uint64_t per_layer = ssm_state + conv_taps * conv_ch * f32;   // the two snapshots
+    if (!checkpoints) return per_layer * (uint64_t) d.n_delta_layers;   // ensure_ssm_snapshot()
     if (specla) {
         // Two banks of k, v, g and conv factors per verified token.
         per_layer += 2 * q * (head_k * rank + head_v * rank + rank + conv_ch) * f32;

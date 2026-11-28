@@ -610,3 +610,58 @@ TEST_CASE(SampledVerifyFixture, constrained_greedy_matches_constrained_ar) {
                            /*walk_grammar_off_by_one=*/true) !=
            generate_greedy_ar(target, sampler, prompt, kTokens)));
 }
+
+// The AR hop commits the root, forwards it alone, and seeds the next root from
+// that forward's argmax. Under a grammar the seed goes through
+// constrained_next_root; `checked` false is the argmax taken as is.
+namespace {
+std::vector<int32_t> generate_hops(const FakeModel & target, const SamplerCfg & sampler,
+                                   const std::vector<int32_t> & prompt, int length,
+                                   bool checked) {
+    std::vector<int32_t> context = prompt, out;
+    std::mt19937_64 rng(0);
+    sampler.constraint->reset();
+    int32_t last_tok = constrained_next_root(target.argmax(context), sampler, out, rng,
+                                             [&](int & v) { v = kVocab; return target.logits(context); });
+    while ((int)out.size() < length) {
+        context.push_back(last_tok);
+        out.push_back(last_tok);
+        sampler.constraint->accept(last_tok);
+        const int32_t argmax = target.argmax(context);
+        last_tok = checked
+            ? constrained_next_root(argmax, sampler, out, rng,
+                                    [&](int & v) { v = kVocab; return target.logits(context); })
+            : argmax;
+    }
+    return out;
+}
+}  // namespace
+
+// Regression: the hop's next root was the raw argmax, so a grammar-rejected
+// token became the root, was committed, and killed the grammar.
+TEST_CASE(SampledVerifyFixture, ar_hop_root_stays_in_grammar) {
+    SamplerCfg sampler;
+    sampler.constraint = alternating_grammar();
+    const std::vector<int32_t> prompt = {1, 2};
+    int unchecked_differs = 0;
+    for (uint64_t model_seed = 1; model_seed <= 40; ++model_seed) {
+        const FakeModel target(model_seed, 2.0f);
+        const auto ar = generate_greedy_ar(target, sampler, prompt, 24);
+        CHECK((generate_hops(target, sampler, prompt, 24, true) == ar));
+        if (generate_hops(target, sampler, prompt, 24, false) != ar) ++unchecked_differs;
+    }
+    CHECK(unchecked_differs >= 30);
+}
+
+TEST_CASE(SampledVerifyFixture, next_root_fails_when_the_row_is_unreadable) {
+    SamplerCfg sampler;
+    sampler.constraint = alternating_grammar();
+    sampler.constraint->reset();
+    std::vector<int32_t> history;
+    std::mt19937_64 rng(0);
+    const int32_t rejected = 3;  // 'd' at a position that allows [abc]
+    CHECK(constrained_next_root(rejected, sampler, history, rng,
+                                [](int &) -> const float * { return nullptr; }) == -1);
+    CHECK(constrained_next_root(0, sampler, history, rng,
+                                [](int &) -> const float * { return nullptr; }) == 0);
+}

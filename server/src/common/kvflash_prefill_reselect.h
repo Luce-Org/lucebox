@@ -13,14 +13,16 @@
 
 namespace luce::common {
 
-// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass. Mode 4 needs the qk policy and the exact
-// scorer; any other value (the retired modes 1-3 and 5 included) is off. A mismatch is reported in *why (cleared first).
-inline int kvflash_reselect_mode(int env_mode, bool qk_policy, const char * scorer, std::string * why) {
-    if (why) why->clear();
-    if (!qk_policy || env_mode != 4) return 0;
-    if (scorer && std::string(scorer) == "exact") return env_mode;
-    if (why) *why = "LUCE_KVFLASH_PREFILL_RESELECT=4 needs LUCE_KVFLASH_RESELECT_SCORER=exact";
-    return 0;
+// LUCE_KVFLASH_PREFILL_RESELECT: 0 off, 4 reselect by exact attention mass. Mode 4 needs the qk policy; any other
+// value (the retired modes 1-3 and 5 included) is off.
+inline int kvflash_reselect_mode(int env_mode, bool qk_policy) {
+    return qk_policy && env_mode == 4 ? env_mode : 0;
+}
+
+// Tokens between two decode-time reselects (LUCE_KVFLASH_TAU, at least 1); 0 = none. A recall mode plans the pool for
+// the whole turn when the prefill reaches the cut and holds that plan while the answer decodes.
+inline int kvflash_decode_reselect_tau(int reselect_mode, int tau_env) {
+    return reselect_mode != 0 ? 0 : std::max(1, tau_env);
 }
 
 // Which recall features stay on. Recall (mode 4) and the user-question queries need the per-token query capture
@@ -208,6 +210,14 @@ inline int kvflash_pin_preamble(Pager & pager, int preamble_end, int reserve_row
 
 // Recall eligibility floor (chunks): v1's 10-chunk sink block, or past the pinned preamble.
 inline int kvflash_recall_first_chunk(int pinned_chunks) { return std::max(kKvFlashRecallUnit, pinned_chunks); }
+// Unit-aware floor: when unit < kKvFlashRecallUnit and pinned_chunks < 10,
+// chunks [max(1, pinned_chunks)..9] are evictable, so allow recall on them
+// instead of trapping [64, 640) in an unrecallable dead zone.
+inline int kvflash_recall_first_chunk(int pinned_chunks, int unit) {
+    return unit > 0 && unit < kKvFlashRecallUnit
+        ? std::max(1, pinned_chunks)
+        : std::max(kKvFlashRecallUnit, pinned_chunks);
+}
 
 // Chunks of exact tail window next to `recall_chunks` of recalled blocks and `reserve` chunks of room.
 // `pin_reserve_chunks` (the preamble reserve, rows of the pool held for the pins) is taken off the
@@ -244,7 +254,7 @@ inline int kvflash_recall_first_window(const KvFlashRecallIn & in) {
 inline KvFlashRecallPlan kvflash_recall_plan(const std::vector<float> & scores, const KvFlashRecallIn & in) {
     KvFlashRecallPlan r;
     r.k_units = in.unit > 0 ? in.recall_chunks / in.unit : 0;
-    r.first_chunk = kvflash_recall_first_chunk(in.pinned_chunks);
+    r.first_chunk = kvflash_recall_first_chunk(in.pinned_chunks, in.unit);
     r.first_window = kvflash_recall_first_window(in);
     r.tail = in.cur_chunk - r.first_window;
     r.picked = kvflash_recall_pick(scores, r.first_window, r.k_units, in.unit, r.first_chunk);
