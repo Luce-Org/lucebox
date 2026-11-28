@@ -138,6 +138,7 @@ public:
 
     bool park(ParkTarget target) override;
     Residency residency() const override;
+    int kvflash_pool_tokens() const override { return kvflash_active() ? kvflash_tokens_ : 0; }
     bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
     bool reinstate(std::string & error) override;
     bool unpark(ParkTarget target) override;
@@ -326,6 +327,8 @@ protected:
         ~ReselectRequestScope() { scores.clear(); }
     };
     int                     kvflash_recall_blocks_ = 0;      // LUCE_KVFLASH_RECALL_BLOCKS (R-LRU)
+    bool                    kvflash_recall_auto_ = false;    // LUCE_KVFLASH_RECALL_BLOCKS=auto (scaled per request from effective pinned chunks)
+    int                     kvflash_effective_recall_blocks() const;
     int                     kvflash_select_queries_ = 0;     // queries kept per prefill (kQueryCaptureTokens in mode 4, else 0): selector v2, 0 = v1
     int                     kvflash_select_unit_ = luce::common::kKvFlashRecallUnit;   // LUCE_KVFLASH_SELECT_UNIT: chunks per recall unit; budget stays 10 * k chunks
     std::vector<float>      kvflash_q_tail_;                 // this prefill's last prompt queries, oldest first (selector v2)

@@ -437,14 +437,14 @@ bool Qwen35Backend::init() {
     // model (Spark's pattern). LRU is the fallback when nothing is found
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
-    bool kvflash_recall_auto = false;
+    kvflash_recall_auto_ = false;
     {
         kvflash_prefill_reselect_ = luce::common::kvflash_reselect_mode(env_int_or_default("LUCE_KVFLASH_PREFILL_RESELECT", 0), kvflash_qk_policy_);
         kvflash_score_pool_recent_ = env_int_or_default("LUCE_KVFLASH_SCORE_POOL_RECENT", 0) == 1;
         kvflash_m4_single_ = env_int_or_default("LUCE_KVFLASH_M4_SINGLE", 1) != 0;
         const char * rb_env = std::getenv("LUCE_KVFLASH_RECALL_BLOCKS");
         if (rb_env && std::string(rb_env) == "auto") {
-            kvflash_recall_auto = true;
+            kvflash_recall_auto_ = true;
             kvflash_recall_blocks_ = 6;
         } else {
             kvflash_recall_blocks_ = std::max(0, env_int_or_default("LUCE_KVFLASH_RECALL_BLOCKS", 0));
@@ -490,11 +490,11 @@ bool Qwen35Backend::init() {
             kvflash_preamble_reserve_ = reserve;
             kvflash_preamble_rows_ = std::min(rows, reserve);
         }
-        if (kvflash_recall_auto) {
+        if (kvflash_recall_auto_) {
             const int ct = KvFlashConfig{}.chunk_tokens;
             const int avail_chunks = std::max(0, kvflash_tokens_ / ct - kvflash_preamble_reserve_ / ct - 1);
             kvflash_recall_blocks_ = std::max(6, avail_chunks / 30);
-            std::fprintf(stderr, "[kvflash] auto recall_blocks=%d (pool=%d, avail_chunks=%d)\n",
+            std::fprintf(stderr, "[kvflash] auto recall_blocks=%d (pool=%d, base avail_chunks=%d, scales with effective pins)\n",
                          kvflash_recall_blocks_, kvflash_tokens_, avail_chunks);
         }
     }
@@ -3522,13 +3522,14 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
         const int eff_pin_res = std::min(
             kvflash_preamble_reserve_ / ctk,
             luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ctk));
+        const int recall_blocks = kvflash_effective_recall_blocks();
         auto p4 = luce::common::kvflash_mode4_plan(tokens, kv_offset, w_.im_start_id, w_.user_id,
             luce::common::kvflash_max_turn_tokens(ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
-                                                  luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_));
+                                                  luce::common::kKvFlashRecallUnit * recall_blocks));
         p4.r = luce::common::kvflash_uq_snap_rewind(s.uqp, p4.r);
         const auto gate = luce::common::kvflash_recall_gate(
             p4.run, p4.r, end_abs, ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
-            luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_);
+            luce::common::kKvFlashRecallUnit * recall_blocks);
         using Skip = luce::common::KvFlashRecallSkip;
         if (kvflash_prefill_reselect_ == 4 && p4.run) {
             s.m4_track = kvflash_m4_single_ && (int)kvf_ids.size() == end_abs;
@@ -3546,9 +3547,9 @@ Qwen35Backend::KvflashRecallSetup Qwen35Backend::kvflash_recall_setup(const std:
                 using Path = luce::common::KvFlashM4Path;
                 Path path = Path::Full;
                 int first_window = 0;
-                if (s.m4_track && kvflash_recall_blocks_ > 0 &&
+                if (s.m4_track && recall_blocks > 0 &&
                     luce::common::kvflash_recall_gate(true, kv_offset, end_abs, ctk, kvflash_pager_.n_pool_blocks(), eff_pin_res,
-                                                      luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_).skip == Skip::None) {
+                                                      luce::common::kKvFlashRecallUnit * recall_blocks).skip == Skip::None) {
                     luce::common::KvFlashM4Ask a;
                     a.uq_hi = kvflash_uq_req_hi_; a.uq_hash = kvflash_uq_req_hash_; a.uq_stored = uq_stored;
                     a.kv_offset = kv_offset; a.chunk_tokens = ctk;
@@ -3791,13 +3792,23 @@ bool Qwen35Backend::kvflash_prefill_score(int sealed_tokens, double & score_ms) 
     return true;
 }
 
+int Qwen35Backend::kvflash_effective_recall_blocks() const {
+    if (!kvflash_recall_auto_ || !kvflash_active()) return kvflash_recall_blocks_;
+    const int ct = std::max(1, kvflash_pager_.chunk_tokens());
+    const int eff_pin = std::min(
+        kvflash_preamble_reserve_ / ct,
+        luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct));
+    const int avail_chunks = std::max(0, kvflash_tokens_ / ct - eff_pin - 1);
+    return std::max(6, avail_chunks / 30);
+}
+
 luce::common::KvFlashRecallIn Qwen35Backend::kvflash_recall_in(int committed, int end) const {
     const KvFlashPager & p = kvflash_pager_;
     const int ct = p.chunk_tokens();
     luce::common::KvFlashRecallIn in;
     in.n_pool_blocks = p.n_pool_blocks();
     in.cur_chunk = p.cur_chunk();
-    in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_recall_blocks_;
+    in.recall_chunks = luce::common::kKvFlashRecallUnit * kvflash_effective_recall_blocks();
     in.unit = kvflash_select_unit_;
     in.reserve = (end - committed + ct - 1) / ct + 1;
     in.pinned_chunks = luce::common::kvflash_pin_chunks(kvflash_preamble_end_, kvflash_preamble_rows_, ct);
@@ -3814,9 +3825,10 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     KvFlashPager & p = kvflash_pager_;
     std::vector<float> & scores = kvflash_scores_;
     const int ct = p.chunk_tokens();
+    const int recall_blocks = kvflash_effective_recall_blocks();
     int tail = -1;   // the pager's configured tail unless recall derives one
     std::vector<int> picked;
-    if (kvflash_recall_blocks_ > 0) {
+    if (recall_blocks > 0) {
         // budget: kKvFlashRecallUnit * k chunks, picked in units of `unit` chunks
         const int unit = kvflash_select_unit_;
         // The pins sit in the rows LUCE_KVFLASH_PREAMBLE_ROWS reserves in the pool (0 when off): the history budget
@@ -3845,7 +3857,7 @@ void Qwen35Backend::kvflash_prefill_apply(int committed, int end, int q_tok,
     std::fprintf(stderr, "[kvflash] prefill reselect mode=%d scorer=%s k=%d tail=%d @%d (q tok %d) "
                  "picked=[%s]: %d page events; %d in (%.1f MiB H2D) (resident %d/%d blocks) scorer %.1f ms%s\n",
                  kvflash_prefill_reselect_, "exact",
-                 kvflash_recall_blocks_, tail, committed, q_tok, ids.c_str(), events,
+                 recall_blocks, tail, committed, q_tok, ids.c_str(), events,
                  (int)ins, (double)ins * (double)p.chunk_bytes() / 1048576.0,
                  p.resident_blocks(), p.n_pool_blocks(), score_ms, note);
     if (kvflash_select_unit_ != luce::common::kKvFlashRecallUnit)

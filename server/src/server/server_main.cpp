@@ -2572,6 +2572,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n",
                  backend_speculation.ddtree_budget);
+    if (sconfig.kvflash_enabled && sconfig.kvflash_pool_tokens == 0 &&
+        backend->kvflash_pool_tokens() > 0) {
+        sconfig.kvflash_pool_tokens = backend->kvflash_pool_tokens();
+    }
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     const PrefixCacheBudget prefix_ram =
         resolve_prefix_cache_budget(sconfig, *backend);

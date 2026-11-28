@@ -582,6 +582,9 @@ struct ModelBackend {
         return false;
     }
 
+    // Effective KVFlash resident pool capacity in tokens (0 when KVFlash is off).
+    virtual int kvflash_pool_tokens() const { return 0; }
+
     // ── DFlash speculative decode support ────────────────────────────
     // Returns true if this backend can participate in DFlash spec decode
     // (i.e. it implements the DFlashTarget interface).
